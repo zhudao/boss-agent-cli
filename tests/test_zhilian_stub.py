@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 from unittest.mock import MagicMock
-
-import pytest
 from click.testing import CliRunner
 
 from boss_agent_cli.platforms import BossPlatform, Platform, get_platform, list_platforms
@@ -119,14 +117,15 @@ class TestZhilianDelegation:
 		self.plat.user_info()
 		self.mock_client.user_info.assert_called_once_with()
 
-	def test_greet_not_implemented_defaults_from_base(self) -> None:
-		"""Platform 基类 greet 抛 NotImplementedError，Zhilian P0 暂沿用。"""
-		with pytest.raises(NotImplementedError):
-			self.plat.greet("sid", "jid")
+	def test_greet_delegates(self) -> None:
+		self.mock_client.greet.return_value = {"code": 200, "data": {}}
+		self.plat.greet("sid", "jid", "hi")
+		self.mock_client.greet.assert_called_once_with("sid", "jid", "hi")
 
-	def test_apply_not_implemented_defaults_from_base(self) -> None:
-		with pytest.raises(NotImplementedError):
-			self.plat.apply("sid", "jid")
+	def test_apply_delegates(self) -> None:
+		self.mock_client.apply.return_value = {"code": 200, "data": {}}
+		self.plat.apply("sid", "jid", "lid-1")
+		self.mock_client.apply.assert_called_once_with("sid", "jid", "lid-1")
 
 	def test_platform_can_enter_with_context(self) -> None:
 		mock_client = MagicMock()
@@ -156,6 +155,7 @@ class TestZhilianCliIntegration:
 		assert result.exit_code == 0
 		payload = json.loads(result.output)
 		assert "zhilian" in payload["data"]["supported_platforms"]
+		assert "zhipin-recruiter" in payload["data"]["supported_recruiter_platforms"]
 
 	def test_schema_platform_choice_updated(self) -> None:
 		"""schema 的 --platform 选项 choices 应包含 zhilian。"""
@@ -167,3 +167,14 @@ class TestZhilianCliIntegration:
 		payload = json.loads(result.output)
 		platform_opt = payload["data"]["global_options"]["--platform"]
 		assert "zhilian" in platform_opt.get("choices", [])
+
+	def test_schema_marks_hr_as_recruiter_only(self) -> None:
+		from boss_agent_cli.main import cli
+
+		runner = CliRunner()
+		result = runner.invoke(cli, ["schema"])
+		assert result.exit_code == 0
+		payload = json.loads(result.output)
+		availability = payload["data"]["commands"]["hr"]["availability"]
+		assert availability["roles"] == ["recruiter"]
+		assert availability["candidate_platforms"] == []

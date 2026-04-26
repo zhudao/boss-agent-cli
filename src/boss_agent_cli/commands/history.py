@@ -18,14 +18,14 @@ def history_cmd(ctx: click.Context, page: int) -> None:
 	auth = AuthManager(data_dir, logger=logger)
 	with get_platform_instance(ctx, auth) as platform:
 		raw = platform.job_history(page)
-		zp_data = raw.get("zpData", {})
-		job_list = zp_data.get("jobList", [])
+		platform_data = platform.unwrap_data(raw) or {}
+		job_list = platform_data.get("jobList", [])
 
 		items = [JobItem.from_api(raw_item).to_dict() for raw_item in job_list]
 
 	pagination = {
 		"page": page,
-		"has_more": zp_data.get("hasMore", False),
+		"has_more": platform_data.get("hasMore", False),
 		"total": len(items),
 	}
 	hints = {
@@ -41,7 +41,7 @@ def history_cmd(ctx: click.Context, page: int) -> None:
 		render=lambda data: render_job_table(
 			data, "history",
 			page=page,
-			hint_next=f"more: boss history --page {page + 1}" if zp_data.get("hasMore") else "",
+			hint_next=f"more: boss history --page {page + 1}" if platform_data.get("hasMore") else "",
 		),
 		pagination=pagination, hints=hints,
 	)

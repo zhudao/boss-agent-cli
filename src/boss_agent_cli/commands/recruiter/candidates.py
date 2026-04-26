@@ -26,7 +26,7 @@ def candidates_cmd(ctx: click.Context, query: str, city: str | None, job_id: str
 			query, city=city, page=page, job_id=job_id,
 			experience=experience, degree=degree,
 		)
-		data = result.get("zpData", {})
+		data = platform.unwrap_data(result) or {}
 		handle_output(
 			ctx, "recruiter-candidates", data,
 			hints={"next_actions": [

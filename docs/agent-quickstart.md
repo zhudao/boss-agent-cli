@@ -42,6 +42,7 @@ boss greet <security_id> <job_id>
 解析约定：
 - `stdout` 只读 JSON 信封
 - `ok=true` 代表成功，`ok=false` 时读取 `error.code` 与 `error.recovery_action`
+- `boss schema` 除了返回 `supported_platforms` / `supported_recruiter_platforms`，还会给每个命令附带 `availability`，可直接按 `role/platform` 做工具路由
 
 ### 招聘者最小闭环
 

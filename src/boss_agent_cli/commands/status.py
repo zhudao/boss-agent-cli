@@ -26,7 +26,8 @@ def status_cmd(ctx: click.Context) -> None:
 
 	with get_platform_instance(ctx, auth) as platform:
 		info = platform.user_info()
-		user_name = info.get("zpData", {}).get("name", "未知用户")
+		user_info = platform.unwrap_data(info) or {}
+		user_name = user_info.get("name", "未知用户")
 		data = {
 			"logged_in": True,
 			"user_name": user_name,

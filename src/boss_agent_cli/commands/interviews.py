@@ -27,7 +27,8 @@ def interviews_cmd(ctx: click.Context) -> None:
 
 	with get_platform_instance(ctx, auth) as platform:
 		raw = platform.interview_data()
-		interview_list = raw.get("zpData", {}).get("interviewList", [])
+		platform_data = platform.unwrap_data(raw) or {}
+		interview_list = platform_data.get("interviewList", [])
 
 	items = [
 		{

@@ -10,6 +10,7 @@ def _ctx_mock(mock_cls):
 	instance = mock_cls.return_value
 	instance.__enter__ = lambda self: self
 	instance.__exit__ = lambda self, *a: None
+	instance.unwrap_data.side_effect = lambda response: response.get("zpData") if "zpData" in response else response.get("data")
 	return instance
 
 
@@ -63,6 +64,27 @@ def test_chatmsg_not_found(mock_auth_cls, mock_client_cls):
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
+
+
+@patch("boss_agent_cli.commands.chatmsg.get_platform_instance")
+@patch("boss_agent_cli.commands.chatmsg.AuthManager")
+def test_chatmsg_supports_data_envelope(mock_auth_cls, mock_client_cls):
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.friend_list.return_value = {"code": 200, "data": {"result": [_make_friend()]}}
+	mock_client.chat_history.return_value = {
+		"code": 200,
+		"data": {
+			"messages": [
+				{"from": {"uid": 99, "name": "张HR"}, "type": 1, "text": "智联你好", "time": 1700000000000},
+			],
+		},
+	}
+	runner = CliRunner()
+	result = runner.invoke(cli, ["chatmsg", "sec_001"])
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"][0]["text"] == "智联你好"
 
 
 # ── mark ─────────────────────────────────────────────────────────────
@@ -174,6 +196,7 @@ def test_detail_with_job_id(mock_auth_cls, mock_client_cls, mock_cache_cls):
 			},
 		},
 	}
+	mock_client.unwrap_data.return_value = mock_client.job_detail.return_value["zpData"]
 	runner = CliRunner()
 	result = runner.invoke(cli, ["detail", "sec_001", "--job-id", "enc_001"])
 	assert result.exit_code == 0
@@ -202,6 +225,19 @@ def test_me_basic(mock_auth_cls, mock_client_cls):
 	assert "测试用户" in str(parsed["data"])
 
 
+@patch("boss_agent_cli.commands.me.get_platform_instance")
+@patch("boss_agent_cli.commands.me.AuthManager")
+def test_me_user_section_supports_data_envelope(mock_auth_cls, mock_client_cls):
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.user_info.return_value = {"code": 200, "data": {"name": "智联用户", "email": "z@demo.dev"}}
+	runner = CliRunner()
+	result = runner.invoke(cli, ["me", "--section", "user"])
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["user"]["name"] == "智联用户"
+
+
 # ── history ──────────────────────────────────────────────────────────
 
 
@@ -225,6 +261,7 @@ def test_history_success(mock_auth_cls, mock_client_cls):
 			],
 		},
 	}
+	mock_client.unwrap_data.return_value = mock_client.job_history.return_value["zpData"]
 	runner = CliRunner()
 	result = runner.invoke(cli, ["history"])
 	assert result.exit_code == 0
@@ -239,6 +276,7 @@ def test_history_uses_client_context_manager(mock_auth_cls, mock_client_cls):
 	instance.__enter__ = MagicMock(return_value=instance)
 	instance.__exit__ = MagicMock(return_value=None)
 	instance.job_history.return_value = {"code": 0, "zpData": {"hasMore": False, "jobList": []}}
+	instance.unwrap_data.return_value = instance.job_history.return_value["zpData"]
 	runner = CliRunner()
 	result = runner.invoke(cli, ["history"])
 	assert result.exit_code == 0
@@ -257,11 +295,29 @@ def test_interviews_success(mock_auth_cls, mock_client_cls):
 		"code": 0,
 		"zpData": {"interviewList": []},
 	}
+	mock_client.unwrap_data.return_value = mock_client.interview_data.return_value["zpData"]
 	runner = CliRunner()
 	result = runner.invoke(cli, ["interviews"])
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
+
+
+@patch("boss_agent_cli.commands.interviews.get_platform_instance")
+@patch("boss_agent_cli.commands.interviews.AuthManager")
+def test_interviews_supports_zhilian_style_data(mock_auth_cls, mock_client_cls):
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {"zp_token": "x"}}
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.interview_data.return_value = {
+		"code": 200,
+		"data": {"interviewList": [{"jobName": "测试岗位"}]},
+	}
+	mock_client.unwrap_data.return_value = mock_client.interview_data.return_value["data"]
+	runner = CliRunner()
+	result = runner.invoke(cli, ["interviews"])
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["data"][0]["jobName"] == "测试岗位"
 
 
 @patch("boss_agent_cli.commands.detail.CacheStore")
@@ -281,6 +337,7 @@ def test_detail_uses_client_context_manager(mock_auth_cls, mock_client_cls, mock
 			"brandComInfo": {"brandName": "TestCo"},
 		},
 	}
+	instance.unwrap_data.return_value = instance.job_detail.return_value["zpData"]
 	runner = CliRunner()
 	result = runner.invoke(cli, ["detail", "sec_001", "--job-id", "enc_001"])
 	assert result.exit_code == 0
@@ -318,6 +375,9 @@ def test_detail_httpx_fallback_to_browser_on_auth_error(mock_auth_cls, mock_clie
 			}
 		}
 	}
+	def unwrap_data_side_effect(payload):
+		return payload.get("zpData")
+	mock_client.unwrap_data.side_effect = unwrap_data_side_effect
 	runner = CliRunner()
 	result = runner.invoke(cli, ["detail", "sec_001", "--job-id", "enc_001"])
 	assert result.exit_code == 0, f"exit_code={result.exit_code}, output={result.output}"
@@ -358,6 +418,9 @@ def test_detail_httpx_fallback_to_browser_on_none(mock_auth_cls, mock_client_cls
 			}
 		}
 	}
+	def unwrap_data_side_effect(payload):
+		return payload.get("zpData")
+	mock_client.unwrap_data.side_effect = unwrap_data_side_effect
 	runner = CliRunner()
 	result = runner.invoke(cli, ["detail", "sec_001", "--job-id", "enc_001"])
 	assert result.exit_code == 0
@@ -390,6 +453,7 @@ def test_show_uses_client_context_manager(mock_auth_cls, mock_client_cls, mock_g
 			},
 		},
 	}
+	instance.unwrap_data.return_value = instance.job_card.return_value["zpData"]
 	runner = CliRunner()
 	result = runner.invoke(cli, ["show", "1"])
 	assert result.exit_code == 0
@@ -405,6 +469,7 @@ def test_interviews_uses_client_context_manager(mock_auth_cls, mock_client_cls):
 	instance.__enter__ = MagicMock(return_value=instance)
 	instance.__exit__ = MagicMock(return_value=None)
 	instance.interview_data.return_value = {"code": 0, "zpData": {"interviewList": []}}
+	instance.unwrap_data.return_value = instance.interview_data.return_value["zpData"]
 	runner = CliRunner()
 	result = runner.invoke(cli, ["interviews"])
 	assert result.exit_code == 0

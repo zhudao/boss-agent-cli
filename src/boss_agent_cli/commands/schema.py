@@ -3,7 +3,7 @@ from typing import Any
 import click
 
 from boss_agent_cli.output import emit_success
-from boss_agent_cli.platforms import list_platforms
+from boss_agent_cli.platforms import list_platforms, list_recruiter_platforms
 
 # 类型转换：native schema → JSON Schema 基础类型
 _JSON_SCHEMA_TYPE_MAP = {
@@ -58,15 +58,97 @@ def _command_to_json_schema(cmd_name: str, cmd_spec: dict[str, Any]) -> dict[str
 	return schema
 
 
+_ROLE_BOTH_COMMANDS = {
+	"login", "status", "doctor", "logout", "schema", "config", "clean", "cities",
+}
+
+_CANDIDATE_COMMANDS = {
+	"search", "detail", "greet", "batch-greet", "recommend", "export", "me", "show",
+	"history", "chat", "chatmsg", "chat-summary", "mark", "exchange", "interviews",
+	"watch", "preset", "pipeline", "follow-up", "apply", "shortlist", "digest",
+	"stats", "resume", "ai",
+}
+
+
+def _availability_note(availability: dict[str, Any]) -> str:
+	roles = ", ".join(availability.get("roles", [])) or "none"
+	candidate_platforms = ", ".join(availability.get("candidate_platforms", [])) or "-"
+	recruiter_platforms = ", ".join(availability.get("recruiter_platforms", [])) or "-"
+	return (
+		f"可用性: roles={roles}; "
+		f"candidate_platforms={candidate_platforms}; "
+		f"recruiter_platforms={recruiter_platforms}"
+	)
+
+
+def _command_availability(
+	cmd_name: str,
+	*,
+	candidate_platforms: list[str],
+	recruiter_platforms: list[str],
+) -> dict[str, Any]:
+	if cmd_name == "hr":
+		subcommand_availability = {
+			sub_name: {
+				"roles": ["recruiter"],
+				"candidate_platforms": [],
+				"recruiter_platforms": recruiter_platforms,
+			}
+			for sub_name in SCHEMA_DATA["commands"]["hr"].get("subcommands", {})
+		}
+		return {
+			"roles": ["recruiter"],
+			"candidate_platforms": [],
+			"recruiter_platforms": recruiter_platforms,
+			"subcommands": subcommand_availability,
+		}
+	if cmd_name in _ROLE_BOTH_COMMANDS:
+		return {
+			"roles": ["candidate", "recruiter"],
+			"candidate_platforms": candidate_platforms,
+			"recruiter_platforms": recruiter_platforms,
+		}
+	if cmd_name in _CANDIDATE_COMMANDS:
+		return {
+			"roles": ["candidate"],
+			"candidate_platforms": candidate_platforms,
+			"recruiter_platforms": [],
+		}
+	return {
+		"roles": ["candidate"],
+		"candidate_platforms": candidate_platforms,
+		"recruiter_platforms": [],
+	}
+
+
+def _inject_availability(data: dict[str, Any]) -> dict[str, Any]:
+	candidate_platforms = data.get("supported_platforms", [])
+	recruiter_platforms = data.get("supported_recruiter_platforms", [])
+	commands: dict[str, Any] = {}
+	for cmd_name, cmd_spec in data["commands"].items():
+		cmd_copy = dict(cmd_spec)
+		cmd_copy["availability"] = _command_availability(
+			cmd_name,
+			candidate_platforms=candidate_platforms,
+			recruiter_platforms=recruiter_platforms,
+		)
+		commands[cmd_name] = cmd_copy
+	data["commands"] = commands
+	return data
+
+
 def _format_openai_tools(data: dict[str, Any]) -> list[dict[str, Any]]:
 	"""OpenAI Functions / Tools API 格式。"""
 	tools = []
 	for cmd_name, cmd_spec in data["commands"].items():
+		description = cmd_spec.get("description", "")
+		if availability := cmd_spec.get("availability"):
+			description = f"{description} [{_availability_note(availability)}]"
 		tools.append({
 			"type": "function",
 			"function": {
 				"name": f"boss_{cmd_name.replace('-', '_')}",
-				"description": cmd_spec.get("description", ""),
+				"description": description,
 				"parameters": _command_to_json_schema(cmd_name, cmd_spec),
 			},
 		})
@@ -77,9 +159,12 @@ def _format_anthropic_tools(data: dict[str, Any]) -> list[dict[str, Any]]:
 	"""Anthropic Tool Use 格式。"""
 	tools = []
 	for cmd_name, cmd_spec in data["commands"].items():
+		description = cmd_spec.get("description", "")
+		if availability := cmd_spec.get("availability"):
+			description = f"{description} [{_availability_note(availability)}]"
 		tools.append({
 			"name": f"boss_{cmd_name.replace('-', '_')}",
-			"description": cmd_spec.get("description", ""),
+			"description": description,
 			"input_schema": _command_to_json_schema(cmd_name, cmd_spec),
 		})
 	return tools
@@ -571,7 +656,7 @@ SCHEMA_DATA = {
 		"--platform": {
 			"type": "string",
 			"default": "zhipin",
-			"description": "招聘平台适配器（zhipin=BOSS 直聘生产可用；zhilian=智联招聘 stub，Week 2 真实现）",
+			"description": "招聘平台适配器（zhipin=BOSS 直聘求职者/招聘者均可用；zhilian=智联招聘已接通求职者侧包络与命令兼容，招聘者侧暂未接入）",
 			"choices": ["zhipin", "zhilian"],
 		},
 		"--json": {
@@ -720,6 +805,8 @@ def schema_cmd(ctx: click.Context, output_format: str) -> None:
 	data["current_platform"] = current
 	data["current_role"] = (ctx.obj or {}).get("role") or "candidate"
 	data["supported_platforms"] = list_platforms()
+	data["supported_recruiter_platforms"] = list_recruiter_platforms()
+	data = _inject_availability(data)
 
 	if output_format == "openai-tools":
 		emit_success("schema", {"format": "openai-tools", "tools": _format_openai_tools(data)})

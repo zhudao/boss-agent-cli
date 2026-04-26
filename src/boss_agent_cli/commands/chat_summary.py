@@ -19,7 +19,8 @@ def chat_summary_cmd(ctx: click.Context, security_id: str, page: int, count: int
 
 	with get_platform_instance(ctx, auth) as platform:
 		friends_resp = platform.friend_list(page=1)
-		items = friends_resp.get("zpData", {}).get("result") or friends_resp.get("zpData", {}).get("friendList") or []
+		friends_data = platform.unwrap_data(friends_resp) or {}
+		items = friends_data.get("result") or friends_data.get("friendList") or []
 
 		gid = None
 		friend_name = "-"
@@ -39,7 +40,8 @@ def chat_summary_cmd(ctx: click.Context, security_id: str, page: int, count: int
 			return
 
 		resp = platform.chat_history(gid, security_id, page=page, count=count)
-		messages = resp.get("zpData", {}).get("messages") or resp.get("zpData", {}).get("historyMsgList") or []
+		msg_data = platform.unwrap_data(resp) or {}
+		messages = msg_data.get("messages") or msg_data.get("historyMsgList") or []
 		summary = summarize_messages(messages, friend_uid=gid)
 
 	handle_output(

@@ -56,10 +56,10 @@ def detail_cmd(ctx: click.Context, security_id: str, lid: str, job_id: str) -> N
 def _detail_via_httpx(platform: Platform, security_id: str, job_id: str, data_dir: Path) -> dict[str, Any] | None:
 	"""快速通道：通过 httpx 获取职位详情（不需要浏览器）"""
 	raw = platform.job_detail(job_id)
-	zp = raw.get("zpData", {})
-	job_info = zp.get("jobInfo", {})
-	boss_info = zp.get("bossInfo", {})
-	brand_info = zp.get("brandComInfo", {})
+	platform_data = platform.unwrap_data(raw) or {}
+	job_info = platform_data.get("jobInfo", {})
+	boss_info = platform_data.get("bossInfo", {})
+	brand_info = platform_data.get("brandComInfo", {})
 
 	if not job_info:
 		return None
@@ -75,7 +75,7 @@ def _detail_via_httpx(platform: Platform, security_id: str, job_id: str, data_di
 		"city": job_info.get("cityName", ""),
 		"experience": job_info.get("experienceName", ""),
 		"education": job_info.get("degreeName", ""),
-		"description": zp.get("jobDetail", "") or job_info.get("postDescription", ""),
+		"description": platform_data.get("jobDetail", "") or job_info.get("postDescription", ""),
 		"address": job_info.get("address", ""),
 		"skills": job_info.get("jobLabels", []) or job_info.get("skills", []),
 		"boss_name": boss_info.get("name", ""),
@@ -89,7 +89,8 @@ def _detail_via_httpx(platform: Platform, security_id: str, job_id: str, data_di
 def _detail_via_browser(platform: Platform, security_id: str, lid: str, data_dir: Path) -> dict[str, Any] | None:
 	"""兜底通道：通过浏览器 job_card 获取职位详情"""
 	raw = platform.job_card(security_id, lid)
-	card = raw.get("zpData", {}).get("jobCard", {})
+	platform_data = platform.unwrap_data(raw) or {}
+	card = platform_data.get("jobCard", {})
 	if not card:
 		return None
 

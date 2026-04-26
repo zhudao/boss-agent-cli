@@ -53,8 +53,8 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 
 	with get_platform_instance(ctx, auth) as platform:
 		resp = platform.friend_list(page=page)
-		zp_data = resp.get("zpData", {})
-		items = zp_data.get("result") or zp_data.get("friendList") or []
+		platform_data = platform.unwrap_data(resp) or {}
+		items = platform_data.get("result") or platform_data.get("friendList") or []
 
 		# 时间筛选阈值
 		cutoff_ts = None

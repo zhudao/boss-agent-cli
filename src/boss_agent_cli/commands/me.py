@@ -27,7 +27,7 @@ def me_cmd(ctx: click.Context, section: str | None, deliver_page: int) -> None:
 				if logger:
 					logger.info("获取用户基本信息...")
 				resp = platform.user_info()
-				zp_data = resp.get("zpData", {})
+				zp_data = platform.unwrap_data(resp) or {}
 				result["user"] = {
 					"name": zp_data.get("name", ""),
 					"email": zp_data.get("email", ""),
@@ -40,21 +40,21 @@ def me_cmd(ctx: click.Context, section: str | None, deliver_page: int) -> None:
 				if logger:
 					logger.info("获取简历基本信息...")
 				resp = platform.resume_baseinfo()
-				zp_data = resp.get("zpData", {})
+				zp_data = platform.unwrap_data(resp) or {}
 				result["resume"] = zp_data
 
 			if "expect" in sections:
 				if logger:
 					logger.info("获取求职期望...")
 				resp = platform.resume_expect()
-				zp_data = resp.get("zpData", {})
+				zp_data = platform.unwrap_data(resp) or {}
 				result["expect"] = zp_data
 
 			if "deliver" in sections:
 				if logger:
 					logger.info("获取投递记录...")
 				resp = platform.deliver_list(page=deliver_page)
-				zp_data = resp.get("zpData", {})
+				zp_data = platform.unwrap_data(resp) or {}
 				result["deliver"] = zp_data
 
 			handle_output(

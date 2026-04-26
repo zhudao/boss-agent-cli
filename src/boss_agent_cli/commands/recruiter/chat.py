@@ -20,7 +20,7 @@ def recruiter_chat_cmd(ctx: click.Context, page: int, job_id: str | None, label_
 	auth = AuthManager(data_dir, logger=logger)
 	with get_recruiter_platform_instance(ctx, auth) as platform:
 		result = platform.friend_list(page=page, label_id=label_id, job_id=job_id)
-		data = result.get("zpData", {})
+		data = platform.unwrap_data(result) or {}
 		handle_output(
 			ctx, "recruiter-chat", data,
 			hints={"next_actions": [

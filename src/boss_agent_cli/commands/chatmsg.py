@@ -27,8 +27,8 @@ def chatmsg_cmd(ctx: click.Context, security_id: str, page: int, count: int) -> 
 
 	with get_platform_instance(ctx, auth) as platform:
 		friends_resp = platform.friend_list(page=1)
-		zp_data = friends_resp.get("zpData", {})
-		items = zp_data.get("result") or zp_data.get("friendList") or []
+		platform_data = platform.unwrap_data(friends_resp) or {}
+		items = platform_data.get("result") or platform_data.get("friendList") or []
 
 		gid = None
 		friend_name = None
@@ -47,7 +47,7 @@ def chatmsg_cmd(ctx: click.Context, security_id: str, page: int, count: int) -> 
 			return
 
 		resp = platform.chat_history(gid, security_id, page=page, count=count)
-		msg_data = resp.get("zpData", {})
+		msg_data = platform.unwrap_data(resp) or {}
 		messages = msg_data.get("messages") or msg_data.get("historyMsgList") or []
 
 		result = []

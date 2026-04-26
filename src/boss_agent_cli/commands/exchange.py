@@ -21,8 +21,8 @@ def exchange_cmd(ctx: click.Context, security_id: str, exchange_type: str) -> No
 
 	with get_platform_instance(ctx, auth) as platform:
 		friends_resp = platform.friend_list(page=1)
-		zp_data = friends_resp.get("zpData", {})
-		items = zp_data.get("result") or zp_data.get("friendList") or []
+		friend_data = platform.unwrap_data(friends_resp) or {}
+		items = friend_data.get("result") or friend_data.get("friendList") or []
 
 		uid = None
 		friend_name: str = "-"

@@ -47,7 +47,8 @@ def show_cmd(ctx: click.Context, index: int) -> None:
 	with get_platform_instance(ctx, auth) as platform:
 		raw = platform.job_card(security_id)
 
-	card = raw.get("zpData", {}).get("jobCard", {})
+	platform_data = platform.unwrap_data(raw) or {}
+	card = platform_data.get("jobCard", {})
 	if not card:
 		handle_error_output(
 			ctx, "show",

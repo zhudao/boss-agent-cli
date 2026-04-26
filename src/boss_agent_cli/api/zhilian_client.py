@@ -17,6 +17,7 @@ Week 2 P0 先落地只读链路：基础 httpx client + 4 个读接口，
 from __future__ import annotations
 
 import atexit
+from html.parser import HTMLParser
 import random
 import sys
 import time
@@ -38,6 +39,9 @@ SEARCH_URL = "https://fe-api.zhaopin.com/api/c/salesman-search/v2"
 DETAIL_URL_TEMPLATE = "https://fe-api.zhaopin.com/api/c/jobs/{job_id}/info"
 RECOMMEND_URL = "https://fe-api.zhaopin.com/api/c/recom-position"
 USER_INFO_URL = "https://i.zhaopin.com/api/c/account/profile"
+CSRF_BOOTSTRAP_URL = "https://www.zhaopin.com/"
+GREET_URL = "https://fe-api.zhaopin.com/c/i/liaoliao/startConversation"
+APPLY_URL = "https://fe-api.zhaopin.com/c/i/sou/deliverPosition"
 
 _DEFAULT_HEADERS: dict[str, str] = {
 	"Accept": "application/json, text/plain, */*",
@@ -54,6 +58,27 @@ _REFERER_MAP: dict[str, str] = {
 
 # atexit safeguard：类比 BossClient 的管理方式
 _OPEN_CLIENTS: weakref.WeakSet["ZhilianClient"] = weakref.WeakSet()
+
+
+class _CsrfMetaParser(HTMLParser):
+	"""从 HTML meta 标签中提取 csrf-token。"""
+
+	def __init__(self) -> None:
+		super().__init__()
+		self.csrf_token: str | None = None
+
+	def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+		if tag.lower() != "meta" or self.csrf_token:
+			return
+		attr_map = {key.lower(): value for key, value in attrs}
+		if attr_map.get("name") == "csrf-token" and attr_map.get("content"):
+			self.csrf_token = attr_map["content"]
+
+
+def _extract_csrf_token(html: str) -> str | None:
+	parser = _CsrfMetaParser()
+	parser.feed(html)
+	return parser.csrf_token
 
 
 def _close_open_clients() -> None:
@@ -84,6 +109,7 @@ class ZhilianClient:
 		self._delay = delay
 		self._cdp_url = cdp_url
 		self._client: httpx.Client | None = None
+		self._csrf_token: str | None = None
 		self._throttle = RequestThrottle(delay)
 		self._closed = False
 		_OPEN_CLIENTS.add(self)
@@ -113,6 +139,33 @@ class ZhilianClient:
 	def _headers_for(self, url: str) -> dict[str, str]:
 		return {"Referer": _REFERER_MAP.get(url, "https://www.zhaopin.com/")}
 
+	def _fetch_csrf_token(self) -> str:
+		for attempt in range(_MAX_RETRIES + 1):
+			client = self._get_client()
+			self._throttle.wait()
+			resp = client.get(
+				CSRF_BOOTSTRAP_URL,
+				headers={"Referer": CSRF_BOOTSTRAP_URL, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+			)
+			self._throttle.mark()
+			self._merge_cookies(resp)
+
+			if resp.status_code in (401, 403) and attempt < _MAX_RETRIES:
+				backoff = (2 ** attempt) + random.uniform(0.3, 0.9)
+				time.sleep(backoff)
+				self._auth.force_refresh(cdp_url=self._cdp_url)
+				self._client = None
+				self._csrf_token = None
+				continue
+
+			resp.raise_for_status()
+			token = _extract_csrf_token(resp.text)
+			if token:
+				return token
+			raise RuntimeError("智联页面未找到 csrf-token")
+
+		raise RuntimeError("智联 csrf-token 获取失败，已达最大重试次数")
+
 	def _merge_cookies(self, resp: httpx.Response) -> None:
 		for name, value in resp.cookies.items():
 			if value:
@@ -122,7 +175,9 @@ class ZhilianClient:
 		for attempt in range(_MAX_RETRIES + 1):
 			client = self._get_client()
 			self._throttle.wait()
-			resp = client.request(method, url, headers=self._headers_for(url), **kwargs)
+			extra_headers = kwargs.pop("headers", {})
+			headers = {**self._headers_for(url), **extra_headers}
+			resp = client.request(method, url, headers=headers, **kwargs)
 			self._throttle.mark()
 			self._merge_cookies(resp)
 
@@ -177,6 +232,40 @@ class ZhilianClient:
 		self.close()
 
 	# ── P0 只读 ────────────────────────────────────
+
+	def get_csrf_token(self, *, force_refresh: bool = False) -> str:
+		"""获取并缓存智联写操作所需的 csrf-token。"""
+		if force_refresh or not self._csrf_token:
+			self._csrf_token = self._fetch_csrf_token()
+		return self._csrf_token
+
+	def greet(self, security_id: str, job_id: str, message: str = "") -> dict[str, Any]:
+		payload: dict[str, Any] = {
+			"securityId": security_id,
+			"jobId": job_id,
+		}
+		if message:
+			payload["message"] = message
+		return self._request(
+			"POST",
+			GREET_URL,
+			data=payload,
+			headers={"csrf-token": self.get_csrf_token()},
+		)
+
+	def apply(self, security_id: str, job_id: str, lid: str = "") -> dict[str, Any]:
+		payload: dict[str, Any] = {
+			"securityId": security_id,
+			"jobId": job_id,
+		}
+		if lid:
+			payload["lid"] = lid
+		return self._request(
+			"POST",
+			APPLY_URL,
+			data=payload,
+			headers={"csrf-token": self.get_csrf_token()},
+		)
 
 	def search_jobs(self, query: str, **filters: Any) -> dict[str, Any]:
 		params: dict[str, Any] = {

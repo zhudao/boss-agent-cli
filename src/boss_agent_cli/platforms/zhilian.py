@@ -60,4 +60,8 @@ class ZhilianPlatform(Platform):
 	def user_info(self) -> dict[str, Any]:
 		return self._client.user_info()
 
-	# greet / apply / friend_list 沿用 Platform 基类的 NotImplementedError 默认
+	def greet(self, security_id: str, job_id: str, message: str = "") -> dict[str, Any]:
+		return self._client.greet(security_id, job_id, message)
+
+	def apply(self, security_id: str, job_id: str, lid: str = "") -> dict[str, Any]:
+		return self._client.apply(security_id, job_id, lid)
