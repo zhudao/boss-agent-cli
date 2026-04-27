@@ -2,7 +2,7 @@ import click
 
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.commands._platform import get_platform_instance
-from boss_agent_cli.display import handle_auth_errors, handle_error_output, handle_output, render_status
+from boss_agent_cli.display import handle_auth_errors, handle_error_output, handle_output, login_action_for_ctx, render_status
 
 
 @click.command("status")
@@ -16,11 +16,12 @@ def status_cmd(ctx: click.Context) -> None:
 
 	token = auth.check_status()
 	if token is None:
+		login_action = login_action_for_ctx(ctx)
 		handle_error_output(
 			ctx, "status",
 			code="AUTH_REQUIRED",
-			message="未登录，请先执行 boss login",
-			recoverable=True, recovery_action="boss login",
+			message=f"未登录，请先执行 {login_action}",
+			recoverable=True, recovery_action=login_action,
 		)
 		return
 

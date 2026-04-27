@@ -8,6 +8,7 @@ from boss_agent_cli.display import (
 	handle_output,
 	handle_error_output,
 	handle_auth_errors,
+	login_action_for_ctx,
 )
 
 
@@ -80,6 +81,7 @@ class TestHandleAuthErrors:
 			mock_err.assert_called_once()
 			call_kwargs = mock_err.call_args
 			assert call_kwargs[1]["code"] == "AUTH_REQUIRED"
+			assert call_kwargs[1]["recovery_action"] == "boss login"
 
 	def test_token_refresh_failed(self):
 		from boss_agent_cli.auth.manager import TokenRefreshFailed
@@ -95,6 +97,22 @@ class TestHandleAuthErrors:
 			mock_err.assert_called_once()
 			call_kwargs = mock_err.call_args
 			assert call_kwargs[1]["code"] == "TOKEN_REFRESH_FAILED"
+			assert call_kwargs[1]["recovery_action"] == "boss login"
+
+	def test_auth_required_uses_zhilian_login_action(self):
+		from boss_agent_cli.auth.manager import AuthRequired
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True, "platform": "zhilian"}
+
+		@handle_auth_errors("search")
+		def impl(ctx):
+			raise AuthRequired()
+
+		with patch("boss_agent_cli.display.handle_error_output") as mock_err:
+			impl(ctx)
+			mock_err.assert_called_once()
+			call_kwargs = mock_err.call_args
+			assert call_kwargs[1]["recovery_action"] == "boss --platform zhilian login"
 
 	def test_generic_exception(self):
 		ctx = MagicMock()
@@ -134,6 +152,18 @@ class TestHandleOutputFallback:
 			mock_out.isatty.return_value = True
 			handle_output(ctx, "test", {"key": "val"})
 			mock_emit.assert_called_once()
+
+
+class TestLoginActionForCtx:
+	def test_default_platform_uses_plain_login(self):
+		ctx = MagicMock()
+		ctx.obj = {}
+		assert login_action_for_ctx(ctx) == "boss login"
+
+	def test_zhilian_platform_uses_platform_specific_login(self):
+		ctx = MagicMock()
+		ctx.obj = {"platform": "zhilian"}
+		assert login_action_for_ctx(ctx) == "boss --platform zhilian login"
 
 
 # ── handle_error_output TTY 分支 ─────────────────────────────

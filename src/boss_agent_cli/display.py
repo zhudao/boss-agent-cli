@@ -18,6 +18,14 @@ from boss_agent_cli.output import emit_success
 console = Console(stderr=True)
 
 
+def login_action_for_ctx(ctx: Any) -> str:
+	"""Return the platform-aware login recovery command."""
+	platform_name = "zhipin"
+	if ctx and getattr(ctx, "obj", None):
+		platform_name = ctx.obj.get("platform") or "zhipin"
+	return "boss --platform zhilian login" if platform_name == "zhilian" else "boss login"
+
+
 def is_json_mode(ctx) -> bool:
 	"""Check if --json flag is set or stdout is piped (non-TTY)."""
 	force_json = ctx.obj.get("json_output", False) if ctx and ctx.obj else False
@@ -288,16 +296,18 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 			try:
 				return func(ctx, *args, **kwargs)
 			except AuthRequired:
+				login_action = login_action_for_ctx(ctx)
 				handle_error_output(
 					ctx, command_name, code="AUTH_REQUIRED",
-					message="未登录，请先执行 boss login",
-					recoverable=True, recovery_action="boss login",
+					message=f"未登录，请先执行 {login_action}",
+					recoverable=True, recovery_action=login_action,
 				)
 			except TokenRefreshFailed:
+				login_action = login_action_for_ctx(ctx)
 				handle_error_output(
 					ctx, command_name, code="TOKEN_REFRESH_FAILED",
 					message="Token 刷新失败，请重新登录",
-					recoverable=True, recovery_action="boss login",
+					recoverable=True, recovery_action=login_action,
 				)
 			except AccountRiskError as e:
 				recovery = (

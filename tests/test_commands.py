@@ -40,6 +40,16 @@ def test_status_not_logged_in(mock_auth_cls):
 	assert parsed["error"]["code"] == "AUTH_REQUIRED"
 
 
+@patch("boss_agent_cli.commands.status.AuthManager")
+def test_status_not_logged_in_for_zhilian_has_platform_specific_recovery(mock_auth_cls):
+	mock_auth_cls.return_value.check_status.return_value = None
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--platform", "zhilian", "status"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["recovery_action"] == "boss --platform zhilian login"
+
+
 @patch("boss_agent_cli.commands.status.get_platform_instance")
 @patch("boss_agent_cli.commands.status.AuthManager")
 def test_status_logged_in_happy_path(mock_auth_cls, mock_client_cls):
