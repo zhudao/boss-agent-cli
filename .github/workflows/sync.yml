@@ -21,9 +21,12 @@ jobs:
             exit 1
           fi
           echo "upstream=$UPSTREAM" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync
         run: |
           gh repo sync ${{ github.repository }} --source ${{ steps.upstream.outputs.upstream }} --force
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
