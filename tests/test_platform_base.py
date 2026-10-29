@@ -58,9 +58,31 @@ class TestBossEnvelopeAdapter:
 		assert self.plat.unwrap_data({"code": 0}) is None
 
 	def test_parse_error_stoken_expired(self) -> None:
-		code, msg = self.plat.parse_error({"code": 37, "message": "stoken invalid"})
+		code, msg = self.plat.parse_error({"code": 37, "message": "stoken expired"})
 		assert code == "TOKEN_REFRESH_FAILED"
-		assert "stoken" in msg.lower() or msg
+		assert msg == "stoken expired"
+
+	def test_parse_error_stoken_invalid_is_environment_risk(self) -> None:
+		code, msg = self.plat.parse_error({"code": 37, "message": "stoken invalid"})
+		assert code == "ENVIRONMENT_RISK"
+		assert msg == "stoken invalid"
+
+	def test_parse_error_environment_risk_code_37(self) -> None:
+		"""环境异常文案的 code 37 必须归为 ENVIRONMENT_RISK，不得转回 TOKEN_REFRESH_FAILED。"""
+		code, msg = self.plat.parse_error({"code": 37, "message": "环境存在异常"})
+		assert code == "ENVIRONMENT_RISK"
+		assert msg == "环境存在异常"
+
+	def test_parse_error_code_37_message_falls_back_to_zp_data(self) -> None:
+		"""只带 zpData 文案的 code 37：信封 message 不得为空（#403 review 第 4 项的退化场景）。"""
+		code, msg = self.plat.parse_error({"code": 37, "zpData": "环境存在异常"})
+		assert code == "ENVIRONMENT_RISK"
+		assert msg == "环境存在异常"
+
+	def test_parse_error_ambiguous_code_37_fails_closed(self) -> None:
+		"""语义不明的 code 37 fail closed 为 ENVIRONMENT_RISK。"""
+		code, _ = self.plat.parse_error({"code": 37, "message": "请求失败"})
+		assert code == "ENVIRONMENT_RISK"
 
 	def test_parse_error_rate_limited(self) -> None:
 		code, _ = self.plat.parse_error({"code": 9, "message": "请求频繁"})
@@ -86,6 +108,18 @@ class TestBossEnvelopeAdapter:
 	def test_parse_error_message_network_error(self) -> None:
 		code, _ = self.plat.parse_error({"code": "ERR", "message": "request timeout"})
 		assert code == "NETWORK_ERROR"
+
+	def test_parse_error_message_auth_expired(self) -> None:
+		code, _ = self.plat.parse_error({"code": "ERR", "message": "token expired"})
+		assert code == "AUTH_EXPIRED"
+
+	def test_parse_error_message_rate_limited(self) -> None:
+		code, _ = self.plat.parse_error({"code": "ERR", "message": "rate limit"})
+		assert code == "RATE_LIMITED"
+
+	def test_parse_error_message_account_risk(self) -> None:
+		code, _ = self.plat.parse_error({"code": "ERR", "message": "请完成安全验证"})
+		assert code == "ACCOUNT_RISK"
 
 
 class TestBossPlatformDelegation:

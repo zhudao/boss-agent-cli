@@ -4,18 +4,22 @@ import click
 
 from boss_agent_cli.commands import (
 	ai_cmd,
+	ai_local,
+	agent,
 	apply,
 	chat,
 	chat_summary,
 	chatmsg,
 	cities,
 	clean,
+	crawl,
 	config_cmd,
 	detail,
 	digest,
 	doctor,
 	exchange,
 	export,
+	favorites,
 	greet,
 	history,
 	interviews,
@@ -24,6 +28,7 @@ from boss_agent_cli.commands import (
 	mark,
 	me,
 	pipeline,
+	platforms,
 	preset,
 	recommend,
 	resume_cmd,
@@ -34,14 +39,19 @@ from boss_agent_cli.commands import (
 	stats,
 	status,
 	watch,
+	wizard,
 )
 from boss_agent_cli.commands.recruiter import applications as recruiter_applications
+from boss_agent_cli.commands.recruiter import accept_resume as recruiter_accept_resume
+from boss_agent_cli.commands.recruiter import download_resume as recruiter_download_resume
 from boss_agent_cli.commands.recruiter import candidates as recruiter_candidates
 from boss_agent_cli.commands.recruiter import chat as recruiter_chat
 from boss_agent_cli.commands.recruiter import jobs as recruiter_jobs
 from boss_agent_cli.commands.recruiter import reply as recruiter_reply
 from boss_agent_cli.commands.recruiter import request_resume as recruiter_request_resume
+from boss_agent_cli.commands.recruiter import recommendations as recruiter_recommendations
 from boss_agent_cli.commands.recruiter import resume as recruiter_resume
+from boss_agent_cli.commands.recruiter import whoami as recruiter_whoami
 from boss_agent_cli.display import handle_error_output
 from boss_agent_cli.platforms import list_recruiter_platforms
 
@@ -49,9 +59,11 @@ from boss_agent_cli.platforms import list_recruiter_platforms
 def register_candidate_commands(cli: click.Group) -> None:
 	"""Register candidate and shared top-level commands."""
 	cli.add_command(schema.schema_cmd, "schema")
+	cli.add_command(wizard.wizard_cmd, "wizard")
 	cli.add_command(login.login_cmd, "login")
 	cli.add_command(logout.logout_cmd, "logout")
 	cli.add_command(status.status_cmd, "status")
+	cli.add_command(platforms.platforms_cmd, "platforms")
 	cli.add_command(doctor.doctor_cmd, "doctor")
 	cli.add_command(search.search_cmd, "search")
 	cli.add_command(detail.detail_cmd, "detail")
@@ -74,12 +86,16 @@ def register_candidate_commands(cli: click.Group) -> None:
 	cli.add_command(pipeline.follow_up_cmd, "follow-up")
 	cli.add_command(apply.apply_cmd, "apply")
 	cli.add_command(shortlist.shortlist_group, "shortlist")
+	cli.add_command(favorites.favorites_group, "favorites")
 	cli.add_command(preset.preset_group, "preset")
 	cli.add_command(digest.digest_cmd, "digest")
 	cli.add_command(config_cmd.config_group, "config")
 	cli.add_command(clean.clean_cmd, "clean")
+	cli.add_command(crawl.crawl_group, "crawl")
 	cli.add_command(resume_cmd.resume_group, "resume")
+	ai_cmd.ai_group.add_command(ai_local.ai_local_group, "local")
 	cli.add_command(ai_cmd.ai_group, "ai")
+	cli.add_command(agent.agent_group, "agent")
 	cli.add_command(stats.stats_cmd, "stats")
 
 
@@ -108,6 +124,7 @@ def hr_group(ctx: click.Context) -> None:
 def register_recruiter_commands(cli: click.Group) -> None:
 	"""Register recruiter shortcut commands."""
 	cli.add_command(hr_group, "hr")
+	hr_group.add_command(recruiter_whoami.whoami_cmd, "whoami")
 	hr_group.add_command(recruiter_applications.applications_cmd, "applications")
 	hr_group.add_command(recruiter_resume.resume_cmd, "resume")
 	hr_group.add_command(recruiter_chat.recruiter_chat_cmd, "chat")
@@ -117,3 +134,7 @@ def register_recruiter_commands(cli: click.Group) -> None:
 	hr_group.add_command(recruiter_candidates.candidates_cmd, "candidates")
 	hr_group.add_command(recruiter_reply.reply_cmd, "reply")
 	hr_group.add_command(recruiter_request_resume.request_resume_cmd, "request-resume")
+	hr_group.add_command(recruiter_accept_resume.accept_resume_cmd, "accept-resume")
+	hr_group.add_command(recruiter_download_resume.download_resume_cmd, "download-resume")
+	hr_group.add_command(recruiter_recommendations.recommendations_cmd, "recommendations")
+	hr_group.add_command(recruiter_recommendations.greet_cmd, "greet")

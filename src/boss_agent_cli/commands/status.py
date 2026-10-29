@@ -1,5 +1,8 @@
+from pathlib import Path
+
 import click
 
+from boss_agent_cli.api.request_budget import risk_lock_status as lock_status
 from boss_agent_cli.auth.health import assess_auth_health
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.commands._platform import get_platform_instance
@@ -39,6 +42,8 @@ def status_cmd(ctx: click.Context, live: bool) -> None:
 		"auth_summary": auth_health.summary,
 		"auth_health": auth_health.public_summary(),
 		"checks": auth_health.checks_as_dicts(),
+		# 只读本地锁文件，不连浏览器、不访问网络
+		"cdp_risk_lock": lock_status(Path(data_dir)),
 	}
 
 	if not live:
@@ -48,7 +53,7 @@ def status_cmd(ctx: click.Context, live: bool) -> None:
 			data,
 			render=lambda payload: render_status(payload, login_action=login_action_for_ctx(ctx)),
 			hints={
-				"next_actions": _status_next_actions(auth_health.auth_state, platform_name=platform_name),
+				"next_actions": _status_next_actions(auth_health.auth_state, login_action=login_action_for_ctx(ctx)),
 				"live_probe": "运行 boss status --live 执行一次只读在线验证",
 			},
 		)
@@ -78,8 +83,7 @@ def status_cmd(ctx: click.Context, live: bool) -> None:
 		)
 
 
-def _status_next_actions(auth_state: str, *, platform_name: str) -> list[str]:
-	login_action = "boss --platform zhilian login" if platform_name == "zhilian" else "boss login"
+def _status_next_actions(auth_state: str, *, login_action: str) -> list[str]:
 	if auth_state == "complete":
 		return ["boss status --live — 可选执行一次只读在线验证"]
 	if auth_state == "partial":

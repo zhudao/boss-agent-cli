@@ -16,13 +16,13 @@ uv run pytest tests/ -v
 uv run pre-commit install
 ```
 
-Python **≥ 3.10** 是最低要求。项目使用 [`uv`](https://github.com/astral-sh/uv) 管理依赖，`uv sync --all-extras` 会在本地 `.venv` 中安装运行时和开发依赖。
+Python **≥ 3.11** 是最低要求。项目使用 [`uv`](https://github.com/astral-sh/uv) 管理依赖，`uv sync --all-extras` 会在本地 `.venv` 中安装运行时和开发依赖。
 
 ## 编码规范
 
 - Python 源码缩进使用 **tab**。
 - `pyproject.toml` 中的 `indent-width = 4` 表示格式工具的视觉宽度，不表示改为空格缩进。
-- Python >= 3.10，使用 `X | Y` 联合类型。
+- Python >= 3.11，使用 `X | Y` 联合类型。
 - 命令输出必须保持 JSON 信封契约：stdout 只输出 Agent 可读 JSON，stderr 输出日志和进度。
 - commit message：`type: 中文描述`（feat / fix / refactor / docs / test / chore / ci）。
 - 类型检查：`uv run mypy src/boss_agent_cli`，CI 阻塞式门禁，新代码必须零 mypy 错误。
@@ -50,6 +50,14 @@ uv run pytest tests/test_agent_docs.py tests/test_open_source_docs.py -q
 git diff --check
 ```
 
+## 采用度量与遥测原则
+
+项目采用度只参考两个被动来源：PyPI 下载量和 GitHub Insights（star / clone / traffic）。
+
+不要引入任何形式的运行时遥测、使用埋点、匿名统计回传或远程日志，即使它们是可选或匿名的。除用户显式发起的 API 调用外，数据不应离开本机；遥测会破坏这条承诺。
+
+在决定是否投入推广、示例或集成工作前，先查看上述被动信号，而不是靠遥测收集使用情况。
+
 ## 提交流程
 
 1. **Fork** 本仓库并 clone 到本地。
@@ -62,7 +70,7 @@ git diff --check
    ```
 5. **原子提交**：每个 commit 只做一件事。
 6. **Push** 并向 `master` 发起 Pull Request。
-7. **CI 全绿**才能合并：4 个 Python 版本（3.10–3.13）跑测试，加 lint / typecheck / docs / 安全扫描。
+7. **CI 全绿**才能合并：`CI` 工作流在 PR 上跑 ruff / mypy / pre-commit 和 Python 3.11、3.12、3.14 的测试（fork 的 PR 同样会跑，不需要任何 secret），另有 CodeQL 和 GitGuardian 安全扫描。测试全部离线，不要写需要网络、真实浏览器或真实账号的测试。
 
 维护者会使用 squash merge，所以最终 squash 标题也要遵守上面的 commit 格式。
 
@@ -87,11 +95,11 @@ git diff --check
 - `exit 0` 表示成功（`ok=true`）。
 - `exit 1` 表示失败（`ok=false`）。
 
-出错时信封必须包含 `error.code`、`error.recoverable` 和 `error.recovery_action`。可用错误码见 `src/boss_agent_cli/commands/schema.py` 中 `SCHEMA_DATA["error_codes"]`（约 line 855）。
+出错时信封必须包含 `error.code`、`error.recoverable` 和 `error.recovery_action`。可用错误码见 `src/boss_agent_cli/schema/error_codes.py` 中的 `ERROR_CODES`（`boss schema` 输出的 `error_codes` 即由它生成）。
 
 ## 测试理念
 
-- **鼓励 TDD**：先写测试再写实现。CI 覆盖率在 [Codecov](https://codecov.io/gh/can4hou6joeng4/boss-agent-cli) 追踪，基线 80%。
+- **鼓励 TDD**：先写测试再写实现。需要看覆盖率时本地跑 `uv run pytest --cov=boss_agent_cli`。
 - **Mock 外部 I/O**：`AuthManager`、`BossClient`、`CacheStore`、`AIService` 是 mock 边界，测试不应真正调用 BOSS 直聘 API。
 - **错误路径对等**：每条成功路径至少对应一条错误路径测试（认证过期、限流、参数非法等）。
 
@@ -104,14 +112,57 @@ git diff --check
 ## 添加新命令
 
 1. 在 `src/boss_agent_cli/commands/` 下新建文件
-2. 在 `main.py` 中注册命令
-3. 在 `schema.py`（`SCHEMA_DATA["commands"]`）中添加命令描述
+2. 在 `commands/register.py` 中注册命令（`register_candidate_commands` / `register_recruiter_commands`；`main.py` 只保留全局选项，不直接挂命令）
+3. 在 `src/boss_agent_cli/schema/data.py`（`SCHEMA_DATA["commands"]`）中添加命令描述；顶层命令数变化时同步 `SCHEMA_DATA["description"]` 中的「共 N 个顶层命令」计数（有测试断言计数与命令表长度一致）
 4. 在 `tests/test_commands.py` 或按命令名新建测试文件
-5. 更新 `skills/boss-agent-cli/SKILL.md`（命令速查表）
-6. 更新 `AGENTS.md`（CLI 不变量契约中的命令数）
+5. 更新 `docs/commands.md` 和 `docs/commands.en.md`（命令速查表）
+6. 更新 `AGENTS.md`（CLI 不变量契约中的命令数）与 `docs/capability-matrix.md` / `docs/capability-matrix.en.md` 中的命令计数；`tests/test_agent_docs.py` 对这些计数字符串有硬编码断言，需一并更新
 7. 更新 `README.md` 和 `README.en.md`（命令参考表）
 8. 更新对应模块的 `CLAUDE.md`
-9. 如果命令对 Agent 通过 MCP 调用有用，还需在 `src/boss_agent_cli/mcp_server.py` 的 `TOOLS` 列表加 Tool 定义、在 `_build_args` 函数加分支（`mcp-server/server.py` 是 thin wrapper，会自动 re-export）
+9. 如果命令对 Agent 通过 MCP 调用有用，还需在 `src/boss_agent_cli/mcp_server.py` 的 `TOOLS` 列表加 Tool 定义、在 `_build_args` 函数加分支；工具名与合规命令标识对不上时（如 `boss_hr_*` 系对应 `recruiter-*`）要登记 `_MCP_TOOL_COMPLIANCE_COMMAND_OVERRIDES`，否则低风险过滤不生效；`mcp-server/server.py` 是手工维护的 re-export 清单，新增公开符号需补一行；工具总数变化时同步 `README.en.md` 中的 "MCP server with N tools"（有测试按 `len(TOOLS)` 动态断言）
+
+## 新增 AI provider
+
+`boss ai` 通过 `src/boss_agent_cli/ai/config.py` 的 `PROVIDER_BASE_URLS` 维护一张 OpenAI 兼容服务商表。欢迎补充新的服务商，**包括由服务商自己的工程师提交**。
+
+但每加一行，维护责任就落到本项目：服务商改域名、调价、下线模型时，文档会静默失真，而没有任何测试守得住。所以有下面三条。
+
+### 1. 文档只写可验证陈述
+
+`docs/integrations/ai-models.md` 里的条目**只描述能力边界**——OpenAI 兼容性、`provider/model` 命名空间、能触达哪些模型、以及模型名以服务端实际支持为准。
+
+不接受：安全姿态断言（「安全网关」「护栏」「零信任」「工具治理」）、定价承诺（「零加价」「最便宜」）、评级或排名、以及会随时间静默失效的规模数字（「200+ 模型」）。判据很简单：**这句话能不能用一次 API 调用证伪？** 不能的，就不写进第一方文档。
+
+这条对**所有**条目适用，包括已经在表里的——现有条目会逐步对齐，不是只对新提交的执行。
+
+### 2. 服务商自荐需要可验证归属
+
+如果你是该服务商的员工并在提交自家的 provider，请在 PR 里提供一条可验证的关联，二选一：
+
+- 用企业域名邮箱（`@yourcompany.com`）提交 commit，**或**
+- 给出服务商官方站点或 GitHub org 指向本仓库 / 本 PR 的公开引用
+
+这不是信任问题，是可维护性问题：端点搬家时需要有人能对口。此前有过一次先例——那条 provider 的 PR 与作者账号后来双双从 GitHub 消失，留下的条目还被一次无关重构误删，很久没人发现。
+
+本条不追溯适用于已有条目。
+
+### 3. 移除机制
+
+服务商端点**连续两个 minor 版本不可用**即直接从 `PROVIDER_BASE_URLS` 移除，不走弃用周期、不提前公告、**不算破坏性变更**。
+
+这条是前两条能够宽松的前提：因为随时能删，所以准入不必苛刻。
+
+### 连锁更新
+
+新增一个 provider 需要同步五处（`boss schema` 不含 provider 枚举，无需改）：
+
+1. `src/boss_agent_cli/ai/config.py` 的 `PROVIDER_BASE_URLS`
+2. `src/boss_agent_cli/commands/ai_cmd.py` 中 `--provider` 的 help 文案（它是取值域的唯一文档，因为该选项没有 `click.Choice` 校验）
+3. `docs/integrations/ai-models.md` 与 `docs/integrations/ai-models.en.md`（中英必须同步）
+4. `tests/test_ai_config.py`：base-url 解析测试 + `test_provider_base_urls_completeness` 的成员断言
+5. `CHANGELOG.md` 的 `[Unreleased]`
+
+> **注意名字相近的服务商。** `--provider` 接受自由字符串，拼错不会报错。`boss ai config` 会回显 `resolved_base_url`，`tests/test_ai_config_cmd.py` 有一条测试断言所有 `*router` 系服务商必须解析到不同端点——新增时如果与既有条目品牌相近，请确认那条测试仍然通过。
 
 ## 提交 Issue
 

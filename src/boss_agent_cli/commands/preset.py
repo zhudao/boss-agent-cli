@@ -8,7 +8,8 @@ from boss_agent_cli.api.endpoints import (
 	STAGE_CODES,
 )
 from boss_agent_cli.cache.store import CacheStore
-from boss_agent_cli.display import handle_error_output, handle_output
+from boss_agent_cli.display import handle_error_output, handle_output, render_action_result, render_list_result
+from boss_agent_cli.search_filters import ACTIVE_LEVELS, build_search_params, resolve_active_level
 
 
 def _build_params(
@@ -23,18 +24,7 @@ def _build_params(
 	job_type: str | None,
 	welfare: str | None,
 ) -> dict[str, str | None]:
-	return {
-		"query": query,
-		"city": city,
-		"salary": salary,
-		"experience": experience,
-		"education": education,
-		"industry": industry,
-		"scale": scale,
-		"stage": stage,
-		"job_type": job_type,
-		"welfare": welfare,
-	}
+	return build_search_params(query, city, salary, experience, education, industry, scale, stage, job_type, welfare)
 
 
 @click.group("preset")
@@ -54,6 +44,7 @@ def preset_group() -> None:
 @click.option("--stage", default=None, type=click.Choice(list(STAGE_CODES.keys()), case_sensitive=False), help="融资阶段")
 @click.option("--job-type", default=None, type=click.Choice(list(JOB_TYPE_CODES.keys()), case_sensitive=False), help="职位类型")
 @click.option("--welfare", default=None, help="福利筛选")
+@click.option("--active", default=None, help="HR 活跃度下限：" + " / ".join(ACTIVE_LEVELS))
 @click.pass_context
 def preset_add_cmd(
 	ctx: click.Context,
@@ -68,18 +59,30 @@ def preset_add_cmd(
 	stage: str | None,
 	job_type: str | None,
 	welfare: str | None,
+	active: str | None,
 ) -> None:
 	if city and city not in CITY_CODES:
 		handle_error_output(ctx, "preset", code="INVALID_PARAM", message=f"未知城市: {city}")
 		return
+	try:
+		active_level = resolve_active_level(active)
+	except ValueError as exc:
+		handle_error_output(ctx, "preset", code="INVALID_PARAM", message=str(exc))
+		return
 
 	params = _build_params(query, city, salary, experience, education, industry, scale, stage, job_type, welfare)
+	if active_level:
+		# 只在设置时写入，旧预设和不带 --active 的预设保持原有 10 个键
+		params["active"] = active_level
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		cache.save_saved_search(name, params)
 	handle_output(
 		ctx,
 		"preset",
 		{"action": "add", "name": name, "params": params},
+		render=lambda d: render_action_result(
+			d, title="preset", next_steps=[f"boss search --preset {name}", "boss preset list"]
+		),
 		hints={"next_actions": [f"boss search --preset {name}", "boss preset list"]},
 	)
 
@@ -93,6 +96,15 @@ def preset_list_cmd(ctx: click.Context) -> None:
 		ctx,
 		"preset",
 		items,
+		render=lambda d: render_list_result(
+			d,
+			"presets",
+			[("名称", "name", "bold cyan"), ("条件", "params", "green"), ("创建时间", "created_at", "dim")],
+			next_steps=["boss preset add <name> --query <关键词>"] if not d else [
+				"boss search --preset <name>",
+				"boss preset remove <name>",
+			],
+		),
 		hints={"next_actions": ["boss search --preset <name>", "boss preset remove <name>"]},
 	)
 
@@ -103,4 +115,9 @@ def preset_list_cmd(ctx: click.Context) -> None:
 def preset_remove_cmd(ctx: click.Context, name: str) -> None:
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		removed = cache.delete_saved_search(name)
-	handle_output(ctx, "preset", {"action": "remove", "name": name, "removed": removed})
+	handle_output(
+		ctx,
+		"preset",
+		{"action": "remove", "name": name, "removed": removed},
+		render=lambda d: render_action_result(d, title="preset", next_steps=["boss preset list"]),
+	)

@@ -4,13 +4,15 @@ repos:
     hooks:
       - id: ruff
         args: [--fix]
-        files: ^(src|tests)/
+        files: ^(src|tests|scripts)/
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
+        # star-history 工作流自动生成，不带结尾换行
+        exclude: ^docs/assets/star-history(-dark)?\.svg$
       - id: check-yaml
       - id: check-added-large-files
         args: [--maxkb=500]

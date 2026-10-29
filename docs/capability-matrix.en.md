@@ -2,12 +2,13 @@
 
 Use this matrix to keep CLI, skills, and MCP integrations aligned across different agent entry points.
 
-Default Low-Risk Assistance Mode: local assistance, read-only first, user-triggered, no risk-control bypass, no bulk outreach, and no platform-data scraping. Capabilities marked as restricted return `COMPLIANCE_BLOCKED` and should be completed manually on the official website.
+Compatibility modes `assisted` and `research` can both call every implemented capability and no longer produce mode-level `COMPLIANCE_BLOCKED`. Missing platform implementations return `NOT_SUPPORTED`; long workflows remain bounded, redacted, checkpointed, and stoppable. Use `boss schema` availability and risk metadata as the source of truth.
 
 ## Auth and environment
 
 | Capability | CLI command | Login required | Transport |
 |---|---|---|---|
+| Shared workflow | `boss` / `boss wizard` | Depends on goal | TTY / JSON / MCP + SQLite checkpoint |
 | Protocol discovery | `boss schema` | No | Local |
 | Log in | `boss login` | No | User-triggered login |
 | Log out | `boss logout` | No | Local |
@@ -15,13 +16,14 @@ Default Low-Risk Assistance Mode: local assistance, read-only first, user-trigge
 | Environment diagnostics | `boss doctor` | No | Hybrid |
 | Config management | `boss config` | No | Local |
 | Cache cleanup | `boss clean` | No | Local |
+| Resumable crawl | `boss crawl run/start/resume`, plus `configure/status/results/stop` | Yes | Isolated DrissionPage profile with fixed budgets, checkpoints, and stop control |
 
 ## Job discovery
 
 | Capability | CLI command | Login required | Transport |
 |---|---|---|---|
 | Job search | `boss search` | Yes | Browser; supports `--url` web-filter reuse and comma-separated multi-select filters |
-| Personalized recommendations | `boss recommend` | Yes | Restricted (blocked by default) |
+| Personalized recommendations | `boss recommend` | Yes | Platform adapter |
 | Job detail | `boss detail` | Yes | httpx first, browser fallback |
 | Show by index | `boss show` | No | Local cache |
 | City catalog | `boss cities` | No | httpx |
@@ -31,32 +33,33 @@ Default Low-Risk Assistance Mode: local assistance, read-only first, user-trigge
 
 | Capability | CLI command | Login required | Transport |
 |---|---|---|---|
-| Greet a recruiter | `boss greet` | Yes | Restricted (blocked by default) |
-| Batch greet after search | `boss batch-greet` | Yes | Restricted (blocked by default) |
-| Apply or start the conversation | `boss apply` | Yes | Restricted (blocked by default) |
+| Greet a recruiter | `boss greet` | Yes | Browser / platform adapter |
+| Batch greet after search | `boss batch-greet` | Yes | Bounded search + platform adapter |
+| Apply or start the conversation | `boss apply` | Yes | Browser / platform adapter |
 | Export results | `boss export` | Yes | Browser; supports `--url` web-filter reuse |
 
 ## Conversation management
 
 | Capability | CLI command | Login required | Transport |
 |---|---|---|---|
-| Conversation list | `boss chat` | Yes | Restricted (blocked by default) |
-| Message history | `boss chatmsg [--raw]` | Yes | Restricted (blocked by default); `--raw` preserves structured body/link/job-card fields only after compliance allows the command |
-| Conversation summary | `boss chat-summary` | Yes | Restricted (blocked by default) |
-| Contact labels | `boss mark` | Yes | Restricted (blocked by default) |
-| Contact exchange | `boss exchange` | Yes | Restricted (blocked by default) |
+| Conversation list | `boss chat` | Yes | `auto` uses httpx with stored credentials; explicit `existing-browser` reuses an existing page through CDP |
+| Message history | `boss chatmsg [--raw]` | Yes | Prefer the stable `uid` returned by `boss chat`; `auto` uses httpx with stored credentials, while explicit `existing-browser` reuses an existing page through CDP; `--raw` preserves structured body/link/job-card fields |
+| Conversation summary | `boss chat-summary` | Yes | Prefer the stable `uid`; platform adapter + local processing |
+| Contact labels | `boss mark` | Yes | Platform adapter |
+| Contact exchange | `boss exchange` | Yes | Platform adapter |
 | Interview invites | `boss interviews` | Yes | httpx |
 
 ## Workflow management
 
 | Capability | CLI command | Login required | Transport |
 |---|---|---|---|
-| Pipeline view | `boss pipeline` | Yes | Restricted (blocked by default) |
-| Follow-up filtering | `boss follow-up` | Yes | Restricted (blocked by default) |
-| Daily digest | `boss digest` | Yes | Restricted (blocked by default) |
-| Incremental watch | `boss watch run` | Yes | Restricted (blocked by default); add/list/remove are local |
+| Pipeline view | `boss pipeline` | Yes | Platform reads + local aggregation |
+| Follow-up filtering | `boss follow-up` | Yes | Platform reads + local aggregation |
+| Daily digest | `boss digest` | Yes | Platform reads + local aggregation |
+| Incremental watch | `boss watch run` | Yes | Platform read + local state; add/list/remove are local |
 | Search presets | `boss preset` | No | Local |
 | Shortlist management | `boss shortlist` | No | Local |
+| Shortlist management (shows favorite validity, syncs active only) | `boss favorites` | No | Platform read-only + Local |
 
 ## User profile
 
@@ -93,20 +96,26 @@ Default Low-Risk Assistance Mode: local assistance, read-only first, user-trigge
 
 | Capability | CLI command | Login required | Transport |
 |---|---|---|---|
-| Application inbox | `boss hr applications` | Yes | Restricted (blocked by default) |
-| Candidate search | `boss hr candidates` | Yes | Restricted (blocked by default) |
-| Recruiter chat list | `boss hr chat` | Yes | Restricted (blocked by default) |
-| Chat message history | `boss hr chatmsg <friend_id>` | Yes | Restricted (blocked by default) |
-| Recent-message summaries | `boss hr last-messages [--friend-id <id>]` | Yes | Restricted (blocked by default) |
-| Online resume view | `boss hr resume <geek_id> --job-id <id> --security-id <id>` | Yes | Restricted (blocked by default) |
-| Contact exchange | `boss hr resume --exchange --friend-id <friend_id> [--type wechat]` | Yes | Restricted (blocked by default) |
-| Reply to candidate | `boss hr reply <friend_id> <message>` | Yes | Restricted (blocked by default) |
-| Request attached resume | `boss hr request-resume <friend_id>` | Yes | Restricted (blocked by default) |
-| Job listing and online/offline operations | `boss hr jobs` | Yes | httpx |
+| Recruiter identity | `boss hr whoami` | Yes | httpx; ready only when `identity` is 1; does not switch identity |
+| Application inbox | `boss hr applications` | Yes | Recruiter platform adapter |
+| Candidate search | `boss hr candidates` | Yes | Recruiter platform adapter |
+| Recruiter chat list | `boss hr chat` | Yes | Recruiter platform adapter |
+| Chat message history | `boss hr chatmsg <friend_id>` | Yes | Recruiter platform adapter |
+| Recent-message summaries | `boss hr last-messages [--friend-id <id>]` | Yes | Recruiter platform adapter |
+| Online resume view | `boss hr resume <geek_id> --job-id <id> --security-id <id>` | Yes | Recruiter platform adapter |
+| Contact exchange | `boss hr resume --exchange --friend-id <friend_id> [--type wechat]` | Yes | Recruiter platform adapter |
+| Reply to candidate | `boss hr reply <friend_id> <message>` | Yes | Recruiter platform adapter |
+| Request attached resume | `boss hr request-resume <friend_id>` | Yes | Recruiter platform adapter |
+| Accept attached resume | `boss hr accept-resume <friend_id> --message-id <mid> --yes` | Yes | One-shot HTTP with explicit approval; requires business status zero; offline regression coverage |
+| Download received attachment | `boss hr download-resume <friend_id> --message-id <mid> --output <path>` | Yes | Access check, fixed official host, size limit, no overwrite; offline regression coverage |
+| Job listing and online/offline operations | `boss hr jobs list [--page N]` | Yes | httpx; job-management `data/list` |
+| Recommended candidates | `boss hr recommendations --job-id <id>` | Yes | httpx |
+| First contact | `boss hr greet ... --yes` | Yes | One-shot httpx POST; does not change read status |
 
 Notes:
-- **Transport**: `httpx` means a direct API call; browser transport remains for compatibility and must not be used to retry risk-control blocks. `AI service` means a third-party model API; do not send platform chat records, candidate resumes, or contact details without authorization.
+- **Transport**: `httpx` means a direct API call. Risk-control blocks stop the workflow. Browser/hook adapters may not retry without bounds and must preserve checkpoints and redaction. `AI service` means a third-party model API; do not send chat records, resumes, or contact details without authorization.
+- **Existing-browser sessions**: explicitly select `--browser-source existing-browser` to reuse an already-open target-site page through CDP only, without reading stored credentials, creating contexts/pages, navigating, or launching a browser. Exhausted candidates return `BROWSER_SESSION_NOT_FOUND` plus `boss doctor`; missing credentials under `auto` still return `AUTH_REQUIRED` plus `boss login`. A reachable channel does not prove that the page is logged in, so platform unauthenticated responses remain platform errors. The browser path does not inherit httpx stoken-refresh or rate-limit retries. `stored-cookie` still connects only to an explicit CDP endpoint, with no auto-probing or fallback on failure.
 - For CLI-first integrations, prefer `boss schema` for capability discovery and parameter validation; the schema exposes both `supported_platforms` and `supported_recruiter_platforms`.
-- Current platform coverage: `zhipin` has both candidate and recruiter implementations, but sensitive workflows are blocked by default; `zhilian` supports candidate-side login and read-only workflows, while the recruiter side is still unavailable; `qiancheng` / 51job is a registered placeholder adapter whose real workflows return `NOT_SUPPORTED`.
-- Current auth posture: `zhipin` and `zhilian` keep user-triggered login compatibility, but it must not be used to bypass platform risk controls.
-- Use `boss schema` as the source of truth: it currently exposes 34 top-level commands, with 9 first-level recruiter subcommands under `hr`, while `ai` and `resume` remain command-group entries.
+- Current platform coverage: `boss platforms` reports the registered local adapters, and `boss platforms --platform zhipin` shows a single platform; `zhipin` is the only registered platform and has both candidate and recruiter (`zhipin-recruiter`) implementations.
+- `crawl` uses an isolated Chrome profile, cross-process rate budgets, SQLite checkpoints, and the `crawl stop` kill switch. Fine-grained MCP crawl tools provide local `crawl_status/results/shortlist` operations for existing runs, while `boss_wizard` can start, resume, and stop the shared workflow. The default Hook is `none`; local Hook directories must provide `SHA256SUMS`. Risk codes, a security page, or an exhausted budget stop it and return a resume command.
+- Use `boss schema` as the source of truth: it currently exposes 39 top-level commands, with 14 first-level recruiter subcommands under `hr`, while `ai` and `resume` remain command-group entries.

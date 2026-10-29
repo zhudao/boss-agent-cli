@@ -6,11 +6,9 @@ import click
 
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
-from boss_agent_cli.commands.contact_lookup import FriendLookupLimitExceeded, find_friend_by_security_id
+from boss_agent_cli.commands._contact_lookup import current_friend_security_id_or_emit, resolve_friend_or_emit
 from boss_agent_cli.commands._platform import get_platform_instance
-from boss_agent_cli.display import boss_command_for_ctx, error_contract_for_code, handle_auth_errors, handle_error_output, handle_output, render_simple_list
-
-NOT_SUPPORTED_RECOVERY_ACTION = "切换平台或调整命令参数后重试"
+from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_not_supported, handle_output, handle_platform_error_output, render_simple_list
 
 _MSG_TYPE_MAP = {
 	1: "文本", 2: "图片", 3: "招呼", 4: "简历", 5: "系统",
@@ -19,14 +17,17 @@ _MSG_TYPE_MAP = {
 
 
 @click.command("chatmsg")
-@click.argument("security_id")
+@click.argument("security_id", metavar="UID_OR_SECURITY_ID")
 @click.option("--page", default=1, help="页码")
 @click.option("--count", default=20, help="每页消息数量")
-@click.option("--raw", "show_raw", is_flag=True, default=False, help="输出保真结构化消息字段（仍受合规门控）")
+@click.option("--raw", "show_raw", is_flag=True, default=False, help="输出保真结构化消息字段")
 @click.pass_context
 @handle_auth_errors("chatmsg")
 def chatmsg_cmd(ctx: click.Context, security_id: str, page: int, count: int, show_raw: bool) -> None:
-	"""查看与指定好友的聊天消息历史"""
+	"""查看与指定好友的聊天消息历史
+
+	SECURITY_ID 可传 boss chat 输出的 uid（推荐，跨请求稳定）或 security_id。
+	"""
 	if not require_compliance_allowed(ctx, "chatmsg"):
 		ctx.exit(1)
 
@@ -35,68 +36,33 @@ def chatmsg_cmd(ctx: click.Context, security_id: str, page: int, count: int, sho
 	auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
 
 	with get_platform_instance(ctx, auth) as platform:
-		try:
-			friend_item, friends_error = find_friend_by_security_id(platform, security_id)
-		except NotImplementedError as exc:
-			handle_error_output(
-				ctx, "chatmsg",
-				code="NOT_SUPPORTED",
-				message=str(exc) or "当前平台不支持沟通列表能力",
-				recoverable=True,
-				recovery_action=NOT_SUPPORTED_RECOVERY_ACTION,
-			)
-			return
-		except FriendLookupLimitExceeded as exc:
-			handle_error_output(
-				ctx, "chatmsg",
-				code="NETWORK_ERROR",
-				message=str(exc),
-				recoverable=True,
-				recovery_action="重试",
-			)
-			return
-		if friends_error is not None:
-			code, message = platform.parse_error(friends_error)
-			recoverable, recovery_action = error_contract_for_code(code)
-			handle_error_output(
-				ctx, "chatmsg",
-				code=code,
-				message=message or "沟通列表获取失败",
-				recoverable=recoverable,
-				recovery_action=recovery_action,
-			)
-			return
+		friend_item = resolve_friend_or_emit(
+			ctx,
+			"chatmsg",
+			platform,
+			security_id,
+			not_found_message=(
+				f"未在沟通列表中找到联系人 {security_id}，请确认该联系人存在"
+				"（可用 boss chat 输出的 uid 或 security_id）"
+			),
+		)
 		if friend_item is None:
-			handle_error_output(
-				ctx, "chatmsg",
-				code="JOB_NOT_FOUND",
-				message=f"未在沟通列表中找到 security_id={security_id}，请确认该联系人存在",
-			)
 			return
 		gid = str(friend_item.get("uid", ""))
 		friend_name = friend_item.get("name") or "-"
+		# securityId 是每请求轮换的令牌，必须用本次 friend_list 返回的新值，
+		# 否则会拿一个已失效的令牌去请求消息历史。
+		fresh_security_id = current_friend_security_id_or_emit(ctx, "chatmsg", friend_item)
+		if fresh_security_id is None:
+			return
 
 		try:
-			resp = platform.chat_history(gid, security_id, page=page, count=count)
+			resp = platform.chat_history(gid, fresh_security_id, page=page, count=count)
 		except NotImplementedError as exc:
-			handle_error_output(
-				ctx, "chatmsg",
-				code="NOT_SUPPORTED",
-				message=str(exc) or "当前平台不支持聊天记录能力",
-				recoverable=True,
-				recovery_action=NOT_SUPPORTED_RECOVERY_ACTION,
-			)
+			handle_not_supported(ctx, "chatmsg", exc, fallback_message="当前平台不支持聊天记录能力")
 			return
 		if not platform.is_success(resp):
-			code, message = platform.parse_error(resp)
-			recoverable, recovery_action = error_contract_for_code(code)
-			handle_error_output(
-				ctx, "chatmsg",
-				code=code,
-				message=message or "聊天记录获取失败",
-				recoverable=recoverable,
-				recovery_action=recovery_action,
-			)
+			handle_platform_error_output(ctx, "chatmsg", platform, resp, fallback_message="聊天记录获取失败")
 			return
 		msg_data = platform.unwrap_data(resp) or {}
 		messages = msg_data.get("messages") or msg_data.get("historyMsgList") or []
@@ -122,7 +88,7 @@ def chatmsg_cmd(ctx: click.Context, security_id: str, page: int, count: int, sho
 			render=_render,
 			hints={"next_actions": [
 				f"{boss_command_for_ctx(ctx, 'chat')} — 返回沟通列表",
-				f"{boss_command_for_ctx(ctx, f'detail {security_id}')} — 查看职位详情",
+				f"{boss_command_for_ctx(ctx, f'detail {fresh_security_id}')} — 查看职位详情",
 			]},
 		)
 

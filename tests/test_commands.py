@@ -47,22 +47,6 @@ def test_login_cdp_connection_error_returns_json_envelope(mock_auth_cls):
 	assert parsed["error"]["recovery_action"] == "boss login"
 
 
-@patch("boss_agent_cli.commands.login.AuthManager")
-def test_login_timeout_returns_platform_aware_recovery_action(mock_auth_cls):
-	mock_auth_cls.return_value.login.side_effect = TimeoutError("扫码登录超时")
-	runner = CliRunner()
-	result = runner.invoke(cli, ["--platform", "zhilian", "login"])
-	assert result.exit_code == 1
-	assert result.stderr == ""
-	parsed = json.loads(result.output)
-	assert parsed["ok"] is False
-	assert parsed["command"] == "login"
-	assert parsed["error"]["code"] == "LOGIN_TIMEOUT"
-	assert "登录等待超时" in parsed["error"]["message"]
-	assert parsed["error"]["recoverable"] is True
-	assert parsed["error"]["recovery_action"] == "boss --platform zhilian login"
-
-
 @patch("boss_agent_cli.commands.status.AuthManager")
 def test_status_not_logged_in(mock_auth_cls):
 	mock_auth_cls.return_value.check_status.return_value = None
@@ -74,16 +58,6 @@ def test_status_not_logged_in(mock_auth_cls):
 	assert parsed["error"]["code"] == "AUTH_REQUIRED"
 	assert parsed["hints"]["auth_health"]["primary_name"] == "wt2"
 	assert parsed["hints"]["auth_health"]["secondary_name"] == "stoken"
-
-
-@patch("boss_agent_cli.commands.status.AuthManager")
-def test_status_not_logged_in_for_zhilian_has_platform_specific_recovery(mock_auth_cls):
-	mock_auth_cls.return_value.check_status.return_value = None
-	runner = CliRunner()
-	result = runner.invoke(cli, ["--platform", "zhilian", "status"])
-	assert result.exit_code == 1
-	parsed = json.loads(result.output)
-	assert parsed["error"]["recovery_action"] == "boss --platform zhilian login"
 
 
 @patch("boss_agent_cli.commands.status.AuthManager")
@@ -260,11 +234,12 @@ def test_doctor_command(mock_auth_cls, mock_probe_cdp, mock_httpx_get, mock_extr
 	assert "checks" in parsed["data"]
 	assert any(item["name"] == "network" for item in parsed["data"]["checks"])
 	assert any(item["name"] == "cookie_extract" for item in parsed["data"]["checks"])
+	mock_extract_cookies.assert_not_called()
 	assert any(item["name"] == "auth_token_quality" for item in parsed["data"]["checks"])
 	assert any(item["name"] == "credential_file" for item in parsed["data"]["checks"])
 	assert any(item["name"] == "candidate_search_health" for item in parsed["data"]["checks"])
 	assert parsed["hints"]["next_actions"]
-	assert any("官方页面" in action and "手动完成" in action for action in parsed["hints"]["next_actions"])
+	assert any("官方页面" in action and "手动完成" in action for action in parsed["hints"]["operator_actions"])
 
 
 @patch("boss_agent_cli.commands.doctor.extract_cookies")
@@ -284,7 +259,7 @@ def test_doctor_with_partial_token_quality_warn(mock_auth_cls, mock_probe_cdp, m
 	quality = next(item for item in parsed["data"]["checks"] if item["name"] == "auth_token_quality")
 	assert quality["status"] == "warn"
 	assert "stoken 缺失" in quality["detail"]
-	assert any("boss status" in action for action in parsed["hints"]["next_actions"])
+	assert any(action.endswith(" status --live") for action in parsed["hints"]["next_actions"])
 
 
 @patch("boss_agent_cli.commands.recommend.CacheStore")
@@ -380,7 +355,7 @@ def test_recommend_with_score(mock_auth_cls, mock_client_cls, mock_cache_cls):
 @patch("boss_agent_cli.commands.recommend.CacheStore")
 @patch("boss_agent_cli.commands.recommend.get_platform_instance")
 @patch("boss_agent_cli.commands.recommend.AuthManager")
-def test_recommend_supports_zhilian_style_data(mock_auth_cls, mock_client_cls, mock_cache_cls):
+def test_recommend_supports_data_envelope(mock_auth_cls, mock_client_cls, mock_cache_cls):
 	mock_cache = _ctx_mock(mock_cache_cls)
 	mock_cache.is_greeted.return_value = False
 	mock_client = _ctx_mock(mock_client_cls)
@@ -477,11 +452,12 @@ def test_recommend_with_score_reports_not_supported(mock_auth_cls, mock_client_c
 	mock_client.recommend_jobs.assert_not_called()
 
 
+@patch("boss_agent_cli.commands.search.CrawlBudget")
 @patch("boss_agent_cli.commands.search.run_search_pipeline")
 @patch("boss_agent_cli.commands.search.CacheStore")
 @patch("boss_agent_cli.commands.search.AuthManager")
 @patch("boss_agent_cli.commands.search.get_platform_instance")
-def test_search_with_score(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline):
+def test_search_with_score(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline, mock_budget_cls):
 	mock_cache = _ctx_mock(mock_cache_cls)
 	mock_cache.get_search.return_value = None
 	_ctx_mock(mock_client_cls)
@@ -521,6 +497,43 @@ def test_search_with_score(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_
 	parsed = json.loads(result.output)
 	assert parsed["data"][0]["match_score"] >= 0
 	assert "match_reasons" in parsed["data"][0]
+	before_list_request = mock_pipeline.call_args.kwargs["before_list_request"]
+	before_list_request()
+	mock_budget_cls.assert_called_once_with(mock_cache)
+	mock_budget_cls.return_value.wait.assert_called_once_with("list")
+
+
+@patch("boss_agent_cli.commands.search.run_search_pipeline")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.AuthManager")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+def test_search_sort_score_orders_by_local_match_score(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline):
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.get_search.return_value = None
+	_ctx_mock(mock_client_cls)
+	mock_pipeline.return_value = SimpleNamespace(
+		items=[
+			{"job_id": "low", "title": "低分", "security_id": "s1", "match_score": 10},
+			{"job_id": "high", "title": "高分", "security_id": "s2", "match_score": 90},
+		],
+		has_more=False,
+		total=2,
+		stats=SimpleNamespace(
+			pages_scanned=1,
+			jobs_seen=2,
+			jobs_prefiltered=0,
+			detail_checks=0,
+		),
+	)
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["search", "golang", "--sort", "score"])
+
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert [item["job_id"] for item in parsed["data"]] == ["high", "low"]
+	assert mock_pipeline.call_count == 1
+	assert mock_pipeline.call_args.kwargs["max_pages"] == 1
 
 
 @patch("boss_agent_cli.commands.search.run_search_pipeline")
@@ -562,6 +575,22 @@ def test_search_supports_url_and_multiselect_filters(mock_client_cls, mock_auth_
 	}
 
 
+@patch("boss_agent_cli.commands.search.run_search_pipeline")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.AuthManager")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+def test_search_cache_key_includes_current_result_schema(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline):
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.get_search.return_value = json.dumps({"data": [], "pagination": None, "hints": None})
+
+	result = CliRunner().invoke(cli, ["search", "产品", "--job-type", "实习"])
+
+	assert result.exit_code == 0
+	cache_params = mock_cache.get_search.call_args.args[0]
+	assert cache_params["cache_schema"] == 3
+	mock_pipeline.assert_not_called()
+
+
 def test_search_rejects_non_boss_url():
 	runner = CliRunner()
 	result = runner.invoke(cli, ["search", "--url", "https://example.com/jobs?query=Python"])
@@ -569,45 +598,6 @@ def test_search_rejects_non_boss_url():
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "INVALID_PARAM"
-
-
-@patch("boss_agent_cli.commands.search.run_search_pipeline")
-@patch("boss_agent_cli.commands.search.CacheStore")
-@patch("boss_agent_cli.commands.search.AuthManager")
-@patch("boss_agent_cli.commands.search.get_platform_instance")
-def test_search_supports_zhilian_platform_minimal_loop(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline):
-	mock_cache = _ctx_mock(mock_cache_cls)
-	mock_cache.get_search.return_value = None
-	_ctx_mock(mock_client_cls)
-	mock_pipeline.return_value = SimpleNamespace(
-		items=[{
-			"job_id": "zl_001",
-			"title": "Go 开发",
-			"company": "智联测试公司",
-			"salary": "20-30K",
-			"city": "广州",
-			"experience": "3-5年",
-			"education": "本科",
-			"security_id": "zl_sec_001",
-			"greeted": False,
-		}],
-		has_more=False,
-		total=1,
-		stats=SimpleNamespace(
-			pages_scanned=1,
-			jobs_seen=1,
-			jobs_prefiltered=0,
-			detail_checks=0,
-		),
-	)
-	runner = CliRunner()
-	result = runner.invoke(cli, ["--platform", "zhilian", "search", "golang"])
-	assert result.exit_code == 0
-	parsed = json.loads(result.output)
-	assert parsed["ok"] is True
-	assert parsed["data"][0]["job_id"] == "zl_001"
-	mock_auth_cls.assert_called_once()
-	assert mock_auth_cls.call_args.kwargs["platform"] == "zhilian"
 
 
 @patch("boss_agent_cli.index_cache.save_index", side_effect=PermissionError("readonly"))
@@ -696,7 +686,7 @@ def test_search_ignores_index_cache_write_failure(mock_client_cls, mock_auth_cls
 @patch("boss_agent_cli.commands.search.CacheStore")
 @patch("boss_agent_cli.commands.search.AuthManager")
 @patch("boss_agent_cli.commands.search.get_platform_instance")
-def test_search_json_hints_keep_jobseeker_flow_read_only(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline, mock_save_index):
+def test_search_json_hints_expose_available_candidate_actions(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline, mock_save_index):
 	mock_cache = _ctx_mock(mock_cache_cls)
 	mock_cache.get_search.return_value = None
 	_ctx_mock(mock_client_cls)
@@ -730,9 +720,7 @@ def test_search_json_hints_keep_jobseeker_flow_read_only(mock_client_cls, mock_a
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
 	assert "使用 boss detail <security_id> 查看职位详情" in actions
-	assert "如需投递或沟通，请回到平台官网由用户手动完成" in actions
-	assert all("boss greet" not in action for action in actions)
-	assert all("boss apply" not in action for action in actions)
+	assert "使用 boss apply <security_id> <job_id> 投递，或 boss greet <security_id> <job_id> 沟通" in actions
 	mock_save_index.assert_called_once()
 
 
@@ -788,7 +776,7 @@ def test_export_supports_data_envelope(mock_auth_cls, mock_client_cls):
 				{
 					"encryptJobId": "j1",
 					"jobName": "Go 开发",
-					"brandName": "智联科技",
+					"brandName": "示例科技",
 					"salaryDesc": "20K-30K",
 					"cityName": "上海",
 					"areaDistrict": "浦东",
@@ -808,11 +796,11 @@ def test_export_supports_data_envelope(mock_auth_cls, mock_client_cls):
 		},
 	}
 	runner = CliRunner()
-	result = runner.invoke(cli, ["--json", "--platform", "zhilian", "export", "golang", "--count", "1"])
+	result = runner.invoke(cli, ["--json", "export", "golang", "--count", "1"])
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
-	assert parsed["data"]["jobs"][0]["company"] == "智联科技"
+	assert parsed["data"]["jobs"][0]["company"] == "示例科技"
 
 
 @patch("boss_agent_cli.commands.export.get_platform_instance")
@@ -846,6 +834,21 @@ def _make_friend_item(name, brand, relation_type, last_ts):
 		"sourceType": 0,
 		"lastMessageInfo": {"status": 2},
 	}
+
+
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_does_not_require_stored_credentials_before_platform_read(mock_auth_cls, mock_client_cls):
+	"""显式现有浏览器读取不应被命令层的本地凭据预检阻止。"""
+	mock_auth_cls.return_value.check_status.return_value = None
+	_ctx_mock(mock_client_cls)
+	mock_client_cls.return_value.friend_list.return_value = {"zpData": {"result": []}}
+
+	result = CliRunner().invoke(cli, ["--browser-source", "existing-browser", "chat"])
+
+	assert result.exit_code == 0
+	mock_auth_cls.return_value.check_status.assert_not_called()
+	mock_client_cls.return_value.friend_list.assert_called_once_with(page=1)
 
 
 @patch("boss_agent_cli.commands.chat.get_platform_instance")
@@ -989,7 +992,7 @@ def test_chat_reports_not_supported_when_friend_list_missing(mock_auth_cls, mock
 @patch("boss_agent_cli.commands.chat.get_platform_instance")
 @patch("boss_agent_cli.commands.chat.AuthManager")
 def test_chat_export_md(mock_auth_cls, mock_client_cls, tmp_path):
-	"""--export md 导出包含 security_id 和 diff 摘要"""
+	"""--export md 导出包含联系人标识映射表和 diff 摘要"""
 	import time
 	now_ms = int(time.time() * 1000)
 	mock_auth_cls.return_value.check_status.return_value = {"cookies": {}}
@@ -1011,8 +1014,9 @@ def test_chat_export_md(mock_auth_cls, mock_client_cls, tmp_path):
 	assert result.exit_code == 0
 	with open(out_file, encoding="utf-8") as f:
 		content = f.read()
-	assert "security_id" in content  # 折叠映射表中包含
-	assert "sec_张HR" in content    # 完整 sid 在映射表中
+	# 映射表标题已改为「联系人标识」：展示的是可跨请求复用的 uid
+	assert "联系人标识映射表" in content
+	assert "sec_张HR" in content    # 无 uid 时回退展示 security_id
 	assert "S1" in content          # 主表用短编号
 	assert "BOSS 直聘沟通列表" in content
 	assert "对方主动" in content
@@ -1271,7 +1275,7 @@ def test_chat_snapshot_page_merge(mock_auth_cls, mock_client_cls, tmp_path):
 	assert result.exit_code == 0
 
 	# 验证快照包含两页的数据
-	with open(snapshot_dir / f"{today}.json") as f:
+	with open(snapshot_dir / f"{today}.json", encoding="utf-8") as f:
 		merged = json.load(f)
 	sids = {item["security_id"] for item in merged}
 	assert "sid_a" in sids      # page 1 保留
@@ -1348,7 +1352,7 @@ def test_chat_summary_supports_data_envelope(mock_auth_cls, mock_client_cls):
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.friend_list.return_value = {
 		"code": 200,
-		"data": {"result": [_make_friend_item("张HR", "智联科技", 1, 1700000000000) | {"uid": 12345}]},
+		"data": {"result": [_make_friend_item("张HR", "示例科技", 1, 1700000000000) | {"uid": 12345}]},
 	}
 	mock_client.chat_history.return_value = {
 		"code": 200,
@@ -1360,7 +1364,7 @@ def test_chat_summary_supports_data_envelope(mock_auth_cls, mock_client_cls):
 		},
 	}
 	runner = CliRunner()
-	result = runner.invoke(cli, ["--json", "--platform", "zhilian", "chat-summary", "sec_张HR"])
+	result = runner.invoke(cli, ["--json", "chat-summary", "sec_张HR"])
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
@@ -1373,7 +1377,7 @@ def test_chat_summary_finds_contact_on_second_page(mock_auth_cls, mock_client_cl
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.friend_list.side_effect = [
 		{"code": 200, "data": {"result": [_make_friend_item("其他HR", "别家公司", 1, 1700000000000) | {"securityId": "sec_other", "uid": 99999}]}},
-		{"code": 200, "data": {"result": [_make_friend_item("张HR", "智联科技", 1, 1700000000000) | {"uid": 12345}]}},
+		{"code": 200, "data": {"result": [_make_friend_item("张HR", "示例科技", 1, 1700000000000) | {"uid": 12345}]}},
 	]
 	mock_client.chat_history.return_value = {
 		"code": 200,
@@ -1385,7 +1389,7 @@ def test_chat_summary_finds_contact_on_second_page(mock_auth_cls, mock_client_cl
 		},
 	}
 	runner = CliRunner()
-	result = runner.invoke(cli, ["--json", "--platform", "zhilian", "chat-summary", "sec_张HR"])
+	result = runner.invoke(cli, ["--json", "chat-summary", "sec_张HR"])
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
@@ -1400,7 +1404,7 @@ def test_chat_summary_not_found_keeps_job_not_found(mock_auth_cls, mock_client_c
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.friend_list.return_value = {"code": 200, "data": {"result": []}}
 	runner = CliRunner()
-	result = runner.invoke(cli, ["--json", "--platform", "zhilian", "chat-summary", "sec_missing"])
+	result = runner.invoke(cli, ["--json", "chat-summary", "sec_missing"])
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
@@ -1415,7 +1419,7 @@ def test_chat_summary_not_found_after_second_page_keeps_job_not_found(mock_auth_
 		{"code": 200, "data": {"result": [], "hasMore": False}},
 	]
 	runner = CliRunner()
-	result = runner.invoke(cli, ["--json", "--platform", "zhilian", "chat-summary", "sec_missing"])
+	result = runner.invoke(cli, ["--json", "chat-summary", "sec_missing"])
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
@@ -1432,7 +1436,7 @@ def test_pipeline_supports_data_envelope(mock_auth_cls, mock_client_cls):
 				{
 					"name": "张HR",
 					"title": "后端工程师",
-					"brandName": "智联科技",
+					"brandName": "示例科技",
 					"lastMsg": "你好",
 					"lastTime": "今天 10:00",
 					"lastTS": 1700000000000,
@@ -1449,12 +1453,12 @@ def test_pipeline_supports_data_envelope(mock_auth_cls, mock_client_cls):
 		"code": 200,
 		"data": {
 			"interviewList": [
-				{"jobName": "后端工程师", "brandName": "智联科技", "interviewTimeDesc": "明天 10:00"},
+				{"jobName": "后端工程师", "brandName": "示例科技", "interviewTimeDesc": "明天 10:00"},
 			],
 		},
 	}
 	runner = CliRunner()
-	result = runner.invoke(cli, ["--json", "--platform", "zhilian", "pipeline", "--now-ts-ms", "1700000000000"])
+	result = runner.invoke(cli, ["--json", "pipeline", "--now-ts-ms", "1700000000000"])
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
@@ -1505,7 +1509,7 @@ def test_digest_supports_data_envelope(mock_auth_cls, mock_client_cls):
 				{
 					"name": "张HR",
 					"title": "后端工程师",
-					"brandName": "智联科技",
+					"brandName": "示例科技",
 					"lastMsg": "你好",
 					"lastTime": "今天 10:00",
 					"lastTS": 1700000000000,
@@ -1523,7 +1527,7 @@ def test_digest_supports_data_envelope(mock_auth_cls, mock_client_cls):
 		"data": {"interviewList": []},
 	}
 	runner = CliRunner()
-	result = runner.invoke(cli, ["--json", "--platform", "zhilian", "digest", "--now-ts-ms", "1700000000000"])
+	result = runner.invoke(cli, ["--json", "digest", "--now-ts-ms", "1700000000000"])
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
@@ -1616,6 +1620,7 @@ def test_search_reports_pipeline_platform_error(mock_client_cls, mock_auth_cls, 
 def test_search_reports_welfare_not_supported(mock_client_cls, mock_auth_cls, mock_cache_cls):
 	mock_cache = _ctx_mock(mock_cache_cls)
 	mock_cache.get_search.return_value = None
+	mock_cache.reserve_crawl_budget.return_value = 0.0
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.search_jobs.return_value = {
 		"code": 0,
@@ -1656,7 +1661,7 @@ def test_search_reports_welfare_not_supported(mock_client_cls, mock_auth_cls, mo
 @patch("boss_agent_cli.commands.detail.CacheStore")
 @patch("boss_agent_cli.commands.detail.AuthManager")
 @patch("boss_agent_cli.commands.detail.get_platform_instance")
-def test_detail_json_hints_keep_jobseeker_flow_read_only(mock_client_cls, mock_auth_cls, mock_cache_cls):
+def test_detail_json_hints_expose_available_candidate_actions(mock_client_cls, mock_auth_cls, mock_cache_cls):
 	mock_cache = _ctx_mock(mock_cache_cls)
 	mock_cache.is_greeted.return_value = False
 	mock_client = _ctx_mock(mock_client_cls)
@@ -1682,16 +1687,14 @@ def test_detail_json_hints_keep_jobseeker_flow_read_only(mock_client_cls, mock_a
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
-	assert "如需投递或沟通，请回到 BOSS 直聘官方页面由用户手动完成" in actions
-	assert all("boss greet" not in action for action in actions)
-	assert all("boss apply" not in action for action in actions)
+	assert "boss apply <security_id> <job_id> 或 boss greet <security_id> <job_id>" in actions
 
 
 @patch("boss_agent_cli.commands.show.CacheStore")
 @patch("boss_agent_cli.commands.show.AuthManager")
 @patch("boss_agent_cli.commands.show.get_platform_instance")
 @patch("boss_agent_cli.commands.show.get_job_by_index")
-def test_show_json_hints_keep_jobseeker_flow_read_only(mock_get_job, mock_client_cls, mock_auth_cls, mock_cache_cls):
+def test_show_json_hints_expose_available_candidate_actions(mock_get_job, mock_client_cls, mock_auth_cls, mock_cache_cls):
 	mock_get_job.return_value = {"security_id": "sec_001"}
 	mock_cache = _ctx_mock(mock_cache_cls)
 	mock_cache.is_greeted.return_value = False
@@ -1720,13 +1723,11 @@ def test_show_json_hints_keep_jobseeker_flow_read_only(mock_get_job, mock_client
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
-	assert "如需投递或沟通，请回到 BOSS 直聘官方页面由用户手动完成" in actions
-	assert all("boss greet" not in action for action in actions)
-	assert all("boss apply" not in action for action in actions)
+	assert "boss apply <security_id> <job_id> 或 boss greet <security_id> <job_id>" in actions
 
 
 @patch("boss_agent_cli.commands.stats._collect_stats")
-def test_stats_json_hints_keep_application_manual_handoff(mock_collect_stats):
+def test_stats_json_hints_expose_available_application_action(mock_collect_stats):
 	mock_collect_stats.return_value = {
 		"window_days": 30,
 		"funnel": {"greeted": 1, "applied": 0, "shortlist": 0},
@@ -1741,5 +1742,4 @@ def test_stats_json_hints_keep_application_manual_handoff(mock_collect_stats):
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
-	assert "如需投递，请回到平台官网由用户手动完成" in actions
-	assert all("boss apply" not in action for action in actions)
+	assert "使用 boss apply <security_id> <job_id> 继续投递" in actions

@@ -6,23 +6,49 @@ import shutil
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 import click
 
-from boss_agent_cli.display import handle_output
+from rich.table import Table
+
+from boss_agent_cli import display
+from boss_agent_cli.api.cdp_risk_lock import lock_path
+from boss_agent_cli.api.request_budget import budget_directory
+from boss_agent_cli.display import handle_output, render_next_steps
 
 
 @click.command("clean")
 @click.option("--dry-run", is_flag=True, default=False, help="仅预览将清理的内容，不实际删除")
-@click.option("--all", "clean_all", is_flag=True, default=False, help="清理全部缓存（包括未过期的搜索缓存和打招呼记录）")
+@click.option(
+	"--all", "clean_all", is_flag=True, default=False, help="清理全部缓存（包括未过期的搜索缓存和打招呼记录）"
+)
 @click.option("--privacy", is_flag=True, default=False, help="清理本地敏感数据（登录会话、简历、聊天快照和导出文件）")
 @click.option("--days", default=30, help="清理超过指定天数的快照和导出文件")
+@click.option(
+	"--risk-lock",
+	"risk_lock",
+	is_flag=True,
+	default=False,
+	help="用户确认官方目标业务页恢复后显式清除 BOSS 本地风控锁；不解除服务器风险",
+)
 @click.pass_context
-def clean_cmd(ctx: click.Context, dry_run: bool, clean_all: bool, privacy: bool, days: int) -> None:
+def clean_cmd(ctx: click.Context, dry_run: bool, clean_all: bool, privacy: bool, days: int, risk_lock: bool) -> None:
 	"""清理过期缓存和临时文件。"""
 	data_dir = ctx.obj["data_dir"]
 	results = []
 	total_freed = 0
+
+	# 0) 本地风险锁：显式 opt-in，文件名及 target 标签沿用历史协议，不连浏览器。
+	if risk_lock:
+		directories = dict.fromkeys((Path(data_dir).resolve(), budget_directory(Path(data_dir))))
+		freed, count = 0, 0
+		for directory in directories:
+			removed_bytes, removed_count = _clean_path(lock_path(directory), dry_run=dry_run)
+			freed += removed_bytes
+			count += removed_count
+		results.append({"target": "CDP 风控锁", "cleaned": count, "bytes_freed": freed})
+		total_freed += freed
 
 	# 1) 搜索缓存
 	freed, count = _clean_search_cache(data_dir, dry_run=dry_run, clean_all=clean_all)
@@ -55,6 +81,9 @@ def clean_cmd(ctx: click.Context, dry_run: bool, clean_all: bool, privacy: bool,
 			freed, count = _clean_path(path, dry_run=dry_run)
 			results.append({"target": target, "cleaned": count, "bytes_freed": freed})
 			total_freed += freed
+		freed, count = _clean_crawl_data(data_dir, dry_run=dry_run)
+		results.append({"target": "crawl 任务与导出", "cleaned": count, "bytes_freed": freed})
+		total_freed += freed
 
 	# 6) 全量清理额外项
 	if clean_all:
@@ -72,9 +101,20 @@ def clean_cmd(ctx: click.Context, dry_run: bool, clean_all: bool, privacy: bool,
 		"total_bytes_freed": total_freed,
 		"total_bytes_freed_display": _format_size(total_freed),
 	}
+	if risk_lock:
+		data["risk_lock"] = {
+			"local_lock_removed": bool(results[0]["cleaned"] and not dry_run),
+			"platform_risk_status": "unverified",
+		}
 
 	hints: dict[str, list[str]] = {"next_actions": []}
-	if dry_run:
+	if risk_lock:
+		hints["operator_actions"] = [
+			"本地清锁不解除服务器风险；请确认官方目标业务页已恢复，再由用户显式恢复原任务，若再次命中风险立即停止",
+		]
+	if dry_run and risk_lock:
+		hints["operator_actions"].append("预演未解除锁；确认恢复后由用户执行 boss clean --risk-lock")
+	elif dry_run:
 		hints["next_actions"].append("boss clean — 执行实际清理")
 	elif privacy:
 		hints["next_actions"].append("boss login — 隐私清理后需要重新登录")
@@ -82,7 +122,41 @@ def clean_cmd(ctx: click.Context, dry_run: bool, clean_all: bool, privacy: bool,
 	else:
 		hints["next_actions"].append("boss doctor — 检查清理后环境状态")
 
-	handle_output(ctx, "clean", data, hints=hints)
+	handle_output(
+		ctx,
+		"clean",
+		data,
+		render=lambda d: _render_clean(d, hints["next_actions"]),
+		hints=hints,
+	)
+
+
+def _render_clean(data: dict[str, Any], next_steps: list[str]) -> None:
+	"""清理结果表格（TTY 路径）。dry-run 时明确标注未真正删除。"""
+	title = "clean（预演，未实际删除）" if data.get("dry_run") else "clean"
+	table = Table(title=title)
+	table.add_column("目标", style="bold cyan")
+	table.add_column("条数", justify="right", style="green")
+	table.add_column("释放", justify="right", style="yellow")
+	for row in data.get("results", []):
+		table.add_row(
+			str(row.get("target", "-")),
+			str(row.get("cleaned", 0)),
+			_human_bytes(row.get("bytes_freed", 0)),
+		)
+	display.console.print(table)
+	display.console.print(f"  合计释放 [bold]{data.get('total_bytes_freed_display', '0 B')}[/bold]")
+	render_next_steps(next_steps)
+
+
+def _human_bytes(value: int) -> str:
+	"""字节数转人类可读；与信封里的 total_bytes_freed_display 口径一致。"""
+	size = float(value)
+	for unit in ("B", "KB", "MB", "GB"):
+		if size < 1024 or unit == "GB":
+			return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+		size /= 1024
+	return f"{size:.1f} GB"
 
 
 def _clean_search_cache(data_dir: Path, *, dry_run: bool, clean_all: bool) -> tuple[int, int]:
@@ -181,6 +255,25 @@ def _clean_greet_records(data_dir: Path, *, dry_run: bool) -> tuple[int, int]:
 def _clean_apply_records(data_dir: Path, *, dry_run: bool) -> tuple[int, int]:
 	"""清理投递记录。"""
 	return _clean_table(data_dir, "apply_records", dry_run=dry_run)
+
+
+def _clean_crawl_data(data_dir: Path, *, dry_run: bool) -> tuple[int, int]:
+	files_size, files_count = _clean_path(data_dir / "crawl", dry_run=dry_run)
+	db_path = data_dir / "cache" / "boss_agent.db"
+	if not db_path.exists():
+		return files_size, files_count
+	conn = sqlite3.connect(str(db_path))
+	try:
+		row = conn.execute("SELECT COUNT(*) FROM crawl_runs").fetchone()
+		count = int(row[0])
+		if not dry_run:
+			conn.execute("DELETE FROM crawl_jobs")
+			conn.execute("DELETE FROM crawl_runs")
+			conn.execute("DELETE FROM crawl_budget")
+			conn.commit()
+		return files_size + count * 200, files_count + count
+	finally:
+		conn.close()
 
 
 def _clean_table(data_dir: Path, table: str, *, dry_run: bool) -> tuple[int, int]:

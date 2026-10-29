@@ -7,15 +7,13 @@ import click
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._platform import get_platform_instance
-from boss_agent_cli.commands.chat_export import render_export
-from boss_agent_cli.commands.chat_snapshot import save_snapshot_and_diff, load_snapshot
-from boss_agent_cli.commands.chat_utils import (
+from boss_agent_cli.services.chat_export import render_export
+from boss_agent_cli.services.chat_snapshot import save_snapshot_and_diff, load_snapshot
+from boss_agent_cli.services.chat_utils import (
 	RELATION_LABELS, FROM_FILTER, MSG_STATUS_LABELS,
 	sanitize_csv_cell, escape_md_cell,
 )
-from boss_agent_cli.display import error_contract_for_code, handle_auth_errors, handle_error_output, handle_output, login_action_for_ctx, render_simple_list
-
-NOT_SUPPORTED_RECOVERY_ACTION = "切换平台或调整命令参数后重试"
+from boss_agent_cli.display import handle_auth_errors, handle_error_output, handle_not_supported, handle_output, handle_platform_error_output, render_simple_list
 
 # 向后兼容别名（旧测试引用 chat._sanitize_csv_cell 等）
 _RELATION_LABELS = RELATION_LABELS
@@ -47,39 +45,14 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 	logger = ctx.obj["logger"]
 	auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
 
-	token = auth.check_status()
-	if token is None:
-		login_action = login_action_for_ctx(ctx)
-		handle_error_output(
-			ctx, "chat",
-			code="AUTH_REQUIRED",
-			message=f"未登录，请先执行 {login_action}",
-			recoverable=True, recovery_action=login_action,
-		)
-		return
-
 	with get_platform_instance(ctx, auth) as platform:
 		try:
 			resp = platform.friend_list(page=page)
 		except NotImplementedError as exc:
-			handle_error_output(
-				ctx, "chat",
-				code="NOT_SUPPORTED",
-				message=str(exc) or "当前平台不支持沟通列表能力",
-				recoverable=True,
-				recovery_action=NOT_SUPPORTED_RECOVERY_ACTION,
-			)
+			handle_not_supported(ctx, "chat", exc, fallback_message="当前平台不支持沟通列表能力")
 			return
 		if not platform.is_success(resp):
-			code, message = platform.parse_error(resp)
-			recoverable, recovery_action = error_contract_for_code(code)
-			handle_error_output(
-				ctx, "chat",
-				code=code,
-				message=message or "沟通列表获取失败",
-				recoverable=recoverable,
-				recovery_action=recovery_action,
-			)
+			handle_platform_error_output(ctx, "chat", platform, resp, fallback_message="沟通列表获取失败")
 			return
 		platform_data = platform.unwrap_data(resp) or {}
 		items = platform_data.get("result") or platform_data.get("friendList") or []
@@ -126,6 +99,9 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 				"last_time": last_time_str,
 				"last_ts": last_ts,
 				"msg_status": msg_status_label,
+				# uid 是跨请求稳定的联系人标识，chatmsg/chat-summary/mark/exchange
+				# 都应优先使用它；security_id 是每请求轮换的令牌，仅作参考。
+				"uid": item.get("uid") or "",
 				"security_id": item.get("securityId") or "",
 				"encrypt_job_id": item.get("encryptJobId") or "",
 				"unread": item.get("unreadMsgCount") or 0,
@@ -153,7 +129,11 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 
 			# 路径安全校验：禁止 .. 跳转
 			resolved = os.path.realpath(output_path)
-			if ".." in os.path.relpath(resolved, os.getcwd()):
+			try:
+				relative_output = os.path.relpath(resolved, os.getcwd())
+			except ValueError:
+				relative_output = resolved
+			if ".." in relative_output:
 				safe_dir = os.path.realpath(export_dir if 'export_dir' in dir() else data_dir)
 				if not resolved.startswith(safe_dir) and not resolved.startswith(os.path.realpath(os.getcwd())):
 					handle_error_output(
@@ -177,9 +157,9 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 				render=lambda d: click.echo(
 					f"已导出 {d['count']} 条到 {d['path']}", err=True
 				),
-				hints={"next_actions": [
-					"boss detail <security_id> — 查看职位详情",
-					"如需沟通，请回到平台官网由用户手动完成",
+					hints={"next_actions": [
+						"boss detail <security_id> — 查看职位详情",
+						"boss chatmsg <uid> — 查看消息后继续沟通（uid 见上方输出）",
 				]},
 			)
 			return
@@ -202,6 +182,7 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 					("Boss", "name", "bold cyan"),
 					("职称", "title", "dim"),
 					("公司", "brand_name", "green"),
+					("uid", "uid", "dim"),
 					("发起方", "initiated_by", "magenta"),
 					("未读", "unread", "red"),
 					("已读", "msg_status", "dim"),
@@ -213,9 +194,9 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 		handle_output(
 			ctx, "chat", friends,
 			render=_render,
-			hints={"next_actions": [
-				"boss detail <security_id> — 查看职位详情",
-				"如需沟通，请回到平台官网由用户手动完成",
+				hints={"next_actions": [
+					"boss detail <security_id> — 查看职位详情",
+					"boss chatmsg <uid> — 查看消息后继续沟通（uid 见上方输出）",
 			]},
 		)
 

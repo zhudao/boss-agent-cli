@@ -3,36 +3,30 @@
 from __future__ import annotations
 
 import sys
-from typing import Any, Mapping, MutableMapping
+import weakref
+from typing import Any, Callable, Mapping, MutableMapping
 
 
 def browser_headers(
 	default_headers: Mapping[str, str],
 	token: Mapping[str, Any],
-	*,
-	include_client_id: bool = False,
-	default_platform: str | None = None,
 ) -> dict[str, str]:
 	"""Build browser-like headers from persisted auth metadata."""
 	headers = dict(default_headers)
 	if ua := token.get("user_agent"):
 		headers["User-Agent"] = str(ua)
-	if include_client_id and (client_id := token.get("x_zp_client_id") or token.get("client_id")):
-		headers["x-zp-client-id"] = str(client_id)
-	platform_header = sec_ch_ua_platform(default_platform=default_platform)
+	platform_header = sec_ch_ua_platform()
 	if platform_header:
 		headers["sec-ch-ua-platform"] = platform_header
 	return headers
 
 
-def sec_ch_ua_platform(*, default_platform: str | None = None) -> str | None:
+def sec_ch_ua_platform() -> str | None:
 	"""Return the current platform value used by browser-style headers."""
 	if sys.platform == "win32":
 		return '"Windows"'
 	if sys.platform == "linux":
 		return '"Linux"'
-	if default_platform:
-		return f'"{default_platform}"'
 	return None
 
 
@@ -55,3 +49,17 @@ def add_stoken_to_get_params(method: str, kwargs: MutableMapping[str, Any], stok
 	params = kwargs.get("params", {})
 	params["__zp_stoken__"] = stoken
 	kwargs["params"] = params
+
+
+def make_client_registry() -> tuple[weakref.WeakSet[Any], Callable[[], None]]:
+	"""建一个 WeakSet 注册表 + atexit 安全的 close-all 回调；供各 client 复用。"""
+	registry: weakref.WeakSet[Any] = weakref.WeakSet()
+
+	def close_all() -> None:
+		for client in list(registry):
+			try:
+				client.close()
+			except Exception:
+				pass
+
+	return registry, close_all

@@ -3,9 +3,7 @@ import click
 from boss_agent_cli.api.models import JobItem
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.commands._platform import get_platform_instance
-from boss_agent_cli.display import boss_command_for_ctx, error_contract_for_code, handle_auth_errors, handle_error_output, handle_output, render_job_table
-
-NOT_SUPPORTED_RECOVERY_ACTION = "切换平台或调整命令参数后重试"
+from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_not_supported, handle_output, handle_platform_error_output, render_job_table
 
 
 @click.command("history")
@@ -22,23 +20,12 @@ def history_cmd(ctx: click.Context, page: int) -> None:
 		try:
 			raw = platform.job_history(page)
 		except NotImplementedError as exc:
-			handle_error_output(
-				ctx, "history",
-				code="NOT_SUPPORTED",
-				message=str(exc) or "当前平台不支持浏览历史能力",
-				recoverable=True,
-				recovery_action=NOT_SUPPORTED_RECOVERY_ACTION,
-			)
+			handle_not_supported(ctx, "history", exc, fallback_message="当前平台不支持浏览历史能力")
 			return
 		if not platform.is_success(raw):
-			code, message = platform.parse_error(raw)
-			recoverable, recovery_action = error_contract_for_code(code)
-			handle_error_output(
-				ctx, "history",
-				code=code,
-				message=message or "浏览历史获取失败",
-				recoverable=recoverable,
-				recovery_action=recovery_action,
+			handle_platform_error_output(
+				ctx, "history", platform, raw,
+				fallback_message="浏览历史获取失败",
 			)
 			return
 		platform_data = platform.unwrap_data(raw) or {}
@@ -54,7 +41,8 @@ def history_cmd(ctx: click.Context, page: int) -> None:
 	hints = {
 		"next_actions": [
 			f"使用 {boss_command_for_ctx(ctx, 'detail <security_id>')} 查看职位详情",
-			"如需投递或沟通，请回到平台官网由用户手动完成",
+			f"使用 {boss_command_for_ctx(ctx, 'apply <security_id> <job_id>')} 投递，"
+			f"或 {boss_command_for_ctx(ctx, 'greet <security_id> <job_id>')} 沟通",
 			f"使用 {boss_command_for_ctx(ctx, f'history --page {page + 1}')} 查看下一页",
 		],
 	}

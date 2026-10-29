@@ -4,6 +4,7 @@ import pytest
 from boss_agent_cli.search_filters import (
 	SearchFilterCriteria,
 	SearchUrlParseError,
+	compute_match_score,
 	parse_salary_range,
 	parse_boss_search_url,
 	meets_experience_threshold,
@@ -66,7 +67,7 @@ class TestSearchUrlParsing:
 		params = resolve_search_code_params(experience="应届,3-5年", education="本科,硕士", job_type="全职,实习")
 		assert params["experience"] == "108,104"
 		assert params["degree"] == "203,204"
-		assert params["jobType"] == "1901,1903"
+		assert params["jobType"] == "1901,1902"
 
 
 # ── Experience threshold ────────────────────────────────────────────
@@ -183,3 +184,88 @@ class TestPrefilterJob:
 		criteria = SearchFilterCriteria(query="go")
 		ok, reasons = prefilter_job(raw, criteria)
 		assert ok is True
+
+	def test_boss_internship_accepts_verified_response_type(self):
+		raw = {**_make_raw(), "jobType": 4, "jobName": "产品实习生"}
+		criteria = SearchFilterCriteria(query="产品", job_type="实习")
+
+		ok, reasons = prefilter_job(raw, criteria, platform_name="zhipin")
+
+		assert ok is True
+		assert reasons == []
+
+	def test_boss_internship_rejects_non_intern_even_when_title_says_intern(self):
+		raw = {**_make_raw(), "jobType": 5, "jobName": "接受实习生"}
+		criteria = SearchFilterCriteria(query="产品", job_type="实习")
+
+		ok, reasons = prefilter_job(raw, criteria, platform_name="zhipin")
+
+		assert ok is False
+		assert any("jobType=5" in reason for reason in reasons)
+
+	def test_boss_internship_rejects_missing_response_type(self):
+		raw = {**_make_raw(), "jobName": "实习生"}
+		criteria = SearchFilterCriteria(query="产品", raw_params={"jobType": "1902"})
+
+		ok, reasons = prefilter_job(raw, criteria, platform_name="zhipin")
+
+		assert ok is False
+		assert any("jobType=None" in reason for reason in reasons)
+
+	def test_other_platform_does_not_use_boss_response_enum(self):
+		raw = {**_make_raw(), "jobName": "实习生"}
+		criteria = SearchFilterCriteria(query="产品", job_type="实习")
+
+		ok, reasons = prefilter_job(raw, criteria, platform_name="otherplat")
+
+		assert ok is True
+		assert reasons == []
+
+
+class TestComputeMatchScore:
+	def test_welfare_tag_scores_higher_than_description(self):
+		item = {
+			"title": "Golang 后端",
+			"salary": "20-30K",
+			"city": "广州",
+			"experience": "3-5年",
+			"education": "本科",
+			"skills": ["Golang"],
+			"welfare": ["双休"],
+		}
+		criteria = SearchFilterCriteria(
+			query="golang",
+			city="广州",
+			salary="20-50K",
+			experience="3-5年",
+			education="本科",
+		)
+
+		tag_score = compute_match_score(item, ["双休(标签)"], criteria)
+		desc_score = compute_match_score(item, ["双休(描述)"], criteria)
+
+		assert 0 <= desc_score < tag_score <= 100
+
+	def test_welfare_more_matches_score_higher(self):
+		item = {
+			"title": "Python 后端",
+			"salary": "20-30K",
+			"city": "广州",
+			"experience": "3-5年",
+			"education": "本科",
+			"skills": ["Python"],
+			"welfare": ["双休", "五险一金"],
+		}
+		criteria = SearchFilterCriteria(
+			query="python",
+			city="广州",
+			salary="20-50K",
+			experience="3-5年",
+			education="本科",
+		)
+
+		one = compute_match_score(item, ["双休(标签)"], criteria)
+		two = compute_match_score(item, ["双休(标签)", "五险一金(标签)"], criteria)
+
+		assert two > one
+		assert compute_match_score(item, ["双休(标签)", "五险一金(标签)"], criteria) == two

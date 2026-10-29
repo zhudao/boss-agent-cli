@@ -1,14 +1,21 @@
 from unittest.mock import patch, MagicMock
 
+import json
+
+import pytest
+
 import httpx
 
 from boss_agent_cli.api.browser_client import (
-	CDP_DEFAULT_URL,
 	HOME_URL,
 	_HEADLESS_NETWORKIDLE_GRACE_MS,
+	_HOME_NAV_RETRIES,
 	_NAV_TIMEOUT_MS,
+	BrowserNavigationError,
 	BrowserSession,
+	_find_reusable_zhipin_page,
 )
+from boss_agent_cli.api.browser_urls import DEFAULT_CDP_URL, is_zhipin_url
 
 
 def test_browser_session_defaults():
@@ -137,6 +144,7 @@ def test_close_is_idempotent_when_cdp_resources_are_partial_and_raise():
 	session._page = MagicMock()
 	session._context = MagicMock()
 	session._pw = MagicMock()
+	pw = session._pw
 	session._page.close.side_effect = RuntimeError("page already closed")
 	session._context.close.side_effect = RuntimeError("context already closed")
 	session._pw.stop.side_effect = RuntimeError("playwright already stopped")
@@ -145,9 +153,15 @@ def test_close_is_idempotent_when_cdp_resources_are_partial_and_raise():
 	session.close()
 
 	assert session._started is False
-	assert session._page.close.call_count == 2
-	assert session._context.close.call_count == 2
-	assert session._pw.stop.call_count == 2
+	# close 现在是真幂等的：第二次调用因 _started 已为 False 直接返回，不重复拆卸。
+	# 旧实现会重跑一遍，且在 _is_cdp 被复位后走进 headless 分支执行错误的拆卸。
+	assert session._page.close.call_count == 1
+	assert session._context.close.call_count == 1
+	# playwright driver 在首次 close 时被 stop 并置空，第二次 close 不再重复 stop。
+	# 这是有意的：_ensure_playwright() 用 `_pw is None` 判断是否要起新 driver，
+	# close 不置空的话，close 后重启会复用一个已 stop 的 driver。
+	assert pw.stop.call_count == 1
+	assert session._pw is None
 
 
 def test_close_is_idempotent_when_headless_resources_are_partial_and_raise():
@@ -156,6 +170,7 @@ def test_close_is_idempotent_when_headless_resources_are_partial_and_raise():
 	session._started = True
 	session._browser = MagicMock()
 	session._pw = MagicMock()
+	pw = session._pw
 	session._browser.close.side_effect = RuntimeError("browser already closed")
 	session._pw.stop.side_effect = RuntimeError("playwright already stopped")
 
@@ -163,8 +178,53 @@ def test_close_is_idempotent_when_headless_resources_are_partial_and_raise():
 	session.close()
 
 	assert session._started is False
-	assert session._browser.close.call_count == 2
-	assert session._pw.stop.call_count == 2
+	assert session._browser.close.call_count == 1
+	# 同上：driver 首次 close 即释放并置空，避免 close 后重启复用已 stop 的 driver。
+	assert pw.stop.call_count == 1
+	assert session._pw is None
+
+
+@pytest.mark.parametrize("initial_cdp", [True, False])
+def test_close_then_restart_does_not_reuse_previous_channel_state(initial_cdp):
+	"""CDP/headless 相互重连时重置旧通道状态，不复用已经释放的 driver。"""
+	session = BrowserSession(cookies={}, user_agent="")
+	session._started = True
+	session._is_cdp = initial_cdp
+	session._own_context = True
+	session._own_page = True
+	session._page = MagicMock()
+	session._context = MagicMock()
+	session._browser = MagicMock()
+	session._pw = MagicMock()
+	previous_driver = session._pw
+
+	session.close()
+
+	assert session._started is False
+	assert session._is_cdp is False
+	assert session._pw is None
+	previous_driver.stop.assert_called_once()
+
+	with (
+		patch("boss_agent_cli.api.browser_client.sync_playwright") as mock_playwright,
+		patch.object(session, "_try_cdp", return_value=False) if initial_cdp else patch.object(
+			BrowserSession, "_read_devtools_active_port", return_value=None
+		),
+	):
+		driver = mock_playwright.return_value.start.return_value
+		if not initial_cdp:
+			driver.chromium.connect_over_cdp.return_value.contexts = [MagicMock()]
+		session._ensure_started()
+
+	assert session._started is True
+	assert session._is_cdp is not initial_cdp
+	assert session._pw is driver
+	assert driver is not previous_driver
+	if initial_cdp:
+		driver.chromium.launch.assert_called_once()
+	else:
+		driver.chromium.launch.assert_not_called()
+	session.close()
 
 
 def test_try_connect_reuses_existing_context():
@@ -246,14 +306,13 @@ def test_start_headless_tolerates_networkidle_timeout():
 		"networkidle",
 		timeout=_HEADLESS_NETWORKIDLE_GRACE_MS,
 	)
-	logger.info.assert_any_call("[boss] CDP 不可用（提示：需以 --remote-debugging-port=9222 启动 Chrome），降级到 headless patchright")
-	assert any(
-		"headless 首页未进入 networkidle" in call.args[0]
-		for call in logger.info.call_args_list
+	logger.debug.assert_any_call(
+		"[boss] CDP 不可用（提示：需以 --remote-debugging-port=9222 启动 Chrome），降级到 headless patchright"
 	)
+	assert any("headless 首页未进入 networkidle" in call.args[0] for call in logger.debug.call_args_list)
 
 
-def test_ensure_started_falls_back_to_patchright_when_bridge_and_cdp_fail():
+def test_ensure_started_falls_back_to_patchright_when_cdp_fails():
 	session = BrowserSession(cookies={}, user_agent="")
 	mock_pw = MagicMock()
 	sentinel = {"headless_started": False}
@@ -263,7 +322,6 @@ def test_ensure_started_falls_back_to_patchright_when_bridge_and_cdp_fail():
 		session._started = True
 
 	with (
-		patch.object(session, "_try_bridge", return_value=False) as mock_try_bridge,
 		patch("boss_agent_cli.api.browser_client.sync_playwright") as mock_sync_playwright,
 		patch.object(session, "_try_cdp", return_value=False) as mock_try_cdp,
 		patch.object(session, "_start_headless", side_effect=mark_headless_started) as mock_start_headless,
@@ -275,7 +333,6 @@ def test_ensure_started_falls_back_to_patchright_when_bridge_and_cdp_fail():
 	assert sentinel["headless_started"] is True
 	assert session._started is True
 	assert session._pw is mock_pw
-	mock_try_bridge.assert_called_once()
 	mock_sync_playwright.assert_called_once()
 	mock_try_cdp.assert_called_once()
 	mock_start_headless.assert_called_once()
@@ -286,8 +343,12 @@ def test_try_cdp_attempts_http_ws_and_devtools_urls_before_falling_back():
 
 	with (
 		patch.object(session, "_try_connect", return_value=False) as mock_try_connect,
-		patch.object(BrowserSession, "_fetch_ws_url", side_effect=[None, "ws://127.0.0.1:9222/devtools/browser/default"]) as mock_fetch_ws_url,
-		patch.object(BrowserSession, "_read_devtools_active_port", return_value="ws://127.0.0.1:9222/devtools/browser/file") as mock_read_port,
+		patch.object(
+			BrowserSession, "_fetch_ws_url", side_effect=[None, "ws://127.0.0.1:9222/devtools/browser/default"]
+		) as mock_fetch_ws_url,
+		patch.object(
+			BrowserSession, "_read_devtools_active_port", return_value="ws://127.0.0.1:9222/devtools/browser/file"
+		) as mock_read_port,
 	):
 		result = session._try_cdp()
 
@@ -295,13 +356,13 @@ def test_try_cdp_attempts_http_ws_and_devtools_urls_before_falling_back():
 	mock_read_port.assert_called_once()
 	assert [call.args[0] for call in mock_try_connect.call_args_list] == [
 		"http://127.0.0.1:9333",
-		CDP_DEFAULT_URL,
+		DEFAULT_CDP_URL,
 		"ws://127.0.0.1:9222/devtools/browser/default",
 		"ws://127.0.0.1:9222/devtools/browser/file",
 	]
 	assert [call.args[0] for call in mock_fetch_ws_url.call_args_list] == [
 		"http://127.0.0.1:9333",
-		CDP_DEFAULT_URL,
+		DEFAULT_CDP_URL,
 	]
 
 
@@ -311,7 +372,9 @@ def test_request_returns_browser_evaluation_json_and_marks_throttle():
 	session._page = MagicMock()
 	session._throttle = MagicMock()
 	expected = {"code": 0, "zpData": {"jobs": []}}
-	session._page.evaluate.return_value = expected
+	session._context = MagicMock()
+	cdp = session._context.new_cdp_session.return_value
+	cdp.send.return_value = {"result": {"value": expected}}
 
 	result = session.request(
 		"POST",
@@ -323,12 +386,375 @@ def test_request_returns_browser_evaluation_json_and_marks_throttle():
 	assert result == expected
 	session._throttle.wait.assert_called_once()
 	session._throttle.mark.assert_called_once()
-	evaluate_script, evaluate_args = session._page.evaluate.call_args.args
-	assert "fetch(fetchUrl, options)" in evaluate_script
+	method, args = cdp.send.call_args.args
+	assert method == "Runtime.evaluate"
+	assert args["timeout"] == 30000
+	evaluate_args = json.loads(args["expression"].rsplit(")(", 1)[1][:-1])
 	assert evaluate_args == {
 		"method": "POST",
 		"url": "https://www.zhipin.com/wapi/zpgeek/search/joblist.json",
 		"params": {"query": "python", "page": 1},
 		"data": {"city": "101020100"},
 		"referer": "https://www.zhipin.com/web/geek/job",
+		"timeoutMs": 20000,
 	}
+
+
+def test_cold_start_wait_constants_stay_lean():
+	"""回归护栏：冷启动两处等待须保持精简（曾各浪费 ~3s/搜索）。
+
+	- 自动探测默认 localhost:9222 的超时必须短于显式 --cdp-url 的超时；
+	- headless 首页 networkidle 宽限须 <=1s（zhipin 首页基本进不了 networkidle，
+	  domcontentloaded 后 JS 环境即可发请求，长宽限是纯浪费）。
+	"""
+	from boss_agent_cli.api.browser_client import (
+		_CDP_AUTO_PROBE_TIMEOUT,
+		_CDP_PROBE_TIMEOUT,
+		_HEADLESS_NETWORKIDLE_GRACE_MS,
+	)
+
+	assert _CDP_AUTO_PROBE_TIMEOUT < _CDP_PROBE_TIMEOUT
+	assert _CDP_AUTO_PROBE_TIMEOUT <= 1
+	assert _HEADLESS_NETWORKIDLE_GRACE_MS <= 1000
+
+
+def test_fetch_ws_url_honors_short_auto_probe_timeout():
+	"""默认自动探测应以短超时调用 httpx，避免无调试端口时白等。"""
+	with patch("httpx.get") as mock_get:
+		mock_get.return_value = MagicMock(json=lambda: {"webSocketDebuggerUrl": "ws://x"})
+		BrowserSession._fetch_ws_url("http://127.0.0.1:9222", timeout=1)
+		assert mock_get.call_args.kwargs["timeout"] == 1
+
+
+# ── issue #334: CDP 复用已打开的 zhipin 页签，不再每次新开+导航 ─────────────
+
+
+class _FakePage:
+	def __init__(self, url):
+		self.url = url
+
+
+def test_is_zhipin_url_uses_exact_hostname():
+	assert is_zhipin_url("https://www.zhipin.com/web/geek/job")
+	assert is_zhipin_url("https://ZHIPIN.COM./")  # 大小写 + 尾点归一化
+	assert not is_zhipin_url("https://zhipin.com.evil.example/web/geek/job")
+	assert not is_zhipin_url("https://evil.example/?next=https://www.zhipin.com/")
+	assert not is_zhipin_url("not-a-url-with-zhipin.com")
+
+
+def test_find_reusable_zhipin_page_prefers_open_zhipin_tab():
+	ctx = MagicMock()
+	other = _FakePage("https://mail.google.com/")
+	fake = _FakePage("https://zhipin.com.evil.example/web/geek/job")
+	real = _FakePage("https://www.zhipin.com/web/geek/recommend")
+	ctx.pages = [other, fake, real]
+
+	assert _find_reusable_zhipin_page(ctx) is real
+
+
+def test_find_reusable_zhipin_page_none_when_no_zhipin_tab():
+	ctx = MagicMock()
+	ctx.pages = [_FakePage("https://mail.google.com/")]
+	assert _find_reusable_zhipin_page(ctx) is None
+
+
+def test_try_connect_reuses_open_zhipin_page_without_new_tab_or_nav():
+	"""CDP 复用 context 且已有 zhipin 页签时：不新开 page、不导航（修 #334）。"""
+	session = BrowserSession(cookies={}, user_agent="")
+	session._pw = MagicMock()
+
+	mock_browser = MagicMock()
+	mock_user_context = MagicMock()
+	open_zhipin_page = _FakePage("https://www.zhipin.com/web/geek/job")
+	mock_user_context.pages = [open_zhipin_page]
+	mock_browser.contexts = [mock_user_context]
+	session._pw.chromium.connect_over_cdp.return_value = mock_browser
+
+	result = session._try_connect("ws://localhost:9222/test")
+
+	assert result is True
+	assert session._is_cdp is True
+	assert session._own_context is False
+	assert session._own_page is False  # 复用用户页签
+	assert session._page is open_zhipin_page
+	mock_user_context.new_page.assert_not_called()  # 不新开标签页
+	assert open_zhipin_page.url == "https://www.zhipin.com/web/geek/job"  # 未被导航覆盖
+
+
+def test_try_connect_creates_page_when_no_open_zhipin_tab():
+	"""CDP 复用 context 但无 zhipin 页签时：仍新建 page 并导航（回退现状）。"""
+	session = BrowserSession(cookies={}, user_agent="")
+	session._pw = MagicMock()
+
+	mock_browser = MagicMock()
+	mock_user_context = MagicMock()
+	mock_user_context.pages = [_FakePage("https://mail.google.com/")]
+	mock_new_page = MagicMock()
+	mock_user_context.new_page.return_value = mock_new_page
+	mock_browser.contexts = [mock_user_context]
+	session._pw.chromium.connect_over_cdp.return_value = mock_browser
+
+	result = session._try_connect("ws://localhost:9222/test")
+
+	assert result is True
+	assert session._own_page is True
+	mock_user_context.new_page.assert_called_once()
+	assert session._started is True
+	# 首次 CDP 页面必须等待 DOM 就绪，而不是 commit 级等待（首次搜索不再撞上
+	# execution context destroyed）。
+	mock_new_page.goto.assert_called_once_with(HOME_URL, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+
+
+def test_request_does_not_hang_when_new_page_navigation_stalled():
+	"""新建 CDP 页签 goto 超时（_page_ready=False）时，request() 不得对仍在导航的页面
+	evaluate（永久挂起，同 #390）；先有界恢复，仍卡住则抛出 BrowserNavigationError。"""
+	session = BrowserSession(cookies={}, user_agent="")
+	session._pw = MagicMock()
+	mock_browser = MagicMock()
+	mock_ctx = MagicMock()
+	mock_ctx.pages = []
+	mock_new_page = MagicMock()
+	mock_ctx.new_page.return_value = mock_new_page
+	mock_browser.contexts = [mock_ctx]
+	session._pw.chromium.connect_over_cdp.return_value = mock_browser
+	mock_new_page.goto.side_effect = TimeoutError("Timeout 15000ms exceeded")
+
+	assert session._try_connect("ws://localhost:9222/test") is True
+	assert session._page_ready is False
+	assert isinstance(session._home_nav_error, BrowserNavigationError)
+	assert session._home_nav_error.channel == "cdp"
+	assert session._home_nav_error.attempts == _HOME_NAV_RETRIES
+
+	# 页面仍卡住：抛出导航超时，不调 evaluate（永久挂起，同 #390）
+	mock_new_page.wait_for_load_state.side_effect = TimeoutError("still stuck")
+	with pytest.raises(BrowserNavigationError):
+		session.request("GET", "https://www.zhipin.com/wapi/zpgeek/search/joblist.json")
+	mock_new_page.evaluate.assert_not_called()
+
+	# 页面恢复：有界 wait 成功后正常 evaluate，_page_ready 复位
+	mock_new_page.wait_for_load_state.side_effect = None
+	mock_new_page.wait_for_load_state.return_value = None
+	mock_ctx.new_cdp_session.return_value.send.return_value = {"result": {"value": {"code": 0, "zpData": {}}}}
+	res2 = session.request("GET", "https://www.zhipin.com/wapi/zpgeek/search/joblist.json")
+	assert res2["code"] == 0
+
+
+def test_try_connect_resets_page_ready_on_reuse_after_prior_stall():
+	"""上一次尝试新建页签 goto 超时留下 _page_ready=False，下一次复用健康页签时
+	必须重置为 True——否则 request() 会对正常页签误跑 wait_for_load_state。"""
+	session = BrowserSession(cookies={}, user_agent="")
+	session._pw = MagicMock()
+
+	# 第一次：无 zhipin 页签 → 新建，goto 超时 → _page_ready=False
+	mock_browser1 = MagicMock()
+	ctx1 = MagicMock()
+	ctx1.pages = []
+	new_page = MagicMock()
+	ctx1.new_page.return_value = new_page
+	mock_browser1.contexts = [ctx1]
+	session._pw.chromium.connect_over_cdp.return_value = mock_browser1
+	new_page.goto.side_effect = TimeoutError("Timeout 15000ms exceeded")
+	assert session._try_connect("ws://localhost:9222/one") is True
+	assert session._page_ready is False
+
+	# 第二次：复用既有 zhipin 页签（不碰 _page_ready 的分支）→ 必须重置为 True
+	reused_page = _FakePage("https://www.zhipin.com/web/geek/job")
+	mock_browser2 = MagicMock()
+	ctx2 = MagicMock()
+	ctx2.pages = [reused_page]
+	mock_browser2.contexts = [ctx2]
+	session._pw.chromium.connect_over_cdp.return_value = mock_browser2
+	session._started = False  # 模拟新一轮连接
+	assert session._try_connect("ws://localhost:9222/two") is True
+	assert session._page_ready is True  # 复用健康页签不被上次残留污染
+
+
+def test_close_does_not_close_reused_user_page():
+	"""CDP 复用用户页签（_own_page=False）时 close() 不关闭该页。"""
+	session = BrowserSession(cookies={}, user_agent="")
+	session._is_cdp = True
+	session._own_context = False
+	session._own_page = False  # 复用用户页签
+	session._started = True
+	session._page = MagicMock()
+	session._context = MagicMock()
+	session._pw = MagicMock()
+
+	session.close()
+
+	session._page.close.assert_not_called()  # 不关用户的页签
+	session._context.close.assert_not_called()
+
+
+# ── 复用页签运行期撞上用户手动导航：失败驱动的一次性恢复（Issue #423） ─────
+
+
+def _started_cdp_session_with_page(page):
+	session = BrowserSession(cookies={}, user_agent="")
+	session._is_cdp = True
+	session._started = True
+	session._page_ready = True
+	session._page = page
+	session._context = MagicMock()
+
+	def evaluate(method, args):
+		assert method == "Runtime.evaluate"
+		return {"result": {"value": page.evaluate(args["expression"], None)}}
+
+	session._context.new_cdp_session.return_value.send.side_effect = evaluate
+	session._pw = MagicMock()
+	session._throttle = MagicMock()
+	return session
+
+
+def test_is_context_destroyed_error_matches_navigation_races():
+	from boss_agent_cli.api.browser_client import _is_context_destroyed_error
+
+	assert _is_context_destroyed_error(RuntimeError("Execution context was destroyed, most likely because of a navigation"))
+	assert _is_context_destroyed_error(RuntimeError("Target closed"))
+	assert not _is_context_destroyed_error(RuntimeError("Evaluation failed: ReferenceError: fetch is not defined"))
+	assert not _is_context_destroyed_error(TimeoutError("Timeout 15000ms exceeded"))
+
+
+def test_request_recovers_once_after_context_destroyed_mid_navigation():
+	"""首次 evaluate 撞上 execution context destroyed：有界等待就绪后重试同一请求一次，成功返回。"""
+	page = MagicMock()
+	page.evaluate.side_effect = [
+		RuntimeError("Execution context was destroyed, most likely because of a navigation."),
+		{"code": 0, "zpData": {"ok": True}},
+	]
+	session = _started_cdp_session_with_page(page)
+
+	res = session.request("GET", "https://www.zhipin.com/wapi/zpgeek/search/joblist.json")
+
+	assert res["code"] == 0
+	assert page.evaluate.call_count == 2
+	page.wait_for_load_state.assert_called_once_with("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+	assert session._page_ready is True
+
+
+def test_request_returns_error_envelope_when_page_never_becomes_ready_after_navigation():
+	"""恢复等待超时：返回错误信封，不第二次 evaluate、不无界重试。"""
+	page = MagicMock()
+	page.evaluate.side_effect = RuntimeError("Execution context was destroyed")
+	page.wait_for_load_state.side_effect = TimeoutError("still navigating")
+	session = _started_cdp_session_with_page(page)
+
+	res = session.request("GET", "https://www.zhipin.com/wapi/zpgeek/search/joblist.json")
+
+	assert res["code"] == -1
+	assert page.evaluate.call_count == 1
+	assert session._page_ready is False
+
+
+def test_request_retries_at_most_once_on_repeated_context_destroyed():
+	"""恢复后重试仍撞上同类异常：原样上抛，不进入第三次。"""
+	page = MagicMock()
+	page.evaluate.side_effect = RuntimeError("Execution context was destroyed")
+	session = _started_cdp_session_with_page(page)
+
+	with pytest.raises(RuntimeError):
+		session.request("GET", "https://www.zhipin.com/wapi/zpgeek/search/joblist.json")
+
+	assert page.evaluate.call_count == 2
+
+
+def test_request_healthy_path_has_no_extra_wait():
+	"""健康路径零额外往返：不调 wait_for_load_state，只 evaluate 一次。"""
+	page = MagicMock()
+	page.evaluate.return_value = {"code": 0, "zpData": {}}
+	session = _started_cdp_session_with_page(page)
+
+	res = session.request("GET", "https://www.zhipin.com/wapi/zpgeek/search/joblist.json")
+
+	assert res["code"] == 0
+	page.wait_for_load_state.assert_not_called()
+	page.evaluate.assert_called_once()
+
+
+def test_request_propagates_unrelated_evaluate_errors_without_retry():
+	page = MagicMock()
+	page.evaluate.side_effect = RuntimeError("Evaluation failed: ReferenceError")
+	session = _started_cdp_session_with_page(page)
+
+	with pytest.raises(RuntimeError):
+		session.request("GET", "https://www.zhipin.com/wapi/zpgeek/search/joblist.json")
+
+	page.evaluate.assert_called_once()
+	page.wait_for_load_state.assert_not_called()
+
+
+def test_navigate_home_resets_blank_and_retries_after_timeout():
+	"""首页第一次 goto 超时后跳 about:blank，下一次成功则不抛错。"""
+	page = MagicMock()
+	page.url = HOME_URL
+	page.goto.side_effect = [TimeoutError("Timeout 15000ms exceeded"), None, None]
+	session = BrowserSession(cookies={}, user_agent="UA")
+	session._page = page
+
+	session._navigate_home(channel="headless")
+
+	assert [call.args[0] for call in page.goto.call_args_list] == [HOME_URL, "about:blank", HOME_URL]
+	assert session._home_nav_error is None
+
+
+def test_navigate_home_raises_clear_error_when_retries_exhausted():
+	"""两次首页导航都超时：错误文案不再是裸的 Page.goto，诊断里保留原因首行。"""
+	page = MagicMock()
+	page.url = "about:blank"
+	page.goto.side_effect = TimeoutError("Page.goto: Timeout 15000ms exceeded")
+	session = BrowserSession(cookies={}, user_agent="UA")
+	session._page = page
+
+	with pytest.raises(BrowserNavigationError) as captured:
+		session._navigate_home(channel="headless")
+
+	error = captured.value
+	assert error.code == "BROWSER_NAV_TIMEOUT"
+	assert error.attempts == _HOME_NAV_RETRIES
+	assert error.channel == "headless"
+	assert "Page.goto" not in str(error)
+	assert error.details()["cause"].startswith("Page.goto")
+	assert [call.args[0] for call in page.goto.call_args_list] == [HOME_URL, "about:blank", HOME_URL]
+
+
+def test_navigate_home_does_not_reset_a_security_page():
+	"""超时后若已经停在安全验证页，立刻抛风险，不用 about:blank 把验证页清掉。"""
+	from boss_agent_cli.api.client import AccountRiskError
+
+	page = MagicMock()
+	page.url = "about:blank"
+
+	def land_on_security(url: str, **kwargs: object) -> None:
+		if url == HOME_URL:
+			page.url = "https://www.zhipin.com/web/passport/zp/verify.html"
+			raise TimeoutError("Timeout 15000ms exceeded")
+
+	page.goto.side_effect = land_on_security
+	session = BrowserSession(cookies={}, user_agent="UA")
+	session._page = page
+
+	with pytest.raises(AccountRiskError):
+		session._navigate_home(channel="headless")
+
+	page.goto.assert_called_once_with(HOME_URL, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+
+
+def test_start_headless_raises_navigation_error_instead_of_raw_goto_timeout():
+	session = BrowserSession(cookies={"wt2": "abc"}, user_agent="UA")
+	session._pw = MagicMock()
+	browser = MagicMock()
+	context = MagicMock()
+	page = MagicMock()
+	page.url = "about:blank"
+	page.goto.side_effect = TimeoutError("Page.goto: Timeout 15000ms exceeded")
+	context.new_page.return_value = page
+	browser.new_context.return_value = context
+	session._pw.chromium.launch.return_value = browser
+
+	with pytest.raises(BrowserNavigationError) as captured:
+		session._start_headless()
+
+	assert session._started is False
+	assert captured.value.channel == "headless"
+	assert captured.value.attempts == _HOME_NAV_RETRIES

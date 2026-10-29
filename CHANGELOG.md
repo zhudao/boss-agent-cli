@@ -5,20 +5,471 @@
 ## [Unreleased]
 
 ### Added
-- MCP server 新增 `stdio` / `sse` / `http` 三种传输模式，`boss-mcp --transport http --port 8765` 与 `boss-mcp --transport sse` 可直接启动，默认仍保持 `stdio`
-- `mcp-server/README.md` 补齐 SSE / HTTP Streaming 启动示例、默认路径和自定义路径说明
-- MCP 新增 `boss_export`：协议服务对齐 CLI `boss export`，Agent 可直接导出搜索结果为 CSV / JSON / HTML（默认脱敏 job_id/security_id/boss_name），工具计数 31 → 32
+- 搜索结果新增 `job_url`：由 `encryptJobId` 拼出 `https://www.zhipin.com/job_detail/<id>.html`，不额外请求平台。导出脱敏时与 `job_id` 一起替换为 `[REDACTED]`。
+- 新增 `boss hr whoami` / MCP `boss_hr_whoami`：只读 `getUserInfo`，用 `identity` 判断当前登录态是否在招聘者侧。`identity` 为 1 时 `ready` 为 true；账号资料字段 `recruit` 只以 `profile_recruit` 回显，不参与判断。双身份账号停在求职者侧时返回 `ready: false` 和官方页面切换指引，命令本身不切换身份。
+- 新增跨实例、CLI/MCP 子进程与 crawl 的本地共享请求预算：默认单个主动操作持锁至响应分类完成，滑动 60 秒最多 20 次，总等待上限 30 秒；`request_budget_dir` 可显式分组，组内采用统一限制并共享风险阻断。HTTP 429 / code 9 和有效 `Retry-After` 持久化冷却，进程退出只释放执行锁；预算超限返回 `REQUEST_BUDGET_EXHAUSTED`，保留 checkpoint 后显式恢复。主动操作计量不覆盖浏览器自主资源、轮询、自动重定向或认证内部的每条网络请求，不按公网 IP 自动合并任务。
+- 招聘者 `agent run --resume` / MCP `boss_agent_run.resume` 提供显式恢复入口，保留确认结果与队列，普通运行不清除停止状态。
+- 招聘者 `hr chat` 的 hints 新增 `total_unread`：聊天页显示的未读总数，读自页面 geek-list 组件的 `uncountTab$` 第 1 项（实测与页面 UI 一致，覆盖全部会话，不限于已加载的部分）；同时给出原始分项计数 `unread_by_tab` 和来源 `total_unread_source`（`page.uncountTab$[1]`）。只读页面内存，不额外发请求；页面不可用（非 CDP 或没打开聊天页）时三项均为 `null`（Refs #456）。
+- `boss search` 新增 `--active <档位>`，按 HR 活跃度筛选职位（#442）。档位 `online` / `today` / `3d` / `week` / `2w` / `month` / `half-year`，也认 `3day`、`3日` 等写法；平台文案按「在线/刚刚活跃 > 今日活跃 > 3日内活跃 > 本周活跃 > 2周内活跃 > 本月活跃 > 近半年活跃 > 半年前活跃」比较。列表带 `activeTimeDesc` 或 `bossOnline` 为在线时直接判断，否则查 job_card；和 `--welfare` 同用时一次详情请求同时判断两项。启用后跳过搜索缓存，无法识别的文案被排除并写进 `hints.active_filter`。职位结果新增 `boss_active_desc` 字段（`boss_active` 不变，搜索缓存 schema 升到 3），`preset add`、MCP `boss_search` / `boss_preset_add` 与向导求职流程同步支持。
+- 替换仓库 README 与项目站点的展示动画为 48 秒极光发布会成片，提供 MP4、轻量动图、新封面和可交互源工程；站点播放期间保持当前画面，切换到终端演示时暂停视频。
+- 新增维护者发布验证脚本：默认离线核对版本、wheel/sdist 元数据与分发文件，显式启用后可在临时环境全新解析依赖、验证 CLI/MCP，或从 PyPI 安装指定版本复验；输出结构化步骤结果，不执行发布或真实平台请求。
+- 新增仓库根 `llms.txt`：面向 LLM 的单页能力入口（能力真源、信封契约、运行边界与链接），指向 `boss schema` 与关键文档；不引入会与 schema 漂移的静态工具清单。
+- `boss login` 的浏览器 Cookie 提取从 6 个扩展到 10 个：新增 Vivaldi / Arc / LibreWolf / Safari，自动检测优先级不变、新浏览器作为后备；macOS Safari 需要完全磁盘访问，读取失败时静默尝试下一个浏览器。
+- 新增 `docs/research/opencli-benchmark-2026-10-15.md`（含英文对照）：对标 OpenCLI / boss-cli / opencli-mcp / xhs-cli 的差距矩阵、已确认缺陷（文档漂移）与分批改进方案；分层规则复核更正见方案 §3.3。
+- 新增全局 `--exit-codes {envelope,sysexits}`（默认 envelope，0/1 契约不变）：sysexits 模式按错误类别返回语义化退出码（77 认证；75 限流/预算/超时；78 参数/配置；69 风控/平台不支持；其余 1），usage error 通过解析前预扫描同一选项；stdout 信封不受影响。
 
 ### Changed
-- 招聘者写操作收口到同一条 chat-tab Vue/CDP 链路：`boss hr reply` 现在用真实 WebSocket 帧校验发送成功，`boss hr request-resume` 不再需要 `--job-id`，`boss hr resume --exchange` 支持 `phone|wechat`
-- MCP 新增 `boss_hr_exchange`，并同步修正 `boss_hr_request_resume` 的输入契约为仅需 `friend_id`
-- 测试依赖 `pytest` 最低版本提升到 `9.0.3`，并同步更新锁文件，修复 Dependabot 报告的临时目录处理漏洞告警
-- ROADMAP / README / README.en 对齐当前主线事实：`#48` 已完成，智联候选者侧登录与读写链路已接通，招聘者侧仍保持显式拒绝
-- ROADMAP Week 4 招聘者侧能力评估落槌为「暂不接入」（接入条件 0/4 满足，保留 `RecruiterPlatform` 骨架待社区信号重启；详见 `docs/research/platforms/zhaopin-recruiter-evaluation.md`）
+- `boss doctor` 默认不再读取浏览器 Cookie，避免 macOS 钥匙串授权弹窗。需要核对浏览器登录态时使用 `boss doctor --probe-cookies`。`boss status` 与 `boss search` 本来就只看本地凭据。
+- `hr jobs list` 改为读取职位管理页的 `data/list` 接口，并用 `--page` 分页。MCP `boss_hr_jobs` 的 `page` 只在 list 时传给该分页。`boss schema` 同步登记该选项。
+- 招聘者 `chat_geek_info` 改为沟通页当前参数：`uid`、`securityId`，以及调用方提供时的 `geekSource`。没有命令调用这个方法。
+- `boss doctor --live-probe` 复用 `hr whoami` 的身份判断：`identity` 为 0 时先记下求职者侧登录态，不继续请求招聘者接口；`identity` 为 1 时才做招聘者只读探测。命令不切换身份。
+- MCP、OpenAI 和 Anthropic 工具格式统一使用不依赖 MCP SDK 的共享目录，工具导出由旧的不完整命令映射改为与运行时一致的 77 个工具；原生 schema 保留 39 个顶层命令。保留工具参数结构的脱敏例外仅限 schema 明确声明的内置参数路径，真实业务数据和敏感默认值/示例仍脱敏。
+- 恢复面向 PR 的 `CI` 工作流（参照 Wholiver/metis 的 Test 工作流）：`pull_request` 与推送 `master` 时运行 ruff、mypy、pre-commit、CLI/schema 冒烟和 Python 3.10 / 3.12 / 3.14 测试矩阵；只读权限、同一 PR 新推送取消旧运行、不使用任何 secret，外部贡献者的 fork PR 可直接运行。pre-commit 的 end-of-file-fixer 排除 star-history 自动生成的 SVG，并补上 `wizard/renderer.py` 结尾换行，使 `pre-commit run --all-files` 在 master 上可以通过；贡献指南同步更新 CI 说明，去掉已失效的 Codecov 描述。
+- 同步项目站点中英文正文与 `llms.txt` 的 v3.0.0 版本、命令与 MCP 数量、双角色工作流及平台风险停止／显式恢复说明，移除过时的模式级阻断宣传；修正发布会源工程的本地预览服务目录。
+- 文档对齐：`CLAUDE.md` 与 `docs/maintainer/branch-protection.md` 同步 2026-10-09 已恢复的 PR CI（lint + Python 3.10 / 3.12 / 3.14 测试矩阵；required status checks 仍未配置）；`pyproject.toml` 注释改指本地 `scripts/verify_release.py --fresh-install`；中英文 README 与 `CLAUDE.md` 的测试计数更新为 2900+。
 
 ### Fixed
-- `boss hr chat --label-id` 兼容招聘端沟通列表接口直接返回数组的响应形态，避免成功响应被误处理为 `NETWORK_ERROR`
-- `boss interviews` 占位实现现在经 hints 如实声明能力状态（`capability=stub` + `note`），避免 Agent 把空集合占位误读为「无真实面试邀请」
+- `boss search` 等浏览器通道在冷启动时只对首页做一次 15 秒 `page.goto`，首页卡住就以 `NETWORK_ERROR` 原样抛出 `Page.goto Timeout 15000ms`（Discussion #250）。现在与登录预热对齐：超时后若不是安全验证页，就跳到 `about:blank` 再试一次；仍然失败则返回 `BROWSER_NAV_TIMEOUT`，说明要先打开官网首页或刷新登录态。`--url` 仍只解析筛选条件，搜索请求之前还是要先打开首页。把 `--json` 等全局选项写在子命令后面时，`INVALID_PARAM` 会提示该选项必须写在子命令之前。
+- 修正节流完成时间覆盖后续预约、高斯采样突破间隔下限及 crawl 分类别预算边界；使用单调时钟保持预约，crawl 首页种子导航、分页、页面 fetch 和 CDP fallback 分别申请预算。等待及发送前检查停止、风险和截止时间，停止信号不触发重试或通道降级；写后确认受阻保留 `ACTION_UNCONFIRMED` 和 `confirmation_stop`，失败下载仍记节流，429 下载不读正文或创建文件。crawl 在中断或清理失败前保存进度，清理异常保留原风险或预算停止状态。
+- 校验 `--delay`、延迟范围和共享预算配置的有限数值、正整数及绝对路径约束；非法配置不落盘，保留配置修复入口。预算组有效风险状态进入 `status` / `doctor`，显式清风险锁保留预算及冷却，风险写盘失败仍阻断当前实例。
+- 浏览器风险识别续查：聊天页 `/wapi/` 的 HTTP 403 在响应头事件立即停止，不等正文；错误/缺失 Content-Type 的受限 HTML 仍生成脱敏分类元数据。业务 JSON 先解析原码，避免成功响应中的 HTML 说明触发误锁；纯文本业务响应同样检查风险，外站和普通静态资源不误锁。
+- 补齐 code 31（IP/环境限制）、32（账号限制）及官方 `403.html` 访问受限页：API、浏览器、认证与 crawl 在刷新、重登清 Cookie 或继续导航前停止并保存原码/未知状态；隐藏文案不用于猜测当前原因。当前网页 code 31 已只读观察，32 仅有静态与离线证据；页面展示时间和移动端可用均不触发自动解锁。
+- 风险锁改为显式本地恢复：code 35/36、环境类或含糊的 code 37、HTTP 403 和官方 verify/security 安全页在候选、招聘者与认证通道锁存原始风险原因及可用业务码；httpx、headless、裸 CDP、令牌变化和历史 `--ignore-risk-lock` 均不能绕过已记录锁。用户确认目标业务页恢复后执行 `boss clean --risk-lock` 再显式恢复任务，清理不代表平台解封，再次风险立即重锁。code 37 刷新要求凭据与明确过期语义同时存在，风险/安全验证优先；code 35/security 路径与含糊 token 分类为静态证据和离线回归，未声称真实账号线上解除已验证。
+- 独立 crawl 与 API 共用同 `data_dir` 风险锁，在浏览器构造、连接和后台启动前阻断已锁任务；新风险持久化原始原因/业务码，未知码保持 `null`，code 38 明确属于身份资料流程。风险 outcome、已采集队列和 checkpoint 保留，人工恢复放在 `operator_actions`，resume 不清锁；本地结果与已完成 run 导入仍可用。
+- 候选人搜索、推荐、批量沟通与 watch 在同次结果/分页流程中按非空职位 ID 去重，保留首条完整 `security_id/lid`，不按职位 ID 合并不同账号的历史记录。候选池可选 `lid` 经兼容 SQLite 扩展保存，CLI/MCP/schema、crawl/favorites 导入同步；favorites 更新访问上下文时不拼接旧 `lid`。
+- `recommend` 保留缺失/不明确的分页标记为 `has_more=null`，只有平台明确返回布尔 `true` 才给出下一页提示，避免上层无依据继续请求；兼容 `total` 仍是本页条数，新增 `total_kind` 明确其范围。
+- 风险响应在刷新、登录降级或采集 fallback 前停止：原始 code 36、环境类/不明确 code 37、HTTP 403 和安全页共享错误契约；Cookie、二维码各阶段、CDP 探测/刷新、招聘者动作前后回读与自动化读响应均原样传播风险，保存可用 checkpoint，不继续请求或更换通道。
+- 端点显式声明读写与可重放性质，GET 变更和未知操作不再按方法推断可重试；fetch/响应体与 CDP renderer 加有界截止。浏览器上下文销毁、httpx 断链/损坏响应等未知写结果保留 `ACTION_UNCONFIRMED`，候选人与招聘者均不提示自动重发；招聘者准确绑定目标好友，不强制开启禁用编辑器，不以 outgoing WS 或未知手机号动作编号确认成功。
+- 自动化使用独立原子停止标志并在动作边界重新读取，逐项保存已确认防重结果，风险和中断保留进度；wizard 成功结果先落盘再处理超时，旧更新不能覆盖 stop。MCP handler 改用异步子进程，长运行期间控制工具仍可响应，取消/超时有界中断并回收进程，保留副作用未知标记与 checkpoint 宽限。
+- 搜索缓存命中重建本次排序的编号索引，`lid` 随编号、show/detail/job-card 传递，crawl 候选池仅从同 run/job/security 的既有本机缓存恢复 `lid`，兼容旧数据。福利/活跃度筛选先跳过已沟通过职位，有限需求按需串行并在结果足够时停止；apply 原始风险分支不再提示自动重试。
+- 招聘者 `hr chat` 打开聊天页后页面来源仍是 0 条、`unread` 全为 `null`（#456 后续）。实测聊天页（Vue 2 + vue-rx）的会话列表挂在 geek-list 组件实例的 `list$` 和父组件 chat 的 `allList$` 订阅上（`$observables`），不在原快照扫描的 `$data` / computed / `$store` 里；列表项自带 `newMsgCount`、`lastText`、`lastTS`、`lastMsgStatus`、`lastIsSelf`。快照脚本现在先读 vue-rx 订阅（仍只读页面内存、字段白名单），页面已加载的会话直接给出未读数、最后一条消息和时间，没覆盖到的会话再走 `userLastMsg`；`hints.summary_sources.page_snapshot` 给出数据来源路径、已加载条数和页面是否还有更多（`has_more`）。页面只保存已滚动加载的会话，未加载的会话拿不到未读数，仍为 `null`。另外修正快照脚本从未真正执行的问题：`evaluate_js` 不带参数时只把函数表达式求值成函数对象而不调用，快照因此一直为空，现在带参数调用。
+- 招聘者 `hr chat` 的最近消息补全实测全部失败（`last_messages_error: 未知的非法参数`，356 条都退回 `friend_list`，#456 后续）。对照前端代码和 3 个 friendId 的实测：`userLastMsg` 参数本身没错（表单 `src=0&friendIds=a,b,c`），问题是把整页 356 个 friendId 一次塞进去，前端自己每批不超过 100 个，并按 friendSource 分组（店长直聘好友 `src=1`）。现在按 friendSource 分组、每批 50 个串行请求，默认只补前 100 个会话（最多 2 次请求），`hr chat --summary-limit`（0–300，0=不请求）可调，任一批失败立即停止并在 `hints.summary_sources` 记录 `last_messages_error` / `last_messages_error_code` / `last_messages_requests` / `last_messages_skipped`；`hr last-messages` 同样分批并新增 `--limit`。按实测返回形状（`uid`、`lastTS`、`lastMsgInfo.showText/fromId/status/msgTime`）解析：时间优先用毫秒时间戳而不是「12:00」展示串，候选人发来的最后一条消息不再显示成「发送中」（`msg_status` 只对自己发出的消息有值）。该接口不返回未读数，`unread` 仍只来自聊天页快照。
+- 风控锁（#453）补齐聊天页动作和登录覆盖。招聘者 `hr reply` / `hr request-resume` / `hr resume --exchange` 在执行前仅检查本地锁，不为核对令牌建立 CDP 连接；未解除时不执行页面动作。页面的 code 35/36/37 或安全页会锁存并保留原始原因，`error.details.page_risk` 保留接口路径和码。登录、导入和刷新也在平台请求前检查同一锁；历史 `--ignore-risk-lock` 参数保留兼容但不放行，用户确认官方目标业务页恢复后须执行 `boss clean --risk-lock` 显式清除本地阻断。
+- 招聘者 `hr chat` 的未读数、最后一条消息、时间不再全是 `null` / `未知` / `-`。实测沟通列表接口（filterByLabel）只返回 friendId、姓名、updateTime 等基础字段，原实现的补全又没对上数据。现在 CDP 模式下先读聊天页 geek-list 组件里已加载的会话列表（只读页面内存、不发请求，字段按白名单挑选）；页面没覆盖到的会话才调用一次 `userLastMsg`（单次、串行），并兼容消息对象（按 from/to uid 对应候选人）和 `{friendId: 消息}` 映射等返回形状；都拿不到时字段为 `null`，`last_time` 退回 `updateTime` 并标注 `last_time_source`。每条记录新增 `summary_source`，`hints.summary_sources` 给出来源统计和最近消息接口错误。`hr last-messages` 同步改为未知字段输出 `null`。
+- 招聘者 `hr resume --exchange` 在换电话/换微信按钮还没解锁时不再走一遍页面动作、最后报含糊的 `ACTION_UNCONFIRMED`。实测平台要求招聘者先在会话里发过消息才解锁这两个按钮（求简历不受限），未解锁时 `handleExChange` 照常返回但什么都没发。现在交换前先检查按钮组件的禁用状态（`disabled` / `aria-disabled` 属性、`disabled`/`gray` 等 class、根元素 `pointer-events: none`、组件 props/data 的禁用标记）；页面判断不了时，用动作前读到的完整聊天记录里是否有自己发出的消息兜底。确定未解锁时不调用 `handleExChange`，返回新错误码 `EXCHANGE_NOT_AVAILABLE`（`recoverable=true`，提示先 `boss hr reply` 或 `boss hr request-resume` 后再试），`error.details` 带 `availability`、`availability_signals`、`history_self_message`；信号拿不准时不拦截。按钮看起来可用但聊天记录里没有自己的消息时仍按原流程执行，若最终未确认，`ACTION_UNCONFIRMED` 的提示会点出按钮可能尚未解锁。
+- 招聘者 `hr resume --exchange --type wechat` 实际已发出换微信请求却返回 `ACTION_UNCONFIRMED`（#443 后续）。实测这类请求在聊天记录里是不带文案的动作卡片（`body.type=4`、`action.aid=32`），原判定只认文案。现在聊天记录和 WS 帧都按动作卡片的 aid 判定：aid 32 = 换微信，aid 37 = 求附件简历；换手机号的 aid 尚无样本，暂时接受除这两个之外任意 aid 的卡片。卡片必须是自己发出、动作后新出现（mid 不在动作前快照里，且时间不早于动作开始 60 秒以上）。没有 WS 证据时聊天记录回读改为轮询（首读加 3 次重试，共约 6 秒），`error.details` 新增 `history_attempts`；换微信时出现的 aid 37 卡片也计入 `resume_request_detected`。
+- CDP 模式不再用 httpx 带着浏览器登录态访问平台（#452 / #451 后续）。实测 `--cdp-url` 下 `job_card` 先走 httpx（Cookie 从 Chrome 拷出、`__zp_stoken__` 作查询参数），与浏览器通道并发，Chrome 里的 stoken 随即被判异常，之后 CLI 的浏览器请求一律 code 37，而手动浏览因页面重新校验换了 stoken 仍正常。现在配了 `--cdp-url`、显式 `--browser-source existing-browser` / `stored-cookie`，或本进程已接上 CDP Chrome 时，`BossClient` / `BossRecruiterClient` 的所有平台读写都只走浏览器通道（`job_card` 不再 httpx 优先，`detail`、向导详情、收藏、投递记录、聊天等读取一并改走浏览器），没有浏览器实现的操作（招聘者附件下载）返回 `NOT_SUPPORTED`；`search` / `watch` / 向导的福利、活跃度补详情在 CDP 下改为串行并按 `CrawlBudget` 间隔；`crawl` 的列表兜底和详情改为在采集页签内同源请求，去掉 httpx 回退。风险锁沿用历史 `cdp_risk_lock` 名称，摘要仅作诊断；锁存后所有 BOSS 请求在本地拒绝，账号风险保留 `ACCOUNT_RISK`，环境锁保留 `ENVIRONMENT_RISK_LOCKED`。`boss doctor` / `boss status` 展示本地状态，只有用户确认目标业务页恢复并执行 `boss clean --risk-lock` 后才能显式继续；令牌变化不会自动解锁，HTTP/headless 也不能绕过已有锁。`detail` 命中风控后不再换通道补请求。
+- 收紧 `boss search --active` 的请求量（#451 回归，#442）。实测列表项不带 `activeTimeDesc`，原实现会固定翻 5 页并对离线 HR 的职位 3 线程并发取 job_card，`--active 3d` 跑约 28 秒后触发平台风控 code 37。现在 `--active online` 只看列表的 `bossOnline`，不查详情、只翻 1 页，请求量与普通搜索相同；其余档位先看 1 页，结果不足 10 条（或 `limit`）且本页仍有职位要查详情才继续，最多 3 页；在线行直接通过任何档位。需要查详情时改为串行，每次请求前按列表请求的节奏（5–10 秒）间隔，CDP / 指定浏览器来源时只走浏览器 job_card，不再 httpx 与浏览器混用；与 `--welfare` 同用时同样保守，单独 `--welfare` 行为不变。`bossOnline` 统一按 `True` / `1` / `"1"` 判为在线（`JobItem.boss_active` 与活跃度判断共用），`hints.active_filter` 新增 `detail_lookups` 提示实际查了多少个详情。`boss watch` 和向导求职流程的默认翻页同步调整。
+- 招聘者 `hr request-resume` / `hr resume --exchange` 不再把已生效的动作误报为 `unexpected page result`，换微信也不再顺带发出求附件简历请求（#443）。确认按钮只在当前组件和本次动作新弹出的可见弹层里按文字「确定」查找，没有新弹层就不点；求简历同时认新旧两种文案（含「想要一份您的附件简历」），并在动作后只读回查聊天记录。页面动作执行但找不到发送证据时返回新错误码 `ACTION_UNCONFIRMED`（`recoverable=false`，先 `boss hr chatmsg <friend_id>` 核实、勿直接重试），页面日志、确认状态和 WS 统计放进 `error.details`；同时修正 CDP 文本帧被当作 base64 解码的问题。
+- 定向更新安全依赖：`[mcp]` 的 PyJWT 锁定到 2.15.1、`[crawl]` 的 urllib3 锁定到 2.8.0、`[dev]` 的 virtualenv 锁定到 21.7.13，并仅连带更新 python-discovery 到 1.6.1。在对应 extra 中声明安全版本下界，避免全新安装回退到已知风险版本，不扩大基础运行依赖；补齐依赖作用域和 JWT 调用者选项隔离/过期声明校验回归。
+- `boss config set platform` 在写入前按当前注册表拒绝已移除、未知或空平台值；失败不创建配置文件，也不改写已有内容，保留显式 `--platform zhipin` 修复旧配置的入口。
+- `boss doctor` 将可执行后继命令与真人操作指引分别放入 `next_actions` / `operator_actions`，命令保留数据目录、平台、浏览器来源和 CDP 上下文；TTY 显示真人指引。源码质量工具检查和维护脚本建议仅面向本项目源码运行，安装包用户不再被要求拥有开发工具链。
+
+## [3.0.1] - 2026-10-23
+
+### Fixed
+- 招聘者在线简历接口 `/wapi/zpjob/view/geek/info` 返回「旧简历接口已下线」时，`hr resume` 与 wizard 改为 `ENDPOINT_DEPRECATED`（不可恢复，停止重试），并在 `error.details.tracking_issue` 指向 #472。聊天发送旧端点 #217 仍走同一错误码，跟踪链接改到各自的 `details`，不再写死在 `recovery_action`。`recovery_action` 文案改为查看 `error.details.tracking_issue`，错误码本身不变。
+- CDP 回读在线简历时，已解开的 `resumeInfo` 在弹层内部的 `new-chat-resume` 上，外层 `transition` 的 `$children` 为空。读取改为同时扫描弹层里的 Vue 实例；`geekBaseInfo` 只保留解析器会用到的字段。教育经历同时认 `degreeName` / `startDateDesc` / `endDateDesc`。
+- `hr resume` 的在线简历请求改为 `uid`、`encryptJid`、`securityId`，并带 `X-Requested-With: XMLHttpRequest`。不再发送插件时期的参数名，也不生成 `sigx`。登录态沟通页的完整正文由页面自己请求 `GET /wapi/zpjob/view/geek/info/v2`（含 wasm 的 `challenge`）；CLI 不复刻该请求。CDP 下若旧接口仍返回下线文案，且已打开 `/web/chat/index`，再调用页面自己的 `newChatResumeViewer`，只读取 securityId 匹配的白名单字段并关闭弹层。没有聊天页或没有可读正文时，仍返回 `ENDPOINT_DEPRECATED`。
+
+## [3.0.0] - 2026-10-02
+
+### Changed（含 Breaking Change）
+- **移除 Browser Bridge。** 删除本地 daemon、Chrome 扩展、Python `boss_agent_cli.bridge` 包与 `[bridge]` extra，移除 `boss doctor` 的七项 `bridge_*` 诊断；不再探测或连接旧 Bridge 服务。浏览器来源 `auto` 的通道顺序改为 CDP → headless，`existing-browser` 仅复用已有 CDP 浏览器中的目标页；`stored-cookie` 仍只连接显式指定的 CDP 端点，来源约束和风控停止契约不变。
+  - `chat` / `chatmsg` 默认继续使用本地凭据的 httpx 通道；需要不读取本地凭据的现有浏览器会话时，请显式使用 `boss --browser-source existing-browser --cdp-url http://localhost:9222 chat`，并在该浏览器中手动打开和登录 BOSS 直聘。
+  - **升级 CLI 不会停止旧 daemon，也不会卸载浏览器扩展。** 请手动停止旧 daemon（包括其他虚拟环境中的实例），在 `chrome://extensions` 禁用或移除旧扩展，并从安装配置中删除 `[bridge]` extra。CDP 调试端口仅限本机可信环境使用，不得用于规避平台风控。
+- **移除智联招聘（`zhilian`）平台。** 求职者侧适配器（`ZhilianPlatform` / `ZhilianClient` / `zhilian.yaml`）、招聘者侧 `agent` 浏览器 / CDP 自动化（`automation/zhilian_*`）、`ZhilianPlatform` 包级公开导出、schema 与 MCP 描述中的平台可用性、能力矩阵、向导标签、研究文档和演示内容一并删除；BOSS 直聘（`zhipin`）成为唯一注册平台，多平台抽象（`Platform` / `RecruiterPlatform` 注册表与 `--platform` 选项）保留。`boss --platform zhilian ...`（含 `--role recruiter agent run`、`status --live`、`hr ...`、`platforms --platform zhilian`）以及用 `boss-mcp --platform zhilian` 启动的 MCP 宿主，现在都返回七键 `INVALID_PARAM` 信封（`unknown platform 'zhilian', supported: zhipin`）。
+  - 迁移：若 `config.json` 里写着 `platform: zhilian`，所有命令都会被拒绝，运行 `boss --platform zhipin config set platform zhipin` 改回默认平台。
+  - `boss doctor` 不再额外探测 zhaopin.com（`network_zhilian` 检查项移除）；招聘者 `status --live` 的智联 selector 健康检查及其 `SELECTOR_HEALTH_FAILED` 错误、`selector_health` 字段随之移除。
+  - 升级前以 `zhilian` 保存的 wizard run（含 MCP `boss_wizard` 恢复）在恢复时同样返回 `INVALID_PARAM`，不再读取遗留登录态；请以 `zhipin` 新建 run。
+  - 便携包不再附带 `examples/zhilian-recruiter.sh`。
+  - 本地遗留的 `~/.boss-agent/auth/zhilian/` 登录态与自动化存储中的智联条目不再被读取，也不会被 zhipin 运行执行，可手动删除。
+
+### Changed
+- 内部重构：`boss schema` 的能力描述、错误码登记表与格式转换从命令模块 `commands/schema.py` 拆到独立的 `boss_agent_cli.schema` 包（`data` / `error_codes` / `availability` / `formats`），`display` 与 `mcp_tools` 不再反向依赖命令层；CLI 输出、`boss schema` 四种格式与 MCP 工具面均逐字节不变。
+- 内部重构：`commands/` 只保留 Click 命令与 `_` 前缀的 CLI 支撑模块；聊天导出 / 快照、联系人查找、职位导出、job_card 映射、浏览器内核探测等可复用逻辑移入 `boss_agent_cli.services`，平台实例构造移入 `platforms/factory.py`，wizard 不再调用命令模块的私有函数；行为不变。
+- 内部重构：CDP 默认地址与 zhipin / zhilian 域名校验移到 `api/browser_urls.py`，`api/browser_client.py` 不再 import `auth.browser` 的私有符号，打断 api ↔ auth 运行时 import 循环；行为不变。
+- 清理无运行时调用方的代码：`automation/zhilian_browser_actions.py`（与智联自动化平台 `execute_action` 重复的动作分派，#379 后已无调用方）、`automation.events.stable_action_id`、Bridge daemon 的 `start_daemon_background` / `stop_daemon` 与未使用的 `BridgeNotRunning` / `BridgeExtensionDisconnected`、`ai.local_models.parse_model_manifest`，以及 wizard renderer 中三个未被调用的渲染函数。原先经 `execute_browser_action` 覆盖智联浏览器 session 的用例改走运行时真实路径 `ZhilianRecruiterAutomationPlatform.execute_action`；`compliance` 中的历史兼容函数按设计保留。
+
+### Fixed
+- `boss chat` 现在公开跨请求稳定的联系人 `uid`，`chatmsg` / `chat-summary` / `mark` / `exchange` 优先按 `uid` 重新解析联系人并使用本次沟通列表返回的动态 `securityId`；沟通快照、diff 与导出映射同步改用 `uid` 主键，避免轮换令牌导致联系人查找必然失败和快照重复。既有 `security_id` 参数名与无 `uid` 的旧快照仍兼容，但旧令牌仅作兜底且可能已经失效。
+- 移除通用 CI / Docs workflow 后，同步清理失效的 README 状态徽章、远端门禁文档与工作流存在性断言；PR 和发版改为明确执行维护者本地质量门禁，避免主线测试固定读取已删除文件。
+
+## [2.0.1] - 2026-09-29
+
+### Fixed
+- `boss chat` 现在公开跨请求稳定的联系人 `uid`，`chatmsg` / `chat-summary` / `mark` / `exchange` 优先按 `uid` 重新解析联系人并使用本次沟通列表返回的动态 `securityId`；沟通快照、diff 与导出映射同步改用 `uid` 主键，避免轮换令牌导致联系人查找必然失败和快照重复。既有 `security_id` 参数名与无 `uid` 的旧快照仍兼容，但旧令牌仅作兜底且可能已经失效。
+
+## [2.0.0] - 2026-09-15
+
+### Changed（含 Breaking Change）
+- **移除未完成的前程无忧 / 51job（`qiancheng`）占位平台。** 候选者平台注册表、`51job` 别名、`QianchengPlatform` 包级公开导出、schema 可发现性、能力矩阵、向导标签、研究文档和演示内容一并删除；`boss platforms` 同时删除闲置的 `placeholder_only` 图例和 `placeholder` 空分组。`boss --platform qiancheng ...` 与 `boss --platform 51job ...` 现在返回七键 `INVALID_PARAM` 信封，不再返回占位 `NOT_SUPPORTED`。**迁移**：将配置中的 `platform` 改为 `zhipin` 或 `zhilian`；从 Python 导入 `QianchengPlatform` 的下游代码需要移除该依赖。
+- **移除 README 的赞助与推广展示位，并移除 `atlas` provider 接入。** README 两语顶部的 Atlas Cloud 展示位（含 UTM 追踪链接与 logo 资产）和 Doloffer 推广块整体删除；`PROVIDER_BASE_URLS` 移除 `atlas`，`--provider` 帮助、`docs/integrations/ai-models.md` 两语与 CONTRIBUTING 的相关表述同步。这是维护者主动移除赞助关系，不是 CONTRIBUTING「端点不可用」条款下的移除，所以按变更通知记录。**迁移**：已保存 `ai_provider=atlas` 的配置在 `boss ai config` 里会看到 `resolved_base_url` 为空，请改为 `boss ai config --provider custom --base-url https://api.atlascloud.ai/v1 --model <model> --api-key <key>`，服务本身仍可作为自定义 OpenAI 兼容端点使用。
+- **code 37 改为按响应语境分类（对外契约变更）。** 此前所有 code 37 一律全局映射为 `TOKEN_REFRESH_FAILED`
+  （`recoverable=true`，恢复动作 `boss login`）。现在只有文案明确指向 token/stoken 过期的 code 37 保持该行为；
+  环境风险文案及语义不明确的 code 37 一律发新的 `ENVIRONMENT_RISK`（`recoverable=false`），立即停止且不刷新、
+  不重试、不提示重新登录。候选人与招聘者的 httpx 刷新判定与平台 adapter 使用同一分类器
+  （`boss_agent_cli.api.zhipin_errors.classify_code_37`）；候选人浏览器通道额外在环境风控上直接终止。
+  按错误码分支的下游 Agent 请新增 `ENVIRONMENT_RISK` 终止分支，绝不对其自动登录/刷新/重试。
+
+### Added
+- **`login --cdp` 复用现有登录态前做一次只读有效性探测（Issue #424 第二步）。** 复用命中后在同一页面里用浏览器自身会话请求用户信息接口（不读本地凭据，与 `existing-browser` 约束一致）：通过才落盘；服务端已失效则抛 `ReusedSessionStaleError`，`AuthManager` 自动改走 `--force` 路径重登，不再把死凭证当「登录成功」保存；探测命中 code 36 / 环境类 code 37 直接抛 `AccountRiskError` / `EnvironmentRiskError`，`login` 命令按与其他命令相同的风控契约返回 `ACCOUNT_RISK` / `ENVIRONMENT_RISK`（`recoverable=false`），且不再被降级到 QR / patchright 兜底再登一次。页面未就绪或探测网络失败按「未验证」继续并提示。目前只探测 zhipin，智联复用仍只看 cookie 存在性。
+- `boss login --force`：不复用任何既有登录态（Issue #424 第一步）。跳过本地浏览器 Cookie 提取；CDP 路径不扫描已登录 context，清掉当前 context 内目标平台域的 cookie（其他站点与其他 context 不动）后打开登录页重新扫码，堵住「服务端已失效的 `wt2` 被复用路径当成已登录、用户没有重登入口」的死循环。与 `--cdp` 正交，不能与 `--curl-file` / `--cookie-source` 混用；`login` 的选项互斥错误现在按 `INVALID_PARAM` 返回而不是 `NETWORK_ERROR`。
+- `boss login --curl-file` 支持从浏览器 cURL 文本导入 BOSS 登录态，验证后复用原生加密存储，不执行原请求或保存业务请求体。
+- 招聘者模式新增推荐牛人完整卡片和需明确批准的首次招呼；使用单次直连请求及候选人／职位原子防重，不建立 MQTT 连接或发送已读回执。
+- 新增 `hr accept-resume` / `hr download-resume` 及对应 MCP 工具：核对候选人与消息后同意请求，检查权限并下载已收到附件；复用原生认证，不自动重试写请求、不覆盖已有文件。
+- **公开 `--browser-source` 浏览器来源选项**（取值 `auto` / `existing-browser` / `stored-cookie`，默认
+  `auto` 行为不变）。`stored-cookie` 为 fail-closed 严格模式：只连接 `--cdp-url` 指定的 CDP 端点，
+  不自动探测 `localhost:9222`/`DevToolsActivePort`、不降级 Bridge/headless、空浏览器不新建 context
+  注入 Cookie，不可用即发 `CDP_UNAVAILABLE`；`existing-browser` 只复用现有浏览器（Bridge/CDP），
+  不读本地凭据、不启动浏览器，失败发 `BROWSER_SESSION_NOT_FOUND`。stoken 静默刷新同样遵守该策略
+  （#418）。CLI / config / `boss schema` / MCP / wizard 全链路透传；`schema` 的 `global_options`
+  声明该选项并标注 `stability: experimental`，输出带 `current_browser_source`。非 `auto` 来源用于
+  无浏览器通道的平台（当前为 zhilian）时返回 `NOT_SUPPORTED`。由 @iqjiy 提出并发现相关问题，
+  策略表与契约见 Issue #387 / PR #410。
+- **公开职位 lid 与浏览器职位卡片接口。** `JobItem` 新增 `lid` 字段（解析自列表响应
+  `raw.lid`，缺失时为空串，并随 `to_dict()` 序列化）——取 JD 全文需要 `securityId` + `lid`
+  两个参数，此前走 CLI 的调用方拿不到 `lid`。`BossClient` 新增 `job_card_browser(security_id, lid)`，
+  强制走浏览器通道获取职位卡片；既有 `job_card()` 的 httpx 优先行为完全不变。
+
+### Fixed
+- **复用用户页签时撞上手动导航不再挂起（Issue #423）。** `BrowserSession.request()` 的 `evaluate(fetch)` 捕获 patchright 的 `Execution context was destroyed` / `Target closed` 类异常后，做一次有界 `wait_for_load_state` 恢复并重试同一请求**一次**；仍不就绪返回 `code: -1` 错误信封，重试再撞上同类异常原样上抛。健康路径零额外往返（不加等待），其他 evaluate 错误不重试。风控响应不经此路径，#419 契约不受影响。
+- `--browser-source` 的取值域在 `boss schema` 与 `boss-mcp` 两处不再手写三元组，统一从 `api/browser_source.py` 的策略表推导（与 CLI / `config set` 一致，`schema` 里 `choices` 的顺序随之改为策略表顺序），新增来源时不会再漂移；schema 描述补上 `existing-browser` 候选耗尽发 `BROWSER_SESSION_NOT_FOUND`。补齐 config.json 非法 / 带大小写空白的 `browser_source` 值与 MCP 透传的测试。
+- 招聘者写操作在 #403 的 code 37 分类下仍不刷新、不重试；招呼遭遇环境风控时仅提示官方页面人工处理，不再建议调用聊天接口。附件同意的未知结果改用已声明的 `RESUME_ACCEPT_RESULT_UNKNOWN`，确认提示复用通用恢复契约。
+- 附件下载的登录与网络错误采用 schema 恢复指引，二进制 HTTP 401/403 映射为 `AUTH_REQUIRED`；以排他创建替代硬链接落盘，保留不覆盖与写入失败清理，补齐推荐牛人 CLI 成功和失败测试。
+- 修复招聘者首次招呼将 `code=0` 的权益拦截页误判为成功：识别开聊业务拒绝，返回 `GREET_LIMIT`、`sent=false` 及脱敏平台提示；保留拒绝状态并阻止重复发送，不影响其他端点的成功判断。
+- 招聘者招呼与附件操作保留登录失效、令牌刷新失败和账号风控分类，未知发送结果停止重试；最近消息未知未读数不覆盖会话真实计数，支持 `lastMsgInfo.showText`。
+- **复用已登录 CDP 会话并消除首次导航竞态。** `login --cdp` 现在跨所有 browser context
+  按精确 hostname / cookie domain 校验搜索已有 BOSS 登录态（`wt2`/`at`）：命中时复用该
+  context 与既有平台页签，不导航登录页、不轮询等待；cookie 中已含 `__zp_stoken__` 时
+  优先读取 cookie jar，仅在缺失且页面经有界 `wait_for_load_state` 确认可加载后才做页面
+  提取。UA 采集按路径 gate：未登录时在已加载的登录页上提前采集（沿用 #390 顺序），复用
+  新建页签时在首页确认加载后采集，复用既有页签时与 stoken 共用同一次有界就绪检查——
+  导航卡住的页面 UA 与 stoken 都不会被 evaluate（避免 patchright 永久挂起）。清理时只
+  关闭本次调用新建的页面。智联未登录时复用既有 recruiter 页签不再被导航走；智联已登录
+  但无 recruiter 页签时新建页签也会回各自 home（修复 `x-zp-client-id` 在 about:blank 上
+  读取失效导致的 `TokenRefreshFailed`）。API 浏览器会话（`BrowserSession._try_connect`）
+  新建 CDP 页面改为等待 `domcontentloaded`，修复首次搜索出现 `execution context destroyed`
+  的竞态；并为该路径补「卡住不 evaluate」门禁——goto 超时不再被 `except` 吞掉后直接
+  `return True`，而是标记 `_page_ready=False`，`request()` 在 `evaluate(fetch)` 前先做有界
+  `wait_for_load_state` 恢复，仍不就绪则返回错误信封而非永久挂起（与 #390 同一规则）。
+  多 context 复用时在终端打出选中的 context 序号与「账号指纹」（登录态 cookie 值的不可逆
+  哈希前缀，不泄露 cookie），缓解多窗口/多 profile 下的账号歧义。#390 的导航超时/重试、
+  `_safe_user_agent`、`_warm_home_for_runtime` 与 cookie-jar 兜底全部保留。
+- **风控类异常在三个执行器中的终止语义收敛（Issue #419）。** `AccountRiskError` / `EnvironmentRiskError`
+  现在共享基类 `PlatformRiskError`（带稳定 `code`），新增风控码只需登记子类。此前三处执行器会反转或吞掉终止语义：
+  福利筛选线程池的 `except Exception` 会吞掉浏览器通道抛出的风控异常并继续扫描整页；`batch-greet` 靠
+  「频率」字样判停批，code 36 会被重试一次后继续下一个候选人，code 37 环境风控则被打成 `ok:true` +
+  `stopped_reason="RATE_LIMITED"`；wizard runner 的兜底把两者降级成 `NETWORK_ERROR` + 「重试当前 run_id」。
+  现在三处都立即停止、不重试、不继续下一项：线程池取消尚未开始的详情请求并原样上抛；`batch-greet` 命中风控时
+  信封改为 `ok:false` + 对应错误码 + `recoverable=false`，已成功项随 `error.details.greeted` 带回；
+  wizard runner 走专门分支，`recoverable=false`，恢复动作与单次命令路径逐字一致（`display.RISK_ERROR_CONTRACTS`
+  为唯一真源）。wizard 的 `_classify_action_error` 对风控码不再落到「稍后重试」兜底；runner 同时把
+  `BrowserSourceUnavailable` / `BrowserSourceUnsupported` 映射为策略错误码 / `NOT_SUPPORTED`，不再兜成 `NETWORK_ERROR`。
+- **stoken 静默刷新现在遵守 `browser_source` 策略表（Issue #387 seam 收尾）。** #410 把浏览器通道
+  选择收进策略表后，httpx 通道的 stoken 刷新（`_base_client._request` → `AuthManager.force_refresh`）
+  仍绕过策略：`stored-cookie` 下 stoken 过期照样会「CDP 不可用，降级到 headless」，起一个 headless
+  Chromium 带着本地 Cookie 访问平台。现在 `force_refresh` 接收 `browser_source`：fail-closed 来源
+  不再自动探测默认 CDP 端口（没给 `--cdp-url` 直接失败）、CDP 不可用时不再降级 headless，
+  抛带策略错误码（`CDP_UNAVAILABLE`）的 `BrowserSourceUnavailable`；智联显式来源下本地 Cookie 失效时
+  同样 fail-closed，不再打开登录页等扫码。`auto` / 未传参行为逐字不变。该参数尚未暴露到 CLI
+  （由 PR #404 接线），当前只影响程序化调用；信封层把该异常映射为策略错误码的 `display` 分支
+  随 PR #388 落地，在此之前兜底仍为 `NETWORK_ERROR`。
+- 修复 Bridge 已连接日常浏览器时 `chat` / `chatmsg` 仍先要求 CLI 本地 `wt2` 的问题（#386）。
+  Bridge 连接作为本切片的现有浏览器使用信号，走 `existing-browser` 策略的 Bridge → CDP
+  白名单，不读取本地凭据、不新建 context、不启动或降级到 headless；候选耗尽返回
+  `BROWSER_SESSION_NOT_FOUND` + `boss doctor`，真人浏览器指引放在 `operator_actions`。
+  Bridge 未连接时保留原 httpx、stoken 刷新和限流重试语义；本地无凭据仍返回
+  `AUTH_REQUIRED` + `boss login`。中英文风险边界与能力矩阵同步说明：连接存在不等于已验证目标页登录。
+
+### Changed
+- ROADMAP 中 `BrowserSessionProvider` 条目那句「绝不启动新实例、绝不触发登录、绝不静默回退
+  CDP/headless」按 #387 的决定限定为**仅在显式来源下**成立，`auto` 保持既有降级链；中英同步。
+
+## [1.20.0] - 2026-09-03
+
+> **升级提示（仅影响 `mcp` extra）**：`mcp` 依赖的**下界**从 `1.0.0` 提到 `2.1.0`
+> （区间 `mcp>=2.1.0,<3.0.0`）。主推的 `uvx --from boss-agent-cli[mcp] boss-mcp`
+> 每次现解析临时环境，不受影响；受影响的只有「把 `boss-agent-cli[mcp]` 装进一个
+> 还钉着 `mcp<2` 的长期共享环境」这种场景——请一并放开该环境里的 `mcp` 约束。
+> **MCP 线格式与工具集合一字未变**，宿主侧无需任何改动。
+
+### Changed
+- **适配 mcp 2.x Server API（Issue #398），依赖改为 `mcp>=2.1.0,<3.0.0`。** mcp 2.0 移除了
+  `@server.list_tools()` / `@server.call_tool()` 装饰器，改为
+  `add_request_handler(method, params_type, handler)`，且 handler 签名与返回类型一并改变
+  （`(ctx, params)` → `ListToolsResult` / `CallToolResult`）。SSE 与 streamable HTTP 两条传输
+  实现原样保留——本次只做适配，换实现是独立决策。
+  **MCP 线格式一字未变**：`Tool` 的字段名内部从 `inputSchema` 改成 `input_schema`，但 pydantic
+  别名保留，序列化仍输出 `inputSchema`，宿主侧无感知；源码里 71 处构造 kwarg 随之改名（mypy 的
+  pydantic 插件按字段名生成 `__init__`，不认别名）。
+  **上界保留**：上一次声明无上界导致所有全新安装解析到新大版本并崩溃，而 CI 锁着旧版本永远看不到。
+- `CONTRIBUTING.md` / `.en.md` 新增「新增 AI provider」一节，把 provider 的准入与移除写成明规则：
+  文档只写可用一次 API 调用证伪的陈述（不接受安全姿态、定价承诺、评级与会静默过期的规模数字）；
+  服务商自荐需提供可验证归属（企业域名邮箱或官方公开双向引用，不追溯）；端点连续两个 minor
+  版本不可用即直接移除，不走弃用周期、不算破坏性变更。第三条是前两条能够宽松的前提。
+- 按上述规则对齐既有条目：`docs/integrations/ai-models.md` / `.en.md` 的 Atlas Cloud 段落移除
+  59 个模型的全量清单（会随服务商上下线静默失真且无测试可守）与链接上的 UTM 追踪参数，
+  定性措辞压回与 `openrouter` 同一语域，并补回「可用模型以服务端实际支持为准」。
+  README 的赞助展示位不受影响——那是已披露的赞助关系，与 provider 文档条目是两回事。
+- **浏览器通道选择收敛为策略表驱动的单一分发点**（Issue #387 seam 第 2 片的前置改造，无对外行为变更）。
+  `BrowserSession._ensure_started` 原本是硬编码的 Bridge → CDP → headless 三级降级链，
+  中间只有两处插入缝隙；两个并行 PR 各自在其中一处插模式短路时，git 三方合并会干净通过、
+  不留冲突标记，合并后类上会出现两个互不感知的模式布尔，谁生效取决于插入位置且失效方向是
+  fail-open。现新增 `api/browser_source.py`：一张冻结的 `BrowserSourcePolicy` 表声明
+  「通道白名单 / 是否读本地凭据 / 能否新建 context / 能否启动浏览器 / 是否自动探测 CDP /
+  失败发什么码」，`_ensure_started` 变成对 `policy.channels` 的单个循环，类上只保留一个
+  `_policy` 属性。此后新增来源 = 表里加一行，物理上没有第二个插入点。
+  **`auto` 为默认且行为逐字不变**（三级降级链、headless 兜底、失败仍走既有 `NETWORK_ERROR` 兜底），
+  本次不暴露任何 CLI 选项、不新增任何错误码。新增 22 条结构门禁锁定上述性质。
+
+### Fixed
+- **修复设了 SOCKS 系统代理时每一条 httpx 命令都失败**（#412）。全仓四处 `httpx.Client`
+  都用默认 `trust_env=True`，即刻意尊重用户的系统代理；但 httpx 只有装了 `socksio` 才支持
+  `socks5://` scheme，否则在**构造 client 时**就抛 `ImportError`。于是设了
+  `ALL_PROXY=socks5://...` 的用户，`boss status` / `detail` / `favorites` 等每一条只读命令
+  都会失败——而那个 ImportError 被 `display.handle_auth_errors` 的兜底转成
+  `NETWORK_ERROR` + `recovery_action="重试"`，错误码与恢复动作双错，且这是个永远不会
+  因重试而改变的本地环境问题。依赖改为 `httpx[socks]`（拉 `socksio`，35KB、纯 Python、
+  零传递依赖），让代理**能用**而不是失败得好看。
+  CI runner 环境干净、没有代理变量，这条路径在门禁上永远是绿的，故补
+  `tests/test_system_proxy.py` 显式注入代理环境变量把它变成可观测的。
+- `boss ai config` 查看与写入现在都回显 `resolved_base_url`（解析后真正生效的端点）。此前查看模式
+  直出 `load_config()`，用户只设 `--provider` 时 `ai_base_url` 为空，实际地址来自
+  `PROVIDER_BASE_URLS` 查表却从不显示；而 `--provider` 没有 `click.Choice` 校验（自由字符串），
+  名字相近的 provider 记混或拼错时，API key 与简历全文会被发到另一家而界面上看不出任何差别。
+  该命令此前零测试覆盖，一并补齐 7 条。
+- 修复 `BrowserSession` 在 `_start_headless()` 或 playwright driver 启动抛错时泄漏 driver 进程：
+  `_pw` 已 `start()` 却永远不会 `stop()`，下一次 `request()` 会再起一个。现在启动失败路径统一
+  释放 driver。
+- 修复 `BrowserSession.close()` 之后通道标志残留：原实现只置 `_started = False`，`_is_cdp` /
+  `_is_bridge` 保留上一轮的值，导致 close 后重启时一个 headless 轮次可能走进 CDP 拆卸分支
+  而不关闭 browser。`close()` 同时改为真正幂等（已关闭时直接返回，不重复拆卸）。
+- 修复 TTY 下节流等待期间进度条静默不动的观感问题（#400）：`CrawlBudget.wait()` 在等待前把剩余秒数报给 `SearchProgress`，进度条显示一次性「节流等待 Ns…」提示；非 TTY / `--json` 路径与等待 0 秒场景输出完全不变。
+- 修复扫码登录在「首页预热」阶段卡住时永久挂起：BOSS 直聘首页在自动化下偶发长时间不完成加载，`page.goto` 超时后若仍对页面执行 `page.evaluate`（取 UA / stoken），patchright 会因执行上下文无法建立而无限阻塞，导致 `boss login` 卡死且不落盘凭证。现在 UA 改在已加载的登录页上提前采集；`_warm_home_for_runtime` 返回首页是否真正加载完成，仅在确认加载后才对页面 evaluate 提取 stoken，否则回退读取 cookie jar；并对首页导航超时增加「跳 `about:blank` 重置卡死导航后重试一次」，显著降低风控验证页/加载缓慢导致的 `Page.goto: Timeout 15000ms exceeded` 误报。`login_via_cdp` / `refresh_stoken` / `refresh_stoken_via_cdp` 同步加固；CDP 登录/刷新 stoken 也改为优先页面 evaluate、失败回退 cookie jar（安全验证跳转期间 `domcontentloaded` 可能未触发，但 `__zp_stoken__` 已写入 cookie jar）。
+- 修复 BOSS 收藏接口在 `isActive=true` 下仍混入失效职位时的静默误判：`favorites list` 现输出规范化 `job_status` 与状态计数，`favorites sync` 仅导入明确有效职位并报告 active/inactive/unknown 数量；缺失或未知状态不再默认有效。
+
+## [1.19.1] - 2026-08-27
+
+### Fixed
+- **修复全新安装的 `boss-mcp` 完全起不来。** `mcp` 此前声明为无上界的 `mcp>=1.0.0`，
+  而 mcp 2.0 重写了 `Server` API——`@server.list_tools()` / `@server.call_tool()` 全部移除，
+  改为 `add_request_handler`。`mcp_server` 在模块层就用这些装饰器，因此任何解析到 2.x 的
+  全新安装都直接 `AttributeError: 'Server' object has no attribute 'call_tool'`，
+  `boss-mcp` 连启动都做不到。已收紧为 `mcp>=1.0.0,<2.0.0`。
+  这不是 1.19.0 引入的：1.18.0 在 mcp 2.x 下有完全相同的崩溃，只是此前没人从 PyPI
+  全新装一次验过。issue #377 的报告人当时用了 `--with 'mcp<2.0'`，所以他们看到的是
+  `-32601` 而不是崩溃。
+  mcp 2.x 的适配另开 issue 跟踪，放开上界之前不做。
+
+### Added
+- CI 新增 `fresh_install` job：**刻意不走 `uv.lock`**，装构建产物、让依赖按 `pyproject`
+  的约束重新解析，再真跑一次 MCP 会话。此前所有 job 都锁着 1.x 依赖，因此
+  「CI 全绿、用户全崩」可以长期共存——这个 job 守的就是**门禁看到的与用户拿到的**
+  之间那道缝。红灯验证：移除 `mcp` 上界后该 job 以「initialize 没有收到响应」失败。
+
+## [1.19.0] - 2026-08-27
+
+### Fixed
+- 修正 CI docker job 的 `tools/list` 断言存在竞态：`printf` 写完三行就关闭 stdin，
+  MCP 服务器可能在回 `tools/list` 之前就因 EOF 退出，读端拿到空串报 `JSONDecodeError`
+  （已在 CI 上真实发生）。改为写完后保持 stdin 一段时间，并按 JSON-RPC `id` 认响应而非
+  依赖行序；`tools/list` 无响应时给出明确断言而不是解析错误。**一道会随机变红的门禁
+  等于没有门禁**——它会挡住无关的合并，正如同批修掉的 PTY 用例那样。
+- 修正 Docs 工作流的 `Check whitespace` 对**落后于 master 的 PR 一律假红**：
+  `git fetch --no-tags --depth=1 origin <base>` 只取到 base 的 tip 并留下浅克隆边界，
+  落后的 PR 分支算不出 merge base，`git diff --check A...B` 直接以
+  `fatal: origin/master...HEAD: no merge base` 退出 128——报出来像空白字符违规，
+  实际是这一步崩了。#382 / #383 / #390 三个外部 PR 的 `docs` 红灯都是这个原因，
+  且恰好是等得最久、落后最多的贡献者最容易撞上，还会被当成他们自己的问题。
+  去掉 `--depth=1` 即可（checkout 已用 `fetch-depth: 0`，这里只是补 `origin/<base>` 引用）。
+- **修复 MCP `tools/list` 从未注册：v1.18.0 的 MCP 入口对任何 host 都不可用。**
+  `mcp_server.list_tools` 缺失 `@server.list_tools()` 装饰器，`initialize` 握手正常，但 client
+  第一次列工具即 `-32601 Method not found`——73 个工具一个都拿不到。回归由 1.18.0 的
+  `mcp_server` 拆分引入，该拆分合并 33 分钟后即发版，没有留下暴露窗口。
+  四道门禁同时失效，故本次连门禁一起补（见下方 Added）：`tests/test_mcp_server.py` 用 mock 模块
+  顶替整个 `mcp` 包，装饰器在不在原理上观测不到；CI 的 stdio 握手只断言 `initialize`；
+  eval 跑离线 fixture 绕开协议层；`__all__` + `mcp-server/server.py` 的 re-export 让这个
+  未注册的孤儿函数在 ruff / mypy 眼里完全正常。感谢 @xie-good 报告、@LiuLin1220 修复。
+- 脱敏放宽：`_SENSITIVE_KEY_PARTS` 是子串匹配，`ai_max_tokens` / `token_expires_in` 只因键名含
+  `token` 就被替换成 `[REDACTED]`。凭据必然是字符串或容器，故把 bool 豁免补完整为
+  `(bool, int, float, None)`，并加护栏测试锁定 `stoken` / `api_key` / `cookies` 等仍被脱敏。
+- 修正三个终端呈现缺陷：结果列表菜单每页重绘任务摘要框（此前被 `clear_before` 清掉）；
+  `render_run` 新增 `with_preview` 开关，浏览列表时职位不再被摘要框与可选菜单列两遍；
+  `search` 长任务在 TTY 下注入 `SearchProgress` 显示实时进度（管道 / `--json` 仍传原 logger）。
+- 修正 `tests/test_wizard.py` 的 PTY 用例假红：启动同步循环 5s 超时后**照样发送按键**，
+  此时 prompt_toolkit 尚未接管输入，按键被丢弃，最终报成「没退出」——把「启动慢」误诊为
+  「交互坏」，且不留任何线索。现在必须确认菜单真渲染出来才发按键，否则以「菜单未渲染」
+  失败并附上已捕获输出；期限放宽到 30s / 20s 并可用环境变量覆盖（命中同步标记即跳出，
+  快机器仍约 1s）。此前它曾在 CI 的 P0 baseline job 上超时并挡住合并，而同一 commit 的
+  五个测试矩阵 job 全过。
+
+### Added
+- MCP handler 注册守卫 `tests/test_mcp_handler_registration.py`：不查装饰器语法，直接问运行时
+  注册表 `server.request_handlers`。「装饰器名 → request 类型」的映射**从 SDK 自身反推**
+  （在全新 `Server` 上应用装饰器后 diff 注册表键），因此 SDK 将来新增 `list_prompts` /
+  `read_resource` 等 handler 时守卫覆盖面自动跟上，不需人工维护。同时断言 `tools/list` 经协议
+  发出的工具集合与 `mcp_tools.TOOLS` **逐名相等**（不引入硬编码计数）。两条测试刻意在子进程里
+  跑：`tests/test_mcp_server.py` 会 `sys.modules.setdefault("mcp", <mock>)`，一旦拿到 mock，
+  `request_handlers` 就是 MagicMock，守卫会静默变成恒真。
+- CI 的 docker job 在同一个 stdio 会话里补做 `tools/list`，断言工具列表非空且含 `boss_status`。
+  只断言 `initialize` 正是让上面那个回归发出去的原因。
+- 开放 assisted / research 下全部已实现能力，移除模式级 `COMPLIANCE_BLOCKED` 执行门
+  （错误码保留作历史协议兼容）；平台未实现的能力仍返回 `NOT_SUPPORTED`。
+- 新增共享 Workflow 持久化与纯终端 `boss wizard`：无子命令时默认进入向导，TTY 向导与
+  `--input-json` / `--resume` / MCP 共用同一个确定性 runner，状态落 SQLite 的
+  `workflow_runs` / `workflow_steps`。`schema` 与 MCP 同步暴露 `wizard` 与 `wizard_catalog`。
+- 增强 crawl 传输：登录态注入、页面内请求与回退，命中风控时保留浏览器便于续跑。
+- 信封 `hints` 拆为双受众通道：`next_actions` 给 Agent 执行的后继命令，`operator_actions` 给真人的
+  自然语言指引（扫码、去浏览器操作等）。判定标准是「是否需要人离开终端」，不是「是否需要确认」。
+  TTY 下 `display.render_operator_actions` **只渲染 `operator_actions`** 到 stderr——此前 TTY 分支
+  把 `hints` 整个丢弃，真人从来看不到任何提示。无 `operator_actions` 时零输出，既有命令的 TTY
+  行为逐字节不变。`SCHEMA_DATA["conventions"]` 新增 `hints` 与 `command_vs_wizard` 两块。
+- 新增向导入口登录门 `wizard/preflight.py`：登录检查从 goal 的第一个 step 前移到收集角色 /
+  平台 / 目标 / 参数之前——此前未登录时这五层选择全部白做。已登录时零输出零开销（本地文件读，
+  不预检浏览器内核）；未登录时可内联扫码登录并无缝进向导；浏览器内核缺失时先给
+  `patchright install chromium` 指引，不再开完浏览器才失败。headless 路径保持 `WAITING_INPUT`
+  不变（TTY 下人就在终端前，阻塞等扫码是刻意的；Agent 不能卡在子进程里空等）。
+- 向导未登录时 run 状态由 `failed` 改为 `WAITING_INPUT`，可 `--resume` 且保留已选的角色 /
+  平台 / 目标，不必从头重走。
+- 补齐候选者侧九个命令组（`stats` / `preset` / `watch` / `clean` / `ai-local` / `resume` / `ai` /
+  `crawl` / `agent`）共 63 处 `handle_output` 的 TTY 渲染分支，真人不再需要自己读 JSON 信封。
+  `display.py` 新增 `render_next_steps` / `render_action_result` / `render_list_result` /
+  `render_record_result` / `render_ai_result` 五个通用件；`render_ai_result` 不假设键名、只按值类型
+  呈现，并对所有值做 escape，避免 AI 输出里的方括号被 Rich 当标记解析。stdout 仍只有单行信封。
+- 向导整个多轮交互会话跑在 alternate screen（`\033[?1049h` / `\033[?1049l`）里：进入切、退出还原，
+  终端原有内容完好，不再往 scrollback 留残框——`clear_wizard_screen` 的 `\033[2J` 只清可视屏、
+  清不掉历史，这是「上滚看到多个框」的根因。用 context manager 保证还原（`commands/wizard.py`
+  有 59 处 `return` 且内部会 `raise SystemExit`，逐点还原必然漏）。单次 flag 路径
+  （`--status` / `--resume` / `--stop`）刻意不进备用屏，否则渲染完立刻被抹掉。菜单包进 `Frame`，
+  框标题为当前步骤；菜单支持 `←` / `Esc` 返回。
+
+## [1.18.0] - 2026-07-29
+
+### Added
+- 容器化落地：仓库自带的 `Dockerfile` 重写为多阶段 uv 构建（`uv sync --frozen` 严格按 `uv.lock` 安装，依赖不再漂移）+ 非 root 运行 + `.dockerignore` + `docker-compose.yml` + [Docker 接入文档](docs/integrations/docker.md)，并在 CI 新增 `docker` job 每次构建并验证 CLI 信封、MCP stdio 握手与非 root 身份。镜像定位刻意收窄为**只跑 MCP server 与只读 / 本地命令**：不含浏览器内核，`boss login` 仍在宿主机完成后挂载 `~/.boss-agent`（容器内 `HOME=/data`，故默认数据目录解析为 `/data/.boss-agent`）。不发布 registry 镜像。
+- P0 质量门禁新增离线 MCP 评测：`evals/run_eval.py --mode fixture`，产物写 CI 临时目录，避免污染入库的 `evals/results/`。
+- CI 矩阵补齐 Python 3.14；`scripts/` 纳入 ruff lint 门禁，并补齐 CI 冒烟路径。
+
+### Fixed
+- 修正 MCP 工具 `boss_favorites_list` 的 `page` 参数 schema：类型写成了 JSON Schema 不存在的 `"int"`（其余 105 个参数均为合法值），严格校验 schema 的 MCP 宿主可能因此拒掉该工具。同时给 `boss_crawl_status` / `boss_crawl_results` / `boss_crawl_shortlist` 的 9 个参数补上缺失的 `description`——Agent 依赖它判断该传什么值。新增三条契约测试守住这一整类问题（type 合法性、参数必须有 description、顶层结构与 required/items 完整性）。
+- `RecruiterPlatform` 抽象基类补齐两个已被命令层实际调用、却从未写进契约的方法：`send_message_by_friend`（`hr reply` 在用）与 `job_detail`（`hr jobs detail` 在用）。此前它们只存在于 `BossRecruiterPlatform` 实现里，任何新写的招聘者平台按 ABC 实现完都能通过类型检查，却会在这两条命令上运行时抛 `AttributeError`。
+- MCP 的 HTTP streaming 传输改用 `@asynccontextmanager` 声明 lifespan：此前是裸 async generator，会走 Starlette 的弃用路径并触发 `DeprecationWarning`。
+- MCP `_run_boss` 现在只接受 JSON 对象形式的 CLI 信封：解析结果非 dict 时（契约违例）返回 `CLI_ERROR` 信封，而不是把非 dict 结果透传给调用方。
+- GitHub Release 资产过滤改为只上传 `dist/*.whl` / `dist/*.tar.gz`，避免构建后端生成的 `dist/.gitignore` 被当成 `default.gitignore` 垃圾资产挂上 Release。
+
+### Changed
+- 将 1600+ 行的 `mcp_server.py` 拆为 `mcp_tools`（工具目录与合规过滤）、`mcp_args`（工具名 → CLI 参数映射）与精简后的服务器/传输层；公开符号原样再导出，`mcp-server/server.py` wrapper 与既有测试导入路径不变。
+- mypy 逐模块严格化白名单 120 → 130：纳入 `crawler/` 全部子模块、`commands/crawl.py`、`commands/_recruiter_platform.py`、`mcp_server.py`，以及拆分后的 `mcp_args.py` / `mcp_tools.py`。
+- `pyproject.toml` 显式钉死 ruff 规则集 `select = ["E4", "E7", "E9", "F"]`。此前未配置 `[tool.ruff.lint]`，门禁范围实际由所装 ruff 版本的隐式默认值决定——升级到 0.16.0 时默认集扩展到 I / BLE / RUF / UP / DTZ / S / PYI 等家族，同一份代码凭空多出 344 条报错。新增规则家族改为需单独提 PR 并连同修复一起评审。
+- 依赖刷新（`uv.lock`）：rich 14.3.3 → 15.0.0、uvicorn 0.46.0 → 0.51.0、pytest 9.0.3 → 9.1.1、ruff 0.15.8 → 0.16.0、websockets 16.0 → 16.1.1 等共 20 个包。rich 为大版本跨越，`display.py` 是全仓唯一使用方，已在加强断言后的渲染测试下逐项验证无行为变化。
+- 补齐渲染层断言并收紧 crawl / 招聘者平台实例化覆盖；codecov 项目门槛同步收紧。
+- README 首页 badge 行增加 MCP Toplist live rank（中英对称）。
+
+## [1.17.0] - 2026-07-27
+
+### Added
+- 新增 `boss favorites list/sync`：读取 BOSS 职位收藏（geekGetJob?tag=4）并同步到本地候选池，让 `boss ai analyze-jd/fit/resume-optimize/chat-coach` 能处理用户真正感兴趣的职位。默认只读、assisted 放行、用户主动触发；sync 远端只读拉取后本地 upsert（按稳定 job_id 去重，刷新动态 security_id 并保留首次收藏时间），list 单页预览不落库且输出脱敏 `security_id`/`job_id` 为 `[REDACTED]`（完整值落库后从 `shortlist list` 取，遵循现有导出脱敏约定）。MCP 仅暴露 `boss_favorites_list`（只读预览），sync 不对 MCP 暴露以保持 assisted 主动触发边界。查看职位详情需 sync 落库后用 `boss --json shortlist list` 取完整 `security_id`/`job_id`，再 `boss detail <security_id> --job-id <job_id>` 查看（list 预览已脱敏；detail 以 sid 为必填位置参数，httpx 快速通道只用 job_id）。
+- 搜索结果与详情输出新增原始岗位类型、规范化用工类型、每周实习天数、最短实习周期等字段；导出与索引缓存同步保留这些元数据。
+- 新增受限 Research Mode 的可恢复 BOSS crawl 工作流：独立 Chrome profile、固定请求/详情/墙钟/重试预算、SQLite checkpoint、停止开关、外置 Hook 完整性校验，以及脱敏 selector 导入本地候选池。MCP 保持 assisted-only，仅可读取或本地导入已有 crawl run。
+
+### Fixed
+- 修复 BOSS 直聘“实习”筛选错误映射为兼职参数的问题：请求参数改为 `jobType=1902`；明确仅搜索实习时，搜索、导出和批量打招呼会按响应中的真实岗位类型失败关闭，避免把全职、兼职或类型缺失的岗位误当作实习岗位。搜索缓存结构同步升级，避免复用旧版本产生的混合岗位缓存。
+
+## [1.16.0] - 2026-07-17
+
+### Added
+- 新增显式 `operating_mode` 双模式契约：默认 `assisted` 保持既有低风险阻断；用户主动设置 `research` 后，可启用策略注册表声明的浏览器协议、反调试、风控适配和受控采集研究能力。`boss schema` 同步暴露当前模式、可选模式和逐命令风险/数据分类。
+
+### Changed
+- 合规护栏升级为不可变能力策略注册表，CLI、schema 与默认 MCP 过滤从同一真源派生；旧内部配置 `low_risk_mode=false` 兼容映射到 `research`，但不再作为公开配置入口。
+
+## [1.15.0] - 2026-07-14
+
+### Added
+- 新增 `boss ai cover-letter <resume> [--jd <文本|@文件>|--job-id <id>] [--tone 简洁专业|热情积极|谨慎稳重] [--lang zh|en]`：基于本地简历与目标岗位起草求职信/自我介绍草稿，纯本地 + AIService、零平台请求，draft-only（只产出文本、不发送、不进敏感命令）；MCP 同步新增 `boss_ai_cover_letter`。
+
+### Removed
+- 移除 `config.json` 中 6 个从未被任何命令消费的死配置键（`default_city` / `default_salary` / `batch_greet_max` / `login_timeout` / `resume_default_template` / `resume_export_format`）：此前它们可经 `boss config set` 设置却静默无效，现改为按未知键明确拒绝；同时消除 `resume_export_format` 默认 `pdf` 与 `resume export` 命令默认 `json` 的自相矛盾。
+- 移除 `interviews` 命令中恒为假的 `_stub` 占位分支：`interview_data` 端点对 zhipin/zhilian 均已接通、无任何 client 再写入 `_stub`，故删除该死码及其 `capability: stub` hint（纯内部清理，正常输出不变）。
+
+### Changed
+- 命令层错误信封统一改用既有 `handle_platform_error_output`：当平台响应携带 `error.details`（主要是 `qiancheng` 占位响应）时，错误信封现在会带上 `details` 字段（新增字段，与已在用该 helper 的 `me` / `history` / hr `jobs` 命令口径一致）；BOSS 直聘 / 智联的真实响应不含该字段，输出不变。
+
+### Fixed
+- 修复智联招聘 CDP / 浏览器页面选择的域名校验：此前用 `"zhaopin.com" in url` 子串判断，可能被 `zhaopin.com.evil.example` 等伪造 hostname 误判为可信页面；改为 `urlparse().hostname` 精确匹配 `zhaopin.com` 及其子域（CodeQL `py/incomplete-url-substring-sanitization`，两处页面查找共用同一 host 判断）。
+- 修复 #334：CDP 模式下每次搜索/推荐等高风险操作都会在用户 Chrome 新开一个 BOSS 首页标签页并导航（观感为“反复自动新开/刷新页面”）。现优先复用用户已打开的 zhipin 标签页（精确 hostname 校验），不再多余新开与导航，`close()` 也不再关闭被复用的用户标签页；无已打开 zhipin 页时回退原新建行为。风控即停（code 36）逻辑不变。
+
+## [1.14.0] - 2026-06-25
+
+### Added
+- `boss shortlist` 新增本地标签、备注与离线对比能力：`shortlist add --tags/--note` 可在加入候选池时记录本地整理信息，`shortlist annotate` 支持增删标签和更新备注，`shortlist compare [--tag]` 仅从 SQLite 候选池读取并按标签本地过滤；MCP 同步新增 `boss_shortlist_annotate` / `boss_shortlist_compare`，默认低风险工具数 33 → 35。
+- 新增 `boss ai fit --resume <name> [--limit N]`：基于本地简历与候选池已缓存职位详情生成逐岗匹配度、能力缺口、关键词命中和建议；缺少详情的岗位只报告本地缺口并提示先执行 `boss detail`，不发起任何新增平台请求。
+- 新增 `boss ai suggest-keywords [--limit N]`：基于候选池职位分析推荐搜索关键词组合，零平台请求，纯本地 AI 辅助；MCP 同步新增 `boss_ai_suggest_keywords`。
+- 新增 `boss ai resume-optimize <name> --jd <text>|--job-id <id>`：基于目标岗位优化简历措辞（仅建议，不修改简历），支持从缓存读取职位描述，零平台请求；MCP 同步新增 `boss_ai_resume_optimize`，默认低风险工具数 35 → 37。
+
+### Changed
+- 转向 MCP-first：README / landing / docs 将 MCP（`uvx --from boss-agent-cli[mcp] boss-mcp`，33 个默认低风险 MCP 工具）列为 Agent 首选接入，移除 `npx skills add` 引导；MCP server 新增 server-level `instructions` 承载低风险与错误恢复 doctrine；独立 Agent Skill 仓库 boss-skill 退役。CLI 命令、JSON 信封与错误码不变，仍以 `boss schema` 为真源。
+- `boss search` 结果新增纯本地 `match_score`，福利筛选结果可用 `--sort score` 按匹配分降序输出；评分只使用已抓取字段与福利匹配注解，不改变翻页、详情补抓、节流或并发上限。
+- 修正 ROADMAP 多平台条目的智联状态漂移：父行此前仍写"智联为 v2.0 优先接入候选（2-3 周）"，与自身已勾选的 Week 2-3 子项（只读 + 写操作已实现）及 CHANGELOG 1.12.0「候选者侧已接通」矛盾；改为如实声明"智联候选者侧已接入"，保留拉勾/猎聘不接入与 51job backlog 结论。
+
+### Changed
+- 修正 `docs/marketing/awesome-submissions.md` 投稿模板内自相矛盾且陈旧的数字（命令数 34/33、招聘者子命令 7、MCP 工具 49/31、测试 1315、release 1.11.0），统一为当前准确值：35 顶层命令 / 9 招聘者子命令 / 33 默认低风险 MCP 工具 / 1467 测试 / release 1.13.1（其中"默认低风险 MCP 工具"取合规过滤后实际导出的 33 个，与 README.en 受测口径一致）。
+
+### Changed
+- 修正贡献者文档中指向已迁出路径 `skills/boss-agent-cli/SKILL.md` 的陈旧引用（`CONTRIBUTING.md` / `CONTRIBUTING.en.md` 添加新命令清单第 5 步改为 `docs/commands.md`、PR 模板指向独立仓库 boss-skill），消除迁出 SKILL 后遗留的误导。
+- 合并 `docs/blog/` 进 `docs/marketing/`：发布/推广文案归拢到单一目录，去除同类内容的双目录冗余。
+
+## [1.13.1] - 2026-06-16
+
+### Changed
+- `--welfare` 搜索的职位描述详情新增本地缓存（按稳定的 `job_id`/`encryptJobId` 键，TTL 24h）：重复或微调条件的 welfare 搜索复用已取描述，跳过对应 `job_card` 请求，减少平台请求量并加速重跑；不改变请求间隔与并发上限（合规姿态不变）。
+- `RequestThrottle` 改为线程安全：welfare 详情线程池并发调用下，加锁并预占下一次发送时刻，杜绝竞态导致的请求突发（突发更像爬虫，是合规风险）。
+
+### Fixed
+- `boss search` 浏览器通道冷启动削减两处无效等待（CDP 自动探测超时 3s→1s、headless 首页 networkidle 宽限 3s→0.8s），普通搜索实测 14.3s→10.0s（约 -30%），惠及全部搜索；零新增请求、不触碰风控节流。
+- `boss export` 缺少关键词时的 `INVALID_PARAM` 信封补充可执行 `recovery_action`，Agent 可程序化恢复。
+
+## [1.13.0] - 2026-06-11
+
+### Added
+- `boss platforms` 新增 `--platform` 单平台过滤，支持 `qiancheng` 与 `51job` 别名，仅读取本地能力元数据并保持未知平台的 `INVALID_PARAM` JSON 包络。
+- `boss platforms` 输出新增 `capability_status_legend`，解释 `available` / `not_supported` / `placeholder_only` / `low_risk_blocked` 的清晰语义，避免 Agent 将占位或低风险阻断误读为真实能力。
+- `boss schema` 错误码枚举补齐 login 链路 6 码（`LOGIN_TIMEOUT` / `CDP_UNAVAILABLE` / `BROWSER_KERNEL_MISSING` / `LOGIN_RISK_CONTROL` / `LOGIN_EXPIRED` / `LOGIN_CREDENTIAL_EXTRACTION_FAILED`），错误码总数 26 → 32，Agent 可经 schema 发现全部登录错误的恢复动作。
+
+### Changed
+- 补强 `boss config` 未知配置项错误路径的 stdout 单行 JSON 包络契约测试，确保 Agent 可稳定解析 `INVALID_PARAM`。
+- PR 模板补充无 `Co-authored-by` 尾注或 AI 署名行检查项，对齐贡献规范。
+- 51job/前程无忧占位适配器补齐候选者侧全量能力的稳定 `NOT_SUPPORTED` 包络，避免未启用真实适配前落入默认 `NotImplementedError`。
+- 补强 51job/前程无忧占位包络的 `capability` 明细契约，确保 Agent 可稳定区分具体未支持能力。
+- 双语 README 重构为导航型主页：命令参考与诊断排障下沉到 `docs/commands(.en).md` 与 `docs/troubleshooting(.en).md`，中英结构对齐；根目录演示资产归位 `demo/`，推广物料归位 `docs/marketing/`。
+- Agent Skill 安装路径统一为 `npx skills add can4hou6joeng4/boss-skill`：CLI 的 Agent Skill 迁至独立仓库 [boss-skill](https://github.com/can4hou6joeng4/boss-skill)（仓库本身即 Skill），与 CLI 发版节奏解耦；CLI 能力与错误码继续以 `boss schema` 自描述为真源。
+
+### Fixed
+- `boss doctor` 的 `patchright_chromium` 检查改为按 patchright 自带 `browsers.json` 声明的修订版精确校验，修复"缓存存在其他版本即报 ok 但 `boss login` 启动浏览器失败"的假绿灯。
+- `boss login` 浏览器内核缺失时不再误报 `CDP_UNAVAILABLE`：新增 `BROWSER_KERNEL_MISSING` 分类，`recovery_action` 修正为可执行的 `patchright install chromium`。
+- 隔离简历导出默认路径测试，避免每次全量测试向仓库根目录写入临时文件。
+
+### Removed（含 Breaking Change）
+- 根目录 `SKILL.md` 迁移至独立仓库 [boss-skill](https://github.com/can4hou6joeng4/boss-skill)；**此前经 `npx skills add can4hou6joeng4/boss-agent-cli` 安装的用户，请改用 `npx skills add can4hou6joeng4/boss-skill` 获取更新**。CLI 命令行为、JSON 信封与既有错误码全部向后兼容。
+- `skills/boss-resume-downloader` 招聘者简历批量同步工作流退役下线（与默认低风险合规姿态存在张力）；历史版本可在本仓库 git 历史中找到。
+
+## [1.12.0] - 2026-06-09
+
+### Added
+- MCP server 新增 `stdio` / `sse` / `http` 三种传输模式，`boss-mcp --transport http --port 8765` 与 `boss-mcp --transport sse` 可直接启动，默认仍保持 `stdio`。
+- `mcp-server/README.md` 补齐 SSE / HTTP Streaming 启动示例、默认路径和自定义路径说明。
+- MCP 新增 `boss_export`：协议服务对齐 CLI `boss export`，Agent 可直接导出搜索结果为 CSV / JSON / HTML（默认脱敏 job_id/security_id/boss_name），工具计数 31 → 32。
+- 增加前程无忧 / 51job（`qiancheng`）平台占位适配器，统一返回 `NOT_SUPPORTED`，为后续多平台能力矩阵保留低风险扩展入口。
+
+### Changed
+- 招聘者写操作收口到同一条 chat-tab Vue/CDP 链路：`boss hr reply` 现在用真实 WebSocket 帧校验发送成功，`boss hr request-resume` 不再需要 `--job-id`，`boss hr resume --exchange` 支持 `phone|wechat`。
+- MCP 新增 `boss_hr_exchange`，并同步修正 `boss_hr_request_resume` 的输入契约为仅需 `friend_id`。
+- 测试依赖 `pytest` 最低版本提升到 `9.0.3`，并同步更新锁文件，修复 Dependabot 报告的临时目录处理漏洞告警。
+- ROADMAP / README / README.en 对齐当前主线事实：`#48` 已完成，智联候选者侧登录与读写链路已接通，招聘者侧仍保持显式拒绝。
+- ROADMAP Week 4 招聘者侧能力评估落槌为「暂不接入」（接入条件 0/4 满足，保留 `RecruiterPlatform` 骨架待社区信号重启；详见 `docs/research/platforms/zhaopin-recruiter-evaluation.md`）。
+- README 与设计文档同步前程无忧占位状态，并明确 RPA / 浏览器自动化风控边界。
+
+### Fixed
+- `boss hr chat --label-id` 兼容招聘端沟通列表接口直接返回数组的响应形态，避免成功响应被误处理为 `NETWORK_ERROR`。
+- `boss interviews` 占位实现现在经 hints 如实声明能力状态（`capability=stub` + `note`），避免 Agent 把空集合占位误读为「无真实面试邀请」。
+- 改善登录错误诊断，并补强登录合规与隐私清理契约。
+
+### Tests
+- 补强低风险合规、求职流程只读、智联客户端生命周期、招聘者平台生命周期、终端渲染、统计、简历命令、联系人查找、招聘端点和招聘端低风险阻断等回归契约。
+
+### Packaging
+- 显式排除本地虚拟环境、缓存和构建产物，避免本地 `.venv*` 目录污染 sdist。
 
 ## [1.11.0] - 2026-04-23
 

@@ -1,6 +1,6 @@
 # boss-agent-cli MCP Server
 
-Expose `boss-agent-cli` as a default low-risk MCP surface for Claude Desktop, Cursor, and other MCP-compatible hosts. The default server exposes local assistance, job search/detail, local shortlist, local resume, and AI-helper tools. Automated outreach, bulk actions, chat records, candidate personal data, and sensitive recruiter workflows are not exposed by default.
+Expose the full candidate, recruiter, local, AI, and workflow surface of `boss-agent-cli` to Claude Desktop, Cursor, and other MCP-compatible hosts. Historical assisted/research settings have identical capability access; missing platform implementations still return `NOT_SUPPORTED`.
 
 Related docs:
 - [Agent Quickstart](../docs/agent-quickstart.en.md)
@@ -9,7 +9,7 @@ Related docs:
 ## Install
 
 ```bash
-uv tool install "boss-agent-cli[mcp]"
+uv tool install "boss-agent-cli[mcp,crawl]"  # use [mcp] only when crawl tools are not needed
 ```
 
 From source:
@@ -49,7 +49,13 @@ Add the server in Cursor Settings -> MCP Servers:
 
 ## Available tools
 
-The current MCP server exposes **32 low-risk tools** by default.
+The current MCP server exposes **78 implemented tools**.
+
+### Shared workflow
+
+| Tool | Description |
+|------|-------------|
+| `boss_wizard` | Run a role/platform/goal workflow, or query, resume, and stop it by explicit `run_id`; shares state with the human `boss wizard` |
 
 ### Auth and environment
 
@@ -74,7 +80,26 @@ The current MCP server exposes **32 low-risk tools** by default.
 | `boss_shortlist_add` | Add a job to the local shortlist |
 | `boss_shortlist_remove` | Remove a job from the local shortlist |
 | `boss_preset_add/list/remove` | Manage local search presets |
-| `boss_watch_add/list/remove` | Manage local watch presets; `watch run` is not exposed by default |
+| `boss_watch_add/list/remove/run` | Manage and execute job watches |
+
+### Candidate actions and conversations
+
+| Tool | Description |
+|------|-------------|
+| `boss_greet` / `boss_batch_greet` / `boss_apply` | Greet, bounded batch greet, and apply/start a conversation |
+| `boss_chat` / `boss_chatmsg` / `boss_chat_summary` | Conversation list, message history, and summary |
+| `boss_mark` / `boss_exchange` | Contact labels and contact exchange |
+| `boss_pipeline` / `boss_follow_up` / `boss_digest` | Candidate progress, follow-up selection, and digest |
+
+### Existing crawl tasks
+
+| Tool | Description |
+|------|-------------|
+| `boss_crawl_status` | Read cursor, job count, detail progress, risk state, and resume command |
+| `boss_crawl_results` | Read persisted jobs for a run, filtered by page/detail state if needed |
+| `boss_crawl_shortlist` | Import one run's jobs into the local shortlist without a platform call |
+
+Fine-grained crawl tools read or import existing tasks; `boss_wizard` goals `crawl_start/crawl_resume/crawl_stop` can start, resume, or stop the shared workflow. The default Hook is `none`; local Hook directories must contain `SHA256SUMS`. This project does not redistribute third-party scripts.
 
 ### User and resume
 
@@ -95,14 +120,20 @@ The current MCP server exposes **32 low-risk tools** by default.
 | `boss_ai_interview_prep` | Generate interview preparation from a job description |
 | `boss_ai_chat_coach` | Coach communication from user-provided text |
 
-### Recruiter low-risk entry points
+### Recruiter workflow
 
 | Tool | Description |
 |------|-------------|
+| `boss_hr_whoami` | Check whether the current login is on the recruiter side; ready only when identity is 1, without switching identity |
 | `boss_hr_jobs` | Manage job listings and online/offline state |
 | `boss_hr_jobs_detail` | View recruiter-side job details |
+| `boss_hr_applications` / `boss_hr_candidates` | Applications and candidate search |
+| `boss_hr_accept_resume` / `boss_hr_download_resume` | Accept a specific resume request and download a received attachment after checking access |
+| `boss_hr_recommendations` / `boss_hr_greet` | Recommended candidates, greeting preview, and operator-approved first contact without changing read status |
+| `boss_hr_resume` / `boss_hr_exchange` / `boss_hr_request_resume` | Online resumes, contact exchange, and attached-resume requests |
+| `boss_hr_chat` / `boss_hr_chatmsg` / `boss_hr_last_messages` / `boss_hr_reply` | Recruiter conversation reads and replies |
 
-Sensitive tools such as `boss_greet`, `boss_apply`, `boss_chat`, `boss_chatmsg`, `boss_pipeline`, `boss_digest`, `boss_hr_candidates`, and `boss_hr_reply` are not exposed by default. Direct CLI calls return `COMPLIANCE_BLOCKED` in default low-risk mode.
+Every implemented tool is exposed. `ACCOUNT_RISK`, `ENVIRONMENT_RISK`, `AUTH_REQUIRED`, `RATE_LIMITED`, and `NOT_SUPPORTED` still use the standard JSON error envelope; agents should follow `error.recovery_action`.
 
 ## Example prompt
 
@@ -110,7 +141,7 @@ After configuration, you can say this directly in Claude Desktop:
 
 > "Help me search for Golang roles in Guangzhou with 双休 and 五险一金, then add promising jobs to the local shortlist."
 
-Claude can call `boss_search`, `boss_detail`, and `boss_shortlist_add`. Applications, messaging, contact exchange, and candidate handling should be completed manually on the official website.
+Claude can run a full workflow through `boss_wizard` or compose fine-grained tools such as `boss_search`, `boss_detail`, `boss_shortlist_add`, and `boss_apply`.
 
 ## Transports
 

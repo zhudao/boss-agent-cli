@@ -1,0 +1,39 @@
+name: Update Contributors
+
+on:
+  # PR 合并后刷新（pull_request_target 保证 fork PR 合并时也拿得到写权限）
+  pull_request_target:
+    types: [closed]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  update-contributors:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Generate contributors SVG
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/update_contributors.py
+
+      # master 为保护分支,且 GITHUB_TOKEN 发起的 PR 不会触发必需检查,
+      # 因此有变更时开 PR,由维护者手动合并。
+      - name: Create PR if changed
+        uses: peter-evans/create-pull-request@v8
+        with:
+          commit-message: "chore: 更新贡献者名单"
+          title: "chore: update contributors"
+          body: "PR 合并后自动刷新 CONTRIBUTORS.svg(scripts/update_contributors.py)。"
+          branch: chore/update-contributors
+          add-paths: CONTRIBUTORS.svg
+          delete-branch: true

@@ -1,6 +1,11 @@
 import pytest
 
-from boss_agent_cli.search_filters import SearchFilterCriteria, SearchPipelinePlatformError, resolve_welfare_keywords, run_search_pipeline
+from boss_agent_cli.search_filters import (
+	SearchFilterCriteria,
+	SearchPipelinePlatformError,
+	resolve_welfare_keywords,
+	run_search_pipeline,
+)
 
 
 class FakeLogger:
@@ -12,14 +17,25 @@ class FakeLogger:
 
 
 class FakeCache:
-	def __init__(self, greeted_ids: set[str] | None = None):
+	def __init__(self, greeted_ids: set[str] | None = None, descs: dict[str, str] | None = None):
 		self.greeted_ids = greeted_ids or set()
+		self.descs = descs or {}
+		self.put_calls: list[tuple[str, str]] = []
 
 	def is_greeted(self, security_id: str) -> bool:
 		return security_id in self.greeted_ids
 
+	def get_job_desc(self, security_id: str) -> str | None:
+		return self.descs.get(security_id)
+
+	def put_job_desc(self, security_id: str, description: str) -> None:
+		self.put_calls.append((security_id, description))
+		self.descs[security_id] = description
+
 
 class FakeClient:
+	name = "zhipin"
+
 	def __init__(self, pages: list[dict], descriptions: dict[str, str | Exception]):
 		self.pages = list(pages)
 		self.descriptions = descriptions
@@ -36,6 +52,9 @@ class FakeClient:
 	def parse_error(self, response: dict) -> tuple[str, str]:
 		return response.get("error_code", "UNKNOWN"), response.get("message", "")
 
+	def unwrap_data(self, response: dict):
+		return response.get("zpData") if "zpData" in response else response.get("data")
+
 	def job_card(self, security_id: str, lid: str = ""):
 		self.detail_calls.append((security_id, lid))
 		value = self.descriptions[security_id]
@@ -46,8 +65,15 @@ class FakeClient:
 		return {"zpData": {"jobCard": {"postDescription": value}}}
 
 
-def _make_job_raw(*, security_id: str, job_id: str, welfare: list[str] | None = None, lid: str = ""):
-	return {
+def _make_job_raw(
+	*,
+	security_id: str,
+	job_id: str,
+	welfare: list[str] | None = None,
+	lid: str = "",
+	job_type: int | None = None,
+):
+	raw = {
 		"encryptJobId": job_id,
 		"jobName": f"Job-{job_id}",
 		"brandName": f"Company-{job_id}",
@@ -67,10 +93,79 @@ def _make_job_raw(*, security_id: str, job_id: str, welfare: list[str] | None = 
 		"securityId": security_id,
 		"lid": lid,
 	}
+	if job_type is not None:
+		raw["jobType"] = job_type
+	return raw
+
+
+def test_pipeline_strict_internship_keeps_only_verified_response_type():
+	client = FakeClient(
+		pages=[{
+			"zpData": {
+				"hasMore": False,
+				"jobList": [
+					_make_job_raw(security_id="sec-intern", job_id="job-intern", job_type=4),
+					_make_job_raw(security_id="sec-campus", job_id="job-campus", job_type=5),
+					_make_job_raw(security_id="sec-unknown", job_id="job-unknown"),
+				],
+			},
+		}],
+		descriptions={},
+	)
+
+	result = run_search_pipeline(
+		client,
+		FakeCache(),
+		FakeLogger(),
+		criteria=SearchFilterCriteria(query="实习生", job_type="实习"),
+	)
+
+	assert [item["job_id"] for item in result.items] == ["job-intern"]
+	assert result.items[0]["raw_job_type"] == 4
+	assert result.items[0]["employment_type"] == "实习"
 
 
 def _welfare_conditions():
 	return [("双休", resolve_welfare_keywords("双休"))]
+
+
+@pytest.mark.parametrize("across_pages", [False, True])
+def test_pipeline_same_round_job_dedup_reduces_details_without_mixing_access_context(across_pages):
+	first = _make_job_raw(security_id="sid-first", job_id="synthetic-job", lid="lid-first")
+	rotated = _make_job_raw(security_id="sid-rotated", job_id="synthetic-job", lid="lid-rotated")
+	other = _make_job_raw(security_id="sid-other", job_id="synthetic-other", lid="lid-other")
+	pages = (
+		[{"code": 0, "zpData": {"jobList": [first], "hasMore": True}}, {"code": 0, "zpData": {"jobList": [rotated, other], "hasMore": False}}]
+		if across_pages else [{"code": 0, "zpData": {"jobList": [first, rotated, other], "hasMore": False}}]
+	)
+	client = FakeClient(pages, {"sid-first": "Synthetic 双休 description", "sid-other": "Synthetic 双休 description"})
+	result = run_search_pipeline(
+		client, FakeCache(), FakeLogger(), criteria=SearchFilterCriteria(query="Synthetic"),
+		max_pages=2, welfare_conditions=_welfare_conditions(), detail_channel="browser",
+	)
+	assert client.detail_calls == [("sid-first", "lid-first"), ("sid-other", "lid-other")]
+	assert [(item["job_id"], item["security_id"], item["lid"]) for item in result.items] == [
+		("synthetic-job", "sid-first", "lid-first"), ("synthetic-other", "sid-other", "lid-other"),
+	]
+	assert result.stats.jobs_seen == 3 and result.stats.detail_checks == 2
+	assert len(client.search_calls) == (2 if across_pages else 1)
+
+
+def test_pipeline_keeps_missing_job_ids_and_distinct_jobs_with_same_security_separate():
+	items = [
+		_make_job_raw(security_id="sid-missing-a", job_id=""),
+		_make_job_raw(security_id="sid-missing-b", job_id=""),
+		_make_job_raw(security_id="sid-shared", job_id="synthetic-a", lid="lid-a"),
+		_make_job_raw(security_id="sid-shared", job_id="synthetic-b", lid="lid-b"),
+	]
+	client = FakeClient([{"code": 0, "zpData": {"jobList": items, "hasMore": False}}], {})
+	result = run_search_pipeline(client, FakeCache(), FakeLogger(), criteria=SearchFilterCriteria(query="Synthetic"))
+	assert len(result.items) == 4
+	assert [(item["job_id"], item["security_id"], item["lid"]) for item in result.items] == [
+		("", "sid-missing-a", ""), ("", "sid-missing-b", ""),
+		("synthetic-a", "sid-shared", "lid-a"), ("synthetic-b", "sid-shared", "lid-b"),
+	]
+	assert client.detail_calls == []
 
 
 def test_pipeline_uses_detail_fallback_and_marks_greeted():
@@ -92,6 +187,25 @@ def test_pipeline_uses_detail_fallback_and_marks_greeted():
 	assert len(result.items) == 1
 	assert result.items[0]["security_id"] == "sec-1"
 	assert result.items[0]["greeted"] is True
+	assert "双休(描述)" in result.items[0]["welfare_match"]
+
+
+def test_pipeline_supports_data_envelope_for_welfare_detail():
+	client = FakeClient(
+		pages=[{"code": 200, "data": {"hasMore": False, "jobList": [_make_job_raw(security_id="sec-1", job_id="job-1")]}}],
+		descriptions={"sec-1": {"code": 200, "data": {"jobCard": {"postDescription": "岗位描述写明周末双休"}}}},
+	)
+
+	result = run_search_pipeline(
+		client,
+		FakeCache(),
+		FakeLogger(),
+		criteria=SearchFilterCriteria(query="python"),
+		welfare_conditions=_welfare_conditions(),
+	)
+
+	assert len(result.items) == 1
+	assert result.items[0]["security_id"] == "sec-1"
 	assert "双休(描述)" in result.items[0]["welfare_match"]
 
 
@@ -126,6 +240,28 @@ def test_pipeline_passes_raw_params_to_search_client():
 			"raw_params": {"city": "101280100", "experience": "108,104"},
 		},
 	}
+
+
+def test_pipeline_runs_list_budget_before_every_page_request():
+	client = FakeClient(
+		pages=[
+			{"zpData": {"hasMore": True, "jobList": [_make_job_raw(security_id="sec-1", job_id="job-1")]}},
+			{"zpData": {"hasMore": False, "jobList": [_make_job_raw(security_id="sec-2", job_id="job-2")]}},
+		],
+		descriptions={},
+	)
+	waits: list[str] = []
+
+	run_search_pipeline(
+		client,
+		FakeCache(),
+		FakeLogger(),
+		criteria=SearchFilterCriteria(query="python"),
+		max_pages=2,
+		before_list_request=lambda: waits.append("wait"),
+	)
+
+	assert waits == ["wait", "wait"]
 
 
 def test_pipeline_detail_exception_does_not_abort_other_matches():
@@ -174,6 +310,125 @@ def test_pipeline_skip_greeted_filters_detail_matched_items():
 	)
 
 	assert result.items == []
+	assert client.detail_calls == []
+	assert result.stats.detail_checks == 0
+	assert result.stats.detail_requests == 0
+
+
+def test_pipeline_limit_stops_serial_details_after_enough_matches(monkeypatch):
+	from boss_agent_cli import search_filters
+
+	def reject_parallel(*args, **kwargs):
+		raise AssertionError("limited enrichment must be serial")
+
+	monkeypatch.setattr(search_filters, "ThreadPoolExecutor", reject_parallel)
+	client = FakeClient(
+		pages=[{"zpData": {"hasMore": True, "jobList": [
+			_make_job_raw(security_id=f"sec-{i}", job_id=f"job-{i}", lid=f"lid-{i}")
+			for i in range(4)
+		]}}],
+		descriptions={"sec-0": "周末双休"},
+	)
+	waits = []
+	result = run_search_pipeline(
+		client, FakeCache(), FakeLogger(), criteria=SearchFilterCriteria(query="python"),
+		welfare_conditions=_welfare_conditions(), limit=1, max_pages=5,
+		before_detail_request=lambda: waits.append("wait"),
+	)
+	assert [item["job_id"] for item in result.items] == ["job-0"]
+	assert client.detail_calls == [("sec-0", "lid-0")]
+	assert len(client.search_calls) == 1
+	assert waits == ["wait"]
+	assert result.stats.detail_checks == result.stats.detail_requests == 1
+
+
+def test_pipeline_skips_greeted_before_activity_or_welfare_enrichment():
+	jobs = [_make_job_raw(security_id=f"sec-{i}", job_id=f"job-{i}") for i in range(4)]
+	for job in jobs:
+		job["bossOnline"] = False
+	client = FakeClient(pages=[{"zpData": {"hasMore": False, "jobList": jobs}}], descriptions={})
+	result = run_search_pipeline(
+		client, FakeCache({f"sec-{i}" for i in range(4)}), FakeLogger(),
+		criteria=SearchFilterCriteria(query="python"), welfare_conditions=_welfare_conditions(),
+		active="today", skip_greeted=True, detail_channel="browser",
+	)
+	assert result.items == []
+	assert client.detail_calls == []
+	assert result.stats.detail_checks == result.stats.detail_requests == 0
+
+
+def test_pipeline_reuses_cached_description_before_remaining_network_details():
+	client = FakeClient(
+		pages=[{"zpData": {"hasMore": False, "jobList": [
+			_make_job_raw(security_id=f"sec-{i}", job_id=f"job-{i}") for i in range(4)
+		]}}],
+		descriptions={"sec-1": "单休", "sec-2": "周末双休"},
+	)
+	cache = FakeCache(descs={"job-0": "周末双休"})
+	result = run_search_pipeline(
+		client, cache, FakeLogger(), criteria=SearchFilterCriteria(query="python"),
+		welfare_conditions=_welfare_conditions(), limit=2, detail_channel="browser",
+	)
+	assert [item["job_id"] for item in result.items] == ["job-0", "job-2"]
+	assert client.detail_calls == [("sec-1", ""), ("sec-2", "")]
+	assert result.stats.detail_checks == 3
+	assert result.stats.detail_requests == 2
+	assert ("job-0", "周末双休") not in cache.put_calls
+
+
+def test_pipeline_sufficient_list_tags_skip_remaining_detail_work():
+	client = FakeClient(
+		pages=[{"zpData": {"hasMore": False, "jobList": [
+			_make_job_raw(security_id="sec-detail", job_id="job-detail"),
+			_make_job_raw(security_id="sec-list", job_id="job-list", welfare=["双休"]),
+		]}}],
+		descriptions={},
+	)
+	result = run_search_pipeline(
+		client, FakeCache(), FakeLogger(), criteria=SearchFilterCriteria(query="python"),
+		welfare_conditions=_welfare_conditions(), limit=1, detail_channel="browser",
+	)
+	assert [item["job_id"] for item in result.items] == ["job-list"]
+	assert client.detail_calls == []
+	assert result.stats.detail_checks == result.stats.detail_requests == 0
+
+
+def test_pipeline_mixed_enrichment_keeps_list_order():
+	client = FakeClient(
+		pages=[{"zpData": {"hasMore": False, "jobList": [
+			_make_job_raw(security_id="sec-network", job_id="job-network"),
+			_make_job_raw(security_id="sec-tag", job_id="job-tag", welfare=["双休"]),
+			_make_job_raw(security_id="sec-cache", job_id="job-cache"),
+		]}}],
+		descriptions={"sec-network": "周末双休"},
+	)
+	result = run_search_pipeline(
+		client, FakeCache(descs={"job-cache": "周末双休"}), FakeLogger(),
+		criteria=SearchFilterCriteria(query="python"), welfare_conditions=_welfare_conditions(),
+		limit=3, detail_channel="browser",
+	)
+	assert [item["job_id"] for item in result.items] == ["job-network", "job-tag", "job-cache"]
+	assert client.detail_calls == [("sec-network", "")]
+
+
+@pytest.mark.parametrize("raw_risk", [False, True])
+def test_pipeline_limited_detail_risk_stops_later_work(raw_risk):
+	from boss_agent_cli.api.client import AccountRiskError
+
+	error = {"code": 36, "message": "synthetic risk", "error_code": "ACCOUNT_RISK"} if raw_risk else AccountRiskError("synthetic risk")
+	client = FakeClient(
+		pages=[{"zpData": {"hasMore": True, "jobList": [
+			_make_job_raw(security_id=f"sec-{i}", job_id=f"job-{i}") for i in range(3)
+		]}}],
+		descriptions={"sec-0": error},
+	)
+	with pytest.raises(SearchPipelinePlatformError if raw_risk else AccountRiskError):
+		run_search_pipeline(
+			client, FakeCache(), FakeLogger(), criteria=SearchFilterCriteria(query="python"),
+			welfare_conditions=_welfare_conditions(), limit=2, max_pages=5,
+		)
+	assert client.detail_calls == [("sec-0", "")]
+	assert len(client.search_calls) == 1
 
 
 def test_pipeline_stops_after_limit_during_welfare_search():
@@ -304,3 +559,171 @@ def test_pipeline_reports_welfare_not_supported():
 
 	assert exc_info.value.code == "NOT_SUPPORTED"
 	assert "不支持福利详情筛选" in exc_info.value.message
+
+
+def test_pipeline_caches_fresh_job_desc_after_fetch():
+	"""首次取详情后应把描述写回缓存（put_job_desc 被调用）。"""
+	client = FakeClient(
+		pages=[{"zpData": {"hasMore": False, "jobList": [_make_job_raw(security_id="sec-1", job_id="job-1")]}}],
+		descriptions={"sec-1": "这里提供双休和五险一金"},
+	)
+	cache = FakeCache()
+	result = run_search_pipeline(
+		client,
+		cache,
+		FakeLogger(),
+		criteria=SearchFilterCriteria(query="python"),
+		welfare_conditions=_welfare_conditions(),
+	)
+	assert len(result.items) == 1
+	assert client.detail_calls == [("sec-1", "")]  # 取了一次详情（按 securityId 取）
+	assert ("job-1", "这里提供双休和五险一金") in cache.put_calls  # 写回缓存（按稳定的 job_id）
+
+
+def test_pipeline_cache_hit_skips_job_card_request():
+	"""描述缓存命中（按 job_id）时应跳过 job_card 请求（不触网、不计请求）。"""
+	client = FakeClient(
+		pages=[{"zpData": {"hasMore": False, "jobList": [_make_job_raw(security_id="sec-1", job_id="job-1")]}}],
+		descriptions={"sec-1": "不应被调用"},
+	)
+	cache = FakeCache(descs={"job-1": "这里提供双休和五险一金"})
+	result = run_search_pipeline(
+		client,
+		cache,
+		FakeLogger(),
+		criteria=SearchFilterCriteria(query="python"),
+		welfare_conditions=_welfare_conditions(),
+	)
+	assert len(result.items) == 1
+	assert client.detail_calls == []  # 命中缓存，零取详情请求
+	assert cache.put_calls == []  # 命中无需写回
+
+
+# ── SearchProgress 端到端接线（真人链路）────────────────────────
+
+
+def test_real_pipeline_drives_search_progress_counters(monkeypatch):
+	"""用真实管线驱动 SearchProgress，证明进度接线端到端有效。
+
+	这是无平台账号条件下能做到的最强验证：管线是真的，只有 client/cache 是 fake。
+	"""
+	import io
+
+	from rich.console import Console
+
+	from boss_agent_cli.display import SearchProgress
+
+	stream = io.StringIO()
+	monkeypatch.setattr(
+		"boss_agent_cli.display.console",
+		Console(file=stream, force_terminal=False, width=120),
+	)
+
+	client = FakeClient(
+		pages=[{
+			"zpData": {
+				"hasMore": False,
+				"jobList": [
+					_make_job_raw(security_id="sec-a", job_id="job-a"),
+					_make_job_raw(security_id="sec-b", job_id="job-b"),
+				],
+			},
+		}],
+		descriptions={"sec-a": "福利：双休 五险一金", "sec-b": "单休，无补贴"},
+	)
+	progress = SearchProgress("搜索 Golang", max_pages=1)
+
+	result = run_search_pipeline(
+		client,
+		FakeCache(),
+		progress,
+		criteria=SearchFilterCriteria(query="Golang"),
+		welfare_conditions=_welfare_conditions(),
+	)
+
+	# 管线真的产出了一个匹配项
+	assert [item["job_id"] for item in result.items] == ["job-a"]
+
+	# 进度对象如实反映了管线过程
+	assert progress.pages == 1, "翻页应被计数"
+	assert progress.matched == 1, "匹配项应被计数"
+	assert progress.excluded >= 1, "不匹配项应被计数"
+
+	out = stream.getvalue()
+	assert "Company-job-a" in out, "匹配项应逐条打印到终端"
+	assert "Company-job-b" not in out, "排除项不应刷屏"
+	assert "1/1" in progress.status_text()
+
+
+def test_pipeline_platform_risk_exception_stops_remaining_detail_checks(monkeypatch):
+	"""风控异常形态（浏览器通道抛 AccountRiskError）必须终止扫描，不得被吞掉继续跑完整页（Issue #419）。"""
+	from boss_agent_cli import search_filters
+	from boss_agent_cli.api.client import AccountRiskError
+
+	monkeypatch.setattr(search_filters, "_WELFARE_WORKERS", 1)
+	client = FakeClient(
+		pages=[
+			{
+				"zpData": {
+					"hasMore": False,
+					"jobList": [
+						_make_job_raw(security_id="sec-risk", job_id="job-risk"),
+						_make_job_raw(security_id="sec-2", job_id="job-2"),
+						_make_job_raw(security_id="sec-3", job_id="job-3"),
+					],
+				},
+			},
+		],
+		descriptions={
+			"sec-risk": AccountRiskError("BOSS 直聘风控拦截 (code 36)", is_cdp=True),
+			"sec-2": "岗位描述明确写了双休",
+			"sec-3": "岗位描述明确写了双休",
+		},
+	)
+
+	with pytest.raises(AccountRiskError):
+		run_search_pipeline(
+			client,
+			FakeCache(),
+			FakeLogger(),
+			criteria=SearchFilterCriteria(query="python"),
+			welfare_conditions=_welfare_conditions(),
+		)
+
+	assert client.detail_calls == [("sec-risk", "")], "风控后剩余职位不得再取详情"
+
+
+def test_pipeline_platform_error_cancels_pending_detail_checks(monkeypatch):
+	"""响应字典形态的平台错误同样取消队列里尚未开始的详情请求。"""
+	from boss_agent_cli import search_filters
+
+	monkeypatch.setattr(search_filters, "_WELFARE_WORKERS", 1)
+	client = FakeClient(
+		pages=[
+			{
+				"zpData": {
+					"hasMore": False,
+					"jobList": [
+						_make_job_raw(security_id="sec-1", job_id="job-1"),
+						_make_job_raw(security_id="sec-2", job_id="job-2"),
+					],
+				},
+			},
+		],
+		descriptions={
+			"sec-1": {"code": 36, "message": "风控", "error_code": "ACCOUNT_RISK"},
+			"sec-2": "岗位描述明确写了双休",
+		},
+	)
+
+	with pytest.raises(SearchPipelinePlatformError) as exc_info:
+		run_search_pipeline(
+			client,
+			FakeCache(),
+			FakeLogger(),
+			criteria=SearchFilterCriteria(query="python"),
+			welfare_conditions=_welfare_conditions(),
+		)
+
+	assert exc_info.value.code == "ACCOUNT_RISK"
+	assert client.detail_calls == [("sec-1", "")]

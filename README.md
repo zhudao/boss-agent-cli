@@ -1,711 +1,233 @@
 <div align="center">
 
+<img src="docs/assets/logo.png" width="112" alt="boss-agent-cli logo">
+
 # boss-agent-cli
 
-**专为 AI Agent 设计的 BOSS 直聘本地辅助 CLI 工具**
+*🤖 面向真人与 AI Agent 的招聘平台 CLI —— 纯终端向导 · 福利筛选 · 双角色工作流 · JSON 信封。*
 
-> 默认低风险模式：本地辅助 · 只读优先 · 用户主动触发 · 不规避风控 · 不批量触达 · 不抓取平台数据
->
-> 求职者：搜索 · 福利筛选 · 详情查看 · 候选池 · 本地简历与 AI 辅助
-
-[![CI](https://github.com/can4hou6joeng4/boss-agent-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/can4hou6joeng4/boss-agent-cli/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/can4hou6joeng4/boss-agent-cli/branch/master/graph/badge.svg)](https://codecov.io/gh/can4hou6joeng4/boss-agent-cli)
-[![Python](https://img.shields.io/badge/Python-≥3.10-3776AB?logo=python&logoColor=white&style=flat-square)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-≥3.11-3776AB?logo=python&logoColor=white&style=flat-square)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/can4hou6joeng4/boss-agent-cli?style=flat-square)](https://github.com/can4hou6joeng4/boss-agent-cli/releases)
 [![PyPI Downloads](https://img.shields.io/pypi/dm/boss-agent-cli?style=flat-square)](https://pypi.org/project/boss-agent-cli/)
-[![Contributors](https://img.shields.io/github/contributors/can4hou6joeng4/boss-agent-cli?style=flat-square)](https://github.com/can4hou6joeng4/boss-agent-cli/graphs/contributors)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](https://github.com/can4hou6joeng4/boss-agent-cli/pulls)
-[![Open in Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/can4hou6joeng4/boss-agent-cli)
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Fcan4hou6joeng4%2Fboss-agent-cli.svg)](https://mcptoplist.com/server/glama%2Fcan4hou6joeng4%2Fboss-agent-cli)
 
-[快速上手](docs/getting-started.md) · [安装](#-安装) · [快速开始](#-快速开始) · [角色模式](#-角色模式与多平台) · [Agent 集成](#-ai-agent-集成) · [命令参考](#-命令参考) · [排障](#-诊断与排障) · [架构](#-技术架构) · [更新日志](CHANGELOG.md) · [路线图](ROADMAP.md)
+[快速上手](docs/getting-started.md) · [Agent 集成](#-agent-集成) · [命令](#-命令) · [排障](docs/troubleshooting.md) · [路线图](ROADMAP.md) · **中文** | [English](README.en.md)
 
-**中文** | [English](README.en.md)
-
-<a href="demo/showcase/boss-agent-cli-showcase.mp4" title="观看完整项目展示视频">
-  <img src="demo/showcase/boss-agent-cli-showcase.gif" alt="boss-agent-cli 项目展示动图" width="100%">
+<a href="demo/showcase/boss-agent-cli-showcase.mp4" title="观看 48 秒产品发布会动画">
+  <img src="demo/showcase/boss-agent-cli-showcase.gif?v=keynote-20261008" alt="boss-agent-cli 极光发布会动画：福利筛选、双角色工作流与 Agent 接入" width="100%">
 </a>
 
-**[观看完整展示视频](demo/showcase/boss-agent-cli-showcase.mp4)** · [查看终端交互演示](demo-zh.gif) · schema 驱动 · 福利筛选 · JSON 信封 · 开源工程质量
-
-<p align="center">
-  <img src="demo-zh.gif" alt="boss-agent-cli 终端交互演示（1280×720 / 30fps）" width="100%">
-</p>
+**[观看 48 秒发布会动画](demo/showcase/boss-agent-cli-showcase.mp4)** · [交互版](https://can4hou6joeng4.github.io/boss-agent-cli/keynote-animation/) · [终端交互演示](demo/demo-zh.gif) · 福利筛选 · 双角色工作流 · Agent 接入
 
 </div>
 
-> [!TIP]
-> <img src="https://github.com/peterfei/ai-agent-team/raw/main/examples/doloffer.png" alt="Doloffer logo" width="220">
->
-> **Doloffer Guide** 致力于让优质 AI 工具的获取更简单。平台主打 GPT 与 Claude 等主流 AI 服务的正版会员充值，提供一站式订阅管理，主打安全稳定与无忧售后。
->
-> 💡 **极速订阅**： [专属链接](https://doloffer.com/friend/BEv3yvKS)（输入优惠码 `AI8888` 享 9 折特惠）
+## 🧭 为什么
 
-> A local-assist CLI for AI Agents working around [BOSS Zhipin](https://www.zhipin.com/) data already available to the user. Default low-risk mode is read-only first, user-triggered, and does not automate outreach, bulk actions, risk-control bypasses, or candidate personal-data workflows. See [README.en.md](README.en.md) for the English version.
+boss-agent-cli 把职位发现、福利筛选、本地简历与 AI、投递沟通、招聘者候选人处理和可恢复采集统一到一个 CLI。真人直接运行 `boss` 进入纯终端向导；Agent 使用 JSON、schema、MCP 或 Python API 调用同一套 workflow 与状态。`boss schema` 始终是能力真源。
 
-## ⚠️ 合规边界
+## ⚠️ 运行边界
 
-本项目默认启用低风险辅助模式，目标是收缩为“本地辅助 / 只读优先 / 用户主动触发 / 不规避风控 / 不批量触达 / 不抓取平台数据”的低风险工具。CLI 默认会阻断打招呼、批量打招呼、投递、联系方式交换、招聘者候选人搜索、候选人简历、聊天记录、附件简历请求和消息回复等敏感能力。需要投递、沟通、候选人处理或联系方式交换时，请回到 BOSS 直聘官方页面由用户手动完成。
+历史配置 `operating_mode=assisted|research` 继续兼容，但两种模式都可调用全部已实现能力，不再产生模式级 `COMPLIANCE_BLOCKED`。平台尚未实现的能力仍准确返回 `NOT_SUPPORTED`；认证失效、账号风险和网络错误保留结构化错误与恢复动作。长流程仍受 timeout、retry、预算、checkpoint 和 stop 控制。
 
----
+## ✨ 核心能力
 
-## 💡 为什么用 boss-agent-cli？
-
-传统求职：打开网页 → 翻几十页 → 逐个看详情 → 手动整理候选岗位 → 忘了跟进谁。
-
-**boss-agent-cli 让 AI Agent 帮你做本地整理和只读辅助**：
-
-```bash
-boss search "Golang" --city 广州 --welfare "双休,五险一金"   # 搜索 + 福利筛选
-boss detail <security_id>                                    # 查看详情
-boss shortlist add <security_id> <job_id>                    # 加入本地候选池
-boss stats                                                   # 本地统计
-```
-
-所有输出为 **结构化 JSON**，Agent 一调用就能理解；涉及投递、沟通和候选人个人信息处理的动作默认回到平台官网手动完成。
-
----
-
-## 🧭 导航目录
-
-- [为什么用 boss-agent-cli](#-为什么用-boss-agent-cli)
-- [演示素材](#-演示素材)
-- [核心能力](#-核心能力)
-- [安装](#-安装)
-- [快速开始](#-快速开始)
-- [登录链路](#-登录链路)
-- [角色模式与多平台](#-角色模式与多平台)
-- [AI Agent 集成](#-ai-agent-集成)
-- [命令参考](#-命令参考)
-- [诊断与排障](#-诊断与排障)
-- [配置](#-配置)
-- [技术架构](#-技术架构)
-- [贡献](#-贡献)
-
----
-
-## 🎬 演示素材
-
-| 类型 | 入口 | 适合场景 |
-|------|------|----------|
-| 项目展示动图 | [首页自动播放 GIF](demo/showcase/boss-agent-cli-showcase.gif) | 快速理解项目定位、schema 驱动、JSON 信封与开源工程质量 |
-| 完整展示视频 | [16 秒 MP4](demo/showcase/boss-agent-cli-showcase.mp4) | 查看更清晰、更完整的项目叙事 |
-| 终端交互演示 | [终端 GIF](demo-zh.gif) · [VHS 录制脚本](demo-zh.tape) | 直接观察 CLI 命令和输出形态（1280×720 / 30fps） |
-| 可复现源工程 | [HyperFrames 源文件](demo/hyperframes-showcase/) | 维护或迭代 README 首页展示动画 |
-
----
-
-## 🌟 核心能力
-
-### 求职者工作流
-
-- `🔍 职位发现`：关键词搜索、8 维筛选、按编号回看同一条结果。命令：`search` `show`
-- `🎯 福利筛选`：`--welfare "双休,五险一金"` 会自动翻页、补抓详情、按 AND 逻辑做真实匹配。命令：`search --welfare`
-- `📌 本地候选池`：查看详情后保存、移除、复盘候选岗位；投递和沟通回到平台官网手动完成。命令：`detail` `show` `shortlist`
-- `📊 本地统计`：基于本地缓存查看候选池、投递记录和清理结果。命令：`stats` `shortlist` `clean`
-- `👀 本地预设`：保存搜索条件和候选池；自动增量拉取默认阻断。命令：`watch add/list/remove` `preset` `shortlist`
-- `💬 沟通边界`：聊天记录、会话摘要、标签和联系方式交换等敏感链路默认阻断；沟通请回到平台官网手动完成。
-- `🤖 AI 求职增强`：JD 分析、简历润色、定向优化、模拟面试、沟通指导。命令：`ai analyze-jd` `ai polish` `ai optimize` `ai interview-prep` `ai chat-coach`
-
-### 招聘者工作流
-
-- `👔 招聘者边界`：候选人搜索、投递申请、在线简历、沟通记录、附件简历请求、联系方式交换和消息回复默认阻断，请回到 BOSS 直聘官方招聘者页面手动处理。
-- `📌 职位管理`：查看职位、上架、下架，作为招聘者端的最小可操作闭环。命令：`hr jobs list` `hr jobs online` `hr jobs offline`
-
-### 平台与集成基础
-
-- `🔌 多平台抽象`：`Platform` / `RecruiterPlatform` 双注册表已落地；默认低风险模式优先暴露只读和本地辅助链路。命令：`--platform zhipin|zhilian|qiancheng`
-- `📤 结构化输出`：stdout 只输出 JSON 信封，适合 CLI 编排、Shell Agent、MCP 和 Python SDK。命令：`schema` `export`
-- `🧩 Agent 接入`：同一套能力可通过 Skill、subprocess、MCP、Python SDK 四种路径暴露给 Agent。文档：`docs/agent-quickstart.md` `docs/agent-hosts.md`
-
----
-
-## 📦 安装
-
-```bash
-# 推荐：通过 uv 安装（秒级，自动隔离）
-uv tool install boss-agent-cli
-
-# 安装浏览器（仅用于用户主动登录和本地导出场景）
-patchright install chromium
-```
-
-<details>
-<summary>📋 其他安装方式</summary>
-
-```bash
-# pipx（隔离环境）
-pipx install boss-agent-cli
-patchright install chromium
-
-# pip
-pip install boss-agent-cli
-patchright install chromium
-
-# 从源码（开发用）
-git clone https://github.com/can4hou6joeng4/boss-agent-cli.git
-cd boss-agent-cli
-uv sync --all-extras
-uv run patchright install chromium
-```
-
-</details>
-
----
+- **职位发现**：关键词搜索 + 8 维筛选，按编号回看缓存结果 —— `search` `show` `detail`
+- **福利筛选（核心差异化）**：`--welfare "双休,五险一金"` 自动翻页补抓、按 AND 逻辑做**真实匹配**，并可 `--sort score` 按本地匹配分排序 —— `search --welfare`
+- **HR 活跃度筛选**：`--active 3d` 只留最近活跃的 HR，避免把投递次数浪费在长期不上线的岗位上；`online` 只看列表、请求量与普通搜索相同，其余档位可能要逐个查职位详情，更慢、风控风险更高，低风险场景建议用 `--active online` —— `search --active`
+- **纯终端向导**：直接运行 `boss` 或 `boss wizard`，选择角色、平台和目标；同一 workflow 也可用 `--input-json`、run ID 或 MCP 推进和恢复
+- **本地候选池与统计**：查看详情后本地保存、读取带有效状态的网页职位收藏并仅同步有效项 / 用标签和备注复盘候选岗位、离线对比、查看漏斗统计 —— `shortlist` `stats` `watch` `preset` `favorites`
+- **AI 求职增强 + 本地模型**：JD 分析、简历润色、定向优化、候选池匹配、模拟面试、沟通指导；本地模型权重外置，支持 Ollama/vLLM OpenAI 兼容接口 —— `ai analyze-jd` `ai local configure` `ai local smoke`
+- **Schema 驱动 + JSON 信封**：stdout 只输出 `{ok, data, pagination, error, hints}` 信封，`boss schema` 是能力真源，适合 CLI 编排 / Shell Agent / MCP / Python SDK
+- **招聘者完整链路**：先确认招聘者身份，再进入候选人搜索、推荐牛人、首次招呼、附件简历接收与下载、简历、聊天/最近消息、回复和职位管理 —— `hr whoami/candidates/recommendations/greet/applications/resume/chat/last-messages/reply/request-resume/accept-resume/download-resume/jobs`
+- **平台抽象**：`Platform` / `RecruiterPlatform` 双注册表 + `--platform` 全局选项；当前注册平台为 `zhipin`（BOSS 直聘）
 
 ## 🚀 快速开始
 
 ```bash
-# 1. 环境自检
-boss doctor
+# 安装（uv 推荐；浏览器内核仅用于用户主动登录 / 本地导出）
+uv tool install boss-agent-cli
+patchright install chromium
 
-# 2. 登录（按平台选择链路）
-boss login
+# 真人入口：直接进入角色、平台和目标向导
+boss
 
-# 3. 验证登录态
-boss status
+# Agent / 高级用户仍可直接调用命令
+boss doctor                                                   # 环境自检
+boss login                                                    # 登录（按平台选择链路）
+boss status                                                   # 验证登录态
+boss search "Golang" --city 广州 --welfare "双休,五险一金"     # 搜索 + 福利筛选
+boss search "Golang" --city 广州 --active 3d                  # 只看 3 日内活跃的 HR
+boss detail <security_id>                                     # 查看详情
+boss shortlist add <security_id> <job_id> --tags 后端,远程    # 加入本地候选池并打本地标签
+boss shortlist compare --tag 远程                             # 离线对比候选岗位
+boss stats                                                    # 本地统计
 
-# 4. 搜索广州的 Golang 职位，要求双休+五险一金
-boss search "Golang" --city 广州 --welfare "双休,五险一金"
-
-# 5. 查看详情 → 加入本地候选池
-boss detail <security_id>
-boss shortlist add <security_id> <job_id>
-
-# 6. 导出 + 本地统计
-boss export "Golang" --city 广州 --count 50 -o jobs.csv
-boss stats
-
-# 7. 本地搜索预设（自动增量拉取默认阻断）
-boss watch add my-golang "Golang" --city 广州 --welfare "双休"
-boss watch list
-
-# 9. 招聘者模式
-boss hr jobs list                     # 我发布的职位（只读）
-# 候选人搜索、简历、聊天、回复、联系方式交换等默认低风险模式会阻断
+# 招聘者模式
+boss hr candidates "Python" --city 101010100
+boss hr recommendations --job-id <encJobId>
+boss hr jobs list
 ```
 
----
+所有命令输出结构化 JSON（`ok` 判断成败，默认 `exit 0/1`；可选 `--exit-codes sysexits` 返回按错误类别区分的语义化退出码）。完整上手见 [快速上手](docs/getting-started.md)。
 
-## 🔐 登录链路
-
-`boss login` 会按当前平台选择登录链路：
-
-| 平台 | 登录链路 | 说明 |
-|------|----------|------|
-| `zhipin` | 用户主动登录链路（Cookie / CDP / QR / 浏览器兜底） | 仅用于低风险辅助，不用于规避平台风控 |
-| `zhilian` | 用户主动登录链路（Cookie / CDP / 浏览器兜底） | 当前优先复用本地浏览器登录态 |
-
-补充说明：
-- `boss login` 默认按当前 `--platform` / 配置文件里的 `platform` 工作
-- `boss --platform zhilian login` 已可用，当前覆盖**求职者侧**认证链路
-- `boss --platform zhilian` 目前已支持候选者侧 `search / detail / user_info`；推荐流和写操作默认受低风险模式阻断
-- `boss --platform zhilian hr ...` 仍不支持，CLI 会直接拒绝执行招聘者侧子命令
-
-涉及 Cookie、CDP、patchright、真实账号、请求频率或平台接口漂移的问题，请先阅读 [平台风险边界](docs/platform-risk.md)。
-
-<details>
-<summary>📖 CDP 启动示例</summary>
-
-macOS：
-
-```bash
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-  --remote-debugging-port=9222 \
-  --user-data-dir=/tmp/boss-chrome
-```
-
-Linux：
-
-```bash
-google-chrome \
-  --remote-debugging-port=9222 \
-  --user-data-dir=/tmp/boss-chrome
-```
-
-Windows PowerShell：
-
-```powershell
-$chromeCandidates = @(
-  "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-  "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
-  "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
-)
-
-$chrome = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $chrome) { throw "Google Chrome executable was not found" }
-
-& $chrome `
-  --remote-debugging-port=9222 `
-  --remote-allow-origins=* `
-  --user-data-dir="$env:LOCALAPPDATA\boss-agent-cdp-profile"
-```
-
-启动后在另一个终端使用 CDP 登录：
-
-```bash
-boss --cdp-url http://localhost:9222 login --cdp
-```
-
-</details>
-
----
-
-## 🎭 角色模式与多平台
-
-boss-agent-cli 同时覆盖求职者和招聘者两端，并为后续接入更多招聘平台做了抽象。
-
-### 角色切换
-
-| 选项 | 说明 | 典型命令 |
-|------|------|----------|
-| `--role candidate`（默认） | 求职者视角 | `search` / `detail` / `shortlist` |
-| `--role recruiter` | 招聘者视角 | `hr jobs list`；候选人相关敏感命令默认阻断 |
-
-快捷入口：`boss hr <子命令>` 会自动把当前会话切换到招聘者角色，不必显式传 `--role`。
-
-```bash
-# 方式 A: --role 显式指定
-boss --role recruiter ...
-
-# 方式 B: 招聘者快捷组（自动切换 role）
-boss hr applications
-boss hr candidates "Golang"
-```
-
-注意：
-- `boss hr ...` 当前仅支持默认招聘者平台 `zhipin-recruiter`
-- 若当前平台是 `zhilian`，CLI 会在入口直接提示切回 `boss --platform zhipin hr ...`
-
-### 多平台抽象
-
-`Platform` / `RecruiterPlatform` 双注册表让命令层不耦合具体平台协议：
+## 🎭 角色与平台
 
 | 平台 | 求职者 | 招聘者 | 状态 |
-|------|:------:|:------:|------|
+|------|:--:|:--:|------|
 | BOSS 直聘 (`zhipin`) | ✅ | ✅ | 默认 |
-| 智联招聘 (`zhilian`) | 🟡 候选者侧登录 + 读写链路已接通 | — | 招聘者侧未接入，运行时会直接拒绝 `hr` 子命令 |
-| 前程无忧 / 51job (`qiancheng`) | 🚧 已注册占位 | — | 统一返回 `NOT_SUPPORTED`，待只读研究门槛满足后再接入真实能力 |
 
 ```bash
-# 指定平台
-boss --platform zhilian search "Python"
-
-# 设为默认
-boss config set platform zhilian
-# 51job 当前仅用于识别平台身份；真实命令会返回 NOT_SUPPORTED
-boss --platform qiancheng status
+boss platforms                             # 查看已注册平台与能力状态（当前仅 zhipin）
+boss --platform zhipin search "Python"     # --platform 默认即 zhipin，可省略
 ```
 
-设计细节见 [docs/platform-abstraction.md](docs/platform-abstraction.md)。
+`boss hr ...` 与招聘者侧 `agent` 自动化当前均只支持 `zhipin-recruiter`。设计细节见 [docs/platform-abstraction.md](docs/platform-abstraction.md)。
 
----
+## 🤖 Agent 集成
 
-## 🤖 AI Agent 集成
-
-推荐先阅读：[Agent Quickstart](docs/agent-quickstart.md) · [Host Examples](docs/agent-hosts.md) · [Capability Matrix](docs/capability-matrix.md)
-
-### 方式一：Skill 安装（推荐）
-
-```bash
-npx skills add can4hou6joeng4/boss-agent-cli
-```
-
-安装后 Agent 自动获得调用 `boss` 命令的能力，无需手动配置。
-
-### 方式二：手动配置
-
-在 AI Agent 的规则文件中添加：
-
-```markdown
-当用户要求搜索职位、整理候选岗位等 BOSS 直聘辅助操作时，通过 Bash 调用 `boss` CLI：
-1. 运行 `boss status` 检查登录态
-2. 若未登录，运行 `boss login` 提示用户扫码
-3. 根据用户意图调用 search / detail / show / shortlist
-4. 解析 stdout JSON，`ok` 字段判断成败
-5. 用户提到福利要求时使用 `--welfare` 参数
-6. 投递、打招呼、交换联系方式、招聘者候选人处理和消息回复必须回到平台官网由用户手动完成
-```
-
-### 方式三：Python 直接嵌入（不走 subprocess）
-
-包已随 `py.typed` 标记发布，可直接作为类型化的 Python 库使用：
-
-```python
-from boss_agent_cli import AuthManager, BossClient, AuthRequired
-
-auth = AuthManager(data_dir=Path("~/.boss-agent").expanduser())
-try:
-    with BossClient(auth) as client:
-        result = client.search_jobs("Golang", city="广州")
-except AuthRequired:
-    ...  # 提示用户 boss login
-```
-
-公开 API（详见 `boss_agent_cli.__all__`）：`AuthManager` / `BossClient` / `CacheStore` / `JobItem` / `JobDetail` / `AIService` / `ResumeData` 等核心类型。
-
-### 输出协议
-
-所有命令输出 JSON 到 stdout，统一信封格式：
+推荐先读：[Agent Quickstart](docs/agent-quickstart.md) · [Capability Matrix](docs/capability-matrix.md) · [Host Examples](docs/agent-hosts.md)
 
 ```json
-{
-  "ok": true,
-  "schema_version": "1.0",
-  "command": "search",
-  "data": [...],
-  "pagination": {"page": 1, "has_more": true, "total": 15},
-  "error": null,
-  "hints": {"next_actions": ["boss detail <security_id>"]}
-}
+// 方式一：MCP（推荐）—— Claude Desktop / Cursor 等 MCP 宿主，暴露 78 个已实现工具
+{ "mcpServers": { "boss-agent": { "command": "uvx", "args": ["--from", "boss-agent-cli[mcp]", "boss-mcp"] } } }
 ```
 
-| 约定 | 说明 |
-|------|------|
-| `stdout` | 仅 JSON 结构化数据 |
-| `stderr` | 日志和进度信息 |
-| `exit 0` | 命令成功 (`ok=true`) |
-| `exit 1` | 命令失败 (`ok=false`) |
+不想在本机配 Python 工具链，可用仓库自带的容器：`BOSS_UID=$(id -u) BOSS_GID=$(id -g) docker compose run --rm boss-mcp`。镜像刻意不含浏览器内核 —— 先在宿主机 `boss login`，再把 `~/.boss-agent` 挂进去，详见 [Docker 接入](docs/integrations/docker.md)。
 
----
-
-## 📚 命令参考
-
-### 基础操作
-
-| 命令 | 说明 |
-|------|------|
-| `boss schema` | 输出完整工具能力描述 JSON（34 个顶层命令 + hr 分组展开，Agent 首先调用） |
-| `boss login` | 四级降级登录 |
-| `boss logout` | 退出登录 |
-| `boss status` | 检查登录态 |
-| `boss doctor` | 诊断环境、依赖、凭据完整性和网络；默认仅本地诊断，`--live-probe` 才执行低频只读探测；敏感操作或命中风控时提示回到官方页面手动完成 |
-| `boss me` | 我的信息（用户/简历/期望/投递记录） |
-
-### 职位搜索
-
-| 命令 | 说明 |
-|------|------|
-| `boss search <query>` | 搜索职位（支持 `--url` 网页筛选、逗号多选、`--welfare` 筛选、`--preset` 预设） |
-| `boss recommend` | 受限：默认低风险模式阻断，避免自动读取推荐流 |
-| `boss detail <security_id>` | 职位详情（`--job-id` 走快速通道） |
-| `boss show <#>` | 按编号查看上次搜索结果 |
-| `boss cities` | 40 个支持城市 |
-
-### 求职动作
-
-| 命令 | 说明 |
-|------|------|
-| `boss greet <sid> <jid>` | 受限：默认低风险模式阻断，打招呼请回到平台官网手动完成 |
-| `boss batch-greet <query>` | 受限：默认低风险模式阻断，避免批量触达 |
-| `boss apply <sid> <jid>` | 受限：默认低风险模式阻断，投递请回到平台官网手动完成 |
-| `boss exchange <sid>` | 受限：默认低风险模式阻断，联系方式交换涉及个人信息 |
-
-### 沟通跟进
-
-| 命令 | 说明 |
-|------|------|
-| `boss chat` | 受限：默认低风险模式阻断，涉及会话数据 |
-| `boss chatmsg <sid> [--raw]` | 受限：默认低风险模式阻断；`--raw` 仅在合规放行后保留结构化 body、链接和职位卡片字段 |
-| `boss chat-summary <sid>` | 受限：默认低风险模式阻断，依赖通信内容 |
-| `boss mark <sid> --label X` | 受限：默认低风险模式阻断，涉及平台关系写入 |
-| `boss interviews` | 面试邀请 |
-| `boss history` | 浏览历史 |
-
-### 流水线监控
-
-| 命令 | 说明 |
-|------|------|
-| `boss pipeline` | 受限：默认低风险模式阻断，依赖会话/面试数据 |
-| `boss follow-up` | 受限：默认低风险模式阻断，依赖会话/面试数据 |
-| `boss digest` | 受限：默认低风险模式阻断，依赖会话/面试数据 |
-| `boss watch add/list/remove/run` | add/list/remove 为本地预设；run 默认阻断，避免自动增量拉取平台数据 |
-| `boss shortlist add/list/remove` | 候选池 |
-| `boss preset add/list/remove` | 搜索预设 |
-
-### 招聘者模式
-
-| 命令 | 说明 |
-|------|------|
-| `boss hr applications` | 受限：默认低风险模式阻断，涉及候选人投递申请 |
-| `boss hr resume <geek_id> --job-id <id> --security-id <id>` | 受限：默认低风险模式阻断，涉及候选人在线简历 |
-| `boss hr resume --exchange --friend-id <friend_id> [--type wechat]` | 受限：默认低风险模式阻断，涉及联系方式交换 |
-| `boss hr chat` | 受限：默认低风险模式阻断，涉及候选人沟通列表 |
-| `boss hr chatmsg <friend_id>` | 受限：默认低风险模式阻断，涉及候选人聊天记录 |
-| `boss hr last-messages [--friend-id <id>]` | 受限：默认低风险模式阻断，涉及候选人消息摘要 |
-| `boss hr jobs list/offline/online` | 职位列表与上下线管理 |
-| `boss hr candidates <keyword>` | 受限：默认低风险模式阻断，涉及候选人搜索 |
-| `boss hr reply <friend_id> <message>` | 受限：默认低风险模式阻断，回复请回到平台官网手动完成 |
-| `boss hr request-resume <friend_id>` | 受限：默认低风险模式阻断，附件简历请求请回到平台官网手动完成 |
-
-### 简历与 AI
-
-| 命令 | 说明 |
-|------|------|
-| `boss resume init/list/show/edit/delete/export/import/clone/diff/link/applications` | 本地简历管理 |
-| `boss ai config` | 配置 AI 服务 |
-| `boss ai analyze-jd` | 分析岗位要求 |
-| `boss ai polish` | 润色简历 |
-| `boss ai optimize` | 针对目标岗位优化 |
-| `boss ai suggest` | 求职建议 |
-| `boss ai reply` | 生成招聘者消息回复草稿 |
-| `boss ai interview-prep` | 基于 JD 生成模拟面试题 |
-| `boss ai chat-coach` | 基于聊天记录给沟通建议 |
-
-> 支持 Claude 4.7 / GPT-5 / DeepSeek-V3 / Qwen3 等最新模型，详见 [推荐模型与入口](docs/integrations/ai-models.md)。
-
-### 系统管理
-
-| 命令 | 说明 |
-|------|------|
-| `boss config list/set/reset` | 配置管理 |
-| `boss clean` | 清理缓存 |
-| `boss stats` | 投递转化漏斗统计（greeted/applied/shortlist） |
-| `boss export <query>` | 导出结果（CSV/JSON/HTML，支持 `--url` 网页筛选） |
-
-<details>
-<summary>🔎 搜索筛选参数详解</summary>
+OpenCode 源码项目可直接使用仓库示例：
 
 ```bash
-boss search "golang" \
-  --city 广州 \             # 城市（40 个可选）
-  --salary 20-50K \         # 薪资范围
-  --experience 3-5年,5-10年 \ # 经验要求（支持逗号多选）
-  --education 本科,硕士 \    # 学历要求（支持逗号多选）
-  --scale 100-499人 \       # 公司规模
-  --industry 互联网 \       # 行业
-  --stage 已上市 \          # 融资阶段
-  --welfare "双休,五险一金"  # 福利筛选（AND 逻辑）
+cp examples/opencode/opencode.json ./opencode.json
+uv sync --all-extras
+uv run boss-mcp --data-dir ./.boss-agent --help
 ```
 
-也可以先在 BOSS 直聘网页上手动选好筛选条件，再复制搜索页 URL 给 CLI：
+portable / 全局安装后，在任意 OpenCode 项目里使用 `examples/opencode.json`，它会启动 `boss-mcp --data-dir ./.boss-agent`，让 review、pending、日志按项目隔离。
 
 ```bash
-boss search --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280100&experience=104,105'
-boss export --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280100' --count 50 -o jobs.csv
+# 方式二：subprocess —— 先让 Agent 读能力自描述，再解析 stdout JSON
+boss schema
 ```
 
-**福利筛选工作原理**：
-1. 先检查职位福利标签（`welfareList`）
-2. 标签不匹配时自动获取职位描述全文搜索
-3. 自动翻页（最多 5 页）
-4. 每个结果带 `welfare_match` 说明匹配来源
+```python
+# 方式三：Python 直接嵌入（随 py.typed 发布，可作类型化库）
+from boss_agent_cli import AuthManager, BossClient, AuthRequired
+with BossClient(AuthManager(...)) as client:
+    result = client.search_jobs("Golang", city="广州")
+```
 
-支持关键词：`双休` `五险一金` `年终奖` `餐补` `住房补贴` `定期体检` `股票期权` `加班补助` `带薪年假`
+## 📚 命令
 
-</details>
+`boss schema` 暴露 39 个顶层命令 + 14 个一级招聘者子命令，按工作流分组：
 
----
+- **认证**：`login` · `logout` · `status` · `doctor`
+- **职位发现**：`search` · `detail` · `show` · `cities` · `history`
+- **本地整理**：`watch` · `preset` · `shortlist` · `stats` · `favorites`
+- **可恢复采集**：`crawl configure/run/start/status/results/resume/stop/shortlist`
+- **简历 / AI**：`resume` · `me` · `ai analyze-jd` · `ai polish` · `ai optimize` · `ai fit` · `ai suggest-keywords` · `ai resume-optimize` · `ai cover-letter` · `ai interview-prep` · `ai chat-coach` · `ai local`
+- **系统 / workflow**：`wizard` · `schema` · `platforms` · `export` · `config` · `clean`
+- **候选者动作**：`greet` · `batch-greet` · `apply` · `exchange` · `chat*` · `pipeline` · `digest`
+- **招聘者**：`hr whoami/applications/candidates/recommendations/greet/resume/chat/chatmsg/last-messages/reply/request-resume/accept-resume/download-resume/jobs`
 
-## 🔧 诊断与排障
+完整命令表、参数与福利筛选原理见 **[命令参考](docs/commands.md)**；能力真源是 `boss schema`（支持 `--format openai-tools` / `anthropic-tools` 导出工具定义）。
+
+批量采集需要额外安装 `uv sync --extra crawl`。它使用独立的 `<data-dir>/crawl/chrome-profile`，不会接管日常 Chrome profile。默认不注入 Hook；如需使用本地脚本，必须同时显式提供 Hook 档位和包含 `SHA256SUMS` 的目录：
+
+```powershell
+boss crawl configure --max-requests 20 --max-details 50 --max-seconds 600 --max-retries 1
+boss crawl run "AI" --city 杭州 --pages 3 --with-detail `
+  --hook-profile screenshot-full --hook-dir E:\boss-agent-cli-local-hooks\AntiDebug_Breaker
+boss crawl resume <run_id>
+boss crawl stop <run_id>
+boss agent crawl --run-id <run_id> --resume <简历名>
+```
+
+`crawl run` 顺序执行并保存 SQLite 断点和 JSON / CSV / XLSX 增量产物；请求数、详情数、墙钟时间和重试均受固定预算约束，`boss crawl stop` 可在下一个安全点停止。导出和 `crawl results` 默认不会暴露 `security_id`、职位 ID 或招聘者字段；执行 `boss clean --privacy` 会删除 crawl 状态、预算和导出。细粒度 MCP crawl tools 读取或导入已有 `run_id`；`boss_wizard` 可通过共享 workflow 启动、恢复和停止任务。出现平台风险码或安全页时停止并返回恢复命令。
+
+## 🩺 诊断与排障
 
 ```bash
-boss doctor
-boss status
-# 可选：执行一次低频只读平台验证
-boss status --live
+boss doctor             # 环境自检
+boss status --live      # 可选：一次低频只读探测
 boss doctor --live-probe
 ```
 
-| 检查项 | 说明 |
-|--------|------|
-| `python` | Python 版本 >= 3.10 |
-| `patchright` | CLI 已安装 |
-| `patchright_chromium` | Chromium 已安装 |
-| `cookie_extract` | 本地浏览器 Cookie 可提取 |
-| `credential_file` | 登录态文件是否存在且可读取 |
-| `auth_session` | 登录态存在且可解密 |
-| `cookie_presence` / `wt2_presence` | Cookie 与核心 Cookie 是否存在 |
-| `stoken_presence` / `stoken_freshness` | `__zp_stoken__` 是否生成、是否可能过期 |
-| `auth_token_quality` | 核心凭据（wt2 / stoken） |
-| `cookie_completeness` | 辅助凭据（wbg / zp_at） |
-| `cdp` | Chrome 调试端口可连 |
-| `bridge_daemon` | 本地 Browser Bridge daemon 是否运行 |
-| `bridge_extension` | Chrome 扩展是否连接 daemon |
-| `bridge_protocol` | CLI 与扩展版本/协议是否兼容 |
-| `bridge_workspace` | Bridge 当前 workspace/tab 是否可用 |
-| `bridge_exec` / `bridge_fetch` / `bridge_navigate` | 扩展基础执行、浏览器 fetch 与导航能力 |
-| `browser_channel` | CDP/Bridge 汇总状态；不得用于规避平台风控 |
-| `candidate_search_health` / `candidate_detail_health` | 求职者只读能力前置条件 |
-| `recruiter_read_health` | 招聘者只读能力前置条件；智联招聘者侧会明确标记暂未接入 |
-| `network` | zhipin.com 可访问 |
+错误信封统一携带 `code` + `recoverable` + `recovery_action`，可程序化恢复。`boss doctor` 检查 CDP 可达性并汇总 `browser_channel` 状态。`chat` / `chatmsg` 在默认 `auto` 来源下使用本地凭据的 httpx；显式选择 `--browser-source existing-browser` 才会通过 CDP 复用已有目标页，且不读取 CLI 保存的 Cookie。现有浏览器候选耗尽返回 `BROWSER_SESSION_NOT_FOUND` + `boss doctor`，普通未登录路径仍返回 `AUTH_REQUIRED` + `boss login`。所有来源命中平台风控时都停止当前 workflow 并保存 checkpoint；适配器必须有限运行、脱敏、可停止，并只在风险状态解除后显式恢复。
 
-<details>
-<summary>📖 常见问题修复</summary>
+**v3.0.0 迁移：Browser Bridge daemon、Chrome 扩展和 `[bridge]` 安装 extra 已移除。升级 CLI 不会停止旧 daemon，也不会卸载浏览器扩展。** 请手动停止旧 daemon，禁用或移除旧扩展，并从安装命令中去掉 `[bridge]`。浏览器默认降级链为 CDP → headless；若要只复用已有会话，先在本机 CDP 浏览器的官方页面手动登录，再运行：
 
 ```bash
-# 安装浏览器内核
-patchright install chromium
-
-# 重建登录态
-boss logout && boss login
-
-# CDP 诊断
-boss --cdp-url http://localhost:9222 doctor
-
-# Browser Bridge 诊断
-python -m boss_agent_cli.bridge.daemon --serve
-# 在 Chrome 的 chrome://extensions 中加载并启用 extension/ 后，再运行：
-boss doctor
-
-# 默认 status 只检查本地凭据；需要真实只读验证时显式加 --live
-boss status --live
+boss --browser-source existing-browser --cdp-url http://localhost:9222 chat
 ```
 
-**auth_session 显示"损坏"**：登录态来自旧机器指纹或文件损坏 → `boss logout && boss login`
+该来源不新建页面、不导航、不注入 Cookie，也不启动浏览器。CDP 调试端口仅用于本机可信环境，不要暴露到公网或用来绕过平台风控。
 
-**auth_token_quality 各状态含义**：
-- `wt2/stoken 均存在`：完整，可正常使用
-- `wt2 存在，stoken 缺失`：部分可用，通常是二维码或 Cookie 提取只拿到部分登录态；建议以 Chrome CDP 远程调试端口启动浏览器后运行 `boss login --cdp`，或重新执行 `boss login`
-- `wt2 缺失`：无效 → `boss logout && boss login`
-
-**bridge_daemon / bridge_extension 显示 warn**：本地 daemon 未运行或扩展未连接。
-先启动 daemon，确认 19826 端口未被占用，再到 `chrome://extensions` 加载并启用
-`extension/`。Bridge 只用于本地诊断、用户主动登录兼容和只读辅助；命中平台
-风控时应停止自动化访问，不要切换到 Bridge 重试。
-
-</details>
-
-<details>
-<summary>📖 错误码与自动修复</summary>
-
-| 错误码 | 含义 | Agent 自动修复 |
-|--------|------|---------------|
-| `AUTH_REQUIRED` | 未登录 | `boss login` |
-| `AUTH_EXPIRED` | 登录过期 | `boss login` |
-| `RATE_LIMITED` | 频率过高 | 等待后重试 |
-| `TOKEN_REFRESH_FAILED` | Token 刷新失败 | `boss login` |
-| `ACCOUNT_RISK` | 风控拦截 | 停止自动化访问，回到平台官网手动处理 |
-| `COMPLIANCE_BLOCKED` | 默认低风险模式阻断敏感操作 | 回到平台官网手动完成 |
-| `INVALID_PARAM` | 参数错误 | 修正参数 |
-| `ALREADY_GREETED` | 已打过招呼 | 跳过 |
-| `GREET_LIMIT` | 今日次数用完 | 告知用户 |
-| `NETWORK_ERROR` | 网络错误 | 重试 |
-| `AI_NOT_CONFIGURED` | AI 未配置 | `boss ai config` |
-| `PLATFORM_NOT_SUPPORTED` | 当前平台不支持该角色或子命令 | 切换到支持的平台 |
-
-</details>
-
----
+完整检查项、CDP 启动示例与错误码见 **[诊断与排障](docs/troubleshooting.md)**；涉及 Cookie / CDP / patchright / 请求频率 / 接口漂移的问题先读 [平台风险边界](docs/platform-risk.md)。
 
 ## ⚙️ 配置
 
 ```bash
-boss config list            # 查看所有配置
-boss config set default_city 广州   # 设置默认城市
-boss config reset           # 恢复默认
+boss config list                    # 查看所有配置
+boss config set log_level debug     # 设置日志级别
+boss config reset                   # 恢复默认
 ```
 
-<details>
-<summary>📖 完整配置项</summary>
-
-`~/.boss-agent/config.json`：
-
-```json
-{
-  "default_city": null,
-  "default_salary": null,
-  "request_delay": [1.5, 3.0],
-  "batch_greet_delay": [2.0, 5.0],
-  "batch_greet_max": 10,
-  "log_level": "error",
-  "login_timeout": 120,
-  "cdp_url": null,
-  "export_dir": null
-}
-```
-
-| 配置项 | 说明 |
-|--------|------|
-| `default_city` | 默认城市 |
-| `default_salary` | 默认薪资范围 |
-| `request_delay` | 请求间隔（秒），`[min, max]` |
-| `batch_greet_delay` | 批量打招呼间隔 |
-| `batch_greet_max` | 批量打招呼上限 |
-| `log_level` | 日志级别（error/warning/info/debug） |
-| `login_timeout` | 登录超时（秒） |
-| `cdp_url` | CDP 地址 |
-| `export_dir` | 导出目录 |
-
-</details>
-
----
+配置位于 `~/.boss-agent/config.json`：运行模式（`operating_mode=assisted|research`）、请求间隔、批量打招呼间隔、日志级别、CDP 地址、导出目录、平台 / 角色。
 
 ## 🏗️ 技术架构
 
 ```
 CLI (Click)
-    │
-    ├── AuthManager ── 用户主动登录态管理（本地加密）
-    │       └── TokenStore (Fernet + PBKDF2 机器绑定加密)
-    │
-    ├── Platform 抽象层（多平台注册表）
-    │       ├── BossPlatform (求职者) / BossRecruiterPlatform (招聘者)
-    │       ├── ZhilianPlatform (求职者侧登录 + 读写链路已接通，招聘者侧未接入)
-    │       └── QianchengPlatform (51job 占位适配器，统一返回 NOT_SUPPORTED)
-    │
-    ├── Compliance Guardrails ── 默认低风险模式，阻断敏感写操作和候选人个人信息链路
-    │
-    ├── BossClient / BossRecruiterClient ── httpx + 浏览器兼容通道
-    │       ├── RequestThrottle (高斯延迟 + 突发惩罚)
-    │       ├── BrowserSession (CDP / Bridge / patchright，兼容保留)
-    │       └── BOSS 直聘 wapi (求职者 30 端点 + 招聘者 24 端点，共 54 端点)
-    │
-    ├── CacheStore (SQLite WAL)
-    ├── AIService (OpenAI / Anthropic / 兼容 API)
-    └── output.py → JSON 信封 → stdout
+  └─ 兼容运行元数据（assisted / research 均开放已实现能力）
+       └─ AuthManager ── 用户主动登录态（Fernet + PBKDF2 机器绑定加密）
+       └─ Platform 双注册表 ── BossPlatform / BossRecruiterPlatform
+       └─ BossClient ── httpx + 节流（高斯延迟）；兼容 CDP / patchright 登录与导出
+       └─ CacheStore（SQLite WAL） · AIService（OpenAI-compatible / Ollama / vLLM）
+            └─ output.py → JSON 信封 → stdout
 ```
 
-| 层级 | 选型 |
-|------|------|
-| 语言 | Python >= 3.10 |
-| CLI | Click |
-| HTTP | httpx |
-| 浏览器 | patchright / CDP / Bridge（兼容登录和导出；不得用于规避平台风控） |
-| Cookie | browser-cookie3（10+ 浏览器） |
-| 加密 | cryptography (Fernet + PBKDF2) |
-| 数据库 | sqlite3 (WAL 模式) |
-| 渲染 | rich |
-| AI | OpenAI / Anthropic Chat Completions API |
-| 测试 | pytest（1315 项） |
+**不变量**：stdout 仅 JSON 信封 · stderr 仅日志 · `exit 0/1`（可选 `--exit-codes sysexits` 语义化退出码） · 错误含 `code/recoverable/recovery_action` · `boss schema` 为能力真源。
+**双受众提示**：`hints.next_actions` 是给 Agent 执行的后继命令，`hints.operator_actions` 是给真人操作者的自然语言指引（扫码、在浏览器里调整条件等需要离开终端完成的动作）；TTY 下只渲染后者到 stderr，Agent 应把它转述给操作者。
+**命令还是 wizard**：单次、无状态的能力调用走顶层命令；需要跨步骤状态、可恢复、或中途要把指引递给真人的走 `boss wizard`（goal 取值见 `boss schema` 的 `wizard_catalog`）。
+**选型**：Python ≥ 3.11 · Click · httpx · patchright / CDP（登录、导出与声明的浏览器 adapter）· cryptography（Fernet）· sqlite3（WAL）· pytest（2900+ 项）。
 
----
+## 🔌 本地存储
 
-## 🤝 贡献
+所有状态在 `~/.boss-agent/`：加密登录态、搜索缓存、候选池、本地简历、AI 配置与外置模型登记。模型权重不进入 Python 包；除显式发起的 API 调用或本地模型下载外，数据不离开本机。
 
-欢迎提交 Issue 和 Pull Request。
+## 🤝 贡献者
 
-```bash
-# 本地开发
-git clone https://github.com/can4hou6joeng4/boss-agent-cli.git
-cd boss-agent-cli
-uv sync --all-extras
-uv run pytest tests/ -v    # 运行测试
-uv run ruff check src/     # 代码检查
-```
+欢迎 Issue / PR：`git clone` → `feat/xxx` 分支 → 写测试 → `python scripts/quality_baseline.py`（Windows 中文系统可先 `$env:PYTHONUTF8='1'`）→ PR。详见 [CONTRIBUTING.md](CONTRIBUTING.md)，上手路径见 [快速上手](docs/getting-started.md)。
 
-详见 [CONTRIBUTING.md](CONTRIBUTING.md)
+感谢每一位让 boss-agent-cli 变得更好的贡献者，去关注他们！❤️
 
----
+<a href="https://github.com/can4hou6joeng4/boss-agent-cli/graphs/contributors">
+  <img src="./CONTRIBUTORS.svg" alt="贡献者" width="1000" />
+</a>
 
-## 🙏 致谢
+## ❤️ 支持
 
-- [geekgeekrun](https://github.com/geekgeekrun/geekgeekrun) — 早期浏览器自动化经验参考
-- [boss-cli](https://github.com/jackwener/boss-cli) — CLI 结构化输出 + Agent 友好设计
-- [opencli](https://github.com/jackwener/opencli) — Browser Bridge 架构理念
+- 如果它帮到了你，最直接的支持是点一个 [Star ⭐](https://github.com/can4hou6joeng4/boss-agent-cli)，或分享给正在找工作的人。
+- 用出问题、有新想法，欢迎提 [Issue](https://github.com/can4hou6joeng4/boss-agent-cli/issues)；想动手就直接上 PR。
+- 想看看船队的其他船，欢迎靠泊母港 [bobochang.cn](https://bobochang.cn) 🧭，航海记录在[掘金专栏](https://juejin.cn/user/1187904004821262)。
 
----
+本项目受益于 [geekgeekrun](https://github.com/geekgeekrun/geekgeekrun) · [boss-cli](https://github.com/jackwener/boss-cli) · [opencli](https://github.com/jackwener/opencli)，一并致谢。
+
+## ⭐ Star History
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/star-history-dark.svg">
+  <img alt="Star History" src="docs/assets/star-history.svg" width="100%">
+</picture>
+
+由 [mystarhistory](https://github.com/carsteneu/mystarhistory) 本地生成的静态 SVG，与仓库同源、不依赖第三方服务。
 
 ## ⚠️ 免责声明
 
-本项目仅用于学习交流和本地辅助，使用时请遵守相关法律法规、BOSS 直聘平台用户协议和隐私政策。默认低风险模式会阻断自动触达、批量操作、规避风控和候选人个人信息处理链路；任何投递、沟通、联系方式交换、招聘者候选人处理都应回到平台官网由用户手动完成。因不当使用产生的一切后果由使用者自行承担，与本项目作者无关。
+使用时请遵守适用法律、平台协议和隐私要求。对批量触达、候选人个人数据和浏览器适配设置明确的输入、数量、超时和停止条件，并妥善保护本地凭据与导出产物。因不当使用产生的后果由使用者自行承担，与项目作者无关。
 
----
+## 📑 许可证 & 友情链接
 
-## 📑 许可证
-
-[MIT](LICENSE)
-
-## 👭 友情链接
-
-- [LINUX DO - 新的理想型社区](https://linux.do/)
+[MIT](LICENSE) © [can4hou6joeng4](https://github.com/can4hou6joeng4) · 友链 [LINUX DO](https://linux.do/)

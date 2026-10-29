@@ -3,10 +3,9 @@ import click
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.cache.store import CacheStore
 from boss_agent_cli.commands._platform import get_platform_instance
-from boss_agent_cli.display import error_contract_for_code, handle_auth_errors, handle_error_output, handle_output, render_job_detail
+from boss_agent_cli.services.job_card import build_job_from_card
+from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_error_output, handle_not_supported, handle_output, handle_platform_error_output, render_job_detail
 from boss_agent_cli.index_cache import get_index_info, get_job_by_index
-
-NOT_SUPPORTED_RECOVERY_ACTION = "切换平台或调整命令参数后重试"
 
 
 @click.command("show")
@@ -37,6 +36,7 @@ def show_cmd(ctx: click.Context, index: int) -> None:
 		return
 
 	security_id = job.get("security_id", "")
+	lid = job.get("lid") or ""
 	if not security_id:
 		handle_error_output(
 			ctx, "show",
@@ -48,26 +48,12 @@ def show_cmd(ctx: click.Context, index: int) -> None:
 	auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
 	with get_platform_instance(ctx, auth) as platform:
 		try:
-			raw = platform.job_card(security_id)
+			raw = platform.job_card(security_id, lid)
 		except NotImplementedError as exc:
-			handle_error_output(
-				ctx, "show",
-				code="NOT_SUPPORTED",
-				message=str(exc) or "当前平台不支持职位详情能力",
-				recoverable=True,
-				recovery_action=NOT_SUPPORTED_RECOVERY_ACTION,
-			)
+			handle_not_supported(ctx, "show", exc, fallback_message="当前平台不支持职位详情能力")
 			return
 		if not platform.is_success(raw):
-			code, message = platform.parse_error(raw)
-			recoverable, recovery_action = error_contract_for_code(code)
-			handle_error_output(
-				ctx, "show",
-				code=code,
-				message=message or "职位详情获取失败",
-				recoverable=recoverable,
-				recovery_action=recovery_action,
-			)
+			handle_platform_error_output(ctx, "show", platform, raw, fallback_message="职位详情获取失败")
 			return
 
 	platform_data = platform.unwrap_data(raw) or {}
@@ -80,36 +66,21 @@ def show_cmd(ctx: click.Context, index: int) -> None:
 		)
 		return
 
-	job_id = card.get("encryptJobId", "")
-
 	with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
 		greeted = cache.is_greeted(security_id)
 
-	result = {
-		"job_id": job_id,
-		"title": card.get("jobName", ""),
-		"company": card.get("brandName", ""),
-		"salary": card.get("salaryDesc", ""),
-		"city": card.get("cityName", ""),
-		"experience": card.get("experienceName", ""),
-		"education": card.get("degreeName", ""),
-		"description": card.get("postDescription", ""),
-		"address": card.get("address", ""),
-		"skills": card.get("jobLabels", []),
-		"boss_name": card.get("bossName", ""),
-		"boss_title": card.get("bossTitle", ""),
-		"boss_active": card.get("activeTimeDesc", "离线"),
-		"security_id": security_id,
-		"greeted": greeted,
-		"index": index,
-	}
+	result = build_job_from_card(card, security_id=security_id, greeted=greeted, lid=lid)
+	result["index"] = index
 
-	manual_handoff = "如需投递或沟通，请回到 BOSS 直聘官方页面由用户手动完成"
-	hints = {"next_actions": [manual_handoff, "boss search <query>"]}
+	next_action = (
+		f"{boss_command_for_ctx(ctx, 'apply <security_id> <job_id>')} 或 "
+		f"{boss_command_for_ctx(ctx, 'greet <security_id> <job_id>')}"
+	)
+	hints = {"next_actions": [next_action, "boss search <query>"]}
 	handle_output(
 		ctx,
 		"show",
 		result,
-		render=lambda data: render_job_detail(data, greet_command=manual_handoff),
+		render=lambda data: render_job_detail(data, greet_command=next_action),
 		hints=hints,
 	)

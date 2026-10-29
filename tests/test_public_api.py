@@ -22,6 +22,7 @@ EXPECTED_EXPORTS = {
 	"BossClient",
 	"AuthError",
 	"AccountRiskError",
+	"EnvironmentRiskError",
 	"JobItem",
 	"JobDetail",
 	"CacheStore",
@@ -31,8 +32,6 @@ EXPECTED_EXPORTS = {
 	"ResumeFile",
 	"Platform",
 	"BossPlatform",
-	"QianchengPlatform",
-	"ZhilianPlatform",
 	"get_platform",
 	"list_platforms",
 }
@@ -71,6 +70,12 @@ def test_all_is_defined(boss_agent_cli):
 
 def test_all_matches_expected_exports(boss_agent_cli):
 	assert set(boss_agent_cli.__all__) == EXPECTED_EXPORTS
+
+
+def test_removed_zhilian_platform_is_not_exported(boss_agent_cli):
+	"""智联平台已移除：公开 API 不再提供 ZhilianPlatform。"""
+	assert "ZhilianPlatform" not in boss_agent_cli.__all__
+	assert not hasattr(boss_agent_cli, "ZhilianPlatform")
 
 
 def test_every_export_is_actually_importable(boss_agent_cli):
@@ -172,6 +177,25 @@ def test_version_is_semver_string(boss_agent_cli):
 	assert len(parts) == 3, f"版本应为 X.Y.Z 格式，实际为 {version}"
 	for part in parts:
 		assert part.isdigit(), f"版本各段应为数字，实际为 {part}"
+
+
+def test_package_version_matches_pyproject_and_cli(boss_agent_cli):
+	"""包版本、pyproject 版本与 CLI --version 必须同步。"""
+	import pathlib
+	import re
+
+	from click.testing import CliRunner
+	from boss_agent_cli.main import cli
+
+	root = pathlib.Path(__file__).resolve().parents[1]
+	pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+	match = re.search(r'^version = "([^"]+)"$', pyproject, re.MULTILINE)
+	assert match is not None
+	assert boss_agent_cli.__version__ == match.group(1)
+
+	result = CliRunner().invoke(cli, ["--version"])
+	assert result.exit_code == 0
+	assert boss_agent_cli.__version__ in result.output
 
 
 # ── py.typed marker ──────────────────────────────────────

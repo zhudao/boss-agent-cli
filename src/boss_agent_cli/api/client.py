@@ -1,37 +1,13 @@
 import atexit
-import random
-import time
-import weakref
-from types import TracebackType
-from typing import TYPE_CHECKING, Any, cast
-
-import httpx
+from typing import Any
 
 from boss_agent_cli.api import endpoints
-from boss_agent_cli.api.httpx_helpers import (
-	add_stoken_to_get_params,
-	browser_headers,
-	merge_response_cookies,
-	referer_header,
-)
-from boss_agent_cli.api.throttle import RequestThrottle
-
-if TYPE_CHECKING:
-	from boss_agent_cli.api.browser_client import BrowserSession
-	from boss_agent_cli.auth.manager import AuthManager
-
-_MAX_RETRIES = 3
+from boss_agent_cli.api._base_client import _BaseHttpClient
+from boss_agent_cli.api.httpx_helpers import make_client_registry
+from boss_agent_cli.api.zhipin_errors import classify_code_37
 
 # atexit safeguard: close any BossClient instances not explicitly closed
-_OPEN_CLIENTS: weakref.WeakSet["BossClient"] = weakref.WeakSet()
-
-
-def _close_open_clients() -> None:
-	for client in list(_OPEN_CLIENTS):
-		try:
-			client.close()
-		except Exception:
-			pass
+_OPEN_CLIENTS, _close_open_clients = make_client_registry()
 
 
 atexit.register(_close_open_clients)
@@ -41,132 +17,150 @@ class AuthError(Exception):
 	pass
 
 
-class AccountRiskError(Exception):
-	"""BOSS 直聘风控拦截（code 36）：检测到异常行为。"""
+class PlatformRiskError(Exception):
+	"""平台风控类异常的共同基类：命中即终止，不重试、不换通道、不继续下一项。
 
-	def __init__(self, message: str = "", is_cdp: bool = False):
+	执行器（福利筛选线程池、batch-greet、wizard runner）统一按本基类捕获，
+	新增一个风控码只需在此登记子类，不必逐个执行器加分支（Issue #419）。
+	``code`` 是信封里的稳定错误码，与 ``SCHEMA_DATA["error_codes"]`` 一一对应。
+	"""
+
+	code: str = "ACCOUNT_RISK"
+
+	def __init__(self, message: str = "", is_cdp: bool = False, *, details: dict[str, Any] | None = None):
 		self.is_cdp = is_cdp
+		self.details = details or {}
 		super().__init__(message)
 
+	@staticmethod
+	def from_lock(lock: Any) -> "PlatformRiskError":
+		"""本地阻断保留原始账号/环境风险；旧环境锁继续使用历史错误码。"""
+		from boss_agent_cli.api.cdp_risk_lock import UNLOCK_OPERATOR_ACTIONS
 
-class BossClient:
+		reason = getattr(lock, "reason", "ENVIRONMENT_RISK")
+		platform_code = getattr(lock, "platform_code", 37)
+		cause = (
+			"身份资料流程"
+			if platform_code == 38
+			else "IP/访问环境限制"
+			if platform_code == 31
+			else "账号访问限制"
+			if platform_code == 32
+			else "账号风险"
+			if reason == "ACCOUNT_RISK"
+			else "访问环境风险"
+		)
+		if platform_code is not None:
+			cause += f" (code {platform_code})"
+		if getattr(lock, "corrupt", False):
+			cause = "本地风控锁文件无法解析"
+		steps = "；".join(UNLOCK_OPERATOR_ACTIONS)
+		error_cls = AccountRiskError if reason == "ACCOUNT_RISK" else EnvironmentRiskLockedError
+		return error_cls(
+			f"BOSS 直聘此前命中{cause}，本地风控锁尚未显式解除，本次请求未发送。{steps}。",
+			is_cdp=bool(getattr(lock, "cdp_url", None)),
+			details={
+				"risk_lock": {
+					"locked": True,
+					"reason": reason,
+					"platform_code": platform_code,
+					"explicit_resume_required": True,
+					"corrupt": bool(getattr(lock, "corrupt", False)),
+				}
+			},
+		)
+
+
+class AccountRiskError(PlatformRiskError):
+	"""BOSS 直聘账号侧需人工处理的拦截（code 32/35/36、安全页或身份资料流程）。"""
+
+	code = "ACCOUNT_RISK"
+
+
+class EnvironmentRiskError(PlatformRiskError):
+	"""BOSS 直聘访问环境/IP 风控（code 31/37），不等同于登录过期。"""
+
+	code = "ENVIRONMENT_RISK"
+
+
+class EnvironmentRiskLockedError(EnvironmentRiskError):
+	"""环境风险锁尚未由用户显式解除：任何传输通道均在本地拒绝发送。
+
+	继承 ``EnvironmentRiskError``，所有按风控终止的执行器无需改动即可停下。
+	"""
+
+	code = "ENVIRONMENT_RISK_LOCKED"
+
+
+#: 风控错误码 → 异常类。平台 adapter 的 ``parse_error`` 走响应字典路径时返回的是码，
+#: 执行器用这张表把码升格为异常，与浏览器通道抛出的异常形态走同一条终止分支。
+RISK_ERROR_BY_CODE: dict[str, type[PlatformRiskError]] = {
+	AccountRiskError.code: AccountRiskError,
+	EnvironmentRiskError.code: EnvironmentRiskError,
+	EnvironmentRiskLockedError.code: EnvironmentRiskLockedError,
+}
+
+
+class BossClient(_BaseHttpClient):
 	"""Hybrid API client: browser channel for high-risk ops, httpx for low-risk ops."""
 
-	def __init__(self, auth_manager: "AuthManager", *, delay: tuple[float, float] = (1.5, 3.0), cdp_url: str | None = None) -> None:
-		self._auth = auth_manager
-		self._delay = delay
-		self._client: httpx.Client | None = None
-		self._browser_session: "BrowserSession | None" = None
-		self._throttle = RequestThrottle(delay)
-		self._cdp_url = cdp_url
-		self._closed = False
+	_BASE_URL = endpoints.BASE_URL
+	_DEFAULT_HEADERS = endpoints.DEFAULT_HEADERS
+	_REFERER_MAP = endpoints.REFERER_MAP
+	_AUTH_ERROR_CLS = AuthError
+	_CODE_STOKEN_EXPIRED = endpoints.CODE_STOKEN_EXPIRED
+	_CODE_RATE_LIMITED = endpoints.CODE_RATE_LIMITED
+
+	def _register(self) -> None:
 		_OPEN_CLIENTS.add(self)
 
-	def _get_client(self) -> httpx.Client:
-		if self._client is None:
-			token = self._auth.get_token()
-			headers = browser_headers(endpoints.DEFAULT_HEADERS, token)
-			self._client = httpx.Client(
-				base_url=endpoints.BASE_URL,
-				cookies=token.get("cookies", {}),
-				headers=headers,
-				follow_redirects=True,
-				timeout=30,
-			)
-		return self._client
+	def _unregister(self) -> None:
+		_OPEN_CLIENTS.discard(self)
 
-	def _get_browser(self) -> "BrowserSession":
-		if self._browser_session is None:
-			from boss_agent_cli.api.browser_client import BrowserSession
-			token = self._auth.get_token()
-			self._browser_session = BrowserSession(
-				cookies=token.get("cookies", {}),
-				user_agent=token.get("user_agent", ""),
-				delay=self._delay,
-				cdp_url=self._cdp_url,
-				logger=getattr(self._auth, '_logger', None),
-			)
-		return self._browser_session
-
-	# ── Anti-detection delays (httpx channel) ────────────────────────
-
-	def _headers_for(self, url: str) -> dict[str, str]:
-		return referer_header(url, endpoints.REFERER_MAP, f"{endpoints.BASE_URL}/")
-
-	def _merge_cookies(self, resp: httpx.Response) -> None:
-		merge_response_cookies(self._get_client(), resp)
-
-	# ── httpx request (low-risk ops) ─────────────────────────────────
-
-	def _request(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
-		"""httpx 请求，循环重试（最多 _MAX_RETRIES 次），替代递归调用。"""
-		for attempt in range(_MAX_RETRIES + 1):
-			client = self._get_client()
-			token = self._auth.get_token()
-			stoken = token.get("stoken", "")
-
-			add_stoken_to_get_params(method, kwargs, stoken)
-
-			self._throttle.wait()
-
-			extra_headers = self._headers_for(url)
-			resp = client.request(method, url, headers=extra_headers, **kwargs)
-			self._throttle.mark()
-			self._merge_cookies(resp)
-
-			# 403 或安全验证 → 刷新 token 重试
-			if resp.status_code == 403 or "安全验证" in resp.text:
-				if attempt >= _MAX_RETRIES:
-					raise AuthError("Token 刷新后仍被拒绝，请重新登录")
-				backoff = (2 ** attempt) + random.uniform(0.5, 1.5)
-				time.sleep(backoff)
-				self._auth.force_refresh(cdp_url=self._cdp_url)
-				self._client = None
-				continue
-
-			resp.raise_for_status()
-			data = resp.json()
-			code = data.get("code")
-
-			# stoken 过期 → 刷新重试
-			if code == endpoints.CODE_STOKEN_EXPIRED and attempt < _MAX_RETRIES:
-				backoff = (2 ** attempt) + random.uniform(0.5, 1.5)
-				time.sleep(backoff)
-				self._auth.force_refresh(cdp_url=self._cdp_url)
-				self._client = None
-				continue
-
-			# 频率限制 → 冷却重试
-			if code == endpoints.CODE_RATE_LIMITED and attempt < _MAX_RETRIES:
-				cooldown = min(60, 10 * (2 ** attempt))
-				time.sleep(cooldown)
-				continue
-
-			return cast("dict[str, Any]", data)
-
-		raise AuthError("请求失败，已达最大重试次数")
+	def _should_refresh_token_response(self, data: dict[str, Any]) -> bool:
+		return data.get("code") == endpoints.CODE_STOKEN_EXPIRED and classify_code_37(data) == "token_expired"
 
 	# ── Browser request (high-risk ops) ──────────────────────────────
 
-	def _browser_request(self, method: str, url: str, *, params: dict[str, Any] | None = None, data: dict[str, Any] | None = None) -> dict[str, Any]:
-		result = self._get_browser().request(method, url, params=params, data=data)
-		code = result.get("code")
-		if code == endpoints.CODE_ACCOUNT_RISK:
-			msg = result.get("message", "账户存在异常行为")
-			browser = self._get_browser()
-			is_cdp = getattr(browser, "_is_cdp", False)
-			mode = "CDP" if is_cdp else ("Bridge" if getattr(browser, "_is_bridge", False) else "headless patchright")
-			raise AccountRiskError(
-				f"BOSS 直聘风控拦截 (code {code}): {msg}。"
-				f"当前浏览器模式: {mode}。"
-				f"建议：停止自动化访问并回到 BOSS 直聘官方页面手动处理。",
-				is_cdp=is_cdp,
-			)
+	def _browser_request(
+		self,
+		method: str,
+		url: str,
+		*,
+		params: dict[str, Any] | None = None,
+		data: dict[str, Any] | None = None,
+		browser_source: str | None = None,
+	) -> dict[str, Any]:
+		# 单次请求，不重试：浏览器通道的 stoken 由页面 JS 生成，force_refresh 拿不到新凭证，
+		# 重试只是对已被风控拦截的高风险端点再打一次（见 docs/research/platforms/zhipin.md 红线）。
+		self._check_cdp_risk_lock()
+		browser = self._get_browser(browser_source=browser_source)
+		try:
+			result = browser.request(method, url, params=params, data=data)
+		except PlatformRiskError as exc:
+			self._record_cdp_risk_lock(browser, error=exc)
+			raise
+		self._raise_platform_risk_response(result, browser=browser)
 		return result
+
+	def _read_request(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+		"""显式非 auto 来源才走浏览器；默认保留 httpx 的认证与重试语义。
+
+		缺少本地凭据仍返回 AUTH_REQUIRED，浏览器请求不继承 httpx 的
+		stoken 刷新或限流重试循环。
+		"""
+		from boss_agent_cli.api.browser_source import resolve_policy
+
+		configured = resolve_policy(self._browser_source)
+		if configured.name != "auto":
+			return self._browser_request(method, url, browser_source=configured.name, **kwargs)
+		return self._request(method, url, **kwargs)
 
 	# ── Public API ───────────────────────────────────────────────────
 	# High-risk: search, recommend, greet, job_card → browser channel
-	# Low-risk: status, me, cities, schema, detail → httpx channel
+	# Low-risk: status, me, cities, schema, detail → httpx channel.
+	# CDP / 显式浏览器来源下（is_browser_only），httpx 通道的请求统一改走浏览器，
+	# 见 _BaseHttpClient._request。
 
 	def search_jobs(self, query: str, **filters: Any) -> dict[str, Any]:
 		params: dict[str, Any] = {"query": query, "page": filters.get("page", 1)}
@@ -230,11 +224,16 @@ class BossClient:
 		return self._browser_request("POST", endpoints.GREET_URL, data=data)
 
 	def job_card(self, security_id: str, lid: str = "") -> dict[str, Any]:
-		"""httpx 优先 + 浏览器降级获取职位卡片信息。"""
+		"""httpx 优先 + 浏览器降级获取职位卡片信息；CDP 模式下只走浏览器。"""
+		if self.is_browser_only():
+			return self.job_card_browser(security_id, lid)
 		try:
 			return self.job_card_httpx(security_id, lid)
-		except Exception:
-			pass
+		except Exception as error:
+			from boss_agent_cli.api.request_budget import is_request_stop
+
+			if is_request_stop(error):
+				raise
 		params = {"securityId": security_id, "lid": lid}
 		return self._browser_request("GET", endpoints.JOB_CARD_URL, params=params)
 
@@ -242,6 +241,16 @@ class BossClient:
 		"""通过 httpx 通道获取职位卡片信息（低延迟）。"""
 		params = {"securityId": security_id, "lid": lid}
 		return self._request("GET", endpoints.JOB_CARD_URL, params=params)
+
+	def job_card_browser(self, security_id: str, lid: str = "") -> dict[str, Any]:
+		"""经浏览器通道获取职位卡片信息（强制浏览器，不走 httpx）。
+
+		与 job_card() 的区别：job_card() httpx 优先，仅 httpx 抛异常才降级浏览器；
+		而部分失败以响应字典返回时不抛异常，导致 httpx 通道拿不到完整 JD。
+		job_card_browser() 跳过 httpx，直接走浏览器通道。
+		"""
+		params = {"securityId": security_id, "lid": lid}
+		return self._browser_request("GET", endpoints.JOB_CARD_URL, params=params)
 
 	# ── Low-risk: httpx channel ──────────────────────────────────────
 
@@ -262,9 +271,14 @@ class BossClient:
 		params = {"page": page}
 		return self._request("GET", endpoints.DELIVER_LIST_URL, params=params)
 
+	def job_favorites(self, page: int = 1, tag: int = 4, is_active: bool = True) -> dict[str, Any]:
+		"""获取职位收藏列表（geekGetJob?tag=4，与 deliver_list 同级 wapi 只读 GET）。"""
+		params = {"page": page, "tag": tag, "isActive": "true" if is_active else "false"}
+		return self._request("GET", endpoints.GEEK_GET_JOB_URL, params=params)
+
 	def friend_list(self, page: int = 1) -> dict[str, Any]:
 		params = {"page": page}
-		return self._request("GET", endpoints.FRIEND_LIST_URL, params=params)
+		return self._read_request("GET", endpoints.FRIEND_LIST_URL, params=params)
 
 	def interview_data(self) -> dict[str, Any]:
 		return self._request("GET", endpoints.INTERVIEW_DATA_URL)
@@ -276,9 +290,11 @@ class BossClient:
 	def chat_history(self, gid: str, security_id: str, *, page: int = 1, count: int = 20) -> dict[str, Any]:
 		"""获取与指定好友的聊天消息历史。"""
 		params = {"gid": gid, "securityId": security_id, "page": page, "c": count, "src": 0}
-		return self._request("GET", endpoints.CHAT_HISTORY_URL, params=params)
+		return self._read_request("GET", endpoints.CHAT_HISTORY_URL, params=params)
 
-	def friend_label(self, friend_id: str, label_id: int, friend_source: int = 0, *, remove: bool = False) -> dict[str, Any]:
+	def friend_label(
+		self, friend_id: str, label_id: int, friend_source: int = 0, *, remove: bool = False
+	) -> dict[str, Any]:
 		"""添加或移除好友标签。"""
 		url = endpoints.FRIEND_LABEL_DELETE_URL if remove else endpoints.FRIEND_LABEL_ADD_URL
 		params = {"friendId": friend_id, "friendSource": friend_source, "labelId": label_id}
@@ -297,29 +313,3 @@ class BossClient:
 		"""查询与某招聘者的互动关系（是否已打招呼等）。"""
 		params = {"securityId": security_id}
 		return self._request("GET", endpoints.GEEK_GET_JOB_URL, params=params)
-
-	# ── Lifecycle ────────────────────────────────────────────────────
-
-	def close(self) -> None:
-		"""Release httpx client and browser session. Idempotent."""
-		if self._closed:
-			return
-		self._closed = True
-		if self._browser_session:
-			self._browser_session.close()
-			self._browser_session = None
-		if self._client:
-			self._client.close()
-			self._client = None
-		_OPEN_CLIENTS.discard(self)
-
-	def __enter__(self) -> "BossClient":
-		return self
-
-	def __exit__(
-		self,
-		exc_type: type[BaseException] | None,
-		exc_val: BaseException | None,
-		exc_tb: TracebackType | None,
-	) -> None:
-		self.close()

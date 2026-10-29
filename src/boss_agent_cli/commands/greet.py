@@ -3,6 +3,7 @@ import time
 
 import click
 
+from boss_agent_cli.api.client import RISK_ERROR_BY_CODE, PlatformRiskError
 from boss_agent_cli.api.endpoints import (
 	INDUSTRY_CODES,
 	JOB_TYPE_CODES,
@@ -20,7 +21,10 @@ from boss_agent_cli.display import (
 	handle_output,
 	render_batch_operation_summary,
 	render_message_panel,
+	risk_error_contract,
 )
+from boss_agent_cli.search_filters import SearchFilterCriteria, prefilter_platform_job_type
+from boss_agent_cli.services.job_identity import deduplicate_job_result
 
 
 @click.command("greet")
@@ -150,9 +154,23 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 				return
 			platform_data = platform.unwrap_data(raw) or {}
 			job_list = platform_data.get("jobList", [])
+			criteria = SearchFilterCriteria(
+				query=query,
+				city=city,
+				salary=salary,
+				experience=experience,
+				education=education,
+				industry=industry,
+				scale=scale,
+				stage=stage,
+				job_type=job_type,
+			)
 
 			candidates = []
-			for raw_item in job_list:
+			for raw_item in deduplicate_job_result(job_list):
+				matches, _ = prefilter_platform_job_type(raw_item, criteria, platform_name=platform.name)
+				if not matches:
+					continue
 				item = JobItem.from_api(raw_item)
 				if not cache.is_greeted(item.security_id):
 					candidates.append(item)
@@ -173,6 +191,7 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 
 			results = []
 			stopped_reason = None
+			risk_error: PlatformRiskError | None = None
 
 			for idx, item in enumerate(candidates):
 				retry_count = 0
@@ -182,7 +201,12 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 					try:
 						resp = platform.greet(item.security_id, item.job_id)
 						if not platform.is_success(resp):
-							error_code, _ = platform.parse_error(resp)
+							error_code, error_message = platform.parse_error(resp)
+							risk_cls = RISK_ERROR_BY_CODE.get(error_code)
+							if risk_cls is not None:
+								# 响应字典形态的风控与异常形态走同一条终止分支，
+								# 不再靠 message 里的「频率」字样误判成 RATE_LIMITED（Issue #419）。
+								raise risk_cls(error_message or error_code)
 							raise RuntimeError(error_code if error_code != "UNKNOWN" else (resp.get("message") or "greet failed"))
 						cache.record_greet(item.security_id, item.job_id)
 						results.append({
@@ -194,6 +218,12 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 						})
 						success = True
 						logger.info(f"打招呼成功: {item.title} @ {item.company}")
+						break
+					except PlatformRiskError as exc:
+						# 风控：立即停批，不重试、不 sleep、不继续下一个候选人。
+						risk_error = exc
+						stopped_reason = exc.code
+						logger.warning(f"平台风控，停止批量打招呼: {item.title} @ {item.company}")
 						break
 					except Exception as e:
 						error_msg = str(e)
@@ -233,6 +263,22 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 			}
 			if stopped_reason:
 				data["stopped_reason"] = stopped_reason
+
+			if risk_error is not None:
+				# 停批原因是风控时信封必须是 ok:false + 对应错误码 + recoverable=false，
+				# 而不是 ok:true + stopped_reason——后者会让 Agent 当成「等一会儿重试」。
+				# 已成功的部分随 details 带回，避免 Agent 对同一批候选人重复打招呼。
+				recovery_action, hints = risk_error_contract(risk_error.code)
+				handle_error_output(
+					ctx, "batch-greet",
+					code=risk_error.code,
+					message=str(risk_error) or risk_error.code,
+					recoverable=False,
+					recovery_action=recovery_action,
+					details=data,
+					hints=hints or None,
+				)
+				return
 
 			handle_output(
 				ctx, "batch-greet", data,

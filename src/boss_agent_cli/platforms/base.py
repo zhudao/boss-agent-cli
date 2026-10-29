@@ -48,6 +48,16 @@ class Platform(ABC):
 		if callable(close_fn):
 			close_fn()
 
+	def is_browser_only(self) -> bool:
+		"""平台请求是否只能走浏览器通道（CDP 模式）；为 True 时调用方不得并发发请求。
+
+		默认委托 client 的同名方法；client 没有该能力（纯 httpx 平台）时为 False。
+		"""
+		check = getattr(self._client, "is_browser_only", None)
+		if not callable(check):
+			return False
+		return check() is True
+
 	def __enter__(self) -> "Platform":
 		return self
 
@@ -112,8 +122,6 @@ class Platform(ABC):
 		"""判断响应是否成功。
 
 		- BOSS: ``code == 0``
-		- 智联: ``code == 200``
-		- 猎聘: ``flag == 1``
 		"""
 
 	@abstractmethod
@@ -121,8 +129,6 @@ class Platform(ABC):
 		"""从响应包络提取 data。
 
 		- BOSS: ``response["zpData"]``
-		- 智联: ``response["data"]``
-		- 猎聘: ``response["data"]``
 		"""
 
 	@abstractmethod
@@ -130,7 +136,13 @@ class Platform(ABC):
 		"""解析错误响应，返回 (统一错误码, 原始消息)。
 
 		统一错误码对齐 CLAUDE.md 错误码枚举：
-		AUTH_EXPIRED / RATE_LIMITED / TOKEN_REFRESH_FAILED / ACCOUNT_RISK / UNKNOWN。
+		AUTH_EXPIRED / RATE_LIMITED / TOKEN_REFRESH_FAILED / ACCOUNT_RISK / ENVIRONMENT_RISK / UNKNOWN。
+
+		这里只枚举**从平台响应体解析出来**的码。通道 / 来源类失败
+		（``CDP_UNAVAILABLE``、``BROWSER_SESSION_NOT_FOUND`` 等）由 CLI 自身的
+		浏览器或传输状态产生，走「模块层抛 typed exception →
+		``display.handle_auth_errors`` 转信封」这条路径，根本不经过本方法，
+		所以它们出现在 ``SCHEMA_DATA["error_codes"]`` 里但不应加进这个列表。
 		"""
 
 	@abstractmethod
@@ -162,6 +174,10 @@ class Platform(ABC):
 	def deliver_list(self, page: int = 1) -> dict[str, Any]:
 		"""获取投递记录。"""
 		raise NotImplementedError(f"{self.name} platform does not implement deliver_list")
+
+	def job_favorites(self, page: int = 1, tag: int = 4, is_active: bool = True) -> dict[str, Any]:
+		"""获取职位收藏列表（用户主动同步到本地 shortlist 用，只读 GET）。"""
+		raise NotImplementedError(f"{self.name} platform does not implement job_favorites")
 
 	# ── 职位卡片（详情降级通道）──
 

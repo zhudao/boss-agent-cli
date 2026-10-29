@@ -1,10 +1,13 @@
 import hashlib
 import json
+import secrets
 import sqlite3
 import time
 from pathlib import Path
 from types import TracebackType
-from typing import Any, cast
+from typing import Any, Literal, cast
+
+from boss_agent_cli.services.job_identity import deduplicate_job_result
 
 _SEARCH_TTL = 86400  # 24 hours
 _MAX_SEARCH_CACHE = 100
@@ -26,9 +29,21 @@ class CacheStore:
 				job_id TEXT NOT NULL,
 				greeted_at REAL NOT NULL
 			);
+			CREATE TABLE IF NOT EXISTS recruiter_greet_records (
+				geek_id TEXT NOT NULL,
+				job_id TEXT NOT NULL,
+				status TEXT NOT NULL,
+				updated_at REAL NOT NULL,
+				PRIMARY KEY (geek_id, job_id)
+			);
 			CREATE TABLE IF NOT EXISTS search_cache (
 				cache_key TEXT PRIMARY KEY,
 				response TEXT NOT NULL,
+				created_at REAL NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS job_desc_cache (
+				job_id TEXT PRIMARY KEY,
+				description TEXT NOT NULL,
 				created_at REAL NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS saved_searches (
@@ -59,6 +74,9 @@ class CacheStore:
 				city TEXT NOT NULL,
 				salary TEXT NOT NULL,
 				source TEXT NOT NULL,
+				tags TEXT DEFAULT '',
+				note TEXT DEFAULT '',
+				lid TEXT NOT NULL DEFAULT '',
 				created_at REAL NOT NULL,
 				PRIMARY KEY (security_id, job_id)
 			);
@@ -90,7 +108,461 @@ class CacheStore:
 				applicant_count INTEGER DEFAULT 0,
 				cached_at TEXT
 			);
-		""")
+			CREATE TABLE IF NOT EXISTS crawl_runs (
+				run_id TEXT PRIMARY KEY,
+				params TEXT NOT NULL,
+				status TEXT NOT NULL,
+				stop_requested INTEGER NOT NULL DEFAULT 0,
+				requests_attempted INTEGER NOT NULL DEFAULT 0,
+				detail_requests_attempted INTEGER NOT NULL DEFAULT 0,
+				elapsed_seconds INTEGER NOT NULL DEFAULT 0,
+				next_page INTEGER NOT NULL,
+				list_finished INTEGER NOT NULL DEFAULT 0,
+				output_dir TEXT NOT NULL,
+				error TEXT NOT NULL DEFAULT '',
+				hook_results TEXT NOT NULL DEFAULT '[]',
+				created_at REAL NOT NULL,
+				updated_at REAL NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS crawl_jobs (
+				run_id TEXT NOT NULL,
+				job_key TEXT NOT NULL,
+				selector TEXT,
+				page_no INTEGER NOT NULL,
+				payload TEXT NOT NULL,
+				detail_done INTEGER NOT NULL DEFAULT 0,
+				updated_at REAL NOT NULL,
+				PRIMARY KEY (run_id, job_key)
+			);
+				CREATE TABLE IF NOT EXISTS crawl_budget (
+					budget_key TEXT PRIMARY KEY,
+					last_request_at REAL NOT NULL
+				);
+				CREATE TABLE IF NOT EXISTS workflow_runs (
+					run_id TEXT PRIMARY KEY,
+					role TEXT NOT NULL,
+					platform TEXT NOT NULL,
+					goal TEXT NOT NULL,
+					mode TEXT NOT NULL,
+					status TEXT NOT NULL,
+					current_step TEXT,
+					params TEXT NOT NULL,
+					last_result TEXT,
+					error TEXT,
+					created_at REAL NOT NULL,
+					updated_at REAL NOT NULL
+				);
+				CREATE TABLE IF NOT EXISTS workflow_steps (
+					run_id TEXT NOT NULL,
+					step_name TEXT NOT NULL,
+					ordinal INTEGER NOT NULL,
+					status TEXT NOT NULL,
+					result TEXT,
+					error TEXT,
+					started_at REAL,
+					finished_at REAL,
+					PRIMARY KEY (run_id, step_name)
+				);
+				CREATE INDEX IF NOT EXISTS workflow_steps_run_ordinal
+					ON workflow_steps(run_id, ordinal);
+			""")
+		self._migrate_shortlist_records()
+		self._migrate_crawl_runs()
+		self._migrate_crawl_jobs()
+
+	def _migrate_shortlist_records(self) -> None:
+		columns = {
+			row[1]
+			for row in self._conn.execute("PRAGMA table_info(shortlist_records)").fetchall()
+		}
+		if "tags" not in columns:
+			self._conn.execute("ALTER TABLE shortlist_records ADD COLUMN tags TEXT DEFAULT ''")
+		if "note" not in columns:
+			self._conn.execute("ALTER TABLE shortlist_records ADD COLUMN note TEXT DEFAULT ''")
+		if "lid" not in columns:
+			# 未记录的访问上下文保持未知；不按 job_id 合并或替换历史记录。
+			self._conn.execute("ALTER TABLE shortlist_records ADD COLUMN lid TEXT NOT NULL DEFAULT ''")
+		self._conn.commit()
+
+	def _migrate_crawl_runs(self) -> None:
+		columns = {
+			row[1]
+			for row in self._conn.execute("PRAGMA table_info(crawl_runs)").fetchall()
+		}
+		if "list_finished" not in columns:
+			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN list_finished INTEGER NOT NULL DEFAULT 0")
+		if "stop_requested" not in columns:
+			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0")
+		if "requests_attempted" not in columns:
+			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN requests_attempted INTEGER NOT NULL DEFAULT 0")
+		if "detail_requests_attempted" not in columns:
+			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN detail_requests_attempted INTEGER NOT NULL DEFAULT 0")
+		if "elapsed_seconds" not in columns:
+			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN elapsed_seconds INTEGER NOT NULL DEFAULT 0")
+		if "hook_results" not in columns:
+			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN hook_results TEXT NOT NULL DEFAULT '[]'")
+		self._conn.commit()
+
+	def _migrate_crawl_jobs(self) -> None:
+		columns = {row[1] for row in self._conn.execute("PRAGMA table_info(crawl_jobs)").fetchall()}
+		if "selector" not in columns:
+			self._conn.execute("ALTER TABLE crawl_jobs ADD COLUMN selector TEXT")
+		missing = self._conn.execute(
+			"SELECT run_id, job_key FROM crawl_jobs WHERE selector IS NULL OR selector = ''"
+		).fetchall()
+		for run_id, job_key in missing:
+			self._conn.execute(
+				"UPDATE crawl_jobs SET selector = ? WHERE run_id = ? AND job_key = ?",
+				(self._new_crawl_selector(), run_id, job_key),
+			)
+		self._conn.execute(
+			"CREATE UNIQUE INDEX IF NOT EXISTS crawl_jobs_run_selector ON crawl_jobs(run_id, selector)"
+		)
+		self._conn.commit()
+
+	def _new_crawl_selector(self) -> str:
+		return f"csel_{secrets.token_urlsafe(18)}"
+
+	# ── DrissionPage crawl task state ────────────────────────────────
+
+	def create_crawl_run(
+		self,
+		run_id: str,
+		params: dict[str, Any],
+		output_dir: str,
+		*,
+		next_page: int = 1,
+		status: str = "running",
+	) -> None:
+		now = time.time()
+		self._conn.execute(
+			"INSERT INTO crawl_runs (run_id, params, status, next_page, output_dir, error, created_at, updated_at) "
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			(run_id, json.dumps(params, ensure_ascii=False, sort_keys=True), status, next_page, output_dir, "", now, now),
+		)
+		self._conn.commit()
+
+	def get_crawl_run(self, run_id: str) -> dict[str, Any] | None:
+		row = self._conn.execute(
+			"SELECT run_id, params, status, stop_requested, requests_attempted, detail_requests_attempted, elapsed_seconds, "
+			"next_page, list_finished, output_dir, error, hook_results, created_at, updated_at "
+			"FROM crawl_runs WHERE run_id = ?",
+			(run_id,),
+		).fetchone()
+		if row is None:
+			return None
+		return {
+			"run_id": row[0], "params": json.loads(row[1]), "status": row[2], "stop_requested": bool(row[3]),
+			"requests_attempted": int(row[4]), "detail_requests_attempted": int(row[5]), "elapsed_seconds": int(row[6]),
+			"next_page": row[7], "list_finished": bool(row[8]), "output_dir": row[9], "error": row[10],
+			"hook_results": json.loads(row[11]), "created_at": row[12], "updated_at": row[13],
+		}
+
+	def update_crawl_run_params(self, run_id: str, params: dict[str, Any]) -> None:
+		self._conn.execute(
+			"UPDATE crawl_runs SET params = ?, updated_at = ? WHERE run_id = ?",
+			(json.dumps(params, ensure_ascii=False, sort_keys=True), time.time(), run_id),
+		)
+		self._conn.commit()
+
+	def update_crawl_run(
+		self,
+		run_id: str,
+		*,
+		status: str,
+		next_page: int,
+		error: str = "",
+		list_finished: bool | None = None,
+		hook_results: list[dict[str, Any]] | None = None,
+	) -> None:
+		assignments = ["status = ?", "next_page = ?", "error = ?", "updated_at = ?"]
+		values: list[Any] = [status, next_page, error, time.time()]
+		if list_finished is not None:
+			assignments.append("list_finished = ?")
+			values.append(int(list_finished))
+		if hook_results is not None:
+			assignments.append("hook_results = ?")
+			values.append(json.dumps(hook_results, ensure_ascii=False, sort_keys=True))
+		values.append(run_id)
+		self._conn.execute(
+			f"UPDATE crawl_runs SET {', '.join(assignments)} WHERE run_id = ?",
+			values,
+		)
+		self._conn.commit()
+
+	def request_crawl_stop(self, run_id: str) -> bool:
+		cursor = self._conn.execute(
+			"UPDATE crawl_runs SET stop_requested = 1, updated_at = ? WHERE run_id = ?",
+			(time.time(), run_id),
+		)
+		self._conn.commit()
+		return cursor.rowcount > 0
+
+	def clear_crawl_stop_request(self, run_id: str) -> None:
+		self._conn.execute(
+			"UPDATE crawl_runs SET stop_requested = 0, updated_at = ? WHERE run_id = ?",
+			(time.time(), run_id),
+		)
+		self._conn.commit()
+
+	def update_crawl_run_budget(
+		self,
+		run_id: str,
+		*,
+		requests_attempted: int,
+		detail_requests_attempted: int,
+		elapsed_seconds: int,
+	) -> None:
+		self._conn.execute(
+			"UPDATE crawl_runs SET requests_attempted = ?, detail_requests_attempted = ?, elapsed_seconds = ?, updated_at = ? "
+			"WHERE run_id = ?",
+			(requests_attempted, detail_requests_attempted, elapsed_seconds, time.time(), run_id),
+		)
+		self._conn.commit()
+
+	def put_crawl_job(self, run_id: str, job_key: str, page_no: int, payload: dict[str, Any], *, detail_done: bool) -> None:
+		existing = self._conn.execute(
+			"SELECT selector FROM crawl_jobs WHERE run_id = ? AND job_key = ?", (run_id, job_key)
+		).fetchone()
+		selector = str(existing[0]) if existing and existing[0] else self._new_crawl_selector()
+		self._conn.execute(
+			"INSERT OR REPLACE INTO crawl_jobs (run_id, job_key, selector, page_no, payload, detail_done, updated_at) "
+			"VALUES (?, ?, ?, ?, ?, ?, ?)",
+			(run_id, job_key, selector, page_no, json.dumps(payload, ensure_ascii=False, sort_keys=True), int(detail_done), time.time()),
+		)
+		self._conn.commit()
+
+	def get_crawl_job(self, run_id: str, job_key: str) -> dict[str, Any] | None:
+		row = self._conn.execute(
+			"SELECT selector, page_no, payload, detail_done FROM crawl_jobs WHERE run_id = ? AND job_key = ?",
+			(run_id, job_key),
+		).fetchone()
+		if row is None:
+			return None
+		return {"selector": row[0], "page_no": row[1], "payload": json.loads(row[2]), "detail_done": bool(row[3])}
+
+	def list_crawl_jobs(self, run_id: str) -> list[dict[str, Any]]:
+		rows = self._conn.execute(
+			"SELECT job_key, selector, page_no, payload, detail_done FROM crawl_jobs WHERE run_id = ? ORDER BY page_no, rowid",
+			(run_id,),
+		).fetchall()
+		return [
+			{"job_key": row[0], "selector": row[1], "page_no": row[2], "payload": json.loads(row[3]), "detail_done": bool(row[4])}
+			for row in rows
+		]
+
+	def get_crawl_budget(self, budget_key: str) -> float | None:
+		row = self._conn.execute("SELECT last_request_at FROM crawl_budget WHERE budget_key = ?", (budget_key,)).fetchone()
+		return float(row[0]) if row is not None else None
+
+	def put_crawl_budget(self, budget_key: str, requested_at: float) -> None:
+		self._conn.execute(
+			"INSERT OR REPLACE INTO crawl_budget (budget_key, last_request_at) VALUES (?, ?)",
+			(budget_key, requested_at),
+		)
+		self._conn.commit()
+
+	def reserve_crawl_budget(self, budget_key: str, *, now: float, interval: float) -> float:
+		"""Atomically reserve the next request slot and return seconds to wait.
+
+		``BEGIN IMMEDIATE`` serializes reservations made by separate CLI processes
+		that share this SQLite database.  The stored timestamp may be in the future:
+		it represents an already-reserved request slot, not merely request history.
+		"""
+		try:
+			self._conn.execute("BEGIN IMMEDIATE")
+			row = self._conn.execute(
+				"SELECT last_request_at FROM crawl_budget WHERE budget_key = ?",
+				(budget_key,),
+			).fetchone()
+			last_reserved = float(row[0]) if row is not None else None
+			reserved_at = now if last_reserved is None else max(now, last_reserved + interval)
+			self._conn.execute(
+				"INSERT OR REPLACE INTO crawl_budget (budget_key, last_request_at) VALUES (?, ?)",
+				(budget_key, reserved_at),
+			)
+			self._conn.commit()
+		except Exception:
+			self._conn.rollback()
+			raise
+		return max(0.0, reserved_at - now)
+
+	# ── Shared wizard / headless workflow state ─────────────────────
+
+	def create_workflow_run(
+		self,
+		run_id: str,
+		*,
+		role: str,
+		platform: str,
+		goal: str,
+		mode: str,
+		params: dict[str, Any],
+		steps: tuple[str, ...],
+	) -> None:
+		now = time.time()
+		params_json = json.dumps(params, ensure_ascii=False, sort_keys=True)
+		with self._conn:
+			self._conn.execute(
+				"INSERT INTO workflow_runs "
+				"(run_id, role, platform, goal, mode, status, current_step, params, last_result, error, created_at, updated_at) "
+				"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				(run_id, role, platform, goal, mode, "pending", None, params_json, None, None, now, now),
+			)
+			self._conn.executemany(
+				"INSERT INTO workflow_steps "
+				"(run_id, step_name, ordinal, status, result, error, started_at, finished_at) "
+				"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+				[
+					(run_id, step_name, ordinal, "pending", None, None, None, None)
+					for ordinal, step_name in enumerate(steps)
+				],
+			)
+
+	def get_workflow_run(self, run_id: str) -> dict[str, Any] | None:
+		row = self._conn.execute(
+			"SELECT run_id, role, platform, goal, mode, status, current_step, params, last_result, error, created_at, updated_at "
+			"FROM workflow_runs WHERE run_id = ?",
+			(run_id,),
+		).fetchone()
+		if row is None:
+			return None
+		return {
+			"run_id": row[0],
+			"role": row[1],
+			"platform": row[2],
+			"goal": row[3],
+			"mode": row[4],
+			"status": row[5],
+			"current_step": row[6],
+			"params": json.loads(row[7]),
+			"last_result": json.loads(row[8]) if row[8] else None,
+			"error": json.loads(row[9]) if row[9] else None,
+			"created_at": row[10],
+			"updated_at": row[11],
+		}
+
+	def list_workflow_runs(self, *, limit: int = 20) -> list[dict[str, Any]]:
+		rows = self._conn.execute(
+			"SELECT run_id FROM workflow_runs ORDER BY updated_at DESC LIMIT ?",
+			(max(1, limit),),
+		).fetchall()
+		return [run for row in rows if (run := self.get_workflow_run(str(row[0]))) is not None]
+
+	def list_workflow_steps(self, run_id: str) -> list[dict[str, Any]]:
+		rows = self._conn.execute(
+			"SELECT step_name, ordinal, status, result, error, started_at, finished_at "
+			"FROM workflow_steps WHERE run_id = ? ORDER BY ordinal",
+			(run_id,),
+		).fetchall()
+		return [
+			{
+				"step_name": row[0],
+				"ordinal": row[1],
+				"status": row[2],
+				"result": json.loads(row[3]) if row[3] else None,
+				"error": json.loads(row[4]) if row[4] else None,
+				"started_at": row[5],
+				"finished_at": row[6],
+			}
+			for row in rows
+		]
+
+	def update_workflow_run(
+		self,
+		run_id: str,
+		*,
+		status: str,
+		current_step: str | None,
+		last_result: dict[str, Any] | None = None,
+		error: dict[str, Any] | None = None,
+		preserve_stopped: bool = False,
+	) -> bool:
+		cursor = self._conn.execute(
+			"UPDATE workflow_runs SET status = CASE WHEN ? AND status = 'stopped' THEN status ELSE ? END, "
+			"current_step = ?, last_result = ?, error = ?, updated_at = ? "
+			"WHERE run_id = ?",
+			(
+				preserve_stopped,
+				status,
+				current_step,
+				json.dumps(last_result, ensure_ascii=False, sort_keys=True) if last_result is not None else None,
+				json.dumps(error, ensure_ascii=False, sort_keys=True) if error is not None else None,
+				time.time(),
+				run_id,
+			),
+		)
+		self._conn.commit()
+		return cursor.rowcount > 0
+
+	def update_workflow_step(
+		self,
+		run_id: str,
+		step_name: str,
+		*,
+		status: str,
+		result: dict[str, Any] | None = None,
+		error: dict[str, Any] | None = None,
+	) -> bool:
+		now = time.time()
+		started_at = now if status == "running" else None
+		finished_at = now if status in {"completed", "failed", "waiting_input", "stopped"} else None
+		cursor = self._conn.execute(
+			"UPDATE workflow_steps SET status = ?, result = ?, error = ?, "
+			"started_at = COALESCE(started_at, ?), finished_at = COALESCE(?, finished_at) "
+			"WHERE run_id = ? AND step_name = ?",
+			(
+				status,
+				json.dumps(result, ensure_ascii=False, sort_keys=True) if result is not None else None,
+				json.dumps(error, ensure_ascii=False, sort_keys=True) if error is not None else None,
+				started_at,
+				finished_at,
+				run_id,
+				step_name,
+			),
+		)
+		self._conn.commit()
+		return cursor.rowcount > 0
+
+	def request_workflow_stop(self, run_id: str) -> bool:
+		cursor = self._conn.execute(
+			"UPDATE workflow_runs SET status = ?, updated_at = ? WHERE run_id = ? "
+			"AND status NOT IN (?, ?)",
+			("stopped", time.time(), run_id, "completed", "stopped"),
+		)
+		self._conn.commit()
+		return cursor.rowcount > 0
+
+	@staticmethod
+	def _normalize_shortlist_tags(tags: list[str]) -> list[str]:
+		normalized: list[str] = []
+		seen: set[str] = set()
+		for tag in tags:
+			clean = str(tag).strip()
+			if not clean or clean in seen:
+				continue
+			normalized.append(clean)
+			seen.add(clean)
+		return normalized
+
+	@classmethod
+	def _serialize_shortlist_tags(cls, tags: list[str]) -> str:
+		normalized = cls._normalize_shortlist_tags(tags)
+		if not normalized:
+			return ""
+		return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+
+	@classmethod
+	def _deserialize_shortlist_tags(cls, raw: str | None) -> list[str]:
+		if not raw:
+			return []
+		try:
+			parsed = json.loads(raw)
+		except json.JSONDecodeError:
+			return cls._normalize_shortlist_tags(raw.split(","))
+		if not isinstance(parsed, list):
+			return []
+		return cls._normalize_shortlist_tags([str(tag) for tag in parsed])
 
 	@staticmethod
 	def _make_search_key(params: dict[str, Any]) -> str:
@@ -103,6 +575,32 @@ class CacheStore:
 			(security_id,),
 		).fetchone()
 		return row is not None
+
+	def claim_recruiter_greet(self, geek_id: str, job_id: str) -> str | None:
+		"""原子预约首次招呼；重复调用返回状态，不依赖会轮换的 securityId。
+
+		招聘职位和候选人的加密 ID 组成业务键，与求职者 greet_records 隔离。
+		进程退出或响应丢失时保留 pending，禁止自动再次发送。
+		"""
+		with self._conn:
+			cursor = self._conn.execute(
+				"INSERT OR IGNORE INTO recruiter_greet_records VALUES (?, ?, ?, ?)",
+				(geek_id, job_id, "pending", time.time()),
+			)
+			if cursor.rowcount:
+				return None
+			row = self._conn.execute(
+				"SELECT status FROM recruiter_greet_records WHERE geek_id = ? AND job_id = ?",
+				(geek_id, job_id),
+			).fetchone()
+			return str(row[0])
+
+	def record_recruiter_greet(self, geek_id: str, job_id: str, *, status: Literal["sent", "quota_limited"] = "sent") -> None:
+		with self._conn:
+			self._conn.execute(
+				"UPDATE recruiter_greet_records SET status = ?, updated_at = ? WHERE geek_id = ? AND job_id = ?",
+				(status, time.time(), geek_id, job_id),
+			)
 
 	def get_job_id(self, security_id: str) -> str | None:
 		row = self._conn.execute(
@@ -140,6 +638,38 @@ class CacheStore:
 		)
 		self._conn.commit()
 		self._evict_old_search_cache()
+
+	# ── 职位描述缓存（welfare 详情比对复用，降低重复搜索的取详情请求量）──
+	# 键用 job_id（encryptJobId，跨搜索稳定）；securityId 是每次请求重新生成的
+	# 临时令牌、跨搜索不稳定，不能做缓存键。
+	# 线程安全注意：sqlite 连接非线程安全，这两个方法只可在主线程调用，
+	# 不要在 welfare 详情线程池的 worker 内访问。
+
+	def get_job_desc(self, job_id: str) -> str | None:
+		"""返回缓存的职位描述（命中且未过期），否则 None。"""
+		if not job_id:
+			return None
+		row = self._conn.execute(
+			"SELECT description, created_at FROM job_desc_cache WHERE job_id = ?",
+			(job_id,),
+		).fetchone()
+		if row is None:
+			return None
+		if time.time() - row[1] > self._search_ttl:
+			self._conn.execute("DELETE FROM job_desc_cache WHERE job_id = ?", (job_id,))
+			self._conn.commit()
+			return None
+		return cast("str", row[0])
+
+	def put_job_desc(self, job_id: str, description: str) -> None:
+		"""缓存职位描述（仅当 job_id 与描述非空时写入）。"""
+		if not job_id or not description:
+			return
+		self._conn.execute(
+			"INSERT OR REPLACE INTO job_desc_cache (job_id, description, created_at) VALUES (?, ?, ?)",
+			(job_id, description, time.time()),
+		)
+		self._conn.commit()
 
 	def _evict_old_search_cache(self) -> None:
 		count = self._conn.execute("SELECT COUNT(*) FROM search_cache").fetchone()[0]
@@ -215,6 +745,8 @@ class CacheStore:
 		return hashlib.sha256(raw.encode()).hexdigest()
 
 	def record_watch_results(self, search_name: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+		# 只去重本轮完整列表项；旧记录保留访问上下文复合键，未验证账号前不跨轮按 job_id 合并。
+		items = deduplicate_job_result(items)
 		now = time.time()
 		new_items = []
 		seen_count = 0
@@ -267,24 +799,115 @@ class CacheStore:
 		return row is not None
 
 	def add_shortlist(self, item: dict[str, Any]) -> None:
+		security_id = str(item.get("security_id") or "")
+		job_id = str(item.get("job_id") or "")
+		source = str(item.get("source") or "")
+		lid_value = item.get("lid")
+		lid = lid_value if isinstance(lid_value, str) else ""
+		if not lid:
+			lid = self._crawl_shortlist_lid(security_id, job_id, source)
 		self._conn.execute(
-			"INSERT OR REPLACE INTO shortlist_records (security_id, job_id, title, company, city, salary, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			"INSERT OR REPLACE INTO shortlist_records "
+			"(security_id, job_id, title, company, city, salary, source, tags, note, lid, created_at) "
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
+			"COALESCE(NULLIF(?, ''), (SELECT lid FROM shortlist_records WHERE security_id = ? AND job_id = ?), ''), ?)",
 			(
-				item.get("security_id", ""),
-				item.get("job_id", ""),
+				security_id,
+				job_id,
 				item.get("title", ""),
 				item.get("company", ""),
 				item.get("city", ""),
 				item.get("salary", ""),
-				item.get("source", ""),
+				source,
+				self._serialize_shortlist_tags(item.get("tags", [])),
+				item.get("note", ""),
+				lid,
+				security_id,
+				job_id,
 				time.time(),
 			),
 		)
 		self._conn.commit()
 
+	def add_shortlist_batch(self, items: list[dict[str, Any]], source: str = "favorites") -> dict[str, int]:
+		"""批量导入候选池：按 job_id 去重，刷新 favorites 访问 ID，缺主键则跳过。
+
+		保留既有按 job_id 去重兼容行为（实测 C3 的两次同职位请求 sid 不同）；
+		此历史逻辑尚无已验证的账号/角色作用域，不能据此建立跨账号身份。
+		已有同来源记录刷新 security_id 与同一输入的 lid，但保留用户标签、备注、来源
+		和 created_at；其他来源记录保持不变，不推断访问上下文有效期。
+		`with self._conn:` 上下文保证中途异常自动回滚（deferred 隔离下避免部分批次
+		被下一次 commit 连带提交）。返回 {imported_count, existing_count, skipped_count}。
+		"""
+		imported_count = 0
+		existing_count = 0
+		skipped_count = 0
+		with self._conn:
+			existing_by_job_id: dict[str, tuple[str, str]] = {
+				str(row[1]): (str(row[0]), str(row[2]))
+				for row in self._conn.execute(
+					"SELECT security_id, job_id, source FROM shortlist_records WHERE job_id != '' "
+					"ORDER BY created_at ASC"
+				).fetchall()
+			}
+			for item in items:
+				security_id = str(item.get("security_id") or "")
+				job_id = str(item.get("job_id") or "")
+				lid_value = item.get("lid")
+				lid = lid_value if isinstance(lid_value, str) else ""
+				if not security_id or not job_id:
+					skipped_count += 1
+					continue
+				if job_id in existing_by_job_id:
+					old_security_id, old_source = existing_by_job_id[job_id]
+					if old_source == source and old_security_id != security_id:
+						self._conn.execute(
+							# 原兼容刷新保留；动态上下文必须来自同一条输入，缺 lid 时不能拼上旧 lid。
+							"UPDATE shortlist_records SET security_id = ?, lid = ? "
+							"WHERE security_id = ? AND job_id = ?",
+							(security_id, lid, old_security_id, job_id),
+						)
+						existing_by_job_id[job_id] = (security_id, old_source)
+					elif old_source == source and old_security_id == security_id and lid:
+						self._conn.execute(
+							"UPDATE shortlist_records SET lid = ? WHERE security_id = ? AND job_id = ?",
+							(lid, security_id, job_id),
+						)
+					existing_count += 1
+					continue
+				cursor = self._conn.execute(
+					"INSERT OR IGNORE INTO shortlist_records "
+					"(security_id, job_id, title, company, city, salary, source, tags, note, lid, created_at) "
+					"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+					(
+						security_id,
+						job_id,
+						str(item.get("title", "") or ""),
+						str(item.get("company", "") or ""),
+						str(item.get("city", "") or ""),
+						str(item.get("salary", "") or ""),
+						item.get("source") or source,
+						self._serialize_shortlist_tags(item.get("tags", [])),
+						str(item.get("note", "") or ""),
+						lid,
+						time.time(),
+					),
+				)
+				if cursor.rowcount == 1:
+					imported_count += 1
+					existing_by_job_id[job_id] = (security_id, str(item.get("source") or source))
+				else:
+					existing_count += 1
+		return {
+			"imported_count": imported_count,
+			"existing_count": existing_count,
+			"skipped_count": skipped_count,
+		}
+
 	def list_shortlist(self) -> list[dict[str, Any]]:
 		rows = self._conn.execute(
-			"SELECT security_id, job_id, title, company, city, salary, source, created_at FROM shortlist_records ORDER BY created_at DESC"
+			"SELECT security_id, job_id, title, company, city, salary, source, tags, note, created_at, lid "
+			"FROM shortlist_records ORDER BY created_at DESC"
 		).fetchall()
 		return [
 			{
@@ -295,10 +918,50 @@ class CacheStore:
 				"city": row[4],
 				"salary": row[5],
 				"source": row[6],
-				"created_at": row[7],
+				"tags": self._deserialize_shortlist_tags(row[7]),
+				"note": row[8] or "",
+				"created_at": row[9],
+				"lid": row[10] or self._crawl_shortlist_lid(str(row[0] or ""), str(row[1] or ""), str(row[6] or "")),
 			}
 			for row in rows
 		]
+
+	def _crawl_shortlist_lid(self, security_id: str, job_id: str, source: str) -> str:
+		"""复用同一 crawl 记录的上下文；不推断其他来源的 lid。"""
+		if not source.startswith("crawl:") or not job_id or not security_id:
+			return ""
+		run_id = source.removeprefix("crawl:")
+		if not run_id:
+			return ""
+		try:
+			item = self.get_crawl_job(run_id, job_id)
+		except (ValueError, TypeError):
+			return ""
+		if item is None:
+			return ""
+		payload = item.get("payload")
+		if not isinstance(payload, dict):
+			return ""
+		if str(payload.get("job_id") or "") != job_id or str(payload.get("security_id") or "") != security_id:
+			return ""
+		lid = payload.get("lid")
+		return lid if isinstance(lid, str) else ""
+
+	def set_shortlist_tags(self, security_id: str, job_id: str, tags: list[str]) -> bool:
+		cursor = self._conn.execute(
+			"UPDATE shortlist_records SET tags = ? WHERE security_id = ? AND job_id = ?",
+			(self._serialize_shortlist_tags(tags), security_id, job_id),
+		)
+		self._conn.commit()
+		return cursor.rowcount > 0
+
+	def set_shortlist_note(self, security_id: str, job_id: str, note: str) -> bool:
+		cursor = self._conn.execute(
+			"UPDATE shortlist_records SET note = ? WHERE security_id = ? AND job_id = ?",
+			(note, security_id, job_id),
+		)
+		self._conn.commit()
+		return cursor.rowcount > 0
 
 	def remove_shortlist(self, security_id: str, job_id: str) -> bool:
 		cursor = self._conn.execute(

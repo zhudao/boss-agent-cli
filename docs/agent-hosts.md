@@ -5,7 +5,8 @@
 当前示例覆盖的 CLI 基线：
 - 通过 `boss schema` 做能力发现
 - 通过 `boss status` 确认登录态
-- 通过 `boss search` / `boss detail` / `boss shortlist` 跑通低风险本地整理闭环
+- 通过 `boss_wizard` 或 `boss wizard --input-json` 推进与真人向导共享的 workflow
+- 通过 `boss search` / `boss detail` / `boss apply` 与 `boss hr ...` 使用细粒度能力
 - 通过 JSON 信封读取 `ok`、`data`、`error.code`、`error.recovery_action`
 
 ## 示例列表
@@ -18,6 +19,7 @@
 | Windsurf | Cascade Agent + MCP 或 `.windsurfrules` | [Windsurf](integrations/windsurf.md) |
 | Shell Agent | 任意支持 shell tool 的 Agent 框架或自建编排器 | [Shell Agent](integrations/shell-agent.md) |
 | Python SDK 直调 | 自建 Agent / LangGraph / 业务代码直接驱动 OpenAI 或 Claude SDK | [Python SDK](integrations/python-sdk.md) |
+| Docker 容器 | 不想在本机配 Python 工具链（如 Apple Silicon 环境折腾）；登录仍在宿主机完成 | [Docker](integrations/docker.md) |
 
 ## 选型建议
 
@@ -33,6 +35,7 @@
 2. 所有成功/失败都以 stdout JSON 信封为准，不要解析 stderr。
 3. 把 `boss doctor`、`boss login`、`boss status` 当成统一恢复入口。
 4. 用户提到福利要求时，优先把条件落到 `--welfare`。
+5. 长流程始终保存显式 `run_id`，用 status/resume/stop 管理，不扫描“最新任务”。
 
 ## 相关文档
 

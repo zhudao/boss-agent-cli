@@ -1,9 +1,13 @@
 """模型上下文协议服务测试 — 覆盖工具定义、参数构建和调用逻辑。"""
 import inspect
+import json
+import re
 import sys
 import types
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+import pytest
 
 
 # mcp 包可能未安装，用 mock 模块替代以允许导入 server.py
@@ -15,6 +19,10 @@ _mcp_server.Server = MagicMock()
 _mcp_stdio.stdio_server = MagicMock()
 _mcp_types.TextContent = MagicMock()
 _mcp_types.Tool = type("Tool", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+# mcp 2.x 的 handler 收 (ctx, params) 并返回 Result 对象，故 mcp_server 还需要这四个类型。
+# 用能接受任意关键字的轻量替身即可——本文件不断言它们的行为，只需让 import 成立。
+for _name in ("CallToolRequestParams", "CallToolResult", "ListToolsResult", "PaginatedRequestParams"):
+	setattr(_mcp_types, _name, type(_name, (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}))
 _mcp_mock.server = _mcp_server
 _mcp_mock.types = _mcp_types
 
@@ -26,8 +34,10 @@ sys.modules.setdefault("mcp.types", _mcp_types)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mcp-server"))
 import server  # noqa: E402
 from server import (  # noqa: E402
+	SERVER_INSTRUCTIONS,
 	TOOLS,
 	_build_args,
+	_configure_boss_invocation,
 	_compliance_command_for_tool,
 	_LOW_RISK_BLOCKED_TOOLS,
 	_tool_availability,
@@ -37,7 +47,41 @@ from server import (  # noqa: E402
 	_run_sse_server,
 	run,
 )
+from boss_agent_cli.schema.availability import inject_availability  # noqa: E402
+from boss_agent_cli.schema.data import SCHEMA_DATA  # noqa: E402
+from boss_agent_cli.schema.formats import format_mcp_tools  # noqa: E402
 from boss_agent_cli.compliance import low_risk_blocked_commands  # noqa: E402
+from boss_agent_cli.main import cli  # noqa: E402
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _read(path: str) -> str:
+	return (ROOT / path).read_text(encoding="utf-8")
+
+
+def _placeholder_value(schema: dict) -> object:
+	if "default" in schema:
+		return schema["default"]
+	if schema.get("enum"):
+		return schema["enum"][0]
+	if schema.get("type") == "integer":
+		return 1
+	if schema.get("type") == "boolean":
+		return False
+	if schema.get("type") == "array":
+		item_schema = schema.get("items") or {}
+		return [_placeholder_value(item_schema)]
+	return "placeholder"
+
+
+def _required_arguments(tool) -> dict[str, object]:
+	properties = tool.input_schema.get("properties", {})
+	return {
+		name: _placeholder_value(properties.get(name, {}))
+		for name in tool.input_schema.get("required", [])
+	}
 
 
 # ── 工具定义完整性 ──────────────────────────────────────────────────
@@ -55,11 +99,59 @@ def test_all_tools_have_name_and_description():
 		assert tool.description, f"{tool.name} 缺少描述"
 
 
+# JSON Schema 规范定义的全部合法 type 值。注意没有 "int"——那是 Python 的写法，
+# 严格的 MCP 宿主会拒绝或误处理这样的参数 schema。
+_JSON_SCHEMA_TYPES = frozenset({"null", "boolean", "object", "array", "number", "string", "integer"})
+
+
+def test_all_tool_parameter_types_are_valid_json_schema():
+	"""参数 type 必须是 JSON Schema 合法值。
+
+	曾出现 `boss_favorites_list.page` 写成 `"int"`（其余 105 个参数都写对了）。
+	这类笔误不会让任何现有测试变红，却会让严格校验 schema 的 MCP 宿主拒掉该工具。
+	"""
+	invalid = []
+	for tool in TOOLS:
+		for name, spec in (tool.input_schema or {}).get("properties", {}).items():
+			declared = spec.get("type")
+			if declared is not None and declared not in _JSON_SCHEMA_TYPES:
+				invalid.append(f"{tool.name}.{name} = {declared!r}")
+	assert not invalid, "非法的 JSON Schema type：\n" + "\n".join(invalid)
+
+
+def test_all_tool_parameters_are_described_for_agents():
+	"""每个参数都要有 description——Agent 靠它决定传什么值。"""
+	missing = [
+		f"{tool.name}.{name}"
+		for tool in TOOLS
+		for name, spec in (tool.input_schema or {}).get("properties", {}).items()
+		if not spec.get("description")
+	]
+	assert not missing, "参数缺少 description：\n" + "\n".join(missing)
+
+
+def test_all_tool_schemas_are_well_formed_objects():
+	"""顶层必须是 object、required 只能引用已声明的属性、array 必须带 items。"""
+	problems = []
+	for tool in TOOLS:
+		schema = tool.input_schema or {}
+		properties = schema.get("properties", {})
+		if schema.get("type") != "object":
+			problems.append(f"{tool.name}: 顶层 type 应为 object，实际 {schema.get('type')!r}")
+		for name in schema.get("required", []):
+			if name not in properties:
+				problems.append(f"{tool.name}: required 引用了未声明的属性 {name!r}")
+		for name, spec in properties.items():
+			if spec.get("type") == "array" and "items" not in spec:
+				problems.append(f"{tool.name}.{name}: array 缺少 items")
+	assert not problems, "工具 schema 结构问题：\n" + "\n".join(problems)
+
+
 def test_candidate_tool_description_includes_availability():
 	search = next(t for t in TOOLS if t.name == "boss_search")
 	assert "可用性:" in search.description
 	assert "roles=candidate" in search.description
-	assert "zhilian" in search.description
+	assert "zhilian" not in search.description
 	assert "zhipin" in search.description
 
 
@@ -73,7 +165,7 @@ def test_recruiter_tool_description_includes_availability():
 def test_all_tools_have_input_schema():
 	"""每个工具都应有输入模式定义。"""
 	for tool in TOOLS:
-		schema = tool.inputSchema
+		schema = tool.input_schema
 		assert isinstance(schema, dict), f"{tool.name} 缺少输入模式"
 		assert schema.get("type") == "object", f"{tool.name} 输入模式类型应为 object"
 
@@ -97,12 +189,15 @@ def test_required_tools_present():
 		"boss_status", "boss_doctor", "boss_search", "boss_detail",
 		"boss_me", "boss_cities",
 		"boss_show", "boss_export", "boss_config", "boss_clean",
-		"boss_stats", "boss_ai_reply",
+		"boss_stats", "boss_agent_run", "boss_agent_review_approve",
+		"boss_agent_review_reject", "boss_agent_stop", "boss_ai_reply",
 		"boss_ai_interview_prep", "boss_ai_chat_coach",
 		"boss_resume_list", "boss_resume_show",
 		"boss_ai_analyze_jd", "boss_ai_optimize", "boss_ai_suggest",
+		"boss_ai_fit",
 		"boss_watch_list",
 		"boss_preset_list", "boss_shortlist_list",
+		"boss_shortlist_annotate", "boss_shortlist_compare",
 		"boss_hr_jobs",
 		"boss_hr_jobs_detail",
 	}
@@ -110,49 +205,96 @@ def test_required_tools_present():
 	assert not missing, f"缺少核心工具: {missing}"
 
 
+def test_crawl_tools_only_read_or_locally_shortlist_existing_runs():
+	names = {tool.name for tool in TOOLS}
+	assert {"boss_crawl_status", "boss_crawl_results", "boss_crawl_shortlist"} <= names
+	assert not {"boss_crawl_start", "boss_crawl_resume", "boss_crawl_stop"} & names
+	assert _build_args("boss_crawl_status", {"run_id": "run-1"}) == ["crawl", "status", "run-1"]
+	assert _build_args("boss_crawl_results", {"run_id": "run-1", "page": 2, "detail_status": "pending"}) == [
+		"crawl", "results", "run-1", "--page", "2", "--detail-status", "pending",
+	]
+	assert _build_args("boss_crawl_shortlist", {"run_id": "run-1", "selectors": ["csel_1"], "tags": "AI"}) == [
+		"crawl", "shortlist", "run-1", "--selector", "csel_1", "--tags", "AI",
+	]
+	server_tools = {tool.name: tool.input_schema for tool in TOOLS if tool.name.startswith("boss_crawl_")}
+	schema_tools = {
+		tool["name"]: tool["inputSchema"]
+		for tool in format_mcp_tools(inject_availability({
+			"commands": dict(SCHEMA_DATA["commands"]),
+			"supported_recruiter_platforms": [],
+		}))
+		if tool["name"].startswith("boss_crawl_")
+	}
+	assert server_tools == schema_tools
+
+
 def test_tool_count():
 	"""工具总数应与当前注册一致。"""
-	assert len(TOOLS) == 32
+	assert len(TOOLS) == 78
+
+
+def test_mcp_tool_count_matches_readme():
+	content = _read("README.en.md")
+	match = re.search(r"MCP server with (\d+) tools", content)
+	assert match
+	assert int(match.group(1)) == len(TOOLS)
+
+
+def test_server_instructions_carry_doctrine():
+	assert SERVER_INSTRUCTIONS
+	assert "all implemented" in SERVER_INSTRUCTIONS
+	assert "boss schema" in SERVER_INSTRUCTIONS
+	assert "NOT_SUPPORTED" in SERVER_INSTRUCTIONS
+
+
+def test_every_tool_maps_to_registered_command():
+	registered_commands = set(cli.commands)
+	for tool in TOOLS:
+		arguments = _required_arguments(tool)
+		args = _build_args(tool.name, arguments)
+		assert args, tool.name
+		assert args[0] in registered_commands, tool.name
 
 
 def test_search_tool_requires_query():
 	"""搜索工具应要求 query 参数。"""
 	search = next(t for t in TOOLS if t.name == "boss_search")
-	assert "query" in search.inputSchema.get("required", [])
+	assert "query" in search.input_schema.get("required", [])
 
 
-def test_sensitive_tools_not_exposed_by_default():
-	"""默认低风险模式下，敏感 MCP 工具不直接暴露给 Agent。"""
+def test_all_implemented_tools_are_exposed():
+	"""历史模式不再从 MCP 目录隐藏已实现工具。"""
 	names = {t.name for t in TOOLS}
-	assert "boss_greet" not in names
-	assert "boss_batch_greet" not in names
-	assert "boss_chat" not in names
-	assert "boss_pipeline" not in names
-	assert "boss_watch_run" not in names
-	assert "boss_hr_candidates" not in names
+	assert {
+		"boss_greet",
+		"boss_batch_greet",
+		"boss_chat",
+		"boss_pipeline",
+		"boss_watch_run",
+		"boss_hr_candidates",
+		"boss_hr_reply",
+	} <= names
 
 
-def test_low_risk_blocked_tools_are_derived_from_compliance_commands():
-	"""MCP 低风险过滤集合必须从 compliance 命令集合派生，避免独立手写漂移。"""
-	blocked_commands = low_risk_blocked_commands()
-	assert _LOW_RISK_BLOCKED_TOOLS
-	for tool_name in _LOW_RISK_BLOCKED_TOOLS:
-		assert _compliance_command_for_tool(tool_name) in blocked_commands
+def test_legacy_blocked_tool_export_is_empty():
+	"""保留旧导出符号，但开放策略下不能过滤任何工具。"""
+	assert low_risk_blocked_commands() == set()
+	assert _LOW_RISK_BLOCKED_TOOLS == set()
 	assert _compliance_command_for_tool("boss_hr_exchange") == "recruiter-resume"
 	assert _compliance_command_for_tool("boss_watch_run") == "watch-run"
 
 
 def test_low_risk_blocked_tools_match_schema_blocked_commands():
-	"""MCP 隐藏工具集合必须与 schema 暴露的低风险阻断命令保持同源。"""
+	"""历史 MCP 和 schema 阻断集合在开放策略下均为空。"""
 	blocked_commands = low_risk_blocked_commands()
 	assert {
 		_compliance_command_for_tool(tool_name)
 		for tool_name in _LOW_RISK_BLOCKED_TOOLS
-	} == blocked_commands
+	} <= blocked_commands
 
 
 def test_no_exposed_tool_maps_to_schema_blocked_command():
-	"""默认暴露的 MCP 工具不得映射到 schema/compliance 的低风险阻断命令。"""
+	"""开放后的 MCP 工具不映射到任何模式阻断命令。"""
 	blocked_commands = low_risk_blocked_commands()
 	leaked = [
 		tool.name
@@ -168,6 +310,33 @@ def test_no_exposed_tool_maps_to_schema_blocked_command():
 def test_build_args_status():
 	"""无参数命令应只返回命令名。"""
 	assert _build_args("boss_status", {}) == ["status"]
+
+
+def test_build_args_wizard_run_and_controls():
+	args = _build_args("boss_wizard", {
+		"role": "candidate",
+		"platform": "zhipin",
+		"goal": "job_search",
+		"inputs": {"query": "Python"},
+		"max_retries": 2,
+	})
+	assert args[:2] == ["wizard", "--input-json"]
+	assert json.loads(args[2]) == {
+		"role": "candidate",
+		"platform": "zhipin",
+		"goal": "job_search",
+		"inputs": {"query": "Python"},
+	}
+	assert args[3:] == ["--max-retries", "2"]
+	assert _build_args("boss_wizard", {"action": "status", "run_id": "run-1"}) == [
+		"wizard", "--status", "run-1",
+	]
+	assert _build_args("boss_wizard", {"action": "resume", "run_id": "run-1", "timeout": 30}) == [
+		"wizard", "--resume", "run-1", "--timeout", "30",
+	]
+	assert _build_args("boss_wizard", {"action": "stop", "run_id": "run-1"}) == [
+		"wizard", "--stop", "run-1",
+	]
 
 
 def test_build_args_doctor():
@@ -208,6 +377,11 @@ def test_build_args_search_with_options():
 	assert "20-40K" in args
 	assert "--page" in args
 	assert "2" in args
+
+
+def test_build_args_search_with_score_sort():
+	args = _build_args("boss_search", {"query": "python", "sort": "score"})
+	assert args == ["search", "python", "--sort", "score"]
 
 
 def test_build_args_search_ignores_empty_options():
@@ -401,6 +575,43 @@ def test_run_boss_passes_args(mock_run):
 
 
 @patch("server.subprocess.run")
+def test_run_boss_passes_configured_global_args_before_command(mock_run):
+	"""MCP 宿主配置的全局参数应传给底层 boss CLI。"""
+	mock_run.return_value = MagicMock(stdout='{"ok": true}', stderr="")
+	_configure_boss_invocation(
+		boss_bin="/opt/boss",
+		data_dir="./.boss-agent",
+		platform="zhipin",
+		role="recruiter",
+	)
+	try:
+		_run_boss("agent", "stats")
+		cmd = mock_run.call_args[0][0]
+		assert cmd == [
+			"/opt/boss", "--json",
+			"--data-dir", "./.boss-agent",
+			"--platform", "zhipin",
+			"--role", "recruiter",
+			"agent", "stats",
+		]
+	finally:
+		_configure_boss_invocation()
+
+
+@patch("server.subprocess.run")
+def test_run_boss_passes_browser_source_before_command(mock_run):
+	"""--browser-source 与其他全局参数一样透传给底层 boss CLI，且位于子命令之前。"""
+	mock_run.return_value = MagicMock(stdout='{"ok": true}', stderr="")
+	_configure_boss_invocation(browser_source="stored-cookie")
+	try:
+		_run_boss("status")
+		cmd = mock_run.call_args[0][0]
+		assert cmd == ["boss", "--json", "--browser-source", "stored-cookie", "status"]
+	finally:
+		_configure_boss_invocation()
+
+
+@patch("server.subprocess.run")
 def test_run_boss_timeout(mock_run):
 	"""应设置 120 秒超时。"""
 	mock_run.return_value = MagicMock(stdout='{"ok": true}', stderr="")
@@ -426,6 +637,37 @@ def test_parse_cli_args_defaults():
 	assert args.path == "/mcp"
 	assert args.sse_path == "/sse"
 	assert args.message_path == "/messages/"
+	assert args.boss_bin == "boss"
+	assert args.data_dir is None
+	assert args.platform is None
+	assert args.role is None
+	assert args.browser_source is None
+
+
+def test_parse_cli_args_browser_source_choices_come_from_policy_table():
+	"""--browser-source 的取值域只从策略表推导：每个策略名都能解析，未知值被 argparse 拒绝。"""
+	from boss_agent_cli.api.browser_source import POLICIES
+
+	for name in POLICIES:
+		assert _parse_cli_args(["--browser-source", name]).browser_source == name
+	with pytest.raises(SystemExit):
+		_parse_cli_args(["--browser-source", "bridge"])
+
+
+def test_parse_cli_args_accepts_boss_global_options():
+	args = _parse_cli_args([
+		"--transport", "stdio",
+		"--boss-bin", "/opt/boss",
+		"--data-dir", "./.boss-agent",
+		"--platform", "zhipin",
+		"--role", "recruiter",
+		"--browser-source", "existing-browser",
+	])
+	assert args.boss_bin == "/opt/boss"
+	assert args.data_dir == "./.boss-agent"
+	assert args.platform == "zhipin"
+	assert args.role == "recruiter"
+	assert args.browser_source == "existing-browser"
 
 
 def test_parse_cli_args_http_overrides():
@@ -502,6 +744,22 @@ def test_build_args_stats_with_days():
 	assert args == ["stats", "--days", "7"]
 
 
+def test_build_args_agent_run_and_stop():
+	assert _build_args("boss_agent_run", {"dry_run": True, "limit": 2}) == [
+		"agent", "run", "--dry-run", "--limit", "2",
+	]
+	assert _build_args("boss_agent_review_approve", {"id": "abc"}) == [
+		"agent", "review", "approve", "abc",
+	]
+	assert _build_args(
+		"boss_agent_review_reject",
+		{"id": "abc", "reason": "not-fit"},
+	) == ["agent", "review", "reject", "abc", "--reason", "not-fit"]
+	assert _build_args("boss_agent_stop", {"reason": "manual"}) == [
+		"agent", "stop", "--reason", "manual",
+	]
+
+
 def test_build_args_ai_reply_minimal():
 	args = _build_args("boss_ai_reply", {"recruiter_message": "请问到岗时间？"})
 	assert args == ["ai", "reply", "请问到岗时间？"]
@@ -575,6 +833,11 @@ def test_build_args_ai_suggest():
 	assert args == ["ai", "suggest", "my", "--jd", "后端岗位"]
 
 
+def test_build_args_ai_fit():
+	args = _build_args("boss_ai_fit", {"resume": "my", "limit": 3})
+	assert args == ["ai", "fit", "--resume", "my", "--limit", "3"]
+
+
 def test_build_args_watch_list():
 	assert _build_args("boss_watch_list", {}) == ["watch", "list"]
 
@@ -591,14 +854,36 @@ def test_build_args_shortlist_list():
 	assert _build_args("boss_shortlist_list", {}) == ["shortlist", "list"]
 
 
+def test_build_args_favorites_list_is_fixed_to_job_favorites():
+	assert _build_args("boss_favorites_list", {"page": 2, "tag": 99}) == ["favorites", "list", "--page", "2"]
+
+
 def test_tool_count_after_pr41():
 	"""协议服务工具总数应与当前 MCP 暴露能力完全一致。"""
-	assert len(TOOLS) == 32
+	assert len(TOOLS) == 78
 
 
 def test_build_args_shortlist_add():
-	args = _build_args("boss_shortlist_add", {"security_id": "s1", "job_id": "j1"})
-	assert args == ["shortlist", "add", "s1", "j1"]
+	args = _build_args("boss_shortlist_add", {"security_id": "s1", "job_id": "j1", "tags": "远程,双休", "note": "优先"})
+	assert args == ["shortlist", "add", "s1", "j1", "--tags", "远程,双休", "--note", "优先"]
+
+
+def test_build_args_shortlist_annotate():
+	args = _build_args(
+		"boss_shortlist_annotate",
+		{"security_id": "s1", "job_id": "j1", "add_tags": ["远程", "双休"], "remove_tags": ["外包"], "note": "优先"},
+	)
+	assert args == [
+		"shortlist", "annotate", "s1", "j1",
+		"--add-tag", "远程", "--add-tag", "双休",
+		"--remove-tag", "外包",
+		"--note", "优先",
+	]
+
+
+def test_build_args_shortlist_compare():
+	args = _build_args("boss_shortlist_compare", {"tag": "远程"})
+	assert args == ["shortlist", "compare", "--tag", "远程"]
 
 
 def test_build_args_shortlist_remove():
@@ -692,8 +977,8 @@ def test_build_args_hr_chatmsg():
 
 
 def test_build_args_hr_last_messages():
-	args = _build_args("boss_hr_last_messages", {"friend_ids": [12345, 67890], "page": 2})
-	assert args == ["hr", "last-messages", "--friend-id", "12345", "--friend-id", "67890", "--page", "2"]
+	args = _build_args("boss_hr_last_messages", {"friend_ids": [12345, 67790], "page": 2})
+	assert args == ["hr", "last-messages", "--friend-id", "12345", "--friend-id", "67790", "--page", "2"]
 
 
 def test_build_args_hr_resume():

@@ -1,10 +1,13 @@
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 import types
 from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +25,6 @@ def _doc_paths_for_compliance_guardrails() -> list[str]:
 	return _existing([
 		"README.md",
 		"README.en.md",
-		"SKILL.md",
 		"AGENTS.md",
 		"CLAUDE.md",
 		"docs/agent-quickstart.md",
@@ -44,21 +46,33 @@ def _extract_readme_badges(path: str) -> list[tuple[str, str, str]]:
 
 
 def _load_mcp_tools() -> list:
-	_mcp_mock = types.ModuleType("mcp")
-	_mcp_server = types.ModuleType("mcp.server")
-	_mcp_stdio = types.ModuleType("mcp.server.stdio")
-	_mcp_types = types.ModuleType("mcp.types")
-	_mcp_server.Server = MagicMock()
-	_mcp_stdio.stdio_server = MagicMock()
-	_mcp_types.TextContent = MagicMock()
-	_mcp_types.Tool = type("Tool", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
-	_mcp_mock.server = _mcp_server
-	_mcp_mock.types = _mcp_types
+	# 真 SDK 装了就用真的——本文件只读 TOOLS 的名字与数量，真 SDK 完全够用，
+	# 而且这样才不会出现「单跑本文件用 mock、跟着全套跑用真 SDK」这种按收集顺序
+	# 变结果的情况（`sys.modules.setdefault` 在全套里是 no-op）。mock 只在
+	# 未安装 mcp extra 的环境里兜底。
+	try:
+		import mcp.server  # noqa: F401
+		import mcp.server.stdio  # noqa: F401
+		import mcp.types  # noqa: F401
+	except ImportError:
+		_mcp_mock = types.ModuleType("mcp")
+		_mcp_server = types.ModuleType("mcp.server")
+		_mcp_stdio = types.ModuleType("mcp.server.stdio")
+		_mcp_types = types.ModuleType("mcp.types")
+		_mcp_server.Server = MagicMock()
+		_mcp_stdio.stdio_server = MagicMock()
+		_mcp_types.TextContent = MagicMock()
+		_mcp_types.Tool = type("Tool", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+		# mcp 2.x 的 handler 收 (ctx, params) 并返回 Result 对象，mcp_server 因此还需这四个类型。
+		for _name in ("CallToolRequestParams", "CallToolResult", "ListToolsResult", "PaginatedRequestParams"):
+			setattr(_mcp_types, _name, type(_name, (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}))
+		_mcp_mock.server = _mcp_server
+		_mcp_mock.types = _mcp_types
 
-	sys.modules.setdefault("mcp", _mcp_mock)
-	sys.modules.setdefault("mcp.server", _mcp_server)
-	sys.modules.setdefault("mcp.server.stdio", _mcp_stdio)
-	sys.modules.setdefault("mcp.types", _mcp_types)
+		sys.modules.setdefault("mcp", _mcp_mock)
+		sys.modules.setdefault("mcp.server", _mcp_server)
+		sys.modules.setdefault("mcp.server.stdio", _mcp_stdio)
+		sys.modules.setdefault("mcp.types", _mcp_types)
 
 	spec = importlib.util.spec_from_file_location("boss_mcp_server", ROOT / "mcp-server/server.py")
 	assert spec and spec.loader
@@ -73,7 +87,7 @@ def test_agent_quickstart_exists_and_has_core_sections():
 	content = _read("docs/agent-quickstart.md")
 	assert "# Agent Quickstart" in content
 	assert "## 1) 安装与环境准备" in content
-	assert "## 2) 三步跑通低风险 Agent 闭环" in content
+	assert "## 2) 三步跑通 Agent workflow" in content
 	assert "## 3) 失败恢复与排障" in content
 	assert "[Capability Matrix](capability-matrix.md)" in content
 
@@ -92,34 +106,44 @@ def test_capability_matrix_exists_and_covers_core_capabilities():
 	assert "`boss digest`" in content
 	assert "`boss config`" in content
 	assert "`boss clean`" in content
-	assert "34 个顶层命令" in content
-	assert "9 个一级招聘者子命令" in content
-	assert "`qiancheng` / 51job" in content
-	assert "`NOT_SUPPORTED`" in content
+	assert "39 个顶层命令" in content
+	assert "14 个一级招聘者子命令" in content
+	assert "`zhipin`" in content
+	assert "zhilian" not in content
+	assert "智联" not in content
+	assert "qiancheng" not in content
+	assert "51job" not in content
 
 
-def test_readme_documents_registered_qiancheng_placeholder():
+def test_readme_documents_current_registered_platforms():
 	readme = _read("README.md")
 	readme_en = _read("README.en.md")
 	matrix_en = _read("docs/capability-matrix.en.md")
 
-	assert "--platform zhipin|zhilian|qiancheng" in readme
-	assert "前程无忧 / 51job (`qiancheng`)" in readme
-	assert "QianchengPlatform (51job 占位适配器，统一返回 NOT_SUPPORTED)" in readme
+	assert "当前注册平台为 `zhipin`（BOSS 直聘）" in readme
+	assert "BOSS 直聘 (`zhipin`)" in readme
+	assert "zhilian" not in readme
+	assert "智联" not in readme
+	assert "qiancheng" not in readme
+	assert "51job" not in readme
 
-	assert "51job (`qiancheng`)" in readme_en
-	assert "returns `NOT_SUPPORTED`" in readme_en
-	assert "registered placeholder adapter" in matrix_en
+	assert "`zhipin` (BOSS Zhipin) is the only registered platform" in readme_en
+	assert "BOSS Zhipin (`zhipin`)" in readme_en
+	assert "zhilian" not in readme_en
+	assert "zhaopin" not in readme_en.lower()
+	assert "qiancheng" not in readme_en
+	assert "51job" not in readme_en
+	assert "zhilian" not in matrix_en
+	assert "zhaopin" not in matrix_en.lower()
+	assert "qiancheng" not in matrix_en
+	assert "51job" not in matrix_en
 
 
-def test_readme_and_skill_link_to_new_docs():
+def test_readme_links_to_new_docs():
+	"""根 SKILL.md 已迁至独立仓库 boss-skill，README 是本仓库的文档导航入口。"""
 	readme = _read("README.md")
 	assert "[Agent Quickstart](docs/agent-quickstart.md)" in readme
 	assert "[Capability Matrix](docs/capability-matrix.md)" in readme
-
-	skill = _read("SKILL.md")
-	assert "[Agent Quickstart](docs/agent-quickstart.md)" in skill
-	assert "[Capability Matrix](docs/capability-matrix.md)" in skill
 
 
 def test_mcp_readme_links_to_quickstart_and_matrix():
@@ -151,7 +175,7 @@ def test_readme_homepage_badges_stay_bilingual_and_symmetric():
 
 
 def test_schema_description_mentions_current_top_level_command_count():
-	from boss_agent_cli.commands.schema import SCHEMA_DATA
+	from boss_agent_cli.schema.data import SCHEMA_DATA
 
 	count = len(SCHEMA_DATA["commands"])
 	assert f"{count} 个顶层命令" in SCHEMA_DATA["description"]
@@ -168,7 +192,7 @@ def test_english_agent_docs_exist_and_are_linked_from_english_entrypoints():
 	quickstart = _read("docs/agent-quickstart.en.md")
 	assert "# Agent Quickstart" in quickstart
 	assert "## 1) Install and prepare the environment" in quickstart
-	assert "## 2) Complete the low-risk agent loop in three steps" in quickstart
+	assert "## 2) Complete an agent workflow in three steps" in quickstart
 	assert "## 3) Recovery flow and troubleshooting" in quickstart
 	assert "[Capability Matrix](capability-matrix.en.md)" in quickstart
 
@@ -182,8 +206,8 @@ def test_english_agent_docs_exist_and_are_linked_from_english_entrypoints():
 	assert "| Capability | CLI command | Login required | Transport |" in matrix
 	assert "`boss schema`" in matrix
 	assert "`boss hr candidates`" in matrix
-	assert "34 top-level commands" in matrix
-	assert "9 first-level recruiter subcommands" in matrix
+	assert "39 top-level commands" in matrix
+	assert "14 first-level recruiter subcommands" in matrix
 
 	mcp_readme = _read("mcp-server/README.en.md")
 	assert "[Agent Quickstart](../docs/agent-quickstart.en.md)" in mcp_readme
@@ -230,14 +254,16 @@ def test_glama_metadata_exists_and_declares_owner():
 def test_pyproject_exposes_boss_mcp_script():
 	pyproject = _read("pyproject.toml")
 	assert 'boss-mcp = "boss_agent_cli.mcp_server:run"' in pyproject
-	assert '"mcp>=1.0.0"' in pyproject
+	# 上界是硬要求：mcp 2.0 删掉了 `@server.list_tools()` / `@server.call_tool()`，
+	# 而 mcp_server 在模块层就用它们，装到 2.x 的用户连 boss-mcp 都起不来。
+	# 声明无上界时 CI 仍走 uv.lock 里的 1.x，全绿，用户全崩。放开前必须先适配 2.x API。
+	assert '"mcp>=2.1.0,<3.0.0"' in pyproject
 
 
-def test_agent_facing_docs_keep_low_risk_compliance_boundary():
-	"""Agent-facing docs must not reintroduce old automation-first guidance."""
+def test_agent_facing_docs_keep_bounded_runtime_boundary():
+	"""Open capability docs must not recommend unbounded risk-control bypasses."""
 	for path in _doc_paths_for_compliance_guardrails():
 		content = _read(path)
-		assert "低风险" in content or "low-risk" in content.lower(), path
 		assert "use cdp as a risk-control bypass" not in content.lower(), path
 		assert "use cdp to bypass" not in content.lower(), path
 		assert "启动 CDP Chrome 重试" not in content, path
@@ -255,18 +281,22 @@ def test_agent_facing_docs_keep_low_risk_compliance_boundary():
 		assert "嗅探真实" not in content, path
 
 
-def test_agent_instructions_send_sensitive_actions_to_official_platform():
+def test_agent_instructions_describe_current_open_capability_policy():
 	for path in _existing(("AGENTS.md", "CLAUDE.md", "README.md", "README.en.md")):
 		content = _read(path)
 		assert "COMPLIANCE_BLOCKED" in content, path
 		assert (
-			"平台官网" in content
-			or "官方页面" in content
-			or "官方平台" in content
-			or "official platform" in content.lower()
-			or "official website" in content.lower()
+			"全部已实现能力" in content
+			or "所有已实现能力" in content
+			or "every implemented capability" in content.lower()
+			or "identical capability access" in content.lower()
 		), path
-		assert "batch-greet  -> 默认低风险模式阻断" in content or "batch-greet" in content, path
+		assert (
+			"当前版本不主动产生" in content
+			or "不再产生模式级" in content
+			or "current execution paths" in content.lower()
+			or "no longer produce mode-level" in content.lower()
+		), path
 
 
 def test_public_docs_do_not_expose_low_risk_mode_config_key():
@@ -285,7 +315,7 @@ def test_config_command_does_not_document_internal_low_risk_policy_key():
 
 def test_schema_main_and_modules_command_count_consistent():
 	"""防漂移：Click 顶层命令应与 SCHEMA_DATA 完全一致。"""
-	from boss_agent_cli.commands.schema import SCHEMA_DATA
+	from boss_agent_cli.schema.data import SCHEMA_DATA
 	from boss_agent_cli.main import cli
 
 	registered = list(cli.commands)
@@ -298,3 +328,98 @@ def test_schema_main_and_modules_command_count_consistent():
 		f"仅在 Click: {registered_set - schema_set}，仅在 schema: {schema_set - registered_set}"
 	)
 	assert len(registered) == len(set(registered)), "Click 顶层命令存在重复注册"
+
+
+# 文档中写死的能力计数与其运行时真源的映射。
+_CAPABILITY_COUNT_PATTERNS: tuple[tuple[str, str], ...] = (
+	(r"(\d+)\s*个\s*已实现工具", "tools"),
+	(r"(\d+)\s+implemented\s+(?:MCP\s+)?tools", "tools"),
+	(r"(\d+)\s*个一级招聘者子命令", "recruiter_subcommands"),
+	(r"(\d+)\s+first-level\s+recruiter\s+subcommands", "recruiter_subcommands"),
+	(r"(\d+)\s*个顶层命令", "commands"),
+	(r"(\d+)\s+top-level(?:\s+CLI)?\s+commands", "commands"),
+	(r"(\d+)\s*个(?:默认)?(?:低风险)?\s*MCP\s*工具", "tools"),
+	(r"(\d+)\s*个(?:默认)?低风险工具", "tools"),
+	(r"(\d+)\s+(?:default\s+low-risk\s+)?MCP\s+tools", "tools"),
+	(r"(\d+)\s+default\s+low-risk\s+tools", "tools"),
+	(r"MCP\s+server\s+with\s+(\d+)\s+tools", "tools"),
+)
+
+# CHANGELOG 按定义记录历史事实（如「工具计数 31 → 32」），不该跟随当前值变化。
+_CAPABILITY_COUNT_EXEMPT_DOCS = frozenset({
+	"CHANGELOG.md",
+	"docs/marketing/awesome-submissions.md",
+	"docs/marketing/en-launch-story.md",
+	"docs/marketing/zh-launch-story.md",
+})
+
+
+@pytest.mark.parametrize("text,kind,count", [
+	("暴露 **75 个已实现工具**", "tools", 75),
+	("暴露 **75** 个已实现工具", "tools", 75),
+	("exposes **75 implemented tools**", "tools", 75),
+	("all 75 implemented MCP tools", "tools", 75),
+	("11 个一级招聘者子命令", "recruiter_subcommands", 11),
+	("11 first-level recruiter\nsubcommands", "recruiter_subcommands", 11),
+])
+def test_capability_count_patterns_cover_published_wording(text, kind, count):
+	matches = [
+		int(match.group(1)) for pattern, category in _CAPABILITY_COUNT_PATTERNS if category == kind
+		for match in re.finditer(pattern, text.replace("**", ""))
+	]
+	assert matches == [count]
+
+
+def _public_markdown_docs() -> list[Path]:
+	"""仅返回被 git 跟踪的 Markdown——「对外文档」的准确语义。
+
+	不能直接 glob 文件系统：`docs/blog/linuxdo-promo.md`、`docs/superpowers/` 等
+	本地草稿在 `.gitignore` 里，glob 会让这个断言随各人工作区内容而变——本地红、
+	CI 绿的环境相关假信号。
+	"""
+	result = subprocess.run(
+		["git", "ls-files", "-z", "--", "*.md"],
+		cwd=ROOT,
+		capture_output=True,
+		text=True,
+		check=False,
+	)
+	if result.returncode != 0:
+		pytest.skip("需要 git 工作副本才能确定对外文档集合")
+	paths = [ROOT / name for name in result.stdout.split("\0") if name]
+	return [
+		path
+		for path in paths
+		if path.relative_to(ROOT).as_posix() not in _CAPABILITY_COUNT_EXEMPT_DOCS and path.exists()
+	]
+
+
+def test_docs_capability_counts_match_runtime_source():
+	"""防漂移：文档里写死的顶层命令数 / MCP 工具数必须与运行时真源一致。
+
+	`docs/marketing/` 曾两次出现计数漂移（#346 校正后两周内再次漂移），根因是此前
+	只有 README 与 capability-matrix 被断言覆盖。这里改为扫描全部对外 Markdown，
+	并从 `SCHEMA_DATA` / `TOOLS` 动态取值，避免守卫本身成为下一个硬编码漂移点。
+	"""
+	from boss_agent_cli.schema.data import SCHEMA_DATA
+
+	expected = {
+		"commands": len(SCHEMA_DATA["commands"]),
+		"tools": len(_load_mcp_tools()),
+		"recruiter_subcommands": len(SCHEMA_DATA["commands"]["hr"]["subcommands"]),
+	}
+	mismatches: list[str] = []
+
+	for path in _public_markdown_docs():
+		content = path.read_text(encoding="utf-8").replace("**", "")
+		relative = path.relative_to(ROOT).as_posix()
+		for pattern, kind in _CAPABILITY_COUNT_PATTERNS:
+			for match in re.finditer(pattern, content):
+				found = int(match.group(1))
+				if found != expected[kind]:
+					line = content[: match.start()].count("\n") + 1
+					mismatches.append(
+						f"{relative}:{line} 写着 {found}，当前 {kind} 实际为 {expected[kind]}（命中 {match.group(0)!r}）"
+					)
+
+	assert not mismatches, "对外文档的能力计数已漂移：\n" + "\n".join(mismatches)

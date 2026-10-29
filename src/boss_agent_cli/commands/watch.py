@@ -12,8 +12,24 @@ from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.cache.store import CacheStore
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._platform import get_platform_instance
-from boss_agent_cli.display import handle_auth_errors, handle_error_output, handle_output
-from boss_agent_cli.search_filters import SearchFilterCriteria, SearchPipelinePlatformError, resolve_welfare_keywords, run_search_pipeline
+from boss_agent_cli.display import (
+	handle_auth_errors,
+	handle_error_output,
+	handle_output,
+	render_action_result,
+	render_list_result,
+	render_message_panel,
+)
+from boss_agent_cli.crawler.service import CrawlBudget
+from boss_agent_cli.search_filters import (
+	SearchFilterCriteria,
+	SearchPipelinePlatformError,
+	build_search_params,
+	detail_channel_for,
+	detail_filter_max_pages,
+	resolve_welfare_keywords,
+	run_search_pipeline,
+)
 
 
 def _parse_watch_filters(
@@ -28,18 +44,7 @@ def _parse_watch_filters(
 	job_type: str | None,
 	welfare: str | None,
 ) -> tuple[dict[str, str | None], list[tuple[str, list[str]]] | None]:
-	params = {
-		"query": query,
-		"city": city,
-		"salary": salary,
-		"experience": experience,
-		"education": education,
-		"industry": industry,
-		"scale": scale,
-		"stage": stage,
-		"job_type": job_type,
-		"welfare": welfare,
-	}
+	params = build_search_params(query, city, salary, experience, education, industry, scale, stage, job_type, welfare)
 	welfare_conditions = None
 	if welfare:
 		labels = [w.strip() for w in welfare.split(",") if w.strip()]
@@ -89,6 +94,9 @@ def watch_add_cmd(
 	handle_output(
 		ctx, "watch",
 		{"action": "add", "name": name, "params": params},
+		render=lambda d: render_action_result(
+			d, title="watch", next_steps=[f"boss watch run {name}", "boss watch list"]
+		),
 		hints={"next_actions": [f"boss watch run {name}", "boss watch list"]},
 	)
 
@@ -98,7 +106,20 @@ def watch_add_cmd(
 def watch_list_cmd(ctx: click.Context) -> None:
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		items = cache.list_saved_searches()
-	handle_output(ctx, "watch", items, hints={"next_actions": ["boss watch run <name>", "boss watch remove <name>"]})
+	handle_output(
+		ctx,
+		"watch",
+		items,
+		render=lambda d: render_list_result(
+			d,
+			"watches",
+			[("名称", "name", "bold cyan"), ("条件", "params", "green"), ("创建时间", "created_at", "dim")],
+			next_steps=["boss watch add <name> --query <关键词>"]
+			if not d
+			else ["boss watch run <name>", "boss watch remove <name>"],
+		),
+		hints={"next_actions": ["boss watch run <name>", "boss watch remove <name>"]},
+	)
 
 
 @watch_group.command("remove")
@@ -107,7 +128,12 @@ def watch_list_cmd(ctx: click.Context) -> None:
 def watch_remove_cmd(ctx: click.Context, name: str) -> None:
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		removed = cache.delete_saved_search(name)
-	handle_output(ctx, "watch", {"action": "remove", "name": name, "removed": removed})
+	handle_output(
+		ctx,
+		"watch",
+		{"action": "remove", "name": name, "removed": removed},
+		render=lambda d: render_action_result(d, title="watch", next_steps=["boss watch list"]),
+	)
 
 
 def _execute_single_watch(ctx: click.Context, cache: Any, name: str) -> dict[str, Any] | None:
@@ -144,6 +170,15 @@ def _execute_single_watch(ctx: click.Context, cache: Any, name: str) -> dict[str
 	data_dir = ctx.obj["data_dir"]
 	logger = ctx.obj["logger"]
 	auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
+	active = params.get("active")
+	extra: dict[str, Any] = {}
+	detail_channel = detail_channel_for(ctx.obj)
+	if active or detail_channel == "browser":
+		# 活跃度要查详情或 CDP 模式时串行 + 间隔，CDP 下只走浏览器 job_card（#451 回归修复）
+		if ctx.obj.get("platform", "zhipin") == "zhipin":
+			budget = CrawlBudget(cache)
+			extra["before_detail_request"] = lambda: budget.wait("list")
+		extra["detail_channel"] = detail_channel
 	with get_platform_instance(ctx, auth) as platform:
 		pipeline_result = run_search_pipeline(
 			platform,
@@ -151,8 +186,10 @@ def _execute_single_watch(ctx: click.Context, cache: Any, name: str) -> dict[str
 			logger,
 			criteria=criteria,
 			start_page=1,
-			max_pages=5 if welfare_conditions else 1,
+			max_pages=detail_filter_max_pages(welfare_conditions, active),
 			welfare_conditions=welfare_conditions,
+			active=active,
+			**extra,
 		)
 	watch_result = cache.record_watch_results(name, pipeline_result.items)
 	return {
@@ -189,6 +226,9 @@ def watch_run_cmd(ctx: click.Context, name: str | None, run_all: bool) -> None:
 			handle_output(
 				ctx, "watch",
 				{"mode": "all", "watches": watches, "total": len(watches)},
+				render=lambda d: render_message_panel(
+					{"模式": "全部", "监控数": d.get("total", 0)}, title="watch run"
+				),
 				hints={"next_actions": ["boss watch list", "boss detail <security_id>"]},
 			)
 			return
@@ -219,5 +259,6 @@ def watch_run_cmd(ctx: click.Context, name: str | None, run_all: bool) -> None:
 
 		handle_output(
 			ctx, "watch", summary,
+			render=lambda d: render_message_panel(d, title="watch run"),
 			hints={"next_actions": ["boss detail <security_id>", "boss watch list"]},
 		)

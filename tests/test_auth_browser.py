@@ -2,14 +2,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from boss_agent_cli.api.browser_urls import is_zhipin_url
 from boss_agent_cli.auth.browser import (
 	HOME_URL,
 	LOGIN_PAGE_URL,
 	_NAV_TIMEOUT_MS,
 	_NETWORKIDLE_GRACE_MS,
+	_is_cookie_domain,
+	_safe_user_agent,
+	_warm_home_for_runtime,
 	login_via_cdp,
 	login_via_browser,
 	refresh_stoken,
+	refresh_stoken_via_cdp,
 )
 
 
@@ -56,7 +61,27 @@ def test_login_via_cdp_stops_playwright_on_timeout(mock_sleep, mock_probe_cdp):
 
 @patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
 @patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
-def test_login_via_cdp_stops_playwright_when_user_agent_extraction_fails(mock_sleep, mock_probe_cdp):
+def test_login_via_cdp_poll_propagates_cdp_death(mock_sleep, mock_probe_cdp):
+	"""扫码轮询中途 CDP target 死掉：必须立即抛真实连接错误，而不是吞成 [] 空转到超时。
+
+	回归 code-review Finding：轮询循环若用吞异常的 _matching_cookies（except: return []），
+	会在浏览器已关闭后继续空转 timeout 秒，最终误报「扫码超时」——用户对着不存在的浏览器
+	白等。轮询应与最终读取同样让 ctx.cookies() 异常传播。
+	"""
+	mock_context = MagicMock()
+	mock_context.pages = []
+	# 登录检测阶段未命中，进入轮询后 cookies() 抛错（CDP target closed）
+	mock_context.cookies.side_effect = RuntimeError("CDP target closed")
+	mock_launcher, _, _ = _mock_cdp_playwright(mock_context)
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		with pytest.raises(RuntimeError, match="CDP target closed"):
+			login_via_cdp(timeout=120, platform="zhipin")
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_tolerates_user_agent_extraction_failure(mock_sleep, mock_probe_cdp):
 	mock_context = MagicMock()
 	mock_context.cookies.side_effect = [
 		[{"name": "wt2", "value": "token", "domain": ".zhipin.com"}],
@@ -66,11 +91,41 @@ def test_login_via_cdp_stops_playwright_when_user_agent_extraction_fails(mock_sl
 	mock_page.evaluate.side_effect = RuntimeError("user agent unavailable")
 
 	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
-		with pytest.raises(RuntimeError, match="user agent unavailable"):
-			login_via_cdp(timeout=1)
+		result = login_via_cdp(timeout=1)
 
+	assert result["cookies"]["wt2"] == "token"
+	assert result["user_agent"] == ""
 	mock_page.close.assert_called_once()
 	mock_playwright.stop.assert_called_once()
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_raises_when_final_cookie_read_fails(mock_sleep, mock_probe_cdp):
+	"""最终凭证读取阶段 ctx.cookies() 抛错必须让 login_via_cdp 抛异常，不得返回 cookies={}。
+
+	回归 review #406 二审①：最终读取若用吞异常的 _matching_cookies（except: return []），
+	登录检测成功后 ctx.cookies() 抛错（如 CDP target closed）会返回 cookies={} 的「成功」，
+	而 AuthManager.login 不校验主 cookie，空凭证直接落盘。master 是裸 ctx.cookies() 异常传播。
+	"""
+	mock_context = MagicMock()
+	mock_context.pages = []  # 无既有页签 → 新建
+	# 第一次（发现/登录检测阶段）命中 wt2，之后（最终读取阶段）抛 RuntimeError
+	call = {"n": 0}
+
+	def _cookies():
+		call["n"] += 1
+		if call["n"] == 1:
+			return [{"name": "wt2", "value": "token", "domain": ".zhipin.com"}]
+		raise RuntimeError("CDP target closed")
+
+	mock_context.cookies.side_effect = _cookies
+	mock_launcher, _, new_page = _mock_cdp_playwright(mock_context)
+	new_page.evaluate.return_value = "UA"
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		with pytest.raises(RuntimeError):
+			login_via_cdp(timeout=1, platform="zhipin")
 
 
 @patch("boss_agent_cli.auth.browser._extract_stoken", return_value="fresh-stoken")
@@ -96,7 +151,7 @@ def test_login_via_browser_tolerates_networkidle_timeout(mock_sleep, mock_extrac
 	assert result["stoken"] == "fresh-stoken"
 	assert result["user_agent"] == "UA"
 	mock_browser.new_context.assert_called_once()
-	mock_page.goto.assert_any_call(LOGIN_PAGE_URL, wait_until="domcontentloaded")
+	mock_page.goto.assert_any_call(LOGIN_PAGE_URL, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
 	mock_page.goto.assert_any_call(HOME_URL, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
 	mock_page.wait_for_load_state.assert_called_once_with("networkidle", timeout=_NETWORKIDLE_GRACE_MS)
 	mock_extract_stoken.assert_called_once_with(mock_page)
@@ -124,3 +179,615 @@ def test_refresh_stoken_tolerates_networkidle_timeout(mock_extract_stoken):
 	mock_page.wait_for_load_state.assert_called_once_with("networkidle", timeout=_NETWORKIDLE_GRACE_MS)
 	mock_extract_stoken.assert_called_once_with(mock_page)
 	mock_browser.close.assert_called_once()
+
+
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_browser_falls_back_to_cookie_jar_when_home_nav_stalls(mock_sleep):
+	# 登录页 goto 成功；首页两次 goto 均卡住（超时）→ home_loaded=False
+	mock_page = MagicMock()
+	mock_page.goto.side_effect = [
+		None,  # 登录页
+		TimeoutError("Timeout 15000ms exceeded"),  # 首页 attempt1
+		None,  # about:blank 重置
+		TimeoutError("Timeout 15000ms exceeded"),  # 首页 attempt2
+		None,  # 最后一次 about:blank 重置
+	]
+	mock_page.wait_for_load_state.side_effect = Exception("Timeout 3000ms exceeded")
+	mock_page.evaluate.return_value = "UA"
+
+	mock_context = MagicMock()
+	mock_context.new_page.return_value = mock_page
+	mock_context.cookies.side_effect = [
+		[{"name": "wt2", "value": "token", "domain": ".zhipin.com"}],
+		[
+			{"name": "wt2", "value": "token", "domain": ".zhipin.com"},
+			{"name": "__zp_stoken__", "value": "jar-stoken", "domain": ".zhipin.com"},
+		],
+	]
+
+	mock_browser = MagicMock()
+	mock_browser.new_context.return_value = mock_context
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=_mock_playwright_context(mock_browser)):
+		with patch("boss_agent_cli.auth.browser._extract_stoken") as mock_extract:
+			result = login_via_browser(timeout=2, platform="zhipin")
+
+	assert result["stoken"] == "jar-stoken"
+	assert result["user_agent"] == "UA"
+	# 首页未加载时不得对页面 evaluate 提取 stoken（避免 patchright 永久挂起）
+	mock_extract.assert_not_called()
+	mock_browser.close.assert_called_once()
+
+
+def test_refresh_stoken_returns_empty_when_home_nav_stalls():
+	mock_page = MagicMock()
+	mock_page.goto.side_effect = TimeoutError("Timeout 15000ms exceeded")
+	mock_page.wait_for_load_state.side_effect = Exception("Timeout 3000ms exceeded")
+
+	mock_context = MagicMock()
+	mock_context.new_page.return_value = mock_page
+
+	mock_browser = MagicMock()
+	mock_browser.new_context.return_value = mock_context
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=_mock_playwright_context(mock_browser)):
+		with patch("boss_agent_cli.auth.browser._extract_stoken") as mock_extract:
+			result = refresh_stoken({"wt2": "cookie"}, "UA")
+
+	assert result == ""
+	mock_extract.assert_not_called()
+	mock_browser.close.assert_called_once()
+
+
+def test_refresh_stoken_falls_back_to_cookie_jar_when_home_nav_stalls():
+	mock_page = MagicMock()
+	mock_page.goto.side_effect = TimeoutError("Timeout 15000ms exceeded")
+	mock_page.wait_for_load_state.side_effect = Exception("Timeout 3000ms exceeded")
+
+	mock_context = MagicMock()
+	mock_context.new_page.return_value = mock_page
+	mock_context.cookies.return_value = [{"name": "__zp_stoken__", "value": "jar-stoken", "domain": ".zhipin.com"}]
+
+	mock_browser = MagicMock()
+	mock_browser.new_context.return_value = mock_context
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=_mock_playwright_context(mock_browser)):
+		with patch("boss_agent_cli.auth.browser._extract_stoken") as mock_extract:
+			result = refresh_stoken({"wt2": "cookie"}, "UA")
+
+	assert result == "jar-stoken"
+	mock_extract.assert_not_called()
+	mock_browser.close.assert_called_once()
+
+
+def test_warm_home_for_runtime_reports_false_when_goto_stalls():
+	mock_page = MagicMock()
+	mock_page.goto.side_effect = TimeoutError("Timeout 15000ms exceeded")
+	mock_page.wait_for_load_state.side_effect = Exception("Timeout 3000ms exceeded")
+
+	assert _warm_home_for_runtime(mock_page, HOME_URL, stage="test") is False
+
+
+def test_warm_home_for_runtime_reports_true_when_goto_succeeds():
+	mock_page = MagicMock()
+	mock_page.goto.return_value = None
+	mock_page.wait_for_load_state.side_effect = Exception("Timeout 3000ms exceeded")
+
+	assert _warm_home_for_runtime(mock_page, HOME_URL, stage="test") is True
+
+
+def test_warm_home_for_runtime_retries_and_recovers_when_goto_stalls_then_succeeds():
+	mock_page = MagicMock()
+	# 首次 goto 卡住超时 → about:blank 重置 → 第二次 goto 成功
+	mock_page.goto.side_effect = [TimeoutError("Timeout 15000ms exceeded"), None, None]
+	mock_page.wait_for_load_state.side_effect = Exception("Timeout 3000ms exceeded")
+
+	assert _warm_home_for_runtime(mock_page, HOME_URL, stage="test") is True
+	# home 尝试 2 次 + 1 次 about:blank 重置
+	assert mock_page.goto.call_count == 3
+
+
+def test_warm_home_for_runtime_returns_false_after_all_retries_exhausted():
+	mock_page = MagicMock()
+	# 两次 goto 均卡住；about:blank 重置成功但无法恢复首页
+	mock_page.goto.side_effect = [
+		TimeoutError("Timeout 15000ms exceeded"),
+		None,
+		TimeoutError("Timeout 15000ms exceeded"),
+		None,
+	]
+	mock_page.wait_for_load_state.side_effect = Exception("Timeout 3000ms exceeded")
+
+	assert _warm_home_for_runtime(mock_page, HOME_URL, stage="test") is False
+
+
+def test_safe_user_agent_swallows_evaluate_error():
+	mock_page = MagicMock()
+	mock_page.evaluate.side_effect = RuntimeError("user agent unavailable")
+
+	assert _safe_user_agent(mock_page) == ""
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_extracts_stoken_when_home_loads(mock_sleep, mock_probe_cdp):
+	mock_context = MagicMock()
+	mock_launcher, mock_playwright, mock_page = _mock_cdp_playwright(mock_context)
+	mock_page.evaluate.return_value = "UA"
+	mock_page.goto.return_value = None
+	mock_context.cookies.return_value = [{"name": "wt2", "value": "token", "domain": ".zhipin.com"}]
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		with patch("boss_agent_cli.auth.browser._extract_stoken", return_value="cdp-stoken"):
+			result = login_via_cdp(timeout=1)
+
+	assert result["stoken"] == "cdp-stoken"
+	assert result["user_agent"] == "UA"
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_falls_back_to_cookie_jar_stoken_when_home_stalls(mock_sleep, mock_probe_cdp):
+	mock_context = MagicMock()
+	mock_launcher, mock_playwright, mock_page = _mock_cdp_playwright(mock_context)
+	mock_page.evaluate.return_value = "UA"
+	mock_page.goto.side_effect = TimeoutError("Timeout 15000ms exceeded")
+	mock_page.wait_for_load_state.side_effect = Exception("Timeout 3000ms exceeded")
+	mock_context.cookies.return_value = [
+		{"name": "wt2", "value": "token", "domain": ".zhipin.com"},
+		{"name": "__zp_stoken__", "value": "jar-stoken", "domain": ".zhipin.com"},
+	]
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		with patch("boss_agent_cli.auth.browser._extract_stoken") as mock_extract:
+			result = login_via_cdp(timeout=1)
+
+	assert result["stoken"] == "jar-stoken"
+	mock_extract.assert_not_called()
+	# Blocker 回归（review #406）：首页卡住时 UA/stoken 都不得对页面 evaluate
+	# （patchright 在执行上下文无法建立时永久挂起、不抛异常）。
+	mock_page.evaluate.assert_not_called()
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_refresh_stoken_via_cdp_falls_back_to_cookie_jar(mock_sleep, mock_probe_cdp):
+	mock_context = MagicMock()
+	mock_launcher, mock_playwright, mock_page = _mock_cdp_playwright(mock_context)
+	mock_page.goto.side_effect = TimeoutError("Timeout 15000ms exceeded")
+	mock_page.wait_for_load_state.side_effect = Exception("Timeout 3000ms exceeded")
+	mock_context.cookies.return_value = [{"name": "__zp_stoken__", "value": "jar-stoken", "domain": ".zhipin.com"}]
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		result = refresh_stoken_via_cdp()
+
+	assert result == "jar-stoken"
+	mock_playwright.stop.assert_called_once()
+
+
+# ── 复用已登录 CDP 会话（对齐 #390 之后补齐 #382 意图） ──────────────
+
+
+def test_zhipin_url_and_cookie_domain_use_exact_host_validation() -> None:
+	assert is_zhipin_url("https://www.zhipin.com/web/geek/job")
+	assert not is_zhipin_url("https://not-zhipin.com/")  # 子串陷阱
+	assert not is_zhipin_url("https://zhipin.com.evil.example/")
+	assert _is_cookie_domain(".zhipin.com", ".zhipin.com")
+	assert not _is_cookie_domain("not-zhipin.com", ".zhipin.com")  # 子串匹配会误放行
+
+
+def _make_logged_and_empty_contexts() -> tuple[MagicMock, MagicMock]:
+	logged_ctx = MagicMock()
+	logged_ctx.cookies.return_value = [
+		{"name": "wt2", "value": "tok", "domain": ".zhipin.com"},
+		{"name": "__zp_stoken__", "value": "jar-stoken", "domain": ".zhipin.com"},
+	]
+	empty_ctx = MagicMock()
+	empty_ctx.cookies.return_value = []
+	return logged_ctx, empty_ctx
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_selects_logged_in_context_even_when_not_first(mock_sleep, mock_probe_cdp):
+	logged_ctx, empty_ctx = _make_logged_and_empty_contexts()
+	logged_ctx.pages = []
+	empty_ctx.pages = []
+
+	mock_browser = MagicMock()
+	mock_browser.contexts = [empty_ctx, logged_ctx]
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value.chromium.connect_over_cdp.return_value = mock_browser
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		result = login_via_cdp(timeout=1)
+
+	assert result["cookies"]["wt2"] == "tok"
+	empty_ctx.new_page.assert_not_called()  # 绝不在未登录 context 中创建页签
+	logged_ctx.new_page.assert_called_once()
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_reuse_prints_context_index_and_account_fingerprint(mock_sleep, mock_probe_cdp, capsys):
+	"""复用已登录 context 时，stderr 必须打出 context 序号 + 不可逆账号指纹（多 context 歧义）。"""
+	logged_ctx, empty_ctx = _make_logged_and_empty_contexts()
+	logged_ctx.pages = []
+	empty_ctx.pages = []
+	mock_browser = MagicMock()
+	mock_browser.contexts = [empty_ctx, logged_ctx]  # 命中第 2 个
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value.chromium.connect_over_cdp.return_value = mock_browser
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		login_via_cdp(timeout=1)
+
+	err = capsys.readouterr().err
+	assert "context 2/2" in err  # 选中第 2 个 context
+	assert "账号指纹" in err
+	# 指纹不可逆：不得泄露 cookie 原值
+	assert "tok" not in err
+	# 多 context 时给出纠正提示
+	assert "多个浏览器 context" in err
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_reuses_existing_zhipin_page_without_login_nav(mock_sleep, mock_probe_cdp):
+	logged_ctx, _ = _make_logged_and_empty_contexts()
+	existing_page = MagicMock()
+	existing_page.url = "https://www.zhipin.com/web/geek/job"
+	logged_ctx.pages = [existing_page]
+
+	mock_browser = MagicMock()
+	mock_browser.contexts = [logged_ctx]
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value.chromium.connect_over_cdp.return_value = mock_browser
+
+	with (
+		patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher),
+		patch("boss_agent_cli.auth.browser._extract_stoken") as mock_extract,
+	):
+		result = login_via_cdp(timeout=1)
+
+	existing_page.goto.assert_not_called()  # 不导航登录页、不轮询等待
+	existing_page.close.assert_not_called()  # 只清理本次调用创建的页签
+	assert result["stoken"] == "jar-stoken"  # 复用页签优先信 cookie jar
+	mock_extract.assert_not_called()
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_logged_in_without_suitable_page_warms_new_page(mock_sleep, mock_probe_cdp):
+	logged_ctx, _ = _make_logged_and_empty_contexts()
+	logged_ctx.pages = []
+	mock_launcher, mock_playwright, mock_page = _mock_cdp_playwright(logged_ctx)
+	mock_page.evaluate.return_value = "UA"
+
+	with (
+		patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher),
+		patch("boss_agent_cli.auth.browser._extract_stoken", return_value="page-stoken") as mock_extract,
+	):
+		result = login_via_cdp(timeout=1)
+
+	# 首页确认加载后按 #390 语义走页面提取
+	assert result["stoken"] == "page-stoken"
+	mock_extract.assert_called_once()
+	assert result["user_agent"] == "UA"
+	# 新建页签必须经 _warm_home_for_runtime 回首页（domcontentloaded）
+	mock_page.goto.assert_called_once()
+	assert mock_page.goto.call_args.kwargs["wait_until"] == "domcontentloaded"
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_new_page_stalled_falls_back_to_cookie_jar(mock_sleep, mock_probe_cdp):
+	"""复用登录态但新建页签首页卡住：不得对页面 evaluate，回退 cookie jar。"""
+	logged_ctx, _ = _make_logged_and_empty_contexts()
+	logged_ctx.pages = []
+	mock_launcher, mock_playwright, mock_page = _mock_cdp_playwright(logged_ctx)
+	mock_page.goto.side_effect = TimeoutError("Timeout 15000ms exceeded")
+	mock_page.wait_for_load_state.side_effect = Exception("Timeout 3000ms exceeded")
+
+	with (
+		patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher),
+		patch("boss_agent_cli.auth.browser._extract_stoken") as mock_extract,
+	):
+		result = login_via_cdp(timeout=1)
+
+	assert result["stoken"] == "jar-stoken"
+	mock_extract.assert_not_called()
+	# 首页卡住（home_loaded=False）时 UA 也不得 evaluate（blocker 回归）
+	mock_page.evaluate.assert_not_called()
+
+
+def _make_reuse_page_context(*, jar_stoken: str | None) -> tuple[MagicMock, MagicMock]:
+	"""构造「已登录 context + 既有 zhipin 页签」，jar_stoken=None 表示 cookie jar 缺 stoken。"""
+	logged_ctx = MagicMock()
+	cookies = [{"name": "wt2", "value": "tok", "domain": ".zhipin.com"}]
+	if jar_stoken is not None:
+		cookies.append({"name": "__zp_stoken__", "value": jar_stoken, "domain": ".zhipin.com"})
+	logged_ctx.cookies.return_value = cookies
+	existing_page = MagicMock()
+	existing_page.url = "https://www.zhipin.com/web/geek/job"
+	logged_ctx.pages = [existing_page]
+	return logged_ctx, existing_page
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_reuse_page_extracts_stoken_when_ready(mock_sleep, mock_probe_cdp):
+	"""复用既有页签 + jar 缺 stoken：有界确认就绪后采 UA 并提取 stoken（核心新路径 277-298）。"""
+	logged_ctx, existing_page = _make_reuse_page_context(jar_stoken=None)
+	mock_browser = MagicMock()
+	mock_browser.contexts = [logged_ctx]
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value.chromium.connect_over_cdp.return_value = mock_browser
+	existing_page.evaluate.return_value = "UA"
+
+	with (
+		patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher),
+		patch("boss_agent_cli.auth.browser._extract_stoken", return_value="page-stoken") as mock_extract,
+	):
+		result = login_via_cdp(timeout=1)
+
+	existing_page.goto.assert_not_called()  # 复用页签不导航
+	existing_page.wait_for_load_state.assert_called_once_with("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+	mock_extract.assert_called_once()  # 页面就绪后提取 stoken
+	assert result["stoken"] == "page-stoken"
+	assert result["user_agent"] == "UA"  # 就绪后才采 UA
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_reuse_page_with_jar_stoken_skips_extract_but_collects_ua(mock_sleep, mock_probe_cdp):
+	"""复用既有页签 + jar 已有 stoken：不调 _extract_stoken，但 UA 仍在就绪后采集。"""
+	logged_ctx, existing_page = _make_reuse_page_context(jar_stoken="jar-stoken")
+	mock_browser = MagicMock()
+	mock_browser.contexts = [logged_ctx]
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value.chromium.connect_over_cdp.return_value = mock_browser
+	existing_page.evaluate.return_value = "UA"
+
+	with (
+		patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher),
+		patch("boss_agent_cli.auth.browser._extract_stoken") as mock_extract,
+	):
+		result = login_via_cdp(timeout=1)
+
+	existing_page.goto.assert_not_called()
+	mock_extract.assert_not_called()  # jar 已有 stoken，不做页面提取
+	assert result["stoken"] == "jar-stoken"
+	# UA 仍需就绪门禁后采集（result["user_agent"] 是必需输出）
+	existing_page.wait_for_load_state.assert_called_once_with("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+	assert result["user_agent"] == "UA"
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_reuse_stalled_page_is_not_evaluated(mock_sleep, mock_probe_cdp):
+	"""复用既有页签 + jar 缺 stoken + 页面卡住：_extract_stoken 与 evaluate 都不调用。"""
+	logged_ctx, existing_page = _make_reuse_page_context(jar_stoken=None)
+	mock_browser = MagicMock()
+	mock_browser.contexts = [logged_ctx]
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value.chromium.connect_over_cdp.return_value = mock_browser
+	existing_page.wait_for_load_state.side_effect = Exception("Timeout 15000ms exceeded")
+
+	with (
+		patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher),
+		patch("boss_agent_cli.auth.browser._extract_stoken") as mock_extract,
+	):
+		result = login_via_cdp(timeout=1)
+
+	existing_page.goto.assert_not_called()
+	existing_page.wait_for_load_state.assert_called_once_with("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+	mock_extract.assert_not_called()
+	existing_page.evaluate.assert_not_called()  # 页面卡住：UA 也不采
+	assert result["stoken"] == ""
+	assert result["user_agent"] == ""
+
+
+# ── login --force：不复用既有登录态（Issue #424） ─────────────────
+
+
+def test_clear_platform_cookies_only_touches_target_domain_variants():
+	"""按实际存在的 domain 值逐一清除：.zhipin.com 与 www.zhipin.com 都清，evil-zhipin.com 与其他站点不动。"""
+	from boss_agent_cli.auth.browser import _clear_platform_cookies
+
+	ctx = MagicMock()
+	ctx.cookies.return_value = [
+		{"name": "wt2", "value": "tok", "domain": ".zhipin.com"},
+		{"name": "__zp_stoken__", "value": "s", "domain": "www.zhipin.com"},
+		{"name": "x", "value": "1", "domain": "evil-zhipin.com"},
+		{"name": "y", "value": "2", "domain": "zhipin.com.attacker.net"},
+		{"name": "sid", "value": "3", "domain": ".github.com"},
+	]
+
+	_clear_platform_cookies(ctx, cookie_domain="zhipin.com")
+
+	cleared = sorted(call.kwargs["domain"] for call in ctx.clear_cookies.call_args_list)
+	assert cleared == [".zhipin.com", "www.zhipin.com"]
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_force_skips_reuse_clears_platform_cookies_and_scans(mock_sleep, mock_probe_cdp, capsys):
+	"""reuse_existing=False：不扫描已登录 context、清掉目标平台 cookie、打开登录页并轮询新登录态。"""
+	logged_ctx, existing_page = _make_reuse_page_context(jar_stoken="stale-stoken")
+	# 清除后第一次轮询没有 wt2（已清），第二次出现新扫码产生的 wt2
+	logged_ctx.cookies.side_effect = [
+		[{"name": "wt2", "value": "stale", "domain": ".zhipin.com"}],  # _clear_platform_cookies 枚举
+		[],  # 轮询第 1 次：已清
+		[{"name": "wt2", "value": "fresh", "domain": ".zhipin.com"}],  # 轮询第 2 次：新登录
+		[{"name": "wt2", "value": "fresh", "domain": ".zhipin.com"}],  # 最终读取
+	]
+	mock_launcher, _, new_page = _mock_cdp_playwright(logged_ctx)
+	new_page.evaluate.return_value = "UA"
+
+	with (
+		patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher),
+		patch("boss_agent_cli.auth.browser._find_logged_in_context") as mock_find,
+		patch("boss_agent_cli.auth.browser._extract_stoken", return_value="fresh-stoken"),
+	):
+		result = login_via_cdp(timeout=3, reuse_existing=False)
+
+	mock_find.assert_not_called()  # 不扫描、不复用
+	logged_ctx.clear_cookies.assert_called_once_with(domain=".zhipin.com")
+	existing_page.goto.assert_not_called()  # 既有页签不动
+	new_page.goto.assert_any_call(LOGIN_PAGE_URL, wait_until="commit", timeout=_NAV_TIMEOUT_MS)
+	assert result["cookies"]["wt2"] == "fresh"
+	assert result["stoken"] == "fresh-stoken"
+	assert "--force" in capsys.readouterr().err
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_default_still_reuses_without_clearing(mock_sleep, mock_probe_cdp):
+	"""默认 reuse_existing=True 行为不变：复用已登录 context，绝不清 cookie。"""
+	logged_ctx, existing_page = _make_reuse_page_context(jar_stoken="jar-stoken")
+	mock_browser = MagicMock()
+	mock_browser.contexts = [logged_ctx]
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value.chromium.connect_over_cdp.return_value = mock_browser
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		result = login_via_cdp(timeout=1)
+
+	logged_ctx.clear_cookies.assert_not_called()
+	existing_page.goto.assert_not_called()
+	assert result["stoken"] == "jar-stoken"
+
+
+# ── 复用登录态的只读探测（Issue #424 第二步） ─────────────────
+
+
+def _evaluate_router(probe_result):
+	"""UA 采集与探测共用 page.evaluate：按脚本内容分流。"""
+
+	def _route(script, arg=None):
+		if "fetch(" in script:
+			return probe_result
+		return "UA"
+
+	return _route
+
+
+@pytest.mark.parametrize(
+	("probe_result", "expected"),
+	[
+		({"code": 0, "zpData": {"name": "x"}}, "valid"),
+		({"code": 37, "message": "stoken 已过期"}, "stale"),
+		({"code": 5, "message": "未登录"}, "stale"),
+		({"code": -1, "message": "TypeError: Failed to fetch"}, "unverified"),
+		("not-a-dict", "unverified"),
+	],
+)
+def test_probe_reused_session_classifies_user_info_response(probe_result, expected):
+	from boss_agent_cli.auth.browser import _probe_reused_session
+
+	page = MagicMock()
+	page.evaluate.return_value = probe_result
+	assert _probe_reused_session(page, platform="zhipin") == expected
+	page.evaluate.assert_called_once()
+
+
+def test_probe_reused_session_raises_on_platform_risk():
+	from boss_agent_cli.api.client import AccountRiskError, EnvironmentRiskError
+	from boss_agent_cli.auth.browser import _probe_reused_session
+
+	page = MagicMock()
+	page.evaluate.return_value = {"code": 36, "message": "检测到异常行为"}
+	with pytest.raises(AccountRiskError):
+		_probe_reused_session(page, platform="zhipin")
+
+	page.evaluate.return_value = {"code": 37, "message": "环境存在异常"}
+	with pytest.raises(EnvironmentRiskError):
+		_probe_reused_session(page, platform="zhipin")
+
+
+def test_probe_reused_session_skips_non_zhipin_and_evaluate_failure():
+	from boss_agent_cli.auth.browser import _probe_reused_session
+
+	page = MagicMock()
+	assert _probe_reused_session(page, platform="otherplat") == "unverified"
+	page.evaluate.assert_not_called()
+
+	page.evaluate.side_effect = RuntimeError("target closed")
+	assert _probe_reused_session(page, platform="zhipin") == "unverified"
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_reuse_stale_session_raises_and_does_not_return_credentials(mock_sleep, mock_probe_cdp, capsys):
+	"""复用命中但探测返回未登录：抛 ReusedSessionStaleError，不返回死凭证，页签清理照常。"""
+	from boss_agent_cli.auth.browser import ReusedSessionStaleError
+
+	logged_ctx, existing_page = _make_reuse_page_context(jar_stoken="stale-stoken")
+	existing_page.evaluate.side_effect = _evaluate_router({"code": 37, "message": "stoken 已过期"})
+	mock_browser = MagicMock()
+	mock_browser.contexts = [logged_ctx]
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value.chromium.connect_over_cdp.return_value = mock_browser
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		with pytest.raises(ReusedSessionStaleError):
+			login_via_cdp(timeout=1)
+
+	existing_page.goto.assert_not_called()  # 既有页签仍不导航
+	existing_page.close.assert_not_called()  # 不是本次创建的页签，不关
+	mock_launcher.start.return_value.stop.assert_called_once()
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_reuse_valid_session_returns_credentials(mock_sleep, mock_probe_cdp, capsys):
+	logged_ctx, existing_page = _make_reuse_page_context(jar_stoken="jar-stoken")
+	existing_page.evaluate.side_effect = _evaluate_router({"code": 0, "zpData": {}})
+	mock_browser = MagicMock()
+	mock_browser.contexts = [logged_ctx]
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value.chromium.connect_over_cdp.return_value = mock_browser
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		result = login_via_cdp(timeout=1)
+
+	assert result["cookies"]["wt2"] == "tok"
+	assert result["user_agent"] == "UA"
+	assert "已通过只读验证" in capsys.readouterr().err
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_reuse_stalled_page_skips_probe_and_warns(mock_sleep, mock_probe_cdp, capsys):
+	"""页面未就绪时不做探测（否则 evaluate 会挂起），按 unverified 继续并提示 --force。"""
+	logged_ctx, existing_page = _make_reuse_page_context(jar_stoken="jar-stoken")
+	existing_page.wait_for_load_state.side_effect = RuntimeError("stalled")
+	mock_browser = MagicMock()
+	mock_browser.contexts = [logged_ctx]
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value.chromium.connect_over_cdp.return_value = mock_browser
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		result = login_via_cdp(timeout=1)
+
+	existing_page.evaluate.assert_not_called()
+	assert result["stoken"] == "jar-stoken"
+	assert "--force" in capsys.readouterr().err
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_cdp_reuse_probe_risk_propagates(mock_sleep, mock_probe_cdp):
+	from boss_agent_cli.api.client import EnvironmentRiskError
+
+	logged_ctx, existing_page = _make_reuse_page_context(jar_stoken="jar-stoken")
+	existing_page.evaluate.side_effect = _evaluate_router({"code": 37, "message": "环境存在异常"})
+	mock_browser = MagicMock()
+	mock_browser.contexts = [logged_ctx]
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value.chromium.connect_over_cdp.return_value = mock_browser
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		with pytest.raises(EnvironmentRiskError):
+			login_via_cdp(timeout=1)

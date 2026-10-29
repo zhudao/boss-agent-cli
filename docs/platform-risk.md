@@ -1,20 +1,39 @@
 # 平台风险边界
 
-boss-agent-cli 默认启用低风险辅助模式：本地辅助、只读优先、用户主动触发、不规避风控、不批量触达、不抓取平台数据。项目不控制平台规则、账号风控、接口变更或第三方浏览器环境。使用者需要理解以下边界。
+boss-agent-cli 保留 `assisted|research` 配置兼容性，两种模式均可调用全部已实现能力。项目不控制平台规则、账号风控、接口变更或第三方浏览器环境；开放能力不取消运行预算、checkpoint、停止、脱敏和数据保管要求。
 
-## 0. 默认低风险模式
+## 0. 开放能力与运行控制
 
-默认低风险辅助模式会阻断以下敏感链路：
+候选者写操作、批量触达、招聘者候选人数据和浏览器采集均可进入各自业务层。调用方必须：
 
-- 自动打招呼、批量打招呼、投递/立即沟通、联系方式交换
-- 招聘者侧候选人搜索、投递申请、在线简历、聊天记录、最近消息摘要
-- 招聘者侧消息回复、附件简历请求、手机/微信交换
+- 使用显式输入、数量、timeout、retry 和 stop 条件；
+- 保存并复用 workflow/crawl `run_id`，不得通过扫描“最新任务”隐式恢复；
+- 对 Cookie、Token、`security_id`、联系方式、简历和聊天数据持续脱敏；
+- 遇到 `ACCOUNT_RISK`、安全页或预算耗尽时 checkpoint 并停止，不无界换通道重试。
 
-这些动作应回到 BOSS 直聘官方页面由用户手动完成。不要通过 CDP、patchright、Bridge 或其他自动化方式重试已被平台风控拦截的操作。
+平台未实现的能力返回 `NOT_SUPPORTED`，不得为了完成 workflow 伪造成功。`COMPLIANCE_BLOCKED` 只作为历史错误码保留，当前执行路径不主动产生。
+
+## 0.1 历史模式兼容
+
+```bash
+boss config set operating_mode research
+boss schema --format native
+```
+
+两种模式共享以下运行约束：
+
+- 抓取页数、详情请求、重试和运行时间必须有默认上限；不得以 `0` 隐式表达无限运行。
+- 命中风险页或风险码时先保存 checkpoint；继续需要新的用户动作。
+- **专用 profile 通道**（crawl、research、`boss login --cdp` 的新登录）：必须使用独立 profile，不得关闭或污染用户日常 profile 与原有标签页。
+- **现有浏览器只读通道**（显式选择 `--browser-source existing-browser` 的已有 CDP 浏览器）：只复用已打开的目标站点页面，不导航、关闭、写入、读取或注入本地凭据、新建 context/页面或启动浏览器；通道不可用时返回 `BROWSER_SESSION_NOT_FOUND`，不得降级到 headless、临时 profile 或登录流程。复用登录会话不等于授权发送消息、打招呼或投递。
+- 两类通道都必须遵守本页其余约束。profile 隔离要求的放宽不构成对第 4 节可见浏览器、RPA 或指纹浏览器约束的豁免。
+- Cookie、Token、`__zp_stoken__`、`security_id` 和真实个人信息不得进入日志、错误、导出、fixture 或公开 PR 证据。
+- vendored hook 必须记录上游 repository、commit、license 和内容 hash，并提供逐项开关。
+- 输出数据必须有本地清理和 retention 机制；不得默认全量导入 shortlist 或其他工作流。
 
 ## 1. 平台接口可能变化
 
-项目依赖 BOSS 直聘、智联招聘等平台的网页、接口、Cookie、登录态和响应结构。平台可能随时调整字段、风控、接口路径或页面行为。
+项目依赖 BOSS 直聘等招聘平台的网页、接口、Cookie、登录态和响应结构。平台可能随时调整字段、风控、接口路径或页面行为。
 
 当出现以下现象时，优先按平台漂移处理：
 
@@ -25,9 +44,13 @@ boss-agent-cli 默认启用低风险辅助模式：本地辅助、只读优先�
 
 ## 2. 登录和 Cookie 边界
 
-登录链路会使用 Cookie 提取、CDP、QR httpx 或浏览器兜底。项目只在本地读取和保存登录态，不要求用户把 Cookie、Token、手机号、微信号、姓名、公司信息或 `security_id` 提交到仓库。登录兼容能力不得用于规避平台风控或绕过平台限制。
+登录链路会使用 Cookie 提取、CDP、QR httpx 或浏览器兜底。项目只在本地读取和保存登录态，不要求用户把 Cookie、Token、手机号、微信号、姓名、公司信息或 `security_id` 提交到仓库。任何 adapter 都不得把登录兼容能力升级为风控重试通道，并必须遵守本页 0.1 节约束。
 
-`boss status` 默认只检查本地加密凭据和分层健康状态，不请求真实平台；需要确认在线只读接口是否可用时，必须显式运行 `boss status --live` 或 `boss doctor --live-probe`。`boss doctor` 默认只做本地诊断，输出的 `next_actions` 会保留安全兜底：敏感操作或命中风控时停止自动化访问，并回到官方页面由用户手动完成。`wt2` 存在但 `__zp_stoken__` 缺失时属于部分登录态，通常需要通过真实页面 JS 生成；可在用户主动操作下以 Chrome CDP 远程调试端口启动浏览器后运行 `boss login --cdp`，但不得把 CDP 当成风控绕过通道。
+`chat` / `chatmsg` 在默认 `auto` 来源下保留 httpx 路径，本地没有凭据则返回 `AUTH_REQUIRED` + `boss login`。只有显式选择 `--browser-source existing-browser` 才会通过 CDP 复用已有目标页，不读取或导出 CLI 保存的 Cookie。CDP 可连接不等于已验证目标页面登录，平台返回的未登录响应仍按平台错误解析；CDP 会话或已有目标页不可用时返回 `BROWSER_SESSION_NOT_FOUND` + `boss doctor`，不会启动 headless 或登录流程。`stored-cookie` 只连接显式 `--cdp-url`，不自动探测或降级。浏览器通道不继承 httpx 的 stoken 刷新和限流重试语义。
+
+Browser Bridge daemon 与扩展已在 v3.0.0 移除；升级 CLI 不会停止旧 daemon 或卸载旧扩展，需由用户手动清理。CDP 调试端口仅用于本机可信环境，不应暴露到公网；在官方页面手动完成登录，不得把迁移到 CDP 当成风控绕过路径。
+
+`boss status` 默认只检查本地加密凭据和分层健康状态，不请求真实平台；需要确认在线只读接口是否可用时，必须显式运行 `boss status --live` 或 `boss doctor --live-probe`。命中风控时停止当前 workflow 并保留 checkpoint。`wt2` 存在但 `__zp_stoken__` 缺失时属于部分登录态，通常需要通过真实页面 JS 生成；可在用户主动操作下以 Chrome CDP 远程调试端口启动浏览器后运行 `boss login --cdp`，但不得把 CDP 当成风控绕过通道。
 
 提交 Issue 前必须脱敏：
 
@@ -41,18 +64,19 @@ boss-agent-cli 默认启用低风险辅助模式：本地辅助、只读优先�
 
 ## 3. 请求频率和账号责任
 
-默认请求间隔由 `--delay` 控制。不要把本工具用于高频抓取、批量骚扰、绕过平台限制或违反平台条款的用途。写操作，例如 `greet`、`apply`、`exchange`、`hr reply`，在默认低风险模式下会被阻断；需要沟通或投递时，请回到平台官网手动完成。
+默认请求间隔由 `--delay` 控制。采集、写操作和批量触达必须使用有限预算、显式用户输入与停止条件；不得把模式配置解释为取消账号、数据和运行责任。
+
+BOSS 职位列表请求还共享 SQLite 中的持久预算：普通 `boss search` 与 crawler
+跨 CLI 进程串行预留 5–10 秒请求窗口。搜索缓存命中不会占用请求窗口；删除
+本地缓存或并行启动多个进程不得用于绕过该预算。
 
 ## 4. 浏览器自动化边界
 
-patchright、CDP、Chrome 本地 profile、系统钥匙串、浏览器插件和平台风控都会影响登录与访问稳定性。浏览器能打开不代表 httpx 链路一定可用；httpx 链路可用也不代表浏览器自动化链路一定可用。命中风控时应停止自动化访问，而不是更换自动化通道继续重试。
+patchright、CDP、Chrome 本地 profile、系统钥匙串、浏览器插件和平台风控都会影响登录与访问稳定性。浏览器能打开不代表 httpx 链路一定可用；httpx 链路可用也不代表浏览器自动化链路一定可用。任何模式命中风控时都停止；声明的 adapter 不能无界切换通道或无限重试。
 
-Windows 客户端、可见浏览器、RPA 工具或指纹浏览器不会改变本项目的合规边界。boss-agent-cli 不提供通过 Windows app、CloakBrowser、stealth profile 或类似 RPA 流程规避平台风控的实现、恢复建议或 smoke 路径。允许讨论的范围仅限于低风险人工辅助：打开官方页面、展示诊断结果、提示用户手动处理，以及在命中验证码、`ACCOUNT_RISK`、请求不合法或其他平台异常时立即停止自动化访问。
+Windows 客户端、可见浏览器、CloakBrowser、RPA 工具或指纹浏览器都必须遵守相同的预算、脱敏、checkpoint 和停止策略。普通 CI 不得自动运行真实风控研究。
 
-第三方仓库中的 stealth、response interception、自动滚动抓取、批量提取
-或模拟真实用户指纹示例只能作为风险观察材料。它们不能直接进入主线实现、
-文档推荐路径、测试夹具或 smoke 流程；新平台接入必须先通过
-[多平台适配器研究模板](research/platforms/README.md) 的准入评估。
+第三方仓库中的 stealth、response interception、自动滚动抓取、批量提取或模拟真实用户指纹实现，只有在来源、license、commit、hash、数据路径和停止行为完成审计后，才能进入声明的 adapter；不得进入真实账号 CI。新平台接入仍必须先通过 [多平台适配器研究模板](research/platforms/README.md) 的准入评估。
 
 ## 5. 烟测边界
 

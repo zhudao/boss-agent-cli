@@ -1,9 +1,11 @@
 """RecruiterPlatform ABC + BossRecruiterPlatform adapter 测试。"""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from boss_agent_cli.commands._recruiter_platform import get_recruiter_platform_instance
 from boss_agent_cli.platforms import get_recruiter_platform
 from boss_agent_cli.platforms.zhipin_recruiter import BossRecruiterPlatform
 
@@ -28,6 +30,24 @@ def test_boss_recruiter_is_success():
 	assert platform.is_success({"code": 1}) is False
 
 
+@pytest.mark.parametrize("data, expected", [
+	({"chat": 0, "status": 3, "limitTitle": "今日主动沟通人数已达上限"}, "GREET_LIMIT"),
+	({"chat": 0, "status": 99}, "GREET_RESULT_UNKNOWN"),
+	({"chat": 0, "status": 3, "limitTitle": None}, "GREET_RESULT_UNKNOWN"),
+	({"chat": 1, "status": 3, "limitTitle": "旧提示"}, None),
+	({}, None),
+])
+def test_start_chat_checks_business_result_without_changing_other_endpoints(data, expected):
+	from boss_agent_cli.api.recruiter_endpoints import BOSS_CHAT_START_URL
+	platform = BossRecruiterPlatform(_mock_client())
+	response = {"code": 0, "zpData": data, "__cli_endpoint_hint__": BOSS_CHAT_START_URL}
+	assert platform.is_success(response) is (expected is None)
+	if expected:
+		assert platform.parse_error(response)[0] == expected
+	response["__cli_endpoint_hint__"] = "/unrelated-endpoint"
+	assert platform.is_success(response) is True
+
+
 def test_boss_recruiter_unwrap_data():
 	client = _mock_client()
 	platform = BossRecruiterPlatform(client)
@@ -43,6 +63,22 @@ def test_boss_recruiter_parse_error():
 	assert "too fast" in message
 
 
+def test_boss_recruiter_parse_error_code_37_by_context():
+	"""招聘端 adapter 与候选端使用同一分类器：明确 token 过期才刷新。"""
+	client = _mock_client()
+	platform = BossRecruiterPlatform(client)
+
+	unified, _ = platform.parse_error({"code": 37, "message": "登录状态已失效"})
+	assert unified == "TOKEN_REFRESH_FAILED"
+
+	unified, message = platform.parse_error({"code": 37, "message": "环境存在异常"})
+	assert unified == "ENVIRONMENT_RISK"
+	assert message == "环境存在异常"
+
+	unified, _ = platform.parse_error({"code": 37})
+	assert unified == "ENVIRONMENT_RISK"
+
+
 def test_boss_recruiter_parse_error_maps_invalid_request():
 	client = _mock_client()
 	platform = BossRecruiterPlatform(client)
@@ -55,15 +91,58 @@ def test_parse_error_send_message_121_maps_to_endpoint_deprecated():
 	"""issue #217 — sendReplyMsg 端点 121 重映射为 ENDPOINT_DEPRECATED，引导用户跟 issue。"""
 	client = _mock_client()
 	platform = BossRecruiterPlatform(client)
-	unified, message = platform.parse_error(
-		{
-			"code": 121,
-			"message": "请求不合法(121)",
-			"__cli_endpoint_hint__": "https://www.zhipin.com/wapi/zpchat/fastReply/sendReplyMsg",
-		}
-	)
+	response = {
+		"code": 121,
+		"message": "请求不合法(121)",
+		"__cli_endpoint_hint__": "https://www.zhipin.com/wapi/zpchat/fastReply/sendReplyMsg",
+	}
+	unified, message = platform.parse_error(response)
 	assert unified == "ENDPOINT_DEPRECATED"
 	assert "请求不合法" in message
+	assert response["__cli_error_details__"]["tracking_issue"].endswith("/issues/217")
+
+
+def test_parse_error_view_geek_retired_message_maps_to_endpoint_deprecated():
+	"""issue #472 — 旧简历详情接口下线文案映射为 ENDPOINT_DEPRECATED。"""
+	client = _mock_client()
+	platform = BossRecruiterPlatform(client)
+	response = {
+		"code": "1",
+		"message": "旧简历接口已下线，请关闭相关插件后刷新页面重试",
+		"__cli_endpoint_hint__": "https://www.zhipin.com/wapi/zpjob/view/geek/info",
+	}
+	assert platform.is_success(response) is False
+	unified, message = platform.parse_error(response)
+	assert unified == "ENDPOINT_DEPRECATED"
+	assert message.startswith("旧简历接口已下线")
+	assert response["__cli_error_details__"]["tracking_issue"].endswith("/issues/472")
+	assert "view/geek/info" in response["__cli_error_details__"]["endpoint"]
+
+
+def test_parse_error_retired_resume_message_on_other_endpoint_stays_unknown():
+	"""同一句下线文案出现在其他接口时，不误判成简历端点废弃。"""
+	client = _mock_client()
+	platform = BossRecruiterPlatform(client)
+	response = {
+		"code": "1",
+		"message": "旧简历接口已下线，请关闭相关插件后刷新页面重试",
+		"__cli_endpoint_hint__": "https://www.zhipin.com/wapi/zpjob/chat/geek/info",
+	}
+	unified, _ = platform.parse_error(response)
+	assert unified == "UNKNOWN"
+	assert "__cli_error_details__" not in response
+
+
+def test_is_success_rejects_code_zero_retired_view_geek():
+	client = _mock_client()
+	platform = BossRecruiterPlatform(client)
+	response = {
+		"code": 0,
+		"message": "旧简历接口已下线",
+		"__cli_endpoint_hint__": "https://www.zhipin.com/wapi/zpjob/view/geek/info",
+	}
+	assert platform.is_success(response) is False
+	assert platform.parse_error(response)[0] == "ENDPOINT_DEPRECATED"
 
 
 def test_parse_error_exchange_121_keeps_invalid_param():
@@ -185,3 +264,72 @@ def test_exit_closes_on_exception():
 def test_recruiter_platform_registry():
 	cls = get_recruiter_platform("zhipin-recruiter")
 	assert cls is BossRecruiterPlatform
+
+
+# ── get_recruiter_platform_instance ───────────────────────────────────
+# 命令层测试一律 mock 掉这个 helper，所以它本身此前从未被真实调用过。
+
+
+def _ctx(**obj):
+	return SimpleNamespace(obj=obj)
+
+
+def test_recruiter_instance_defaults_to_zhipin_and_passes_delay_and_cdp(monkeypatch):
+	captured: dict = {}
+
+	class _Client:
+		def __init__(self, auth, *, delay, cdp_url, browser_source=None):
+			captured.update(auth=auth, delay=delay, cdp_url=cdp_url, browser_source=browser_source)
+
+	monkeypatch.setattr("boss_agent_cli.platforms.factory.BossRecruiterClient", _Client)
+	auth = MagicMock()
+	platform = get_recruiter_platform_instance(_ctx(delay=(2.0, 4.0), cdp_url="http://localhost:9222"), auth)
+
+	assert isinstance(platform, BossRecruiterPlatform)
+	assert captured["auth"] is auth
+	assert captured["delay"] == (2.0, 4.0)
+	assert captured["cdp_url"] == "http://localhost:9222"
+	assert captured["browser_source"] == "auto"
+
+
+def test_recruiter_instance_falls_back_to_default_delay_when_ctx_is_empty(monkeypatch):
+	captured: dict = {}
+
+	class _Client:
+		def __init__(self, auth, *, delay, cdp_url, browser_source=None):
+			captured.update(delay=delay, cdp_url=cdp_url, browser_source=browser_source)
+
+	monkeypatch.setattr("boss_agent_cli.platforms.factory.BossRecruiterClient", _Client)
+	get_recruiter_platform_instance(SimpleNamespace(obj=None), MagicMock())
+
+	assert captured["delay"] == (1.5, 3.0)
+	assert captured["cdp_url"] is None
+
+
+def test_recruiter_instance_rejects_platform_without_recruiter_adapter():
+	with pytest.raises(ValueError):
+		get_recruiter_platform_instance(_ctx(platform="unknown"), MagicMock())
+
+
+def test_recruiter_instance_fail_closed_source_raises_unsupported_before_registry():
+	"""非 zhipin + fail-closed 来源：BrowserSourceUnsupported 必须先于 registry ValueError。"""
+	from boss_agent_cli.api.browser_source import BrowserSourceUnsupported
+
+	with pytest.raises(BrowserSourceUnsupported):
+		get_recruiter_platform_instance(
+			_ctx(platform="otherplat", browser_source="stored-cookie"), MagicMock()
+		)
+
+
+def test_recruiter_instance_passes_browser_source_to_client(monkeypatch):
+	"""非默认来源必须显式透传给 BossRecruiterClient。"""
+	captured: dict = {}
+
+	class _Client:
+		def __init__(self, auth, *, delay, cdp_url, browser_source=None):
+			captured.update(browser_source=browser_source)
+
+	monkeypatch.setattr("boss_agent_cli.platforms.factory.BossRecruiterClient", _Client)
+	get_recruiter_platform_instance(_ctx(browser_source="stored-cookie"), MagicMock())
+
+	assert captured["browser_source"] == "stored-cookie"

@@ -15,14 +15,19 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
 	from boss_agent_cli.ai.service import AIService, AIServiceError
-	from boss_agent_cli.api.client import AccountRiskError, AuthError, BossClient
+	from boss_agent_cli.api.client import AccountRiskError, AuthError, BossClient, EnvironmentRiskError
 	from boss_agent_cli.api.models import JobDetail, JobItem
 	from boss_agent_cli.auth.manager import AuthManager, AuthRequired, TokenRefreshFailed
 	from boss_agent_cli.cache.store import CacheStore
-	from boss_agent_cli.platforms import BossPlatform, Platform, ZhilianPlatform, get_platform, list_platforms
+	from boss_agent_cli.platforms import (
+		BossPlatform,
+		Platform,
+		get_platform,
+		list_platforms,
+	)
 	from boss_agent_cli.resume.models import ResumeData, ResumeFile
 
-__version__ = "1.11.0"
+__version__ = "3.0.1"
 
 _LAZY_EXPORT_MODULES = {
 	"AuthManager": "boss_agent_cli.auth.manager",
@@ -31,6 +36,7 @@ _LAZY_EXPORT_MODULES = {
 	"BossClient": "boss_agent_cli.api.client",
 	"AuthError": "boss_agent_cli.api.client",
 	"AccountRiskError": "boss_agent_cli.api.client",
+	"EnvironmentRiskError": "boss_agent_cli.api.client",
 	"JobItem": "boss_agent_cli.api.models",
 	"JobDetail": "boss_agent_cli.api.models",
 	"CacheStore": "boss_agent_cli.cache.store",
@@ -40,8 +46,6 @@ _LAZY_EXPORT_MODULES = {
 	"ResumeFile": "boss_agent_cli.resume.models",
 	"Platform": "boss_agent_cli.platforms",
 	"BossPlatform": "boss_agent_cli.platforms",
-	"QianchengPlatform": "boss_agent_cli.platforms",
-	"ZhilianPlatform": "boss_agent_cli.platforms",
 	"get_platform": "boss_agent_cli.platforms",
 	"list_platforms": "boss_agent_cli.platforms",
 }
@@ -57,6 +61,7 @@ __all__ = [
 	"BossClient",
 	"AuthError",
 	"AccountRiskError",
+	"EnvironmentRiskError",
 	# 数据模型
 	"JobItem",
 	"JobDetail",
@@ -71,8 +76,6 @@ __all__ = [
 	# 平台抽象（Week 1 ABC，详见 Issue #129）
 	"Platform",
 	"BossPlatform",
-	"QianchengPlatform",
-	"ZhilianPlatform",
 	"get_platform",
 	"list_platforms",
 ]

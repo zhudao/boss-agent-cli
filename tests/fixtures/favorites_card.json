@@ -1,0 +1,33 @@
+{
+  "_note": "geekGetJob?tag=4&isActive=true 真实字段脱敏样本：2026-07-24 mitmproxy+CLI 锁定基础 card 字段，2026-08-14 Bridge 实测同一响应可混有 jobValidStatus=1/2。securityId/encryptJobId 已替换为占位；移除可关联账号字段；职位和公司信息均泛化。",
+  "code": 0,
+  "zpData": {
+    "cardList": [
+      {
+        "securityId": "sec_sample_REDACTED",
+        "encryptJobId": "job_sample_REDACTED",
+        "jobName": "示例职位标题",
+        "brandName": "示例公司",
+        "cityName": "北京",
+        "jobSalary": "12-24K",
+        "jobExperience": "经验不限",
+        "jobDegree": "本科",
+        "jobLabels": ["北京 海淀区 中关村", "经验不限", "本科"],
+        "jobValidStatus": 1
+      },
+      {
+        "securityId": "sec_inactive_REDACTED",
+        "encryptJobId": "job_inactive_REDACTED",
+        "jobName": "示例失效职位",
+        "brandName": "示例公司",
+        "cityName": "北京",
+        "jobSalary": "12-24K",
+        "jobExperience": "经验不限",
+        "jobDegree": "本科",
+        "jobLabels": ["北京", "经验不限", "本科"],
+        "jobValidStatus": 2
+      }
+    ],
+    "hasMore": true
+  }
+}

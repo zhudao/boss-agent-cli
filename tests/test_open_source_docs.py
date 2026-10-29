@@ -1,3 +1,4 @@
+from importlib.metadata import metadata
 from pathlib import Path
 
 import yaml
@@ -61,7 +62,8 @@ def test_platform_risk_docs_exist_and_cover_sensitive_boundaries():
 		assert "Windows app" in content or "Windows 客户端" in content
 		assert "RPA" in content
 		assert "CloakBrowser" in content
-		assert "manual" in content.lower() or "手动" in content
+		assert "checkpoint" in content.lower()
+		assert "stop" in content.lower() or "停止" in content
 
 
 def test_security_and_readme_link_platform_risk_docs():
@@ -70,21 +72,39 @@ def test_security_and_readme_link_platform_risk_docs():
 	assert "docs/platform-risk.md" in read("SECURITY.md")
 
 
-def test_readme_documents_browser_bridge_diagnostics():
+def test_readme_documents_browser_bridge_removal_and_manual_cleanup():
 	zh = read("README.md")
 	en = read("README.en.md")
 
 	for content in (zh, en):
-		assert "bridge_daemon" in content
-		assert "bridge_extension" in content
-		assert "bridge_protocol" in content
-		assert "bridge_workspace" in content
-		assert "bridge_exec" in content
-		assert "bridge_fetch" in content
-		assert "bridge_navigate" in content
-		assert "python -m boss_agent_cli.bridge.daemon --serve" in content
+		assert "3.0.0" in content
 		assert "Bridge" in content
+		assert "daemon" in content
+		assert "existing-browser" in content
+		assert "CDP" in content
+		assert "python -m boss_agent_cli.bridge.daemon --serve" not in content
 		assert "风控" in content or "risk-control" in content.lower()
+	assert "停止" in zh
+	assert "扩展" in zh
+	assert "移除" in zh or "卸载" in zh
+	assert "stop" in en.lower()
+	assert "extension" in en.lower()
+	assert "remove" in en.lower() or "uninstall" in en.lower()
+
+
+def test_removed_bridge_is_not_shipped_or_advertised_as_an_extra():
+	"""源码、扩展入口及安装元数据均不得继续提供已下线组件。"""
+	for path in (
+		"src/boss_agent_cli/bridge/__init__.py",
+		"src/boss_agent_cli/bridge/client.py",
+		"src/boss_agent_cli/bridge/daemon.py",
+		"src/boss_agent_cli/bridge/protocol.py",
+		"extension/manifest.json",
+		"extension/background.js",
+		"extension/popup.html",
+	):
+		assert not (ROOT / path).exists(), path
+	assert "bridge" not in metadata("boss-agent-cli").get_all("Provides-Extra", [])
 
 
 def test_platform_research_template_covers_adapter_admission_gate():
@@ -106,8 +126,6 @@ def test_platform_research_template_covers_adapter_admission_gate():
 
 	for token in (
 		"zhipin.md",
-		"zhaopin.md",
-		"51job.md",
 		"lagou.md",
 		"liepin.md",
 		"xunjin58/zp_api",
@@ -119,6 +137,9 @@ def test_platform_research_template_covers_adapter_admission_gate():
 	):
 		assert token in index
 
+	assert "zhaopin" not in index
+	assert "智联" not in index
+
 	assert "research/platforms/README.md" in abstraction_zh
 	assert "第三方 scraper" in abstraction_zh
 	assert "research/platforms/README.md" in abstraction_en
@@ -128,8 +149,6 @@ def test_platform_research_template_covers_adapter_admission_gate():
 def test_platform_research_docs_include_unified_adapter_evaluation():
 	for path in (
 		"docs/research/platforms/zhipin.md",
-		"docs/research/platforms/zhaopin.md",
-		"docs/research/platforms/51job.md",
 		"docs/research/platforms/lagou.md",
 		"docs/research/platforms/liepin.md",
 	):
@@ -142,51 +161,22 @@ def test_platform_research_docs_include_unified_adapter_evaluation():
 		assert "cookie" in content.lower(), path
 		assert "token" in content.lower(), path
 
-
-def test_51job_research_keeps_issue_230_blocked_until_read_only_gate():
-	content = read("docs/research/platforms/51job.md")
-	index = read("docs/research/platforms/README.md")
-	roadmap = read("ROADMAP.md")
-	roadmap_en = read("ROADMAP.en.md")
-
-	for token in (
-		"#230",
-		"research backlog",
-		"candidate-side",
-		"只读",
-		"禁止",
-		"NOT_SUPPORTED",
-		"PLATFORM_RISK",
-		"Adapter admission gate",
-		"stealth",
-		"response interception",
-		"cookie",
-		"token",
+	for removed in (
+		"docs/research/platforms/zhaopin.md",
+		"docs/research/platforms/zhaopin-recruiter-evaluation.md",
 	):
-		assert token in content, token
-
-	for forbidden_scope in ("自动投递", "批量抓取", "验证码", "CloakBrowser"):
-		assert forbidden_scope in content
-
-	assert "51job.md" in index
-	assert "research backlog" in index
-	assert "docs/research/platforms/51job.md" in roadmap
-	assert "docs/research/platforms/51job.md" in roadmap_en
-
+		assert not (ROOT / removed).exists(), removed
 
 def test_maintainer_docs_cover_open_source_governance():
 	branch = read("docs/maintainer/branch-protection.md")
 	release = read("docs/maintainer/release-checklist.md")
 	labels = read("docs/maintainer/labels.md")
 
-	assert "required status checks" in branch
-	assert "test (3.10)" in branch
-	assert "test (3.11)" in branch
-	assert "test (3.12)" in branch
-	assert "test (3.13)" in branch
-	assert "lint" in branch
-	assert "typecheck" in branch
-	assert "docs" in branch
+	assert "Required status checks and approving reviews are intentionally not configured" in branch
+	assert "uv run python scripts/quality_baseline.py" in branch
+	assert "BOSS_SMOKE_DRY_RUN=1 uv run python scripts/smoke_p0.py" in branch
+	assert "uv run python evals/run_eval.py --mode fixture" in branch
+	assert "git diff --check master...HEAD" in branch
 	assert "allow_force_pushes" in branch
 	assert "allow_deletions" in branch
 
@@ -222,7 +212,17 @@ def test_pull_request_template_requires_quality_and_risk_checks():
 	assert "JSON 信封" in template
 	assert "Token / 密码 / Cookie / security_id" in template
 	assert "commit message 格式: `type: 中文描述`" in template
+	assert "Co-authored-by" in template
+	assert "AI 署名" in template
 	assert "（或英文等价）" not in template
+
+
+def test_update_contributors_pr_runs_required_checks():
+	workflow = load_yaml(".github/workflows/update-contributors.yml")
+	create_pr = workflow["jobs"]["update-contributors"]["steps"][2]["with"]
+
+	assert create_pr["commit-message"] == "chore: 更新贡献者名单"
+	assert "skip ci" not in create_pr["commit-message"].lower()
 
 
 def test_issue_templates_collect_contract_and_platform_context():
@@ -275,62 +275,53 @@ def test_issue_templates_are_valid_structured_forms():
 		assert len(ids) == len(set(ids))
 
 
-def test_docs_workflow_runs_open_source_doc_checks():
-	raw_workflow = read(".github/workflows/docs.yml")
-	workflow = load_yaml(".github/workflows/docs.yml")
+def test_ci_workflow_is_safe_for_fork_pull_requests():
+	workflow = load_yaml(".github/workflows/ci.yml")
+	triggers = workflow.get("on", workflow.get(True))
+	assert isinstance(triggers, dict)
+	# fork PR 必须能跑，且不能用拿得到 secret / 写权限的 pull_request_target
+	assert "pull_request" in triggers
+	assert "pull_request_target" not in triggers
+	assert workflow["permissions"] == {"contents": "read"}
+	assert workflow["concurrency"]["cancel-in-progress"] is True
+	text = read(".github/workflows/ci.yml")
+	assert "secrets." not in text
+	for command in ("ruff check", "mypy src/boss_agent_cli", "pre-commit run --all-files", "pytest"):
+		assert command in text, command
+	assert not (ROOT / ".github/workflows/docs.yml").exists()
 
-	expected_paths = [
-		"README.md",
-		"README.en.md",
-		"CONTRIBUTING.md",
-		"CONTRIBUTING.en.md",
-		"SECURITY.md",
-		"docs/**",
-		".github/ISSUE_TEMPLATE/**",
-		".github/PULL_REQUEST_TEMPLATE.md",
-		"tests/test_agent_docs.py",
-		"tests/test_open_source_docs.py",
-		".github/workflows/docs.yml",
-	]
-	expected_run_commands = [
-		"uv python install 3.11",
-		"uv sync --all-extras",
-		"uv run pytest tests/test_agent_docs.py tests/test_open_source_docs.py -q",
-		(
-			"if [ \"${{ github.event_name }}\" = \"pull_request\" ]; then\n"
-			"  git fetch --no-tags --depth=1 origin \"${{ github.base_ref }}\"\n"
-			"  git diff --check \"origin/${{ github.base_ref }}...HEAD\"\n"
-			"elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then\n"
-			"  git diff --check HEAD^...HEAD\n"
-			"else\n"
-			"  git diff --check\n"
-			"fi\n"
-		),
-	]
 
-	assert "name: Docs" in raw_workflow
-	assert workflow["name"] == "Docs"
+def test_labeler_workflow_never_runs_pull_request_code():
+	workflow = load_yaml(".github/workflows/labeler.yml")
+	triggers = workflow.get("on", workflow.get(True))
+	assert "pull_request_target" in triggers
+	# pull_request_target 拿得到写权限，所以绝不能 checkout 或执行 PR 里的代码
+	text = read(".github/workflows/labeler.yml")
+	assert "actions/checkout" not in text
+	assert "run:" not in text
+	assert "secrets." not in text
+	assert workflow["permissions"] == {}
+	job = workflow["jobs"]["label"]
+	assert job["permissions"] == {"contents": "read", "pull-requests": "write"}
 
-	triggers = workflow["on"]
-	assert {"push", "pull_request", "workflow_dispatch"} <= set(triggers)
-	assert triggers["push"]["branches"] == ["master"]
-	assert set(expected_paths) <= set(triggers["push"]["paths"])
-	assert triggers["pull_request"]["branches"] == ["master"]
-	assert "paths" not in triggers["pull_request"]
 
-	jobs = workflow["jobs"]
-	assert "docs" in jobs
-	docs_job = jobs["docs"]
-	assert docs_job["runs-on"] == "ubuntu-latest"
-	checkout_step = docs_job["steps"][0]
-	assert checkout_step["uses"] == "actions/checkout@v6"
-	assert checkout_step["with"]["fetch-depth"] == 0
-	run_commands = [
-		step["run"]
-		for step in docs_job["steps"]
-		if "run" in step
-	]
-	assert run_commands == expected_run_commands
+def test_dependabot_stays_low_noise():
+	config = load_yaml(".github/dependabot.yml")
+	ecosystems = {update["package-ecosystem"]: update for update in config["updates"]}
+	assert set(ecosystems) == {"uv", "github-actions"}
+	for update in ecosystems.values():
+		assert update["schedule"]["interval"] == "weekly"
+		assert update["open-pull-requests-limit"] <= 3
+		assert update["groups"]
+
+
+def test_quality_baseline_script_matches_blocking_p0_commands():
+	content = read("scripts/quality_baseline.py")
+
+	assert '("ruff", ("ruff", "check", "src/boss_agent_cli", "tests", "scripts", "--output-format=concise"))' in content
+	assert '("pytest", ("pytest", "-q"))' in content
+	assert '("mypy", ("mypy", "src/boss_agent_cli"))' in content
+	assert "--skip-mypy" in content
 
 
 def test_contributing_clarifies_verification_and_tab_indentation():

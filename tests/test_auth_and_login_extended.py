@@ -32,8 +32,10 @@ def test_machine_id_linux_reads_machine_id_file(tmp_path, monkeypatch):
 	store = _make_store(tmp_path)
 
 	fake_content = "linux-machine-abc123\n"
-	with patch("boss_agent_cli.auth.token_store.platform.system", return_value="Linux"), \
-		 patch("boss_agent_cli.auth.token_store.Path") as mock_path_cls:
+	with (
+		patch("boss_agent_cli.auth.token_store.platform.system", return_value="Linux"),
+		patch("boss_agent_cli.auth.token_store.Path") as mock_path_cls,
+	):
 		fake_machine_file = MagicMock()
 		fake_machine_file.exists.return_value = True
 		fake_machine_file.read_text.return_value = fake_content
@@ -48,8 +50,10 @@ def test_machine_id_linux_file_missing_falls_back_to_hostname(tmp_path, monkeypa
 	monkeypatch.delenv("BOSS_AGENT_MACHINE_ID", raising=False)
 	store = _make_store(tmp_path)
 
-	with patch("boss_agent_cli.auth.token_store.platform.system", return_value="Linux"), \
-		 patch("boss_agent_cli.auth.token_store.Path") as mock_path_cls:
+	with (
+		patch("boss_agent_cli.auth.token_store.platform.system", return_value="Linux"),
+		patch("boss_agent_cli.auth.token_store.Path") as mock_path_cls,
+	):
 		fake_machine_file = MagicMock()
 		fake_machine_file.exists.return_value = False
 		mock_path_cls.return_value = fake_machine_file
@@ -65,13 +69,17 @@ def test_machine_id_windows_reg_query(tmp_path, monkeypatch):
 	monkeypatch.delenv("BOSS_AGENT_MACHINE_ID", raising=False)
 	store = _make_store(tmp_path)
 
-	fake_stdout = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\r\n    MachineGuid    REG_SZ    abc-windows-guid\r\n"
+	fake_stdout = (
+		"\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\r\n    MachineGuid    REG_SZ    abc-windows-guid\r\n"
+	)
 	fake_result = MagicMock()
 	fake_result.stdout = fake_stdout
 
-	with patch("boss_agent_cli.auth.token_store.platform.system", return_value="Windows"), \
-		 patch("boss_agent_cli.auth.token_store.shutil.which", return_value="/windows/reg.exe"), \
-		 patch("boss_agent_cli.auth.token_store.subprocess.run", return_value=fake_result):
+	with (
+		patch("boss_agent_cli.auth.token_store.platform.system", return_value="Windows"),
+		patch("boss_agent_cli.auth.token_store.shutil.which", return_value="/windows/reg.exe"),
+		patch("boss_agent_cli.auth.token_store.subprocess.run", return_value=fake_result),
+	):
 		result = store._get_machine_id()
 		assert result == "abc-windows-guid"
 
@@ -92,9 +100,11 @@ def test_machine_id_oserror_exception_falls_back(tmp_path, monkeypatch):
 	monkeypatch.delenv("BOSS_AGENT_MACHINE_ID", raising=False)
 	store = _make_store(tmp_path)
 
-	with patch("boss_agent_cli.auth.token_store.platform.system", return_value="Darwin"), \
-		 patch("boss_agent_cli.auth.token_store.shutil.which", return_value="/usr/sbin/ioreg"), \
-		 patch("boss_agent_cli.auth.token_store.subprocess.run", side_effect=OSError("denied")):
+	with (
+		patch("boss_agent_cli.auth.token_store.platform.system", return_value="Darwin"),
+		patch("boss_agent_cli.auth.token_store.shutil.which", return_value="/usr/sbin/ioreg"),
+		patch("boss_agent_cli.auth.token_store.subprocess.run", side_effect=OSError("denied")),
+	):
 		result = store._get_machine_id()
 		# 异常被吃掉，走 fingerprint 兜底
 		assert len(result) == 64
@@ -207,7 +217,9 @@ def test_login_success(mock_auth_cls):
 	"""正常登录成功路径。"""
 	mock_auth = MagicMock()
 	mock_auth.login.return_value = {
-		"cookies": {"wt2": "x"}, "stoken": "s", "_method": "Cookie 提取",
+		"cookies": {"wt2": "x"},
+		"stoken": "s",
+		"_method": "Cookie 提取",
 	}
 	mock_auth_cls.return_value = mock_auth
 
@@ -217,24 +229,6 @@ def test_login_success(mock_auth_cls):
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	assert "Cookie 提取" in parsed["data"]["message"]
-	mock_auth.login.assert_called_once()
-
-
-@patch("boss_agent_cli.commands.login.AuthManager")
-def test_login_supports_zhilian_platform(mock_auth_cls):
-	mock_auth = MagicMock()
-	mock_auth.login.return_value = {
-		"cookies": {"zp_token": "x"}, "user_agent": "ua", "_method": "Cookie 提取",
-	}
-	mock_auth_cls.return_value = mock_auth
-
-	runner = CliRunner()
-	result = runner.invoke(cli, ["--platform", "zhilian", "login"])
-	assert result.exit_code == 0
-	parsed = json.loads(result.output)
-	assert parsed["ok"] is True
-	assert parsed["hints"]["next_actions"][0] == "boss --platform zhilian status — 验证登录态"
-	assert parsed["hints"]["next_actions"][1] == "boss --platform zhilian search <query> — 搜索职位"
 	mock_auth.login.assert_called_once()
 
 
@@ -254,6 +248,31 @@ def test_login_connection_error_recovery_is_boss_chrome(mock_auth_cls):
 
 
 @patch("boss_agent_cli.commands.login.AuthManager")
+def test_login_missing_browser_kernel_recovery_is_patchright_install(mock_auth_cls):
+	"""浏览器内核缺失应返回 BROWSER_KERNEL_MISSING + patchright install 恢复动作。
+
+	回归：patchright 升级后所需 chromium 修订版未安装时，BrowserType.launch
+	报 Executable doesn't exist；此前被笼统归入 CDP_UNAVAILABLE 且
+	recovery_action 给 boss login（重跑无效）。
+	"""
+	mock_auth = MagicMock()
+	mock_auth.login.side_effect = RuntimeError(
+		"BrowserType.launch: Executable doesn't exist at "
+		"/Users/u/Library/Caches/ms-playwright/chromium-1208/chrome-mac-arm64/"
+		"Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+	)
+	mock_auth_cls.return_value = mock_auth
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["login"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "BROWSER_KERNEL_MISSING"
+	assert parsed["error"]["recovery_action"] == "patchright install chromium"
+	assert any("patchright install chromium" in action for action in parsed["hints"]["next_actions"])
+
+
+@patch("boss_agent_cli.commands.login.AuthManager")
 def test_login_timeout_error_recovery_is_retry(mock_auth_cls):
 	"""TimeoutError 应返回 LOGIN_TIMEOUT + 重试建议。"""
 	mock_auth = MagicMock()
@@ -269,19 +288,6 @@ def test_login_timeout_error_recovery_is_retry(mock_auth_cls):
 
 
 @patch("boss_agent_cli.commands.login.AuthManager")
-def test_zhilian_login_timeout_uses_platform_specific_recovery(mock_auth_cls):
-	mock_auth = MagicMock()
-	mock_auth.login.side_effect = TimeoutError("扫码超时")
-	mock_auth_cls.return_value = mock_auth
-
-	runner = CliRunner()
-	result = runner.invoke(cli, ["--platform", "zhilian", "login"])
-	assert result.exit_code == 1
-	parsed = json.loads(result.output)
-	assert parsed["error"]["recovery_action"] == "boss --platform zhilian login"
-
-
-@patch("boss_agent_cli.commands.login.AuthManager")
 def test_login_generic_exception_wrapped_as_network_error(mock_auth_cls):
 	"""泛型异常也应被 wrap 成 NETWORK_ERROR，不裸泄给用户。"""
 	mock_auth = MagicMock()
@@ -294,19 +300,6 @@ def test_login_generic_exception_wrapped_as_network_error(mock_auth_cls):
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "NETWORK_ERROR"
 	assert "登录失败" in parsed["error"]["message"]
-
-
-@patch("boss_agent_cli.commands.login.AuthManager")
-def test_zhilian_login_generic_exception_uses_platform_specific_recovery(mock_auth_cls):
-	mock_auth = MagicMock()
-	mock_auth.login.side_effect = RuntimeError("some unexpected error")
-	mock_auth_cls.return_value = mock_auth
-
-	runner = CliRunner()
-	result = runner.invoke(cli, ["--platform", "zhilian", "login"])
-	assert result.exit_code == 1
-	parsed = json.loads(result.output)
-	assert parsed["error"]["recovery_action"] == "boss --platform zhilian login"
 
 
 @patch("boss_agent_cli.commands.login.AuthManager")
@@ -381,7 +374,9 @@ def test_login_risk_control_error_is_not_suggested_as_plain_network_retry(mock_a
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "LOGIN_RISK_CONTROL"
 	assert "风控" in parsed["error"]["message"]
-	assert any("暂停自动化重试" in action for action in parsed["hints"]["next_actions"])
+	# 风控下没有安全的可执行命令可推荐；指引全部走面向真人的通道。
+	assert parsed["hints"]["next_actions"] == []
+	assert any("暂停自动化重试" in action for action in parsed["hints"]["operator_actions"])
 
 
 @patch("boss_agent_cli.commands.login.AuthManager")
@@ -412,3 +407,100 @@ def test_login_generic_error_keeps_network_fallback_with_doctor_hint(mock_auth_c
 	assert parsed["error"]["code"] == "NETWORK_ERROR"
 	assert "登录失败" in parsed["error"]["message"]
 	assert any("boss doctor" in action for action in parsed["hints"]["next_actions"])
+
+
+# ── login 错误 hints 的双受众通道拆分（R5 / A11）─────────────
+
+
+@pytest.mark.parametrize(
+	"side_effect,expected_code",
+	[
+		(TimeoutError("login timeout"), "LOGIN_TIMEOUT"),
+		(RuntimeError("Executable doesn't exist at /x"), "BROWSER_KERNEL_MISSING"),
+		(ConnectionError("cdp refused"), "CDP_UNAVAILABLE"),
+		(RuntimeError("HTTP 403 forbidden risk control"), "LOGIN_RISK_CONTROL"),
+		(RuntimeError("401 unauthorized"), "LOGIN_EXPIRED"),
+		(RuntimeError("cookie stoken extraction failed"), "LOGIN_CREDENTIAL_EXTRACTION_FAILED"),
+		(RuntimeError("boom"), "NETWORK_ERROR"),
+	],
+)
+@patch("boss_agent_cli.commands.login.AuthManager")
+def test_login_error_hints_split_by_audience(mock_auth_cls, side_effect, expected_code):
+	"""next_actions 只放真命令，自然语言指引一律走 operator_actions。"""
+	mock_auth = MagicMock()
+	mock_auth.login.side_effect = side_effect
+	mock_auth_cls.return_value = mock_auth
+
+	result = CliRunner().invoke(cli, ["login"])
+	assert result.exit_code == 1
+	hints = json.loads(result.output)["error"]
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == expected_code
+
+	hints = parsed["hints"]
+	assert set(hints) == {"next_actions", "operator_actions"}
+	# 每个分类都必须给真人留下可读指引。
+	assert hints["operator_actions"], f"{expected_code} 缺少 operator_actions"
+
+	# next_actions 必须是可执行命令，不是叙述句。
+	for action in hints["next_actions"]:
+		assert action.startswith(("boss", "patchright")), (
+			f"{expected_code} 的 next_actions 混入了非命令条目: {action!r}"
+		)
+		assert "，" not in action and "。" not in action
+
+
+@patch("boss_agent_cli.commands.login.AuthManager")
+def test_login_success_hints_stay_agent_only(mock_auth_cls):
+	"""登录成功是终态，不需要人再做什么——不产出 operator_actions。"""
+	mock_auth = MagicMock()
+	mock_auth.login.return_value = {"_method": "cookie", "token": "t"}
+	mock_auth_cls.return_value = mock_auth
+
+	result = CliRunner().invoke(cli, ["login"])
+	assert result.exit_code == 0
+	hints = json.loads(result.output)["hints"]
+	assert "next_actions" in hints
+	assert not hints.get("operator_actions")
+
+
+@patch("boss_agent_cli.commands.login.AuthManager")
+def test_login_force_flag_propagates_force_relogin(mock_auth_cls):
+	"""--force 应把 force_relogin=True 传到 auth.login，且与 --cdp 正交。"""
+	mock_auth = MagicMock()
+	mock_auth.login.return_value = {"cookies": {}, "stoken": "", "_method": "CDP 扫码"}
+	mock_auth_cls.return_value = mock_auth
+
+	result = CliRunner().invoke(cli, ["login", "--cdp", "--force"])
+	assert result.exit_code == 0
+	kwargs = mock_auth.login.call_args.kwargs
+	assert kwargs["force_relogin"] is True
+	assert kwargs["force_cdp"] is True
+
+
+@patch("boss_agent_cli.commands.login.AuthManager")
+def test_login_force_rejects_cookie_source(mock_auth_cls):
+	"""--force 跳过 Cookie 提取，与 --cookie-source 互斥，按 INVALID_PARAM 拒绝且不触发登录。"""
+	result = CliRunner().invoke(cli, ["login", "--force", "--cookie-source", "chrome"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["error"]["recoverable"] is False
+	mock_auth_cls.return_value.login.assert_not_called()
+
+
+@patch("boss_agent_cli.commands.login.AuthManager")
+def test_login_platform_risk_uses_shared_risk_contract(mock_auth_cls):
+	"""复用探测命中风控时，login 信封与其他命令的 ACCOUNT_RISK 契约一致，不建议重试登录。"""
+	from boss_agent_cli.api.client import AccountRiskError
+
+	mock_auth_cls.return_value.login.side_effect = AccountRiskError("BOSS 直聘风控拦截 (code 36)", is_cdp=True)
+
+	result = CliRunner().invoke(cli, ["login", "--cdp"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "ACCOUNT_RISK"
+	assert parsed["error"]["recoverable"] is False
+	assert "停止自动化访问" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"]

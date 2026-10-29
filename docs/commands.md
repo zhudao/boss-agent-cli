@@ -1,0 +1,320 @@
+# 命令参考
+
+> 能力真源是 `boss schema`（机器可读的完整自描述：命令、参数、平台支持与错误码）。
+> 本页是面向人类的速查表；当两者不一致时，以 `boss schema` 实际输出为准。
+> 英文版见 [commands.en.md](commands.en.md)。
+
+```bash
+boss schema                            # 完整能力 JSON（Agent 首先调用）
+boss schema --format openai-tools      # 导出 OpenAI Functions / Tools 定义
+boss schema --format anthropic-tools   # 导出 Claude Tool Use 定义
+boss <命令> --help                      # 查看单个命令选项
+```
+
+兼容配置：`boss config set operating_mode assisted|research`。两种模式均可调用全部已实现能力；schema 仍提供风险和数据分类，平台缺失能力返回 `NOT_SUPPORTED`。
+
+## 命令还是 wizard
+
+顶层命令和 `boss wizard` 是两套并行的能力面，分工写在 `boss schema` 的 `conventions.command_vs_wizard`：
+
+- **单次、无状态的能力调用** → 顶层命令（`boss search` / `boss detail` / `boss greet` …）
+- **需要跨步骤状态、可恢复、或中途要把指引递给真人** → `boss wizard`（goal 取值见 `wizard_catalog`）
+
+信封的 `hints` 同样按受众分成两条通道（`conventions.hints`）：
+
+| 字段 | 受众 | 形式 |
+|------|------|------|
+| `hints.next_actions` | AI Agent | `boss xxx` 命令，Agent 直接执行 |
+| `hints.operator_actions` | 真人操作者 | 自然语言，通常需要离开终端完成（扫码、在浏览器里调整筛选、处理风控验证） |
+
+TTY 下只把 `operator_actions` 渲染到 stderr；`next_actions` 是纯 Agent 通道，不渲染。Agent 拿到 `operator_actions` 时应转述给操作者，而不是自己编措辞。
+
+**信封与退出码**：每条命令在 stdout 只输出一个七键 JSON 信封；默认 `exit 0` ⇔ `ok=true`、`exit 1` ⇔ `ok=false`。可选全局 `--exit-codes sysexits` 按错误类别返回语义化退出码（77 认证；75 限流/预算/超时；78 参数/配置；69 风控/平台不支持；其余 1），供脚本按失败类型分支；信封内容不变。全局选项（`--json`、`--data-dir`、`--platform`、`--cdp-url` 等）必须写在子命令之前，例如 `boss --json search 关键词`；写在子命令后面会返回 `INVALID_PARAM`，并说明该选项是全局的。
+
+## 基础操作
+
+| 命令 | 说明 |
+|------|------|
+| `boss` / `boss wizard` | TTY 下启动纯向导；`--input-json` 供 Agent 执行共享 workflow，`--status/--resume/--stop <run_id>` 管理持久化任务 |
+| `boss schema` | 输出完整工具能力描述 JSON（39 个顶层命令 + hr 分组展开，Agent 首先调用） |
+| `boss platforms` | 本地平台注册与能力状态（不触网；支持 `--platform` 单平台过滤与 `--capability` 反查，附 `capability_status_legend`） |
+| `boss login` | 用户主动登录（按平台走 Cookie / CDP / QR / 浏览器降级链路）；`--force` 不复用任何既有登录态，跳过本地 Cookie 提取、CDP 下清掉当前 context 内目标平台的 cookie 后重新扫码；BOSS 本地风险锁未解除时拒绝登录，`--ignore-risk-lock` 仅保留参数兼容，不能放行 |
+| `boss logout` | 退出登录 |
+| `boss status` | 检查登录态（默认仅本地；`--live` 才执行低频只读验证） |
+| `boss doctor` | 诊断环境、依赖、凭据完整性和网络；默认仅本地诊断，不读取浏览器 Cookie。`--probe-cookies` 才提取浏览器 Cookie，`--live-probe` 才执行低频只读探测。探测到求职者侧登录态时先标出身份，不继续请求招聘者接口 |
+| `boss me` | 我的信息（用户/简历/期望/投递记录） |
+
+BOSS 的 code `31`（IP/环境限制）/ `32`（账号限制）/ `35` / `36`、环境类或含糊的 code `37`、HTTP 403 和官方 `403.html` 访问受限页及 `verify.html` / `security.html` 安全页会停止请求并锁存本地状态。明确的凭据过期才能进入有限刷新；仅出现 `token` / `stoken` 或同时要求安全验证时不能刷新。风险锁沿用 `cdp_risk_lock.json` 文件名，覆盖候选人与招聘者的 httpx、CDP、headless、聊天页动作、登录、导入、刷新和同 `data_dir` 的独立 crawl；更换令牌或通道不会自动清除锁。`error.details.risk_lock` 保留原始风险原因、可用业务码与 `explicit_resume_required`；账号风险仍返回 `ACCOUNT_RISK`，历史环境锁继续返回 `ENVIRONMENT_RISK_LOCKED`。
+
+由用户在原会话的官方目标业务页确认恢复后，执行 `boss clean --risk-lock` 解除本地阻断，再显式恢复原任务。主页可访问不代表职位页或聊天页已恢复；该清理命令不解除服务器风险，也不验证线上恢复。`--dry-run` 仅预览；再次命中风险会立即重锁。Agent 不应自行执行清锁。
+
+访问受限页展示的恢复时间只作平台提示，不触发定时刷新或自动清锁；移动端可用也不能证明网页端限制已解除。已有受限页时，`login --force` 在清除 Cookie 前同样停止。
+
+### 从浏览器 cURL 导入登录态
+
+浏览器 Cookie 自动提取不可用时，可将自己已登录的 `https://www.zhipin.com` 请求通过 **Copy as cURL (bash)** 复制为原始文本，保存为仅自己可读的文件：
+
+```bash
+boss login --curl-file /path/to/private-request.txt
+# macOS：从剪贴板通过标准输入导入，避免把凭据写入命令参数
+pbpaste | boss login --curl-file -
+```
+
+仅支持常见 POSIX cURL 格式，不支持 PowerShell/cmd 或 Markdown 转义文本；不能与 `--cdp` / `--cookie-source` 混用。只提取内联 Cookie、User-Agent 和 Cookie 中的 stoken；不会执行 cURL、读取其中引用的文件或重放请求体。使用现有用户信息接口做一次只读验证，验证通过后**替换当前 BOSS 原生加密会话**，不合并不同账号的旧 Cookie；验证失败不会覆盖原会话或自动打开浏览器。
+
+导入是登录态的另一种输入方式，不是绕过登录或风控，也不能复制浏览器指纹。后续过期刷新仍遵循原有 AuthManager / 浏览器来源策略，不能保证永远无需浏览器。`zp_token` 请求头不单独保存；招聘请求仍从当前 `bst` Cookie 派生。原始 cURL 文件和剪贴板含登录凭据，CLI 不会替你清除，请妥善处理，不要提交到仓库或发送到聊天中。
+
+## 职位搜索
+
+| 命令 | 说明 |
+|------|------|
+| `boss search <query>` | 搜索职位（支持 `--url` 网页筛选、逗号多选、`--welfare` 筛选、`--active` HR 活跃度筛选、`--sort score` 本地排序、`--preset` 预设） |
+| `boss recommend` | 获取个性化推荐职位 |
+| `boss detail <security_id>` | 职位详情（`--job-id` 走快速通道） |
+| `boss show <#>` | 按编号查看上次搜索结果 |
+| `boss cities` | 40 个支持城市 |
+
+`recommend` 的 `pagination.has_more` 只在平台返回布尔 `hasMore` 时取 `true` 或 `false`；缺失或类型不明确时为 `null`，`has_more_source=unknown`，不会给出下一页执行提示。仅 `true` 提示翻页；`false` 与 `null` 不触发额外探测。兼容字段 `total` 仍是本次返回条数，`total_kind=returned_page_count`，不代表全量职位数。
+
+## 可恢复批量采集
+
+`crawl` 是用户显式触发的有界 Chrome 任务。首次使用需安装 `uv sync --extra crawl`；采集器只启动 `<data-dir>/crawl/chrome-profile` 这个独立 profile，不接管日常 Chrome。请求数、详情数、墙钟时间和重试由固定预算控制，每一步持久化 checkpoint，并可用 `stop` 停止。
+
+```powershell
+boss crawl configure --max-requests 20 --max-details 50 --max-seconds 600 --max-retries 1
+boss crawl run "AI" --city 杭州 --pages 3 --with-detail `
+  --hook-profile screenshot-full --hook-dir E:\boss-agent-cli-local-hooks\AntiDebug_Breaker
+boss crawl resume <run_id>
+boss crawl stop <run_id>
+```
+
+| 命令 | 说明 |
+|------|------|
+| `boss crawl configure [--chrome-path PATH] [--port N] [--max-* N]` | 设置 crawl 专用 Chrome 和请求、详情、墙钟、重试预算；profile 固定为 `<data-dir>/crawl/chrome-profile` |
+| `boss crawl run <query> --city <城市或代码> [--pages N] [--with-detail]` | 串行采集；`--pages` 默认 `5` 且必须为正数；`--with-detail` 串行补全职位详情 |
+| `boss crawl start <query> --city <城市或代码> [...]` | 创建后台任务并立即返回 `run_id`；供本地任务调度使用 |
+| `boss crawl status <run_id>` / `boss crawl results <run_id>` | 仅读取 SQLite 中的页游标、风险状态、详情进度和已持久化职位；不打开浏览器 |
+| `boss crawl resume <run_id> [--pages N] [--with-detail] [--background]` | 从页游标、已见职位和待补详情队列恢复；`--background` 立即返回以便轮询；可提高正数页数上限并补全详情，不重复写入已完成项 |
+| `boss crawl stop <run_id>` | 请求运行中任务在下一个安全点停止并保留 checkpoint |
+| `boss crawl shortlist <run_id> (--all \| --selector <csel_...>)` | 将 crawl 结果导入原项目的本地候选池；不请求平台，保留内部职位关联和详情缓存供 `boss ai fit` 使用 |
+
+默认 Hook 为 `none`。`screenshot-full` 仅在用户明确选择 `--hook-profile screenshot-full --hook-dir <目录>` 时启用；目录必须由用户拥有相应授权，并提供原始 7 个脚本及 `SHA256SUMS`。项目不再发布这些第三方脚本，运行前逐文件校验 SHA-256 并记录脚本标识与摘要；不记录 Cookie、请求头或完整请求体。
+
+候选人侧可用 `boss agent crawl --run-id <run_id> --resume <简历名>` 执行“完成的 crawl → shortlist → ai fit → 按匹配分排序”，不会启动浏览器；`boss agent crawl --query <关键词> --city <城市> --resume <简历名>` 会新建真实采集。已有同 `data_dir` 风险锁时，run/start/resume 和 agent 的新采集在浏览器构造、连接及后台拉起前阻断；resume 只恢复自身断点，不能清锁。新风险保持 `risk_stopped` outcome、已采集队列与 checkpoint，并在 `data.risk_lock` 保留结构化原因和可用业务码，未知业务码为 `null`；人工恢复步骤只放在 `hints.operator_actions`，不提供可自动执行的恢复动作。状态、结果、本地 shortlist 导入和读取已完成 run 仍可用。
+
+每页完成后更新 `<data-dir>/crawl/runs/<run_id>/jobs.json`、`jobs.csv` 和带筛选/冻结首行的 `jobs.xlsx`。XLSX 保留完整值但所有数据行固定为单行和统一行高，长内容仅在表格中截断显示。JSON/CSV/XLSX 和 `crawl results` 默认不包含 `security_id`、职位 ID、selector、招聘者姓名或职位；这些仅保留在受限本地 SQLite 状态，`boss clean --privacy` 会删除 crawl 运行、预算和导出。风险码 `31` / `32` / `35` / `36` / `37`、code `38` 的身份资料流程、安全页、职位列表容器异常、预算耗尽或 stop 请求都会保存断点并停止；code `38` 不等同于验证码。stdout 始终只输出 JSON 信封和恢复命令。
+
+## 求职动作
+
+| 命令 | 说明 |
+|------|------|
+| `boss greet <sid> <jid>` | 向指定招聘者打招呼；重复记录返回 `ALREADY_GREETED` |
+| `boss batch-greet <query>` | 搜索后按显式 `--limit` 批量打招呼，支持 `--dry-run`；命中 `ACCOUNT_RISK` / `ENVIRONMENT_RISK` 立即停批并返回 `ok:false`，已成功项随 `error.details.greeted` 带回 |
+| `boss apply <sid> <jid>` | 发起投递或立即沟通；重复记录返回 `ALREADY_APPLIED` |
+| `boss exchange <uid-or-sid>` | 请求交换手机号或微信；优先使用 `boss chat` 输出的稳定 `uid` |
+
+## 沟通跟进
+
+| 命令 | 说明 |
+|------|------|
+| `boss chat` | 查看沟通列表，支持分页和来源筛选 |
+| `boss chatmsg <uid-or-sid> [--raw]` | 查看聊天历史；优先使用 `boss chat` 输出的稳定 `uid`，`--raw` 保留结构化 body、链接和职位卡片字段 |
+| `boss chat-summary <uid-or-sid>` | 基于聊天历史生成结构化摘要；优先使用稳定 `uid` |
+| `boss mark <uid-or-sid> --label X` | 添加或移除联系人标签；优先使用稳定 `uid` |
+| `boss interviews` | 面试邀请 |
+| `boss history` | 浏览历史 |
+
+## 流水线监控
+
+| 命令 | 说明 |
+|------|------|
+| `boss pipeline` | 聚合会话和面试数据生成候选进度 |
+| `boss follow-up` | 筛选需要跟进的会话和面试项 |
+| `boss digest` | 汇总新增职位、待跟进会话和面试项 |
+| `boss watch add/list/remove/run` | 保存、列出、删除或执行增量职位监控 |
+| `boss shortlist add/list/annotate/compare/remove` | 本地候选池：支持标签、备注和离线对比 |
+| `boss favorites list/sync` | 读取 BOSS 职位收藏并呈现有效状态；sync 只导入明确有效职位（按职位去重、刷新动态访问 ID，保留首次收藏时间） |
+| `boss preset add/list/remove` | 搜索预设 |
+
+`boss shortlist add <sid> <jid> --lid <lid>` 可保存与 `sid` 同一列表项的访问上下文，`list` / `compare` 会返回该值；crawl 和 favorites 导入也保留对应上下文，favorites 预览继续脱敏。`lid` 可省略，保存不代表其仍有效，不推断有效期或跨账号身份。
+
+## 招聘者模式
+
+`boss hr whoami` 只读 `getUserInfo`。`identity` 为 1 表示当前登录态在招聘者侧，`ready` 为 true。`profile_recruit` 对应账号资料里的 `recruit`，只回显，不参与判断。双身份账号停在求职者侧时 `ready` 为 false，需要在官方页面切换到「我要招聘」后再查；命令本身不切换身份。
+
+| 命令 | 说明 |
+|------|------|
+| `boss hr whoami` | 查看当前登录态是否处于招聘者侧；`identity` 为 1 才算就绪，不切换身份 |
+| `boss hr applications` | 查看候选人投递申请 |
+| `boss hr resume <geek_id> --job-id <id> --security-id <id>` | 查看候选人在线简历 |
+| `boss hr resume --exchange --friend-id <friend_id> [--type wechat]` | 请求交换手机号或微信 |
+| `boss hr chat` | 查看候选人沟通列表 |
+| `boss hr chatmsg <friend_id>` | 查看候选人聊天记录 |
+| `boss hr last-messages [--friend-id <id>]` | 批量查看候选人最近消息摘要 |
+| `boss hr jobs list [--page N]` / `offline` / `online` | 职位管理列表与上下线。`list` 读取 `data/list`，默认第 1 页 |
+| `boss hr candidates <keyword>` | 搜索和筛选候选人 |
+| `boss hr reply <friend_id> <message>` | 回复候选人消息 |
+| `boss hr request-resume <friend_id>` | 请求候选人分享附件简历 |
+| `boss hr accept-resume <friend_id> --message-id <mid> --yes` | 同意候选人发来的指定附件简历请求 |
+| `boss hr download-resume <friend_id> --message-id <mid> --output <文件路径>` | 检查权限后下载已收到的指定附件，不覆盖旧文件 |
+| `boss hr recommendations --job-id <encJobId>` | 读取推荐牛人完整卡片和首次开聊参数 |
+| `boss hr greet ... --message <话术> --yes` | 建立候选人会话并单次发送首次招呼，不修改已读状态 |
+
+先在同一组候选人参数和话术后加 `--dry-run` 预览；操作者明确批准该候选人和话术后，才改为 `--yes` 发送。MCP 的 `yes` 默认不传，Agent 不得自行确认；预览本身不构成人工批准。
+
+`greet` 按候选人和招聘职位的加密 ID 在本地原子预约，成功后记录已发送；响应丢失、进程退出或限流时保留预约，禁止自动重发。使用 `boss hr chat --job-id <id>` 核对会话，必要时在官方页面处理，不要删除记录来重发。
+
+`hr chat` 的沟通列表接口只返回基础会话信息（friendId、姓名、updateTime 等），未读数、最后一条消息和时间按以下顺序补全：CDP 模式下先读聊天页里已加载的会话列表（geek-list 组件的 vue-rx 订阅 `list$` / `allList$`，只读页面内存，不发请求；只覆盖页面已滚动加载的会话，`hints.summary_sources.page_snapshot` 给出条数和 `has_more`，未读数只能从这里拿到）；页面里没有覆盖到的会话再调用最近消息接口 `userLastMsg`：按 friendSource 分组、每批 50 个串行请求，默认只补列表前 100 个会话（最多 2 次请求），`--summary-limit <n>`（0–300，0=不请求）可调整，任一批失败即停止；超出上限的会话按下面的兜底处理，`hints.summary_sources.last_messages_skipped` 标明条数。`last_time` 取消息的毫秒时间戳；`msg_status`（未读/已读）只对自己发出的最后一条消息有值，候选人发来的为 `null`。`hr last-messages` 同样分批，`--limit` 默认 100；都拿不到时 `unread` / `msg_status` / `last_msg` 为 `null`，`last_time` 退回会话的 `updateTime` 并标注 `last_time_source: "updateTime"`（这是会话更新时间，不一定是最后一条消息的时间）。每条记录的 `summary_source` 标明来源（`page` / `last_messages` / `friend_list`），`hints.summary_sources` 给出各来源条数和最近消息接口的错误（如有）。不再输出 `-`、`未知` 这类占位。`hints.total_unread` 是聊天页显示的未读总数（页面 `uncountTab$` 第 1 项，覆盖全部会话），`hints.unread_by_tab` 是原始分项计数（第 2、3 项含义未确认），`hints.total_unread_source` 标明来源；只读页面内存，页面不可用时均为 `null`。
+
+`greet` 只发送首次招呼，不建立 MQTT 连接、不清理红点。成功返回 `sent=true`；若发送后本地记录失败，错误信封仍在 `error.details.sent=true` 保留已发送事实，不能因此重发。BOSS 外层 `code=0` 也可能返回权益拦截页；CLI 会识别这类业务拒绝，返回 `GREET_LIMIT`、`error.details.sent=false` 和脱敏平台提示，保留拒绝状态以阻止重发。平台可能按职位限制免费沟通人数，不能把调用方配置的日额度当作平台保证。`chat` / `last-messages` 中未知未读数保留为 `null`，不当作零。
+
+`request-resume` 与 `resume --exchange` 在聊天页里调用官方组件完成动作，只点击本次动作新弹出的确认框。成功需要动作后回读聊天记录看到自己新发出的已知请求文案或已识别类型的动作卡片。只有 outgoing WS 帧、页面调用返回成功或未知手机号动作编号时不能确认发送；这些情况返回 `ACTION_UNCONFIRMED`（`recoverable=false`），`error.details` 附带页面日志、确认按钮状态和 WS 统计。此时动作可能已经生效，先用 `boss hr chatmsg <friend_id>` 核实，不要直接重试。聊天记录证据也不证明接收方已收到或已读。换手机或微信时如果同时看到了求简历消息，成功结果会带 `side_effects: ["resume_request_detected"]`。动作前或回读时首次命中风险立即停止，不继续轮询；禁用或仍在加载的编辑器不会被强制开启，目标好友必须唯一匹配。
+
+### 自动化停止与显式恢复
+
+`boss agent stop --reason <原因>` 保存独立的停止标志，运行中的旧状态快照不能覆盖它。招聘者自动化在动作边界重新读取停止状态，每个已确认动作及时保存防重结果；风险、正常超时或中断时保存已取得的 checkpoint。平台请求已提交但没有确认结果时，先在官方页面核对，禁止自动重发。
+
+在同一浏览器、同一账号完成官方验证并确认原先受阻页面正常后，由操作者明确恢复：`boss --role recruiter agent run --resume`。该选项解除本地停止状态并复用已确认动作与队列，不代表平台风险已经解除；普通 `agent run` 不解锁。MCP `boss_agent_run` 的 `resume` 默认 `false`，Agent 只有收到操作者明确恢复指令后才可设置为 `true`。wizard 和 crawl 的可恢复 run 继续使用各自的 `--resume <run_id>` / `crawl resume <run_id>`；已被 `wizard --stop` 置为 `stopped` 的 run 保持终止，应新建 workflow 或恢复其内部任务。
+
+MCP 的长运行使用异步子进程，运行期间仍能调用停止/状态工具。取消或超时会尝试中断并回收子进程；强制终止后可能有未知副作用，`error.details.outcome_unknown=true` 时不可自动重试。正常返回的 wizard 超时保留可恢复结果，MCP 等待覆盖其显式超时及保存进度的宽限期。
+
+平台要求招聘者先在会话里发过消息，换电话/换微信按钮才会解锁（求简历不受限）。交换前会先看按钮组件是否处于禁用状态（`disabled` 属性、`aria-disabled`、`disabled`/`gray` 等 class、`pointer-events: none`，或组件 props/data 里的禁用标记）；页面上判断不了时，再看动作前读到的完整聊天记录里有没有你发出的消息。确定未解锁时不调用页面交换动作，直接返回 `EXCHANGE_NOT_AVAILABLE`（`recoverable=true`），先回复候选人再试即可；信号拿不准时不拦截，按原流程执行。
+
+### 接收与下载附件简历
+
+先用 `boss hr chatmsg <friend_id>` 核对消息。`accept-resume` 的 `--message-id` 是“对方想发送附件简历”的请求消息 `mid`，不是候选人 ID，也不是附件 ID。先加 `--dry-run` 可离线预览目标（不验证消息状态）；操作者批准后才加 `--yes`。命令重新读取消息和当前会话，确认发送方、请求类型及未处理状态后，单次调用 `exchange/accept`，不自动重试写请求、不新建 MQTT。只有外层 `code=0` 且 `zpData.status=0` 才返回 `accepted=true`；异常或额外确认状态不能当作已同意，需在官方页面核对。
+
+未确认的同意结果使用 `RESUME_ACCEPT_RESULT_UNKNOWN`，保留 `accepted=null`、`recoverable=false`，禁止自动重发；已识别的登录或风险错误仍保留各自错误码，也不自动重试同意操作。未加 `--yes` 时返回 `CONFIRMATION_REQUIRED`，先取得对具体操作的明确批准，不能由 Agent 自行补确认。
+
+同意后，再读取聊天记录，找到附件卡片（`body.hyperLink.hyperLinkType` 为 `1` 或 `9`）。将**附件消息的 mid** 交给下载命令，不能复用请求消息的 mid：
+
+```bash
+boss hr accept-resume <friend_id> --message-id <request_mid> --dry-run
+boss hr accept-resume <friend_id> --message-id <request_mid> --yes
+boss hr chatmsg <friend_id>
+boss hr download-resume <friend_id> --message-id <attachment_mid> --output ./resume.pdf
+```
+
+下载只支持普通 BOSS 会话（`friendSource=0`），从已收到的卡片读取 `id/encryptId`、`authType`，使用当前会话 `encryptUid` 检查 `preview/check.json`。不可见、过期或返回异常时停止；不能在线预览不等于不能下载。只访问固定的官方 `docdownload.zhipin.com` 地址，不请求卡片任意 URL，不跟随下载重定向、不修改邮箱、不自动同意或索要简历。最大 20 MiB，按文件内容识别 PDF、DOC、DOCX、PNG、JPEG；输出扩展名须匹配，父目录须已存在。以 `O_CREAT|O_EXCL`、私有权限创建文件，不覆盖已有文件，不依赖硬链接；写入异常时清理本次创建的未完成文件，但不保证进程被强制终止后的清理。结果不暴露临时下载凭据。文件签名识别不等于病毒检测，附件仍应视为不可信文件。
+
+二进制下载返回 HTTP 401/403 时使用 `AUTH_REQUIRED`。下载中的 `AUTH_REQUIRED`、`TOKEN_REFRESH_FAILED`、`NETWORK_ERROR` 按 `boss schema` 返回恢复指引，处理登录或网络问题后可重试下载；未识别的平台错误映射为 `NETWORK_ERROR`。`ACCOUNT_RISK`、`ENVIRONMENT_RISK` 仍须停止自动化，不自动登录、刷新或重试。下载可恢复不代表可以重发同意请求。
+
+两条命令均复用 CLI 原生认证。协议来自网页 v11308 静态代码，本次整合使用离线回归测试，不代表所有账号和风控场景均可用；网页的同意接口还注入动态 `sigx`，当前 HTTP 路径不伪造指纹，若被拒绝则停止，不自动启动浏览器绕过验证。MCP 对应 `boss_hr_accept_resume` / `boss_hr_download_resume`，同意与下载成功是两个独立状态，不等于对方已读或红点已清理。
+
+## 简历与 AI
+
+| 命令 | 说明 |
+|------|------|
+| `boss resume init/list/show/edit/delete/export/import/clone/diff/link/applications` | 本地简历管理 |
+| `boss ai config` | 配置 AI 服务 |
+| `boss ai local status` | 查看本地模型配置、推荐模型和导入登记 |
+| `boss ai local configure --runtime ollama --model qwen3:14b` | 配置本地 Ollama OpenAI 兼容服务 |
+| `boss ai local pull --model qwen3:14b --confirm-download` | 显式下载本地模型权重 |
+| `boss ai local smoke` | 调用本地模型做一次健康检查 |
+| `boss ai analyze-jd` | 分析岗位要求 |
+| `boss ai polish` | 润色简历 |
+| `boss ai optimize` | 针对目标岗位优化 |
+| `boss ai suggest` | 求职建议 |
+| `boss ai reply` | 生成招聘者消息回复草稿 |
+| `boss ai interview-prep` | 基于 JD 生成模拟面试题 |
+| `boss ai chat-coach` | 基于聊天记录给沟通建议 |
+| `boss ai cover-letter` | 基于本地简历与目标岗位起草求职信/自我介绍（仅草稿，不发送） |
+
+> 支持 Claude 4.7 / GPT-5 / DeepSeek-V3 / Qwen3 等最新模型，详见 [推荐模型与入口](integrations/ai-models.md)。
+
+## 系统管理
+
+| 命令 | 说明 |
+|------|------|
+| `boss config list/set/reset` | 配置管理 |
+| `boss clean` | 清理缓存；`--risk-lock` 在用户确认官方目标业务页恢复后显式清除本地风险锁，`--dry-run` 不解除锁，不宣称平台解封 |
+| `boss stats` | 投递转化漏斗统计（greeted/applied/shortlist） |
+| `boss export <query>` | 导出结果（CSV/JSON/HTML，支持 `--url` 网页筛选） |
+
+### 平台配置校验
+
+`boss config set platform <名称>` 按当前平台注册表校验，内置可用值为 `zhipin`。已移除的平台、未知值和空值返回 `INVALID_PARAM`，不会创建或修改配置文件。
+
+```bash
+boss config set platform zhipin
+```
+
+若旧配置已经包含不支持的平台，仍需显式选择可用平台后修复，不会自动切换平台或读取其他平台的凭据：
+
+```bash
+boss --platform zhipin config set platform zhipin
+```
+
+### 共享请求预算与冷却
+
+同一 `data_dir` 的 CLI、Python 客户端、MCP 子进程与 crawl 共用本地执行锁和滑动 60 秒预算。一次主动操作持锁至响应分类结束；失败尝试与允许的只读重放也消耗预算。进程退出释放执行锁，但不重置预算、冷却或平台风险锁。
+
+| 配置项 | 默认值 | 含义 |
+| --- | --- | --- |
+| `request_delay` | `[1.5, 3.0]` | 实例内间隔范围；高斯采样限制在该范围，额外停顿仍可能延长间隔 |
+| `request_max_per_minute` | `20` | 共享滑动 60 秒窗口内的主动操作上限，必须为正整数 |
+| `request_wait_timeout` | `30.0` | 每次申请执行锁、节流、预算和冷却的总等待上限（秒）；workflow 截止时间更早时优先停止 |
+| `request_budget_dir` | `null` | 默认使用当前 `data_dir`；绝对路径可将多个数据目录显式加入同一预算组 |
+
+如多个本地任务需要共用一组限制，可先配置组目录，再将成员指向它：
+
+```bash
+boss --data-dir /path/to/request-group config set request_max_per_minute 20
+boss --data-dir /path/to/account-a config set request_budget_dir /path/to/request-group
+boss --data-dir /path/to/account-b config set request_budget_dir /path/to/request-group
+```
+
+显式预算组采用组目录 `config.json` 中的上限和等待时限，发送间隔不低于组的 `request_delay` 下限。组内共享风险阻断，但登录态仍保存在各自目录。`status` / `doctor` 展示有效风险状态；确认目标业务页恢复后，由用户执行的 `clean --risk-lock` 清理当前目录及预算组的风险锁，`--dry-run` 不清锁，预算与冷却数据库保留。
+
+HTTP `429` 或业务 code `9` 会保存共享冷却，支持 `Retry-After` 的整数秒数或 HTTP 日期；无效或缺失值使用有界退避。等待期间和实际发送前重新检查风险、停止与超时。申请失败返回七键错误信封 `REQUEST_BUDGET_EXHAUSTED`，`error.details.request_sent=false` 只表示本次主动操作未发出；可能附带 `retry_after_seconds`。保留 checkpoint，处理冷却或并发任务后显式恢复，不循环重试或清除风险锁。若写操作已经发出、确认回读才因预算或停止中断，结果保持 `ACTION_UNCONFIRMED`，通过 `confirmation_stop` 说明原因，先核对实际结果。
+
+计量覆盖接入预算的 HTTP dispatch、浏览器 fetch / 首页导航 / 招聘者前端动作、附件下载，以及 crawl 的导航、分页动作、页面 fetch 和 CDP fallback；不同尝试分别计数。这是主动操作预算：一个页面动作可能产生多条网站请求，浏览器自主资源、轮询、自动重定向和认证启动内部请求未逐包计量，也不会按公网 IP 自动发现或合并其他进程。该机制限制本地负载，不保证平台接受访问，也不解除平台封禁。
+
+`--delay`、`request_delay` 和 `batch_greet_delay` 必须是有限数值且满足 `0 <= 下限 <= 上限`；非法预算配置返回 `INVALID_PARAM`，不会写入配置文件。已有非法配置仍可通过 `config set/reset` 修复。
+
+## 搜索筛选参数详解
+
+```bash
+boss search "golang" \
+  --city 广州 \             # 城市（40 个可选）
+  --salary 20-50K \         # 薪资范围
+  --experience 3-5年,5-10年 \ # 经验要求（支持逗号多选）
+  --education 本科,硕士 \    # 学历要求（支持逗号多选）
+  --scale 100-499人 \       # 公司规模
+  --industry 互联网 \       # 行业
+  --stage 已上市 \          # 融资阶段
+  --welfare "双休,五险一金" \ # 福利筛选（AND 逻辑）
+  --active 3d \             # HR 活跃度下限（也认 3day、3日）
+  --sort score              # 按本地 match_score 降序
+```
+
+也可以先在 BOSS 直聘网页上手动选好筛选条件，再复制搜索页 URL 给 CLI：
+
+```bash
+boss search --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280100&experience=104,105'
+boss export --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280100' --count 50 -o jobs.csv
+```
+
+**福利筛选工作原理**：
+
+1. 先检查职位福利标签（`welfareList`）
+2. 标签不匹配时自动获取职位描述全文搜索
+3. 自动翻页（最多 5 页）
+4. 每个结果带 `welfare_match` 说明匹配来源，并带 `match_score` 供 `--sort score` 本地排序
+
+支持关键词：`双休` `五险一金` `年终奖` `餐补` `住房补贴` `定期体检` `股票期权` `加班补助` `带薪年假`
+
+**HR 活跃度筛选（`--active`）**：
+
+可选档位 `online` / `today` / `3d` / `week` / `2w` / `month` / `half-year`，也认 `3day`、`3日`、`本周`、`两周`、`半年` 这类写法。平台文案按以下顺序比较，只保留不低于所选档位的职位：
+
+在线 / 刚刚活跃 > 今日活跃 > 3日内活跃 > 本周活跃 > 2周内活跃 > 本月活跃 > 近半年活跃 > 半年前活跃
+
+1. HR 在线（列表 `bossOnline` 为 `true` / `1`）直接满足任何档位；列表带 `activeTimeDesc` 时直接按文案判断，都不查详情
+2. **`online` 只看列表**：不查详情、只翻 1 页，请求量和普通搜索一样，**低风险场景推荐用它**
+3. 其余档位遇到列表看不出的离线职位，需要**逐个**查职位详情（串行，每次间隔 5–10 秒；CDP 模式只走浏览器通道），明显更慢、触发平台风控的风险也更高。实测 BOSS 列表通常不带 `activeTimeDesc`，所以离线职位基本都要查详情；和 `--welfare` 同时用时一次详情请求同时判断两项
+4. 翻页更克制：先看 1 页，结果不足 10 条且本页还有职位查过详情才继续，最多 3 页（和 `--welfare` 同用时沿用福利筛选的 5 页）；不读写搜索缓存。实际查了多少个详情写在 `hints.active_filter.detail_lookups`
+5. 文案无法识别或详情没返回活跃度的职位会被排除，数量和原文写在 `hints.active_filter`
+6. 结果新增 `boss_active_desc`（如“本周活跃”）；原有 `boss_active`（在线/离线）保持不变
+
+`boss preset add <name> <query> --active 3d` 可以把档位存进预设。

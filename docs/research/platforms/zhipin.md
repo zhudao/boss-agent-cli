@@ -1,5 +1,7 @@
 # BOSS 直聘（Zhipin）适配器基线研究
 
+> **历史研究基线：** 本文保留调研时的低风险分类术语；当前执行策略已开放全部已实现能力，请以 README、`boss schema` 和现行 backend specs 为准。Browser Bridge 已在 v3.0.0 移除，现有浏览器辅助通道为 CDP，默认浏览器来源可降级至 headless patchright；显式来源仍严格遵守各自的失败关闭约束。
+
 > **结论先行**：BOSS 直聘是 boss-agent-cli 的既有基线平台。后续扩展
 > 应以它的 `BossPlatform` 行为、JSON 信封、错误映射、缓存和低风险合规
 > 边界为对照，而不是把第三方自动化脚本当成实现模板。
@@ -26,7 +28,7 @@
 | Cookie 登录态 | 本地加密存储，只输出脱敏健康状态 | `AuthManager` 统一读取，不在命令层解析 |
 | `wt2` | 主 Cookie 字段之一 | 只记录存在性，不输出原值 |
 | `__zp_stoken__` | 页面 JS 生成的动态字段 | 缺失时属于部分登录态，需用户主动浏览器恢复 |
-| CDP / Bridge | 用户主动启动的浏览器辅助通道 | 用于登录兼容，不作为风控重试通道 |
+| CDP | 用户主动启动的浏览器辅助通道 | 用于登录兼容，不作为风控重试通道 |
 | patchright | 浏览器兼容依赖 | 命中风控时停止自动化，不切换通道继续重试 |
 
 `boss status` 默认只做本地健康诊断；`boss status --live` 和
@@ -55,7 +57,7 @@
 ## 5. 禁止能力
 
 - 不实现自动打招呼、批量打招呼、自动投递、自动消息回复的默认放行路径。
-- 不通过 CDP、patchright、Bridge 或其他通道重试已经被平台风控拦截的请求。
+- 不通过 CDP、patchright 或其他通道重试已经被平台风控拦截的请求。
 - 不复制 stealth、response interception、自动滚动抓取或批量导出脚本。
 - 不在文档、测试、日志或 JSON 信封中保存真实 cookie、token、手机号、微信号、
   真实聊天记录、候选人简历或真实 `security_id`。
@@ -66,8 +68,8 @@
 |------|-----------|
 | 成功码 | `code == 0` |
 | 数据包络 | `zpData` |
-| 常见风控码 | `code=36` 账号风险、`code=37` stoken 过期、`code=9` 限流 |
-| 职位 ID | `encryptJobId`、`securityId` 等加密标识 |
+| 常见风控码 | `code=36` 账号风险；`code=37` 需结合文案判断：环境异常为访问环境风控，明确 token/stoken 过期才是凭证失效；`code=9` 限流 |
+| 职位 ID | `encryptJobId`、`securityId`、`lid` 等加密标识（取 JD 全文需要 `securityId` + `lid`） |
 | 薪资字段 | `salaryDesc` |
 | 城市字段 | 数字 code |
 | 输出契约 | 命令层统一转成 `{ok, schema_version, command, data, pagination, error, hints}` |
@@ -119,7 +121,6 @@ uv run mypy src/boss_agent_cli
 
 ## 与其他研究文档的关系
 
-- 智联候选者侧研究：[zhaopin.md](zhaopin.md)
 - 拉勾风险占位：[lagou.md](lagou.md)
 - 猎聘风险占位：[liepin.md](liepin.md)
 - 平台准入模板：[README.md](README.md)

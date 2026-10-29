@@ -34,12 +34,12 @@ def test_get_token_raises_auth_required_when_no_session(mock_store_cls, tmp_path
 
 
 @patch("boss_agent_cli.auth.manager.TokenStore")
-def test_get_token_raises_platform_specific_auth_required_for_zhilian(mock_store_cls, tmp_path):
+def test_get_token_raises_platform_specific_auth_required_for_non_default_platform(mock_store_cls, tmp_path):
 	store = _make_store(token=None)
 	mock_store_cls.return_value = store
-	manager = AuthManager(tmp_path, platform="zhilian")
+	manager = AuthManager(tmp_path, platform="otherplat")
 
-	with pytest.raises(AuthRequired, match="boss --platform zhilian login"):
+	with pytest.raises(AuthRequired, match="boss --platform otherplat login"):
 		manager.get_token()
 
 
@@ -50,9 +50,9 @@ def test_auth_manager_uses_default_zhipin_store_path(mock_store_cls, tmp_path):
 
 
 @patch("boss_agent_cli.auth.manager.TokenStore")
-def test_auth_manager_uses_platform_scoped_store_path_for_zhilian(mock_store_cls, tmp_path):
-	AuthManager(tmp_path, platform="zhilian")
-	mock_store_cls.assert_called_once_with(tmp_path / "auth" / "zhilian")
+def test_auth_manager_uses_platform_scoped_store_path_for_non_default_platform(mock_store_cls, tmp_path):
+	AuthManager(tmp_path, platform="otherplat")
+	mock_store_cls.assert_called_once_with(tmp_path / "auth" / "otherplat")
 
 
 @patch("boss_agent_cli.auth.manager.TokenStore")
@@ -223,22 +223,6 @@ def test_verify_cookie_returns_false_on_value_error(mock_get, mock_store_cls, tm
 	assert manager._verify_cookie({"cookies": {"wt2": "x"}}) is False
 
 
-@patch("boss_agent_cli.auth.manager.TokenStore")
-@patch("httpx.get")
-def test_verify_cookie_supports_zhilian_http_style_code(mock_get, mock_store_cls, tmp_path):
-	mock_store_cls.return_value = _make_store()
-	mock_resp = MagicMock()
-	mock_resp.json.return_value = {"code": 200, "data": {"name": "tester"}}
-	mock_get.return_value = mock_resp
-
-	manager = AuthManager(tmp_path, platform="zhilian")
-	result = manager._verify_cookie({"cookies": {"zp_token": "abc"}, "user_agent": "UA", "x_zp_client_id": "cid"})
-	assert result is True
-	call = mock_get.call_args
-	assert call.kwargs["cookies"] == {"zp_token": "abc"}
-	assert call.kwargs["headers"]["x-zp-client-id"] == "cid"
-
-
 # ── force_refresh 剩余分支 ────────────────────────────────
 
 
@@ -324,3 +308,158 @@ def test_logout_clears_store_and_cached_token(mock_store_cls, tmp_path):
 
 	store.clear.assert_called_once()
 	assert manager._token is None
+
+
+# ── force_refresh 遵守 browser_source 策略（#387 seam / #404 review 第 10 条）──
+
+
+@patch("boss_agent_cli.auth.manager.TokenStore")
+@patch("boss_agent_cli.auth.manager.refresh_stoken")
+@patch("boss_agent_cli.auth.manager.refresh_stoken_via_cdp")
+@patch("boss_agent_cli.auth.manager.probe_cdp")
+def test_force_refresh_stored_cookie_never_launches_headless(
+	mock_probe_cdp,
+	mock_refresh_cdp,
+	mock_refresh_stoken,
+	mock_store_cls,
+	tmp_path,
+):
+	"""stored-cookie 下 CDP 不可用时必须 fail-closed，绝不降级到 headless。"""
+	from boss_agent_cli.api.browser_source import BrowserSourceUnavailable
+
+	current = {"cookies": {"wt2": "c"}, "stoken": "old", "user_agent": "UA"}
+	store = _make_store(token=current.copy())
+	mock_store_cls.return_value = store
+	mock_probe_cdp.return_value = None
+
+	manager = AuthManager(tmp_path)
+	with pytest.raises(BrowserSourceUnavailable) as exc_info:
+		manager.force_refresh(cdp_url="http://127.0.0.1:9222", browser_source="stored-cookie")
+
+	assert exc_info.value.code == "CDP_UNAVAILABLE"
+	assert exc_info.value.attempted == ("cdp",)
+	mock_probe_cdp.assert_called_once_with("http://127.0.0.1:9222")
+	mock_refresh_stoken.assert_not_called()
+	mock_refresh_cdp.assert_not_called()
+	store.save.assert_not_called()
+	assert manager._token is None
+
+
+@patch("boss_agent_cli.auth.manager.TokenStore")
+@patch("boss_agent_cli.auth.manager.refresh_stoken")
+@patch("boss_agent_cli.auth.manager.refresh_stoken_via_cdp")
+@patch("boss_agent_cli.auth.manager.probe_cdp")
+def test_force_refresh_stored_cookie_does_not_probe_default_port_without_cdp_url(
+	mock_probe_cdp,
+	mock_refresh_cdp,
+	mock_refresh_stoken,
+	mock_store_cls,
+	tmp_path,
+):
+	"""stored-cookie 不自动探测 localhost:9222——没给 --cdp-url 就直接 fail-closed。"""
+	from boss_agent_cli.api.browser_source import BrowserSourceUnavailable
+
+	current = {"cookies": {"wt2": "c"}, "stoken": "old", "user_agent": "UA"}
+	store = _make_store(token=current.copy())
+	mock_store_cls.return_value = store
+
+	manager = AuthManager(tmp_path)
+	with pytest.raises(BrowserSourceUnavailable) as exc_info:
+		manager.force_refresh(cdp_url=None, browser_source="stored-cookie")
+
+	assert exc_info.value.code == "CDP_UNAVAILABLE"
+	mock_probe_cdp.assert_not_called()
+	mock_refresh_stoken.assert_not_called()
+	mock_refresh_cdp.assert_not_called()
+	store.save.assert_not_called()
+
+
+@patch("boss_agent_cli.auth.manager.TokenStore")
+@patch("boss_agent_cli.auth.manager.refresh_stoken")
+@patch("boss_agent_cli.auth.manager.refresh_stoken_via_cdp")
+@patch("boss_agent_cli.auth.manager.probe_cdp")
+def test_force_refresh_stored_cookie_refreshes_via_cdp_when_available(
+	mock_probe_cdp,
+	mock_refresh_cdp,
+	mock_refresh_stoken,
+	mock_store_cls,
+	tmp_path,
+):
+	"""stored-cookie 只锁通道不锁能力：CDP 可用时照常经 CDP 刷新。"""
+	current = {"cookies": {"wt2": "c"}, "stoken": "old", "user_agent": "UA"}
+	store = _make_store(token=current.copy())
+	mock_store_cls.return_value = store
+	mock_probe_cdp.return_value = "ws://127.0.0.1:9222/devtools"
+	mock_refresh_cdp.return_value = "fresh-token"
+
+	manager = AuthManager(tmp_path)
+	manager.force_refresh(cdp_url="http://127.0.0.1:9222", browser_source="stored-cookie")
+
+	mock_refresh_cdp.assert_called_once_with("http://127.0.0.1:9222")
+	mock_refresh_stoken.assert_not_called()
+	assert manager._token["stoken"] == "fresh-token"
+
+
+@patch("boss_agent_cli.auth.manager.TokenStore")
+@patch("boss_agent_cli.auth.manager.refresh_stoken")
+@patch("boss_agent_cli.auth.manager.refresh_stoken_via_cdp")
+@patch("boss_agent_cli.auth.manager.probe_cdp")
+def test_force_refresh_auto_keeps_headless_fallback(
+	mock_probe_cdp,
+	mock_refresh_cdp,
+	mock_refresh_stoken,
+	mock_store_cls,
+	tmp_path,
+):
+	"""auto 行为逐字不变：CDP 不可用时降级 headless。"""
+	current = {"cookies": {"wt2": "c"}, "stoken": "old", "user_agent": "UA"}
+	store = _make_store(token=current.copy())
+	mock_store_cls.return_value = store
+	mock_probe_cdp.return_value = None
+	mock_refresh_stoken.return_value = "fresh-token"
+
+	manager = AuthManager(tmp_path)
+	manager.force_refresh(browser_source="auto")
+
+	mock_refresh_stoken.assert_called_once_with({"wt2": "c"}, "UA")
+	assert manager._token["stoken"] == "fresh-token"
+
+
+@patch("boss_agent_cli.auth.manager.TokenStore")
+def test_force_refresh_rejects_unknown_browser_source(mock_store_cls, tmp_path):
+	"""非法来源名不得静默回落到 auto——静默降级正是策略表要消灭的东西。"""
+	current = {"cookies": {"wt2": "c"}, "stoken": "old", "user_agent": "UA"}
+	store = _make_store(token=current.copy())
+	mock_store_cls.return_value = store
+
+	manager = AuthManager(tmp_path)
+	with pytest.raises(KeyError):
+		manager.force_refresh(browser_source="cdp-required")
+	store.save.assert_not_called()
+
+
+@pytest.mark.parametrize("source", [None, "auto", ""])
+@patch("boss_agent_cli.auth.manager.TokenStore")
+@patch("boss_agent_cli.auth.manager.refresh_stoken")
+@patch("boss_agent_cli.auth.manager.refresh_stoken_via_cdp")
+@patch("boss_agent_cli.auth.manager.probe_cdp")
+def test_force_refresh_default_sources_resolve_to_auto(
+	mock_probe_cdp,
+	mock_refresh_cdp,
+	mock_refresh_stoken,
+	mock_store_cls,
+	tmp_path,
+	source,
+):
+	"""None / 空串 / auto 三者等价，都保留 headless 降级。"""
+	current = {"cookies": {"wt2": "c"}, "stoken": "old", "user_agent": "UA"}
+	store = _make_store(token=current.copy())
+	mock_store_cls.return_value = store
+	mock_probe_cdp.return_value = None
+	mock_refresh_stoken.return_value = "fresh-token"
+
+	manager = AuthManager(tmp_path)
+	manager.force_refresh(browser_source=source)
+
+	mock_refresh_stoken.assert_called_once()
+	assert manager._token["stoken"] == "fresh-token"

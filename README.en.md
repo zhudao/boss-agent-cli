@@ -1,447 +1,236 @@
 <div align="center">
 
+<img src="docs/assets/logo.png" width="112" alt="boss-agent-cli logo">
+
 # boss-agent-cli
 
-**A local-assist CLI for AI Agents working around BOSS Zhipin**
+*🤖 A recruiting-platform CLI for people and AI agents — terminal wizard · welfare filtering · dual-role workflows · JSON envelopes.*
 
-> Default low-risk mode: local assistance · read-only first · user-triggered · no risk-control bypass · no bulk outreach · no platform-data scraping
->
-> Job-seeker: search · welfare filtering · detail review · shortlist · local resume and AI assistance
-
-[![CI](https://github.com/can4hou6joeng4/boss-agent-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/can4hou6joeng4/boss-agent-cli/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/can4hou6joeng4/boss-agent-cli/branch/master/graph/badge.svg)](https://codecov.io/gh/can4hou6joeng4/boss-agent-cli)
-[![Python](https://img.shields.io/badge/Python-≥3.10-3776AB?logo=python&logoColor=white&style=flat-square)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-≥3.11-3776AB?logo=python&logoColor=white&style=flat-square)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/can4hou6joeng4/boss-agent-cli?style=flat-square)](https://github.com/can4hou6joeng4/boss-agent-cli/releases)
 [![PyPI Downloads](https://img.shields.io/pypi/dm/boss-agent-cli?style=flat-square)](https://pypi.org/project/boss-agent-cli/)
-[![Contributors](https://img.shields.io/github/contributors/can4hou6joeng4/boss-agent-cli?style=flat-square)](https://github.com/can4hou6joeng4/boss-agent-cli/graphs/contributors)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](https://github.com/can4hou6joeng4/boss-agent-cli/pulls)
-[![Open in Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/can4hou6joeng4/boss-agent-cli)
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Fcan4hou6joeng4%2Fboss-agent-cli.svg)](https://mcptoplist.com/server/glama%2Fcan4hou6joeng4%2Fboss-agent-cli)
 
-[Getting Started](docs/getting-started.en.md) · [Install](#-install) · [Quickstart](#-quickstart) · [Roles & Platforms](#-roles--platforms) · [Agent Integration](#-agent-integration) · [Commands](#-commands) · [Troubleshooting](#-troubleshooting) · [Architecture](#-architecture) · [Changelog](CHANGELOG.md) · [Roadmap](ROADMAP.en.md)
+[Getting Started](docs/getting-started.en.md) · [Agent Integration](#-agent-integration) · [Commands](#-commands) · [Troubleshooting](docs/troubleshooting.en.md) · [Roadmap](ROADMAP.en.md) · [中文](README.md) | **English**
 
-[中文](README.md) | **English**
-
-<a href="demo/showcase/boss-agent-cli-showcase.mp4" title="Watch the full project showcase video">
-  <img src="demo/showcase/boss-agent-cli-showcase.gif" alt="boss-agent-cli project showcase animation" width="100%">
+<a href="demo/showcase/boss-agent-cli-showcase.mp4" title="Watch the 48-second product keynote">
+  <img src="demo/showcase/boss-agent-cli-showcase.gif?v=keynote-20261008" alt="boss-agent-cli Aurora Keynote: welfare filtering, dual-role workflows and agent integration" width="100%">
 </a>
 
-**[Watch the full showcase video](demo/showcase/boss-agent-cli-showcase.mp4)** · [view the terminal demo](demo-en.gif) · schema-driven · welfare filtering · JSON envelope · open-source engineering quality
-
-<p align="center">
-  <img src="demo-en.gif" alt="boss-agent-cli terminal demo (1280×720 / 30fps)" width="100%">
-</p>
+**[Watch the 48-second keynote](demo/showcase/boss-agent-cli-showcase.mp4)** · [interactive edition](https://can4hou6joeng4.github.io/boss-agent-cli/keynote-animation/) · [terminal demo](demo/demo-en.gif) · welfare filtering · dual-role workflows · agent integration
 
 </div>
 
----
+## 🧭 Why
 
-## 💡 Why boss-agent-cli?
+boss-agent-cli unifies job discovery, welfare filtering, local resumes and AI, application and messaging, recruiter candidate workflows, and resumable crawling in one CLI. People run `boss` for a terminal wizard; agents use JSON, schema, MCP, or the Python API against the same workflow state. `boss schema` remains the capability source of truth.
 
-Traditional job hunting: open a web page → flip through dozens of pages → check each detail → organize shortlists manually → forget who to follow up with.
+## ⚠️ Runtime Boundary
 
-With AI Agents: `boss search` -> `boss detail` -> `boss shortlist` -> `boss stats` — one local-assist chain for organizing work while sensitive actions stay on the official website.
+Historical `operating_mode=assisted|research` configuration remains compatible, but both modes can call every implemented capability and no longer produce mode-level `COMPLIANCE_BLOCKED` errors. Missing platform implementations still return `NOT_SUPPORTED`; authentication, account-risk, and network failures keep structured recovery metadata. Long-running workflows remain bounded by timeout, retry, budget, checkpoint, and stop controls.
 
-Every command outputs **structured JSON** that AI Agents parse directly. Default low-risk mode blocks automated outreach, bulk actions, contact exchange, recruiter candidate data workflows, and risk-control retries.
+## ✨ Features
 
-## ⚠️ Compliance Boundary
-
-The project enables Low-Risk Assistance Mode by default. It is intentionally scoped to local assistance, read-only-first workflows, and user-triggered actions. CLI commands that would greet, batch-greet, apply, exchange contacts, search recruiter candidates, read candidate resumes/chats, request attachments, or reply to candidates are blocked by default; users should perform those actions manually on the official platform.
-
-## 🧭 Table of Contents
-
-- [Why boss-agent-cli?](#-why-boss-agent-cli)
-- [Demo Assets](#-demo-assets)
-- [Core Capabilities](#-core-capabilities)
-- [Install](#-install)
-- [Quickstart](#-quickstart)
-- [Roles & Platforms](#-roles--platforms)
-- [Agent Integration](#-agent-integration)
-- [Commands](#-commands)
-- [Troubleshooting](#-troubleshooting)
-- [Architecture](#-architecture)
-- [Local Storage](#-local-storage)
-- [Contributing](#-contributing)
-
-## 🎬 Demo Assets
-
-| Type | Entry | Best for |
-|------|-------|----------|
-| Project showcase animation | [Homepage autoplay GIF](demo/showcase/boss-agent-cli-showcase.gif) | Quickly understanding the project positioning, schema-driven workflow, JSON envelope, and open-source engineering quality |
-| Full showcase video | [16-second MP4](demo/showcase/boss-agent-cli-showcase.mp4) | Viewing the clearer, complete project narrative |
-| Terminal interaction demo | [Terminal GIF](demo-en.gif) · [VHS tape](demo-en.tape) | Seeing the CLI commands and output shape directly (1280×720 / 30fps) |
-| Reproducible source | [HyperFrames source](demo/hyperframes-showcase/) | Maintaining or iterating the README homepage animation |
-
-## 🌟 Core Capabilities
-
-### Job-seeker workflow
-
-- **Discovery**: keyword search, layered filters, and cached `show` navigation. Commands: `search` `show`
-- **Welfare-aware search**: `--welfare "双休,五险一金"` runs real AND matching by paging, fetching details, and checking text fallback. Command: `search --welfare`
-- **Local shortlist**: inspect details and organize candidate jobs locally; apply and messaging stay on the official website. Commands: `detail` `show` `shortlist`
-- **Pipeline control**: local shortlist and funnel stats from local state. Commands: `shortlist` `stats`
-- **Conversation support**: low-risk local organization only by default; message history, labels, and contact exchange are sensitive workflows and blocked by default.
-- **AI job-hunting assist**: JD analysis, resume polish, role-targeted optimization, interview prep, and chat coaching. Commands: `ai analyze-jd` `ai polish` `ai optimize` `ai interview-prep` `ai chat-coach`
-
-### Recruiter workflow
-
-- **Recruiter boundary**: candidate search, applications, resumes, chat records, attachment requests, contact exchange, and replies are blocked by default; use the official recruiter UI for those actions.
-- **Job lifecycle management**: list, bring online, and take offline recruiter postings. Commands: `hr jobs list` `hr jobs online` `hr jobs offline`
-
-### Platform & integration foundation
-
-- **Schema-first integration**: `boss schema` is the capability source of truth for shell agents, SDKs, and tool-export formats
-- **Structured transport**: stdout is JSON-only, stderr is logs-only, which keeps automation stable
-- **Platform-aware login**: user-triggered login state is stored locally and encrypted; it is not a risk-control bypass workflow
-- **Cross-platform adapter layer**: `Platform` / `RecruiterPlatform` registries are live, with low-risk mode governing sensitive capabilities
-- **MCP server with 32 tools**: exposes only the low-risk tool surface by default
-
-## 📦 Install
-
-```bash
-# Recommended: install via uv (fast, isolated)
-uv tool install boss-agent-cli
-patchright install chromium
-
-# Or pipx
-pipx install boss-agent-cli
-patchright install chromium
-
-# From source
-git clone https://github.com/can4hou6joeng4/boss-agent-cli.git
-cd boss-agent-cli && uv sync --all-extras
-uv run patchright install chromium
-```
+- **Job discovery**: keyword search + layered filters, with cached `show` navigation — `search` `show` `detail`
+- **Welfare filtering (the differentiator)**: `--welfare "双休,五险一金"` pages, fetches details, runs **real AND matching**, and can `--sort score` by local match score — `search --welfare`
+- **HR activity filter**: `--active 3d` keeps only jobs whose recruiter was active recently, so you don't spend applications on recruiters who never log in; `online` is list-only with the same request volume as a plain search, while other levels may fetch per-job details and are slower and riskier — prefer `--active online` for low-risk use — `search --active`
+- **Terminal wizard**: run `boss` or `boss wizard`, select a role, platform, and goal, then resume the same workflow through JSON, run IDs, or MCP
+- **Local shortlist & stats**: inspect details, read web favorited jobs with validity status and sync only active entries, organize candidates with local tags and notes, compare jobs offline, and see funnel stats — `shortlist` `stats` `watch` `preset` `favorites`
+- **AI job-hunting assist + local models**: JD analysis, resume polish, role-targeted optimization, keyword suggestions, resume optimization, shortlist fit reports, interview prep, chat coaching; local weights stay outside the Python package via Ollama/vLLM OpenAI-compatible endpoints — `ai analyze-jd` `ai suggest-keywords` `ai resume-optimize` `ai interview-prep` `ai chat-coach` `ai local configure` `ai local smoke`
+- **Schema-first + JSON envelope**: stdout is a JSON-only `{ok, data, pagination, error, hints}` envelope, `boss schema` is the capability source of truth, and an **MCP server with 78 tools** exposes every implemented capability
+- **Recruiter workflow**: confirm recruiter identity, then candidate search, recommendations, first contact with built-in read-state cleanup, resumes, chats, replies, and job management — `hr whoami/candidates/recommendations/greet/applications/resume/chat/last-messages/reply/request-resume/jobs`
+- **Platform layer**: live `Platform` / `RecruiterPlatform` registries behind the global `--platform` option; `zhipin` (BOSS Zhipin) is the only registered platform
 
 ## 🚀 Quickstart
 
 ```bash
-# 1. Environment check
-boss doctor
+# Install (uv recommended; the browser core is only for user-triggered login / local export)
+uv tool install boss-agent-cli
+patchright install chromium
 
-# 2. Login (automatic 4-tier fallback)
-boss login
+# Human entrypoint: choose role, platform, and goal in the wizard
+boss
 
-# 3. Verify login
-boss status
+# Agents and advanced users can still call commands directly
+boss doctor                                                   # environment check
+boss login                                                    # platform-aware login
+boss status                                                   # verify login
+boss search "Golang" --city 广州 --welfare "双休,五险一金"     # search + welfare filtering
+boss search "Golang" --city 广州 --active 3d                  # only recruiters active in the last 3 days
+boss detail <security_id>                                     # view detail
+boss shortlist add <security_id> <job_id> --tags backend,remote  # add to local shortlist with local tags
+boss shortlist compare --tag remote                           # compare shortlisted jobs offline
+boss stats                                                    # local stats
 
-# 4. Search Golang jobs in Guangzhou with 双休 + 五险一金
-boss search "Golang" --city 广州 --welfare "双休,五险一金"
-
-# 5. View detail → add to local shortlist
-boss show 1
-boss shortlist add <security_id> <job_id>
-
-# 6. AI-powered chat reply
-boss ai reply "请问什么时候方便聊一下？"
-
-# 7. Investment funnel analysis
-boss stats --days 30
-
-# 8. Recruiter mode
-boss hr jobs list                       # my job postings
-# Candidate search, resumes, chat, replies, attachments, and contact exchange are blocked by default.
+# Recruiter mode
+boss hr candidates "Python" --city 101010100
+boss hr recommendations --job-id <encJobId>
+boss hr jobs list
 ```
+
+Every command outputs structured JSON (`ok` for success, `exit 0/1` by default; the optional `--exit-codes sysexits` returns semantic exit codes per error class). Full walk-through: [Getting Started](docs/getting-started.en.md).
 
 ## 🎭 Roles & Platforms
 
-boss-agent-cli covers both the job-seeker and the recruiter side, with a pluggable platform layer for future adapters and explicitly unsupported placeholders.
-
-| Role | Flag | Entry commands |
-|------|------|----------------|
-| Candidate *(default)* | `--role candidate` | `search` / `detail` / `shortlist` |
-| Recruiter | `--role recruiter`, or `boss hr <sub>` shortcut | `hr jobs list`; candidate-data workflows are blocked by default |
-
 | Platform | Candidate | Recruiter | Status |
-|----------|:---------:|:---------:|--------|
+|----------|:--:|:--:|--------|
 | BOSS Zhipin (`zhipin`) | ✅ | ✅ | default |
-| Zhaopin (`zhilian`)    | 🟡 candidate-side login + read/write flow wired | — | recruiter side is still intentionally unavailable at runtime |
-| 51job (`qiancheng`)     | 🚧 registered placeholder | — | returns `NOT_SUPPORTED` until the read-only research gate is satisfied |
 
 ```bash
-# pick a platform
-boss --platform zhilian search "Python"
-boss config set platform zhilian
-# 51job is currently identity-only; real commands return NOT_SUPPORTED
-boss --platform qiancheng status
+boss platforms                             # list registered platforms and capability status (currently zhipin only)
+boss --platform zhipin search "Python"     # zhipin is the default, so --platform can be omitted
 ```
 
-Notes:
-- `boss login` follows the current platform selection
-- `boss --platform zhilian login` is available for candidate-side auth
-- candidate-side `search / detail / user_info` are wired for `zhilian`; recommendation streams and write actions are blocked by default in low-risk mode
-- `boss --platform zhilian hr ...` is still intentionally rejected at runtime because recruiter support is not implemented yet
-- `boss --platform qiancheng ...` is registered for schema/config identity only and returns `NOT_SUPPORTED` for real workflows
-
-Architecture notes: [docs/platform-abstraction.en.md](docs/platform-abstraction.en.md).
+`boss hr ...` and recruiter-side `agent` automation currently support only `zhipin-recruiter`. Architecture notes: [docs/platform-abstraction.en.md](docs/platform-abstraction.en.md).
 
 ## 🤖 Agent Integration
 
-The point of this tool is to let AI Agents help organize job-hunting context without automating sensitive platform actions.
-
-```bash
-# Step 1: let the Agent read the tool self-description
-boss schema
-
-# Step 2: the Agent chains commands via subprocess + JSON parse
-# Example (Python):
-import subprocess, json
-result = subprocess.run(["boss", "search", "Python", "--city", "北京"],
-                        capture_output=True, text=True)
-jobs = json.loads(result.stdout)["data"]["items"]
-```
-
-**MCP integration** (Claude Desktop / Cursor):
+Start here: [Agent Quickstart](docs/agent-quickstart.en.md) · [Capability Matrix](docs/capability-matrix.en.md) · [Host Examples](docs/agent-hosts.en.md)
 
 ```json
-{
-  "mcpServers": {
-    "boss-agent": {
-      "command": "uvx",
-      "args": ["--from", "boss-agent-cli[mcp]", "boss-mcp"]
-    }
-  }
-}
+// Option 1: MCP (recommended) — Claude Desktop / Cursor and other MCP hosts; MCP server with 78 tools
+{ "mcpServers": { "boss-agent": { "command": "uvx", "args": ["--from", "boss-agent-cli[mcp]", "boss-mcp"] } } }
 ```
 
-See [Agent Quickstart](docs/agent-quickstart.en.md) and [Capability Matrix](docs/capability-matrix.en.md) for the full picture.
+Prefer not to set up a local Python toolchain? Use the bundled container: `BOSS_UID=$(id -u) BOSS_GID=$(id -g) docker compose run --rm boss-mcp`. The image deliberately ships no browser kernel — run `boss login` on the host first, then mount `~/.boss-agent`. See [Docker integration](docs/integrations/docker.md).
+
+OpenCode can use the checked-in example directly:
+
+```bash
+cp examples/opencode/opencode.json ./opencode.json
+uv sync --all-extras
+uv run boss-mcp --data-dir ./.boss-agent --help
+```
+
+After portable/global install, copy the bundle's `examples/opencode.json` into any
+OpenCode project. It starts `boss-mcp --data-dir ./.boss-agent`, keeping review,
+pending, and logs project-local.
+
+```bash
+# Option 2: subprocess — let the Agent read the self-description, then parse stdout JSON
+boss schema
+```
+
+```python
+# Option 3: embed in Python (ships with py.typed)
+from boss_agent_cli import AuthManager, BossClient, AuthRequired
+with BossClient(AuthManager(...)) as client:
+    result = client.search_jobs("Golang", city="北京")
+```
 
 ## 📚 Commands
 
-`boss schema` currently exposes 34 top-level commands, plus 9 first-level recruiter subcommands under `hr`, grouped below by workflow:
+`boss schema` exposes 39 top-level commands + 14 first-level recruiter subcommands, grouped by workflow:
 
-| Stage | Commands |
-|-------|----------|
-| **Auth** | `login` · `logout` · `status` · `doctor` |
-| **Discover** | `search` · `detail` · `show` · `cities` · `history` |
-| **Restricted Actions** | `greet` · `batch-greet` · `apply` · `exchange` · `mark` are blocked by default |
-| **Restricted Track** | `chat` · `chatmsg` · `chat-summary` · `pipeline` · `follow-up` · `digest` are blocked by default; `chatmsg --raw` preserves structured body/link/card fields only after compliance allows the command; use `stats` for local state |
-| **Organize** | `watch` · `preset` · `shortlist` |
-| **Resume** | `resume` · `me` |
-| **AI** | `ai config` · `ai analyze-jd` · `ai polish` · `ai optimize` · `ai suggest` · `ai reply` · `ai interview-prep` · `ai chat-coach` |
-| **Utility** | `schema` · `export` · `config` · `clean` |
-| **Recruiter** | `hr jobs list/offline/online`; candidate-data and messaging workflows are blocked by default |
+- **Auth**: `login` · `logout` · `status` · `doctor`
+- **Discover**: `search` · `detail` · `show` · `cities` · `history`
+- **Organize**: `watch` · `preset` · `shortlist` · `stats` · `favorites`
+- **Resumable crawl**: `crawl configure/run/start/status/results/resume/stop/shortlist`
+- **Resume / AI**: `resume` · `me` · `ai analyze-jd` · `ai polish` · `ai optimize` · `ai fit` · `ai suggest-keywords` · `ai resume-optimize` · `ai cover-letter` · `ai interview-prep` · `ai chat-coach` · `ai local`
+- **Utility / workflow**: `wizard` · `schema` · `platforms` · `export` · `config` · `clean`
+- **Candidate actions**: `greet` · `batch-greet` · `apply` · `exchange` · `chat*` · `pipeline` · `digest`
+- **Recruiter**: `hr whoami/applications/candidates/recommendations/greet/resume/chat/chatmsg/last-messages/reply/request-resume/accept-resume/download-resume/jobs`
 
-Run `boss <cmd> --help` for options, or `boss schema` for the complete JSON self-description.
+Full command tables, parameters, and welfare-matching internals: **[Command Reference](docs/commands.en.md)**. The capability source of truth is `boss schema` (with `--format openai-tools` / `anthropic-tools` exports).
 
-Search and export can reuse filters selected manually on the BOSS web UI:
+Bulk crawl requires `uv sync --extra crawl`. It uses its own `<data-dir>/crawl/chrome-profile` and never attaches to a daily Chrome profile. Hooks are disabled by default; local scripts require both an explicit profile and a directory containing `SHA256SUMS`:
 
-```bash
-boss search --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280100&experience=104,105'
-boss export --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280100' --count 50 -o jobs.csv
+```powershell
+boss crawl configure --max-requests 20 --max-details 50 --max-seconds 600 --max-retries 1
+boss crawl run "AI" --city 杭州 --pages 3 --with-detail `
+  --hook-profile screenshot-full --hook-dir E:\boss-agent-cli-local-hooks\AntiDebug_Breaker
+boss crawl resume <run_id>
+boss crawl stop <run_id>
+boss agent crawl --run-id <run_id> --resume <resume-name>
 ```
 
-Parameter mode also supports comma-separated multi-select filters such as `--experience "应届,3-5年"` and `--education "本科,硕士"`.
-
-**Export for any agent framework** — no MCP required:
-
-```bash
-boss schema --format openai-tools      # OpenAI Functions / Tools API
-boss schema --format anthropic-tools   # Claude Tool Use API
-```
+`crawl run` is sequential, checkpoints SQLite state, and incrementally writes JSON / CSV / XLSX artifacts. Request, detail, wall-clock, and retry budgets are fixed; `boss crawl stop` stops at the next safe point. Exports and `crawl results` redact `security_id`, selectors, and recruiter fields; `boss clean --privacy` removes crawl state, budgets, and exports. Fine-grained MCP crawl tools read or import an existing `run_id`; `boss_wizard` can start, resume, and stop the shared workflow. A platform risk code or security page stops the task and returns a resume command.
 
 ## 🩺 Troubleshooting
 
-If something misbehaves, always start with:
-
 ```bash
-boss doctor
-boss status
-# Optional: run an explicit low-frequency read-only live probe
-boss status --live
+boss doctor             # environment check
+boss status --live      # optional low-frequency read-only probe
 boss doctor --live-probe
 ```
 
-<details>
-<summary>📖 Common diagnostic checks</summary>
+Every error envelope carries `code` + `recoverable` + `recovery_action`, so agents can react programmatically. `boss doctor` checks CDP reachability and reports the `browser_channel` summary. With the default `auto` source, `chat` and `chatmsg` use httpx with stored credentials; explicitly selecting `--browser-source existing-browser` reuses an existing target-site tab through CDP without reading CLI-stored cookies. Exhausted existing-browser candidates return `BROWSER_SESSION_NOT_FOUND` plus `boss doctor`, while the ordinary unauthenticated path still returns `AUTH_REQUIRED` plus `boss login`. Every source stops on platform risk-control blocks and checkpoints the workflow; declared adapters must remain bounded, redacted, stoppable, and explicitly resumed only after the risk condition is resolved.
 
-| Check | What it means |
-|-------|---------------|
-| `python_version` | Python ≥ 3.10 installed |
-| `patchright_chromium` | Chromium installed |
-| `cookie_extract` | Local browser cookies accessible |
-| `credential_file` | Encrypted credential file exists and is readable |
-| `auth_session` | Encrypted session file readable |
-| `cookie_presence` / `wt2_presence` | Cookies and the primary auth cookie are present |
-| `stoken_presence` / `stoken_freshness` | `__zp_stoken__` exists and is likely fresh |
-| `auth_token_quality` | Core tokens (wt2 / stoken) present |
-| `cookie_completeness` | Auxiliary tokens (wbg / zp_at) |
-| `cdp` | Chrome DevTools Protocol reachable |
-| `bridge_daemon` | Local Browser Bridge daemon is reachable |
-| `bridge_extension` | Chrome extension is connected to the daemon |
-| `bridge_protocol` | CLI and extension version/protocol are compatible |
-| `bridge_workspace` | Current Bridge workspace/tab is usable |
-| `bridge_exec` / `bridge_fetch` / `bridge_navigate` | Basic extension execution, browser fetch, and navigation capabilities |
-| `browser_channel` | CDP/Bridge summary; not a risk-control bypass path |
-| `candidate_search_health` / `candidate_detail_health` | Candidate read-only prerequisites |
-| `recruiter_read_health` | Recruiter read-only prerequisites; Zhaopin recruiter mode is explicitly marked unsupported |
-| `network` | zhipin.com reachable |
-
-</details>
-
-<details>
-<summary>📖 Login issues</summary>
-
-For Cookie, CDP, patchright, real-account, request-rate, or platform-drift issues, read [Platform Risk Boundaries](docs/platform-risk.en.md) first.
-
-### Cookie extraction fails
+**v3.0.0 migration: the Browser Bridge daemon, Chrome extension, and `[bridge]` installation extra have been removed. Upgrading the CLI does not stop an old daemon or uninstall the browser extension.** Manually stop the old daemon, disable or remove the old extension, and drop `[bridge]` from installation commands. The default browser fallback chain is CDP → headless. To reuse an existing session only, first log in manually on the official site in a local CDP browser, then run:
 
 ```bash
-# Force re-login via QR scan
-boss logout && boss login
+boss --browser-source existing-browser --cdp-url http://localhost:9222 chat
 ```
 
-### BOSS detects automation (code 36 / `ACCOUNT_RISK`)
+This source does not create pages, navigate, inject cookies, or launch a browser. Keep the CDP debugging port within a trusted local environment; never expose it publicly or use it to bypass platform risk controls.
 
-Stop automated access and return to the official BOSS Zhipin website. Do not retry the blocked action through CDP, patchright, or Browser Bridge.
+Full checks, CDP launch examples, and error codes: **[Troubleshooting](docs/troubleshooting.en.md)**. For Cookie / CDP / patchright / request-rate / drift issues, read [Platform Risk Boundaries](docs/platform-risk.en.md) first.
 
-### Browser Bridge is not connected
+## ⚙️ Configuration
 
 ```bash
-python -m boss_agent_cli.bridge.daemon --serve
-# Then load and enable extension/ from chrome://extensions, and run:
-boss doctor
+boss config list                      # view all settings
+boss config set log_level debug       # set the log level
+boss config reset                     # restore defaults
 ```
 
-`bridge_daemon`, `bridge_extension`, `bridge_protocol`, `bridge_workspace`,
-`bridge_exec`, `bridge_fetch`, and `bridge_navigate` show the local daemon,
-extension, tab, and basic browser-command health. Bridge is only for local diagnostics,
-user-triggered login compatibility, and read-only assistance. Do not use it to
-retry platform risk-control blocks.
+Settings live in `~/.boss-agent/config.json`: request delays, batch-greet delay, log level, CDP URL, export dir, platform / role.
 
-### Token expired mid-session
+## 🏗️ Architecture
 
-```bash
-# stoken (core session token) expires after ~24h
-# Re-login or use Chrome CDP hydration; auth_token_quality will report the issue
-boss logout && boss login
+```
+CLI (Click)
+  └─ Wizard / WorkflowRunner (TTY + headless JSON + persisted run state)
+       └─ Capability metadata (assisted / research compatibility; no mode gate)
+       └─ AuthManager ── user-triggered login state (Fernet + PBKDF2 machine-bound encryption)
+       └─ Platform registries ── zhipin / zhipin-recruiter
+       └─ BossClient ── httpx + throttle; CDP / patchright compatible for login & export
+       └─ CacheStore (SQLite WAL) · AIService (OpenAI-compatible / Ollama / vLLM)
+            └─ output.py → JSON envelope → stdout
 ```
 
-</details>
-
-<details>
-<summary>📖 Browser / patchright issues</summary>
-
-### `patchright install chromium` fails
-
-```bash
-# macOS / Linux: ensure write access to ~/Library/Caches (macOS) or ~/.cache (Linux)
-# Windows: run as admin once
-pip install --upgrade patchright
-patchright install chromium --with-deps
-```
-
-### Chromium launches but stays blank
-
-- Check `auth_session` via `boss doctor` — if "corrupted", delete `~/.boss-agent/auth/` and re-login
-- Check `network` — some regions need a proxy: `HTTPS_PROXY=http://...:port boss login`
-
-### CDP connection refused
-
-```bash
-# Verify CDP is actually listening
-curl http://localhost:9222/json/version
-
-# If empty, Chrome wasn't started with --remote-debugging-port
-# macOS users: make sure Chrome is fully quit first (⌘Q, not just close window)
-```
-
-</details>
-
-<details>
-<summary>📖 Search / API errors</summary>
-
-### `code 36` / `ACCOUNT_RISK`
-
-Risk control detected automation. Stop the automated flow and use the official website manually.
-
-### `RATE_LIMITED`
-
-Too many requests in a window. Increase delay:
-
-```bash
-boss --delay 3-7 search "python"
-# Or set globally
-boss config set request_delay "[3.0, 7.0]"
-```
-
-### `JOB_NOT_FOUND`
-
-- Check if job was taken down on BOSS website manually
-- Pass `--job-id` directly if you have `encrypt_job_id`, skips broken detail cache
-
-### Empty search results despite valid query
-
-- Always check `boss doctor` first — often an auth problem surfacing as zero results
-- Add `--log-level debug` to see the actual request going out on stderr
-
-</details>
-
-<details>
-<summary>📖 Error codes & agent-friendly recovery</summary>
-
-Every error response contains `code`, `recoverable`, and `recovery_action`, so agents can react programmatically.
-
-| Error Code | Meaning | Agent Recovery |
-|------------|---------|----------------|
-| `AUTH_REQUIRED` | Not logged in | `boss login` |
-| `AUTH_EXPIRED` | Session expired | `boss login` |
-| `RATE_LIMITED` | Too many requests | Wait and retry |
-| `TOKEN_REFRESH_FAILED` | stoken refresh failed | `boss login` |
-| `ACCOUNT_RISK` | Risk-control block (code 36) | Stop automated access; use the official website manually |
-| `COMPLIANCE_BLOCKED` | Low-risk mode blocked a sensitive command | Use read-only/local tools or complete the action manually on the official website |
-| `JOB_NOT_FOUND` | Job removed or invalid | Skip |
-| `ALREADY_GREETED` | Already messaged recruiter | Skip |
-| `ALREADY_APPLIED` | Already applied | Skip |
-| `GREET_LIMIT` | Daily greet quota hit | Pause until tomorrow |
-| `NETWORK_ERROR` | Connection failed | Retry with backoff |
-| `INVALID_PARAM` | Bad argument | Fix parameter |
-| `AI_NOT_CONFIGURED` | AI service not set up | `boss ai config` |
-| `AI_API_ERROR` | AI provider call failed | Retry / check key |
-| `AI_PARSE_ERROR` | AI response not JSON | Retry |
-
-</details>
-
-<details>
-<summary>📖 Glossary (Chinese terms kept in code)</summary>
-
-| Term | Meaning |
-|------|---------|
-| `stoken` | Session token — core auth credential for BOSS API |
-| `wt2` | Long-lived bearer token, paired with stoken |
-| `wbg` / `zp_at` | Auxiliary cookies used by wapi endpoints |
-| `security_id` | Per-job opaque ID returned by search; used by detail and local organization commands |
-| `encrypt_job_id` | Alternative job ID for the httpx fast path (skips browser) |
-| `CDP` | Chrome DevTools Protocol — compatibility login mechanism, not a risk-control bypass |
-| `wapi` | BOSS Zhipin internal JSON API (behind `www.zhipin.com/wapi/...`) |
-
-These terms appear in JSON responses and error messages as-is — we deliberately don't translate them to keep parity with BOSS's own naming.
-
-</details>
-
-## 🏗 Architecture
-
-See [中文版 README](README.md#-技术架构) for the full architecture diagram.
-
-Short version: Click CLI → Compliance Guardrails → AuthManager (Fernet-encrypted tokens) → BossClient → JSON envelope on stdout.
-
-Invariant contracts:
-- stdout is JSON-only; stderr holds logs (controlled by `--log-level`)
-- Error objects always carry `code` + `recoverable` + `recovery_action`
-- `boss schema` is the authoritative capability source for Agents
+**Invariants**: stdout is JSON-only · stderr holds logs · `exit 0/1` (optional `--exit-codes sysexits` for semantic codes) · errors carry `code/recoverable/recovery_action` · `boss schema` is the authoritative capability source.
+**Two audiences, one envelope**: `hints.next_actions` holds follow-up commands for the Agent to run; `hints.operator_actions` holds natural-language guidance for the human operator (scan a QR code, adjust filters in the browser — anything done away from the terminal). TTY renders only the latter, to stderr; an Agent should relay it to the operator.
+**Command or wizard**: single-shot, stateless capability calls go through top-level commands; anything needing cross-step state, resumability, or handing guidance to a human goes through `boss wizard` (goals listed under `wizard_catalog` in `boss schema`).
+**Stack**: Python ≥ 3.11 · Click · httpx · patchright / CDP (login, export, and declared browser adapters) · cryptography · sqlite3 (WAL) · pytest (2900+).
 
 ## 🔌 Local Storage
 
-All state lives under `~/.boss-agent/` — encrypted tokens, cached searches, chat history snapshots, resumes, AI config. Nothing leaves your machine except explicit API calls.
+All state lives under `~/.boss-agent/` — encrypted tokens, cached searches, shortlist, local resumes, AI config, and external model registry. Model weights are not bundled into the Python package; nothing leaves your machine except explicit API calls or user-confirmed model downloads.
 
 ## 🤝 Contributing
 
-See [CONTRIBUTING.en.md](CONTRIBUTING.en.md) (English) or [CONTRIBUTING.md](CONTRIBUTING.md) (中文). TL;DR: fork → `feat/xxx` branch → write tests → `uv run pytest` → PR.
+See [CONTRIBUTING.en.md](CONTRIBUTING.en.md) and [Getting Started](docs/getting-started.en.md). TL;DR: fork → `feat/xxx` branch → write tests → `python scripts/quality_baseline.py` (on Chinese Windows, set `$env:PYTHONUTF8='1'` first) → PR.
 
-## 📄 License
+Thanks to everyone who has made boss-agent-cli better — go follow them! ❤️
 
-MIT © [can4hou6joeng4](https://github.com/can4hou6joeng4)
+<a href="https://github.com/can4hou6joeng4/boss-agent-cli/graphs/contributors">
+  <img src="./CONTRIBUTORS.svg" alt="contributors" width="1000" />
+</a>
 
-## 👭 Related Communities
+## ❤️ Support
 
-- [LINUX DO - a new community for tech enthusiasts](https://linux.do/)
+- If this project helps you, the most direct support is a [Star ⭐](https://github.com/can4hou6joeng4/boss-agent-cli), or sharing it with someone who is job hunting.
+- Hit a problem or have an idea? Open an [Issue](https://github.com/can4hou6joeng4/boss-agent-cli/issues) — or go straight to a PR.
+- Curious about the rest of the fleet? Drop anchor at the home port [bobochang.cn](https://bobochang.cn) 🧭.
+
+This project benefits from [geekgeekrun](https://github.com/geekgeekrun/geekgeekrun) · [boss-cli](https://github.com/jackwener/boss-cli) · [opencli](https://github.com/jackwener/opencli) — thanks to all of them.
+
+## ⭐ Star History
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/star-history-dark.svg">
+  <img alt="Star History" src="docs/assets/star-history.svg" width="100%">
+</picture>
+
+A static SVG generated locally with [mystarhistory](https://github.com/carsteneu/mystarhistory) — served from this repo, with no third-party dependency.
+
+## ⚠️ Disclaimer
+
+Follow applicable law, platform terms, and privacy requirements. Set explicit input, volume, timeout, and stop limits for bulk outreach, candidate data, and browser-adaptation workflows, and protect local credentials and exported artifacts.
+
+## 📑 License & Communities
+
+[MIT](LICENSE) © [can4hou6joeng4](https://github.com/can4hou6joeng4) · [LINUX DO](https://linux.do/)

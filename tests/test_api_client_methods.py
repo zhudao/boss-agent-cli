@@ -260,6 +260,23 @@ def test_friend_list_default_and_page():
 	assert call.kwargs["params"] == {"page": 4}
 
 
+@pytest.mark.parametrize("source", ["existing-browser", "stored-cookie"])
+def test_friend_list_uses_explicit_browser_source(source):
+	client = BossClient(_StubAuth(), browser_source=source)
+	client._request = MagicMock()
+	client._browser_request = MagicMock(return_value={"code": 0, "zpData": {}})
+
+	client.friend_list(page=2)
+
+	client._browser_request.assert_called_once_with(
+		"GET",
+		endpoints.FRIEND_LIST_URL,
+		browser_source=source,
+		params={"page": 2},
+	)
+	client._request.assert_not_called()
+
+
 def test_interview_data_no_params():
 	client = _make_client()
 	client.interview_data()
@@ -287,6 +304,40 @@ def test_chat_history_custom_pagination():
 	params = client._request.call_args.kwargs["params"]
 	assert params["page"] == 3
 	assert params["c"] == 50
+
+
+@pytest.mark.parametrize("source", ["existing-browser", "stored-cookie"])
+def test_chat_history_uses_explicit_browser_source(source):
+	client = BossClient(_StubAuth(), browser_source=source)
+	client._request = MagicMock()
+	client._browser_request = MagicMock(return_value={"code": 0, "zpData": {}})
+
+	client.chat_history(gid="g1", security_id="s1")
+
+	client._browser_request.assert_called_once_with(
+		"GET",
+		endpoints.CHAT_HISTORY_URL,
+		browser_source=source,
+		params={"gid": "g1", "securityId": "s1", "page": 1, "c": 20, "src": 0},
+	)
+	client._request.assert_not_called()
+
+
+@pytest.mark.parametrize("method,kwargs", [("friend_list", {}), ("chat_history", {"gid": "g1", "security_id": "s1"})])
+def test_auto_read_without_token_raises_auth_required(method, kwargs):
+	"""auto 缺少本地 token 时走 httpx 抛 AuthRequired，不误报来源不可用。"""
+	from boss_agent_cli.auth.manager import AuthRequired
+
+	auth = MagicMock()
+	auth.get_token.side_effect = AuthRequired("未登录，请先执行 boss login")
+	client = BossClient(auth)
+	client._browser_request = MagicMock()
+
+	with pytest.raises(AuthRequired):
+		getattr(client, method)(**kwargs)
+
+	auth.get_token.assert_called_once()
+	client._browser_request.assert_not_called()
 
 
 def test_friend_label_add():
@@ -317,6 +368,20 @@ def test_geek_get_job():
 	assert call.kwargs["params"] == {"securityId": "sid_x"}
 
 
+@pytest.mark.parametrize("method,kwargs", [("friend_list", {}), ("chat_history", {"gid": "g1", "security_id": "s1"})])
+def test_auto_reads_do_not_probe_removed_bridge(method, kwargs):
+	"""即使本机存在旧服务，auto 也只执行既有 httpx 请求，不额外探测 daemon。"""
+	client = _make_client()
+	with patch("httpx.get") as mock_get, patch("httpx.post") as mock_post:
+		result = getattr(client, method)(**kwargs)
+
+	assert result == {"code": 0, "zpData": {}}
+	client._request.assert_called_once()
+	client._browser_request.assert_not_called()
+	mock_get.assert_not_called()
+	mock_post.assert_not_called()
+
+
 # ── 生命周期 / close 等 ─────────────────────────────────────────────────
 
 
@@ -326,6 +391,26 @@ def test_close_is_idempotent():
 	client.close()
 	# 第二次 close 不应抛异常
 	client.close()
+
+
+@patch("boss_agent_cli.api.browser_client.BrowserSession")
+def test_existing_browser_construction_does_not_read_stored_credentials(mock_session_cls):
+	auth = MagicMock()
+	client = BossClient(auth)
+
+	client._get_browser(browser_source="existing-browser")
+
+	auth.get_token.assert_not_called()
+	mock_session_cls.assert_called_once_with(
+		cookies={},
+		user_agent="",
+		delay=(1.5, 3.0),
+		cdp_url=None,
+		logger=auth._logger,
+		browser_source="existing-browser",
+		request_budget=None,
+		request_check=client._check_cdp_risk_lock,
+	)
 
 
 def test_context_manager_closes_on_exit():

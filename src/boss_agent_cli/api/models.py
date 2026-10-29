@@ -2,6 +2,43 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+BOSS_INTERNSHIP_RESPONSE_JOB_TYPE = 4
+
+
+def job_public_url(job_id: str) -> str:
+	"""职位详情页地址。只由 encryptJobId 拼出，不额外请求平台。"""
+	if not job_id:
+		return ""
+	return f"https://www.zhipin.com/job_detail/{job_id}.html"
+
+
+def employment_type_from_raw(raw_job_type: Any) -> str:
+	"""Normalize verified BOSS response job types without guessing unknown codes."""
+	if str(raw_job_type) == str(BOSS_INTERNSHIP_RESPONSE_JOB_TYPE):
+		return "实习"
+	return ""
+
+
+def is_boss_online(value: Any) -> bool:
+	"""列表项 bossOnline 归一化：True / 1 / "1"（及 "true"）视为在线，其余一律离线。
+
+	平台在不同通道里给过布尔和数字两种形态；JobItem 和 --active 判断共用这里，
+	避免一处按真值、一处按 ``is True`` 判断导致结论不一致。
+	"""
+	if isinstance(value, bool):
+		return value
+	if isinstance(value, int):
+		return value == 1
+	if isinstance(value, str):
+		return value.strip().lower() in {"1", "true"}
+	return False
+
+
+def _active_desc(value: Any) -> str:
+	"""列表项里的 HR 活跃度文案（如「刚刚活跃」「本周活跃」）；没有时为空串。"""
+	return value.strip() if isinstance(value, str) else ""
+
+
 @dataclass
 class JobItem:
 	job_id: str
@@ -22,11 +59,21 @@ class JobItem:
 	boss_active: str
 	security_id: str
 	greeted: bool = False
+	raw_job_type: int | str | None = None
+	employment_type: str = ""
+	days_per_week: str = ""
+	least_month: str = ""
+	job_labels: list[str] = field(default_factory=list)
+	lid: str = ""
+	boss_active_desc: str = ""
+	job_url: str = ""
 
 	@classmethod
 	def from_api(cls, raw: dict[str, Any]) -> "JobItem":
+		raw_job_type = raw.get("jobType")
 		return cls(
 			job_id=raw.get("encryptJobId", ""),
+			job_url=job_public_url(str(raw.get("encryptJobId") or "")),
 			title=raw.get("jobName", ""),
 			company=raw.get("brandName", ""),
 			salary=raw.get("salaryDesc", ""),
@@ -41,8 +88,15 @@ class JobItem:
 			stage=raw.get("brandStageName", ""),
 			boss_name=raw.get("bossName", ""),
 			boss_title=raw.get("bossTitle", ""),
-			boss_active="在线" if raw.get("bossOnline") else "离线",
+			boss_active="在线" if is_boss_online(raw.get("bossOnline")) else "离线",
 			security_id=raw.get("securityId", ""),
+			lid=raw.get("lid", ""),
+			raw_job_type=raw_job_type,
+			employment_type=employment_type_from_raw(raw_job_type),
+			days_per_week=raw.get("daysPerWeekDesc", ""),
+			least_month=raw.get("leastMonthDesc", ""),
+			job_labels=raw.get("jobLabels", []),
+			boss_active_desc=_active_desc(raw.get("activeTimeDesc")),
 		)
 
 	def to_dict(self) -> dict[str, Any]:
@@ -63,8 +117,16 @@ class JobItem:
 			"boss_name": self.boss_name,
 			"boss_title": self.boss_title,
 			"boss_active": self.boss_active,
+			"boss_active_desc": self.boss_active_desc,
 			"security_id": self.security_id,
+			"lid": self.lid,
+			"raw_job_type": self.raw_job_type,
+			"employment_type": self.employment_type,
+			"days_per_week": self.days_per_week,
+			"least_month": self.least_month,
+			"job_labels": self.job_labels,
 			"greeted": self.greeted,
+			"job_url": self.job_url,
 		}
 
 
@@ -84,12 +146,18 @@ class JobDetail:
 	security_id: str
 	company_info: dict[str, Any] = field(default_factory=dict)
 	greeted: bool = False
+	raw_job_type: int | str | None = None
+	employment_type: str = ""
+	days_per_week: str = ""
+	least_month: str = ""
+	pay_type: str = ""
 
 	@classmethod
 	def from_api(cls, raw: dict[str, Any]) -> "JobDetail":
 		job_info = raw.get("jobInfo", {})
 		boss_info = raw.get("bossInfo", {})
 		brand_info = raw.get("brandComInfo", {})
+		raw_job_type = job_info.get("jobType")
 		return cls(
 			job_id=job_info.get("encryptJobId", ""),
 			title=job_info.get("jobName", ""),
@@ -103,6 +171,11 @@ class JobDetail:
 			boss_title=boss_info.get("title", ""),
 			boss_active=boss_info.get("activeTimeDesc", "离线"),
 			security_id=job_info.get("securityId", ""),
+			raw_job_type=raw_job_type,
+			employment_type=employment_type_from_raw(raw_job_type),
+			days_per_week=job_info.get("daysPerWeekDesc", ""),
+			least_month=job_info.get("leastMonthDesc", ""),
+			pay_type=job_info.get("payTypeDesc", ""),
 			company_info={
 				"industry": brand_info.get("industryName", ""),
 				"scale": brand_info.get("scaleName", ""),
@@ -124,6 +197,11 @@ class JobDetail:
 			"boss_title": self.boss_title,
 			"boss_active": self.boss_active,
 			"security_id": self.security_id,
+			"raw_job_type": self.raw_job_type,
+			"employment_type": self.employment_type,
+			"days_per_week": self.days_per_week,
+			"least_month": self.least_month,
+			"pay_type": self.pay_type,
 			"company_info": self.company_info,
 			"greeted": self.greeted,
 		}

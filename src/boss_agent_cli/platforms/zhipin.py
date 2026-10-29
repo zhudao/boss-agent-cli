@@ -1,7 +1,7 @@
 """BOSS 直聘平台 adapter。
 
 把现有 ``BossClient`` 包装为 ``Platform`` 实现，零行为变化。
-后续新平台（智联等）实现同一 Platform 接口，
+后续新平台实现同一 Platform 接口，
 命令层可以通过 ``get_platform(name)`` 无差别调用。
 """
 
@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from boss_agent_cli.api.endpoints import BASE_URL
+from boss_agent_cli.api.endpoints import BASE_URL, CODE_ACCOUNT_RESTRICTED, CODE_IP_RESTRICTED, CODE_STOKEN_EXPIRED
+from boss_agent_cli.api.zhipin_errors import classify_code_37, response_message
 from boss_agent_cli.platforms.base import Platform
 
 if TYPE_CHECKING:
@@ -20,7 +21,6 @@ if TYPE_CHECKING:
 _ERROR_CODE_MAP: dict[int, str] = {
 	9: "RATE_LIMITED",
 	36: "ACCOUNT_RISK",
-	37: "TOKEN_REFRESH_FAILED",
 }
 
 
@@ -45,6 +45,20 @@ class BossPlatform(Platform):
 		return response.get("zpData")
 
 	def parse_error(self, response: dict[str, Any]) -> tuple[str, str]:
+		if response.get("code") in (CODE_IP_RESTRICTED, str(CODE_IP_RESTRICTED)):
+			return "ENVIRONMENT_RISK", response_message(response)
+		if response.get("code") in (CODE_ACCOUNT_RESTRICTED, str(CODE_ACCOUNT_RESTRICTED), 35, "35", 36, "36"):
+			return "ACCOUNT_RISK", response_message(response)
+		if response.get("code") in (CODE_STOKEN_EXPIRED, str(CODE_STOKEN_EXPIRED)):
+			code = "TOKEN_REFRESH_FAILED" if classify_code_37(response) == "token_expired" else "ENVIRONMENT_RISK"
+			return code, response_message(response)
+		cli_code = response.get("__cli_error_code__")
+		if (
+			response.get("code") == -1
+			and isinstance(cli_code, str)
+			and cli_code in {"ACTION_UNCONFIRMED", "NETWORK_ERROR"}
+		):
+			return str(cli_code), response_message(response)
 		return self._classify_platform_error(response, _ERROR_CODE_MAP)
 
 	# ── P0 只读委托 ─────────────────────────────────────
@@ -85,8 +99,15 @@ class BossPlatform(Platform):
 	def deliver_list(self, page: int = 1) -> dict[str, Any]:
 		return self._client.deliver_list(page=page)
 
+	def job_favorites(self, page: int = 1, tag: int = 4, is_active: bool = True) -> dict[str, Any]:
+		return self._client.job_favorites(page=page, tag=tag, is_active=is_active)
+
 	def job_card(self, security_id: str, lid: str = "") -> dict[str, Any]:
 		return self._client.job_card(security_id, lid)
+
+	def job_card_browser(self, security_id: str, lid: str = "") -> dict[str, Any]:
+		"""强制走浏览器通道取职位卡片（CDP 模式下不和 httpx 混用）。"""
+		return self._client.job_card_browser(security_id, lid)
 
 	def interview_data(self) -> dict[str, Any]:
 		return self._client.interview_data()
@@ -94,7 +115,9 @@ class BossPlatform(Platform):
 	def chat_history(self, gid: str, security_id: str, page: int = 1, count: int = 20) -> dict[str, Any]:
 		return self._client.chat_history(gid, security_id, page=page, count=count)
 
-	def friend_label(self, friend_id: str, label_id: int, friend_source: int = 0, remove: bool = False) -> dict[str, Any]:
+	def friend_label(
+		self, friend_id: str, label_id: int, friend_source: int = 0, remove: bool = False
+	) -> dict[str, Any]:
 		return self._client.friend_label(friend_id, label_id, friend_source, remove=remove)
 
 	def exchange_contact(self, security_id: str, uid: str, friend_name: str, exchange_type: int = 1) -> dict[str, Any]:

@@ -1,1124 +1,301 @@
-"""MCP Server for boss-agent-cli — 让 Claude Desktop / Cursor 直接调用 BOSS 直聘求职工具。"""
+"""MCP Server for boss-agent-cli — 让 Claude Desktop / Cursor 直接调用 BOSS 直聘求职工具。
+
+工具目录 `TOOLS` 在 `mcp_tools`，工具名 → CLI 参数的映射在 `mcp_args`；
+本模块只保留服务器实例、CLI 调用、传输层与入口。两者的公开符号在下方原样再导出，
+`mcp-server/server.py` wrapper 与既有测试的导入路径因此保持不变。
+"""
 
 import argparse
 import asyncio
-import copy
 import json
+import math
+import signal
 import subprocess
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any, cast
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
-
-from boss_agent_cli.commands.schema import SCHEMA_DATA, _availability_note, _inject_availability
-from boss_agent_cli.compliance import (
-	COMPLIANCE_BLOCKED_ACTION,
-	LOW_RISK_MODE_DESCRIPTION,
-	low_risk_blocked_commands,
+from mcp.types import (
+	CallToolRequestParams,
+	CallToolResult,
+	ListToolsResult,
+	PaginatedRequestParams,
+	TextContent,
 )
-from boss_agent_cli.platforms import list_platforms, list_recruiter_platforms
 
-server = Server("boss-agent-cli")
+from boss_agent_cli.api.browser_source import POLICIES as BROWSER_SOURCES
+from boss_agent_cli.mcp_args import _build_args
+from boss_agent_cli.mcp_tools import TOOLS
+from boss_agent_cli.output import envelope_error
+
+# 向后兼容的再导出：这些符号在拆分前属于本模块，`mcp-server/server.py` wrapper
+# 与既有测试仍按 `boss_agent_cli.mcp_server.<name>` 取用。本模块自身不再使用它们，
+# 故显式标注 F401——删掉会静默破坏 wrapper 和测试的导入路径。
+from boss_agent_cli.mcp_tools import (  # noqa: F401
+	_LOW_RISK_BLOCKED_TOOLS,
+	_MCP_TOOL_COMPLIANCE_COMMAND_OVERRIDES,
+	_SCHEMA_WITH_AVAILABILITY,
+	_availability_of,
+	_build_schema_with_availability,
+	_compliance_command_for_tool,
+	_crawl_task_tools,
+	_decorate_tool_descriptions,
+	_is_low_risk_blocked_tool,
+	_tool_availability,
+)
+
+__all__ = [
+	"SERVER_INSTRUCTIONS",
+	"TOOLS",
+	"call_tool",
+	"list_tools",
+	"main",
+	"run",
+	"server",
+]
+
+if TYPE_CHECKING:
+	# SSE / HTTP 传输是可选路径，starlette 与 session manager 只在对应工厂函数里
+	# 惰性导入；这里仅为类型标注引入，不影响 stdio 传输的启动开销。
+	from collections.abc import AsyncIterator
+
+	from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+	from starlette.applications import Starlette
+	from starlette.types import Receive, Scope, Send
+
+SERVER_INSTRUCTIONS = (
+	"boss-agent-cli over MCP exposes all implemented candidate, recruiter, communication and crawl tools. "
+	"Historical assisted and research configurations have identical capability access; platform adapters may still "
+	"return NOT_SUPPORTED when an operation is not implemented. Every tool returns the same JSON envelope "
+	"{ok, data, pagination, error, hints}; when ok is false, read error.code and error.recovery_action and "
+	"act on it (for example AUTH_REQUIRED means the user runs boss login). boss schema is the capability "
+	"source of truth — do not hardcode command tables."
+	" For hr_greet, preview with dry_run and obtain explicit operator approval for that candidate and message "
+	"before setting yes=true. Never infer approval or retry a confirmation failure with yes=true on your own. "
+	"An uncertain send result requires conversation verification, not another send. "
+	"After a post-send error, inspect error.details.sent and stop; a sent greeting must not be repeated."
+)
+
+server = Server(
+	"boss-agent-cli",
+	instructions=SERVER_INSTRUCTIONS,
+)
 DEFAULT_TRANSPORT = "stdio"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_HTTP_PATH = "/mcp"
 DEFAULT_SSE_PATH = "/sse"
 DEFAULT_MESSAGE_PATH = "/messages/"
+DEFAULT_BOSS_BIN = "boss"
+_BOSS_BIN = DEFAULT_BOSS_BIN
+_BOSS_GLOBAL_ARGS: list[str] = []
+_CLI_TIMEOUT_SECONDS = 120.0
+_CHECKPOINT_GRACE_SECONDS = 5.0
+_TERMINATE_GRACE_SECONDS = 1.0
 
 
-def _build_schema_with_availability() -> dict[str, Any]:
-	data = copy.deepcopy(SCHEMA_DATA)
-	data["supported_platforms"] = list_platforms()
-	data["supported_recruiter_platforms"] = list_recruiter_platforms()
-	return _inject_availability(data)
+def _configure_boss_invocation(
+	*,
+	boss_bin: str = DEFAULT_BOSS_BIN,
+	data_dir: str | None = None,
+	platform: str | None = None,
+	role: str | None = None,
+	browser_source: str | None = None,
+) -> None:
+	"""Configure global flags passed from the MCP host to the underlying boss CLI."""
+	global _BOSS_BIN, _BOSS_GLOBAL_ARGS
+	_BOSS_BIN = boss_bin
+	args: list[str] = []
+	if data_dir:
+		args.extend(["--data-dir", data_dir])
+	if platform:
+		args.extend(["--platform", platform])
+	if role:
+		args.extend(["--role", role])
+	if browser_source:
+		args.extend(["--browser-source", browser_source])
+	_BOSS_GLOBAL_ARGS = args
 
 
-_SCHEMA_WITH_AVAILABILITY = _build_schema_with_availability()
+def _cli_timeout(args: tuple[str, ...]) -> float:
+	# A wizard deadline belongs to the child. The host allows bounded extra
+	# time for that child to commit its result/checkpoint and emit the envelope.
+	if args and args[0] == "wizard" and "--timeout" in args:
+		try:
+			requested = float(args[args.index("--timeout") + 1])
+		except (IndexError, ValueError):
+			return _CLI_TIMEOUT_SECONDS
+		if math.isfinite(requested) and requested > 0:
+			return requested + _CHECKPOINT_GRACE_SECONDS
+	return _CLI_TIMEOUT_SECONDS
 
 
-def _tool_availability(tool_name: str) -> dict[str, Any] | None:
-	name = tool_name.removeprefix("boss_")
-	commands = _SCHEMA_WITH_AVAILABILITY["commands"]
-
-	direct_map = {
-		"chat_summary": "chat-summary",
-		"batch_greet": "batch-greet",
-		"follow_up": "follow-up",
-	}
-	if name in direct_map:
-		return commands[direct_map[name]].get("availability")
-	if name in commands:
-		return commands[name].get("availability")
-
-	if name.startswith("ai_"):
-		sub_name = name.removeprefix("ai_").replace("_", "-")
-		return commands["ai"].get("availability")
-	if name.startswith("resume_"):
-		return commands["resume"].get("availability")
-	if name.startswith("watch_"):
-		return commands["watch"].get("availability")
-	if name.startswith("preset_"):
-		return commands["preset"].get("availability")
-	if name.startswith("shortlist_"):
-		return commands["shortlist"].get("availability")
-	if name.startswith("hr_"):
-		sub_name = name.removeprefix("hr_").replace("_", "-")
-		hr_availability = commands["hr"].get("availability") or {}
-		return hr_availability.get("subcommands", {}).get(sub_name, hr_availability)
-	return None
+def _cli_failure(args: tuple[str, ...], code: str, message: str, **details: Any) -> dict[str, Any]:
+	command = args[0] if args else "mcp"
+	if command in {"agent", "hr", "ai", "resume", "watch", "crawl"} and len(args) > 1:
+		command = f"{command}.{args[1]}"
+	return cast(
+		"dict[str, Any]",
+		json.loads(
+			envelope_error(
+				command,
+				code=code,
+				message=message,
+				recoverable=code != "CLI_ERROR" and not details.get("outcome_unknown", False),
+				recovery_action="检查本地 checkpoint 与平台实际结果，再显式恢复；未确认的写操作不要直接重试",
+				details=details or None,
+			)
+		),
+	)
 
 
-def _decorate_tool_descriptions() -> None:
-	for tool in TOOLS:
-		availability = _tool_availability(tool.name)
-		if availability:
-			tool.description = f"{tool.description} [可用性: {_availability_note(availability)}]"
-
-# ── Tool 定义 ──────────────────────────────────────────────────────
-
-_MCP_TOOL_COMPLIANCE_COMMAND_OVERRIDES = {
-	"boss_batch_greet": "batch-greet",
-	"boss_chat_summary": "chat-summary",
-	"boss_follow_up": "follow-up",
-	"boss_watch_run": "watch-run",
-	"boss_hr_applications": "recruiter-applications",
-	"boss_hr_candidates": "recruiter-candidates",
-	"boss_hr_chat": "recruiter-chat",
-	"boss_hr_chatmsg": "recruiter-chatmsg",
-	"boss_hr_last_messages": "recruiter-last-messages",
-	"boss_hr_resume": "recruiter-resume",
-	"boss_hr_exchange": "recruiter-resume",
-	"boss_hr_reply": "recruiter-reply",
-	"boss_hr_request_resume": "recruiter-request-resume",
-}
-
-
-def _compliance_command_for_tool(tool_name: str) -> str:
-	"""Map an MCP tool name to the CLI compliance command identifier."""
-	if override := _MCP_TOOL_COMPLIANCE_COMMAND_OVERRIDES.get(tool_name):
-		return override
-	return tool_name.removeprefix("boss_").replace("_", "-")
-
-
-def _is_low_risk_blocked_tool(tool_name: str) -> bool:
-	return _compliance_command_for_tool(tool_name) in low_risk_blocked_commands()
-
-TOOLS = [
-	Tool(
-		name="boss_status",
-		description="检查 BOSS 直聘登录态",
-		inputSchema={"type": "object", "properties": {}, "required": []},
-	),
-	Tool(
-		name="boss_doctor",
-		description="诊断本地运行环境、依赖、登录态和网络连通性",
-		inputSchema={"type": "object", "properties": {}, "required": []},
-	),
-	Tool(
-		name="boss_search",
-		description="按关键词和筛选条件搜索 BOSS 直聘职位列表。支持城市、薪资、经验、学历、福利等多维度筛选。",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"query": {"type": "string", "description": "搜索关键词（如 Golang、Python 后端）"},
-				"city": {"type": "string", "description": "城市名称（如 北京、广州）"},
-				"salary": {"type": "string", "description": "薪资范围（如 20-50K）"},
-				"experience": {"type": "string", "description": "经验要求（如 3-5年）"},
-				"education": {"type": "string", "description": "学历要求（如 本科）"},
-				"welfare": {"type": "string", "description": "福利筛选，逗号分隔 AND 逻辑（如 双休,五险一金）"},
-				"page": {"type": "integer", "description": "页码", "default": 1},
-			},
-			"required": ["query"],
-		},
-	),
-	Tool(
-		name="boss_recommend",
-		description="获取基于简历的个性化职位推荐",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"page": {"type": "integer", "description": "页码", "default": 1},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_detail",
-		description="查看职位详情。参数为 security_id（从 search/recommend 结果获取）。",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"security_id": {"type": "string", "description": "职位的 security_id"},
-				"job_id": {"type": "string", "description": "encrypt_job_id，传入可走快速通道"},
-			},
-			"required": ["security_id"],
-		},
-	),
-	Tool(
-		name="boss_greet",
-		description="向招聘者打招呼。需要 security_id 和 job_id。",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"security_id": {"type": "string", "description": "职位的 security_id"},
-				"job_id": {"type": "string", "description": "职位的 encrypt_job_id"},
-			},
-			"required": ["security_id", "job_id"],
-		},
-	),
-	Tool(
-		name="boss_chat",
-		description="查看沟通列表，支持按发起方和时间筛选",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"from_who": {"type": "string", "enum": ["boss", "me"], "description": "筛选发起方"},
-				"days": {"type": "integer", "description": "只显示最近 N 天的记录"},
-				"page": {"type": "integer", "description": "页码", "default": 1},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_me",
-		description="获取当前登录用户信息（基本信息、简历、求职期望、投递记录）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"section": {
-					"type": "string",
-					"enum": ["info", "resume", "expect", "deliver"],
-					"description": "指定查看的部分",
-				},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_cities",
-		description="列出支持的城市列表（约 40 个）",
-		inputSchema={"type": "object", "properties": {}, "required": []},
-	),
-	Tool(
-		name="boss_interviews",
-		description="查看面试邀请列表",
-		inputSchema={"type": "object", "properties": {}, "required": []},
-	),
-	Tool(
-		name="boss_history",
-		description="查看浏览历史",
-		inputSchema={"type": "object", "properties": {}, "required": []},
-	),
-	Tool(
-		name="boss_chatmsg",
-		description="查看与指定好友的聊天消息历史",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"security_id": {"type": "string", "description": "好友的 security_id"},
-				"page": {"type": "integer", "description": "页码", "default": 1},
-				"count": {"type": "integer", "description": "每页消息数量", "default": 20},
-				"raw": {"type": "boolean", "description": "输出保真结构化消息字段（仍受合规门控）", "default": False},
-			},
-			"required": ["security_id"],
-		},
-	),
-	Tool(
-		name="boss_chat_summary",
-		description="基于聊天历史生成结构化摘要与下一步建议",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"security_id": {"type": "string", "description": "好友的 security_id"},
-			},
-			"required": ["security_id"],
-		},
-	),
-	Tool(
-		name="boss_mark",
-		description="给联系人添加或移除标签（新招呼/沟通中/已约面/不合适/收藏等）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"security_id": {"type": "string", "description": "联系人的 security_id"},
-				"tag": {"type": "string", "description": "标签名称"},
-				"remove": {"type": "boolean", "description": "是否移除标签", "default": False},
-			},
-			"required": ["security_id", "tag"],
-		},
-	),
-	Tool(
-		name="boss_exchange",
-		description="请求交换联系方式（手机号或微信）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"security_id": {"type": "string", "description": "联系人的 security_id"},
-			},
-			"required": ["security_id"],
-		},
-	),
-	Tool(
-		name="boss_apply",
-		description="发起投递或立即沟通动作（幂等，不会重复投递）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"security_id": {"type": "string", "description": "职位的 security_id"},
-				"job_id": {"type": "string", "description": "职位的 encrypt_job_id"},
-			},
-			"required": ["security_id", "job_id"],
-		},
-	),
-	Tool(
-		name="boss_batch_greet",
-		description="搜索后批量打招呼（上限 10）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"query": {"type": "string", "description": "搜索关键词"},
-				"city": {"type": "string", "description": "城市名称"},
-				"limit": {"type": "integer", "description": "最大打招呼数量", "default": 5},
-				"dry_run": {"type": "boolean", "description": "预览模式", "default": False},
-			},
-			"required": ["query"],
-		},
-	),
-	Tool(
-		name="boss_show",
-		description="按编号快速查看上次搜索或推荐结果中的职位详情",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"number": {"type": "integer", "description": "职位编号（从搜索结果中获取）"},
-			},
-			"required": ["number"],
-		},
-	),
-	Tool(
-		name="boss_export",
-		description="导出搜索结果为 CSV / JSON / HTML 文件，支持 BOSS 直聘搜索页 URL 复用筛选条件。默认脱敏 job_id/security_id/boss_name，HTML 始终省略平台标识、招聘者姓名和薪资。",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"query": {"type": "string", "description": "搜索关键词；提供 url 时可省略"},
-				"url": {"type": "string", "description": "BOSS 直聘搜索页完整 URL（可省略 query 直接复用网页筛选）"},
-				"city": {"type": "string", "description": "城市名称（如 北京、广州）"},
-				"salary": {"type": "string", "description": "薪资范围（如 20-50K）"},
-				"experience": {"type": "string", "description": "经验要求，支持逗号分隔多选"},
-				"education": {"type": "string", "description": "学历要求，支持逗号分隔多选"},
-				"industry": {"type": "string", "description": "行业类型，支持逗号分隔多选"},
-				"scale": {"type": "string", "description": "公司规模，支持逗号分隔多选"},
-				"stage": {"type": "string", "description": "融资阶段，支持逗号分隔多选"},
-				"job_type": {"type": "string", "description": "职位类型，支持逗号分隔多选"},
-				"count": {"type": "integer", "description": "导出数量", "default": 50},
-				"format": {"type": "string", "enum": ["csv", "json", "html"], "description": "输出格式", "default": "csv"},
-				"output_file": {"type": "string", "description": "输出文件路径；不传则在 stdout 信封内 inline 返回 jobs 列表"},
-				"include_private": {"type": "boolean", "description": "CSV/JSON/stdout 保留 job_id/security_id/boss_name 明文；HTML 始终省略平台标识、招聘者姓名和薪资", "default": False},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_pipeline",
-		description="聚合聊天和面试数据，生成统一候选进度视图",
-		inputSchema={"type": "object", "properties": {}, "required": []},
-	),
-	Tool(
-		name="boss_follow_up",
-		description="筛出需要优先跟进的候选项（未读、超时未推进、面试）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"days_stale": {"type": "integer", "description": "超过 N 天未推进视为待跟进", "default": 3},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_digest",
-		description="汇总新增职位、待跟进会话和面试项的只读日报（支持 md 输出便于邮件/飞书直发）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"days_stale": {"type": "integer", "description": "超过 N 天未推进视为待跟进", "default": 3},
-				"format": {"type": "string", "description": "输出格式", "enum": ["json", "md"], "default": "json"},
-				"output": {"type": "string", "description": "Markdown 输出路径（仅 format=md 时生效）"},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_config",
-		description="查看和修改配置项",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"action": {"type": "string", "enum": ["list", "get", "set", "reset"], "description": "操作类型"},
-				"key": {"type": "string", "description": "配置项名称"},
-				"value": {"type": "string", "description": "配置值（仅 set 时需要）"},
-			},
-			"required": ["action"],
-		},
-	),
-	Tool(
-		name="boss_clean",
-		description="清理过期缓存和临时文件",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"dry_run": {"type": "boolean", "description": "仅预览不删除", "default": False},
-				"all": {"type": "boolean", "description": "全量清理", "default": False},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_stats",
-		description="投递转化漏斗统计（只读聚合打招呼、投递、候选池、监控数据）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"days": {"type": "integer", "description": "统计窗口天数", "default": 30},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_ai_reply",
-		description="基于招聘者消息生成回复草稿（2-3 条候选，支持简历参考和语气偏好）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"recruiter_message": {"type": "string", "description": "招聘者消息文本"},
-				"context": {"type": "string", "description": "会话上下文（可选）"},
-				"resume": {"type": "string", "description": "参考简历名称（可选）"},
-				"tone": {
-					"type": "string",
-					"description": "语气偏好",
-					"enum": ["简洁专业", "热情积极", "谨慎确认"],
-					"default": "简洁专业",
-				},
-			},
-			"required": ["recruiter_message"],
-		},
-	),
-	Tool(
-		name="boss_ai_interview_prep",
-		description="基于目标职位描述生成模拟面试题与准备建议（支持简历参考定制题目）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"jd_text": {"type": "string", "description": "目标职位描述文本"},
-				"resume": {"type": "string", "description": "参考简历名称（可选）"},
-				"count": {"type": "integer", "description": "题量，默认 10", "default": 10},
-			},
-			"required": ["jd_text"],
-		},
-	),
-	Tool(
-		name="boss_ai_chat_coach",
-		description="基于聊天记录诊断沟通状态并给出下一步行动建议与现成消息模板",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"chat_text": {"type": "string", "description": "聊天记录文本"},
-				"resume": {"type": "string", "description": "参考简历名称（可选）"},
-				"style": {
-					"type": "string",
-					"description": "沟通风格偏好（如 简洁专业/积极主动/谨慎稳重）",
-					"default": "简洁专业",
-				},
-			},
-			"required": ["chat_text"],
-		},
-	),
-	Tool(
-		name="boss_resume_list",
-		description="列出所有本地简历（名称、创建时间、关联职位数）",
-		inputSchema={"type": "object", "properties": {}, "required": []},
-	),
-	Tool(
-		name="boss_resume_show",
-		description="查看指定简历的完整内容（基本信息、教育、工作经历、技能、项目）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"name": {"type": "string", "description": "简历名称"},
-			},
-			"required": ["name"],
-		},
-	),
-	Tool(
-		name="boss_ai_analyze_jd",
-		description="分析职位描述并评估简历匹配度，输出匹配分数和差距分析",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"jd_text": {"type": "string", "description": "职位描述文本"},
-				"resume": {"type": "string", "description": "对比的本地简历名称"},
-			},
-			"required": ["jd_text", "resume"],
-		},
-	),
-	Tool(
-		name="boss_ai_optimize",
-		description="基于目标职位描述优化简历（输出优化后结构，不直接写回磁盘）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"resume": {"type": "string", "description": "简历名称"},
-				"jd_text": {"type": "string", "description": "目标职位描述"},
-			},
-			"required": ["resume", "jd_text"],
-		},
-	),
-	Tool(
-		name="boss_ai_suggest",
-		description="基于目标职位给出简历改进建议（按优先级排序，不修改简历）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"resume": {"type": "string", "description": "简历名称"},
-				"jd_text": {"type": "string", "description": "目标职位描述"},
-			},
-			"required": ["resume", "jd_text"],
-		},
-	),
-	Tool(
-		name="boss_watch_list",
-		description="列出所有已保存的监控条件",
-		inputSchema={"type": "object", "properties": {}, "required": []},
-	),
-	Tool(
-		name="boss_watch_run",
-		description="执行指定监控并返回新增职位列表",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"name": {"type": "string", "description": "监控名称"},
-			},
-			"required": ["name"],
-		},
-	),
-	Tool(
-		name="boss_preset_list",
-		description="列出所有搜索预设",
-		inputSchema={"type": "object", "properties": {}, "required": []},
-	),
-	Tool(
-		name="boss_shortlist_list",
-		description="查看候选池中的所有职位",
-		inputSchema={"type": "object", "properties": {}, "required": []},
-	),
-	Tool(
-		name="boss_shortlist_add",
-		description="将职位加入候选池",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"security_id": {"type": "string", "description": "职位安全 ID"},
-				"job_id": {"type": "string", "description": "加密职位 ID"},
-			},
-			"required": ["security_id", "job_id"],
-		},
-	),
-	Tool(
-		name="boss_shortlist_remove",
-		description="从候选池移除职位",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"security_id": {"type": "string", "description": "职位安全 ID"},
-				"job_id": {"type": "string", "description": "加密职位 ID"},
-			},
-			"required": ["security_id", "job_id"],
-		},
-	),
-	Tool(
-		name="boss_preset_add",
-		description="保存搜索预设",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"name": {"type": "string", "description": "预设名称"},
-				"query": {"type": "string", "description": "搜索关键词"},
-				"city": {"type": "string", "description": "城市（可选）"},
-				"salary": {"type": "string", "description": "薪资范围（可选）"},
-				"experience": {"type": "string", "description": "经验要求（可选）"},
-				"education": {"type": "string", "description": "学历要求（可选）"},
-				"welfare": {"type": "string", "description": "福利筛选（可选）"},
-			},
-			"required": ["name", "query"],
-		},
-	),
-	Tool(
-		name="boss_preset_remove",
-		description="删除指定搜索预设",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"name": {"type": "string", "description": "预设名称"},
-			},
-			"required": ["name"],
-		},
-	),
-	Tool(
-		name="boss_watch_add",
-		description="保存增量监控的搜索条件",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"name": {"type": "string", "description": "监控名称"},
-				"query": {"type": "string", "description": "搜索关键词"},
-				"city": {"type": "string", "description": "城市（可选）"},
-				"salary": {"type": "string", "description": "薪资范围（可选）"},
-			},
-			"required": ["name", "query"],
-		},
-	),
-	Tool(
-		name="boss_watch_remove",
-		description="删除指定监控",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"name": {"type": "string", "description": "监控名称"},
-			},
-			"required": ["name"],
-		},
-	),
-	Tool(
-		name="boss_hr_applications",
-		description="招聘者模式：查看候选人投递申请列表",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"job_id": {"type": "string", "description": "按职位筛选（可选）"},
-				"label_id": {"type": "integer", "description": "标签筛选（0=全部, 1=新招呼, 2=沟通中）", "default": 0},
-				"page": {"type": "integer", "description": "页码", "default": 1},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_hr_candidates",
-		description="招聘者模式：搜索候选人",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"query": {"type": "string", "description": "搜索关键词（可选，不传时返回默认候选集）"},
-				"city": {"type": "string", "description": "城市筛选（cityCode，如 101020100；-2=全国）"},
-				"job_id": {"type": "string", "description": "按职位筛选"},
-				"experience": {"type": "string", "description": "经验要求，如 -3,-3（应届）/ -1,-1（不限）"},
-				"degree": {"type": "string", "description": "学历要求，如 201,201 / -1,-1"},
-				"age": {"type": "string", "description": "年龄范围，如 20,25"},
-				"school_level": {"type": "string", "description": "学校层次（如 1101）"},
-				"activeness": {"type": "string", "description": "活跃度，如 2"},
-				"source": {"type": "string", "description": "来源编码（默认 4）"},
-				"salary": {"type": "string", "description": "薪资范围，如 -1,3"},
-				"select": {"type": "boolean", "description": "是否带 select=true", "default": False},
-				"page": {"type": "integer", "description": "页码", "default": 1},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_hr_chat",
-		description="招聘者模式：查看与候选人的沟通列表（含未读数和最近消息摘要）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"page": {"type": "integer", "description": "页码", "default": 1},
-				"job_id": {"type": "string", "description": "按职位筛选"},
-				"label_id": {"type": "integer", "description": "标签筛选（0=全部, 1=新招呼, 2=沟通中）", "default": 0},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_hr_chatmsg",
-		description="招聘者模式：查看与指定候选人的聊天消息历史",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"friend_id": {"type": "integer", "description": "候选人会话 friend_id"},
-				"count": {"type": "integer", "description": "消息数量", "default": 20},
-				"max_msg_id": {"type": "integer", "description": "向前翻页的最大消息 ID"},
-			},
-			"required": ["friend_id"],
-		},
-	),
-	Tool(
-		name="boss_hr_last_messages",
-		description="招聘者模式：批量查看候选人最近消息摘要",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"friend_ids": {
-					"type": "array",
-					"items": {"type": "integer"},
-					"description": "候选人会话 friend_id 列表；不传时从 hr chat 页获取当前页候选人",
-				},
-				"page": {"type": "integer", "description": "沟通列表页码", "default": 1},
-				"job_id": {"type": "string", "description": "按职位筛选"},
-				"label_id": {"type": "integer", "description": "标签筛选（0=全部, 1=新招呼, 2=沟通中）", "default": 0},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_hr_resume",
-		description="招聘者模式：查看候选人在线简历",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"geek_id": {"type": "string", "description": "候选人 geek_id"},
-				"job_id": {"type": "string", "description": "关联职位 ID"},
-				"security_id": {"type": "string", "description": "候选人的 security_id"},
-				"raw": {"type": "boolean", "description": "输出原始 API 数据", "default": False},
-			},
-			"required": ["geek_id", "job_id", "security_id"],
-		},
-	),
-	Tool(
-		name="boss_hr_exchange",
-		description="招聘者模式：请求交换候选人手机号或微信",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"friend_id": {"type": "integer", "description": "候选人会话 friend_id"},
-				"type": {"type": "string", "description": "交换类型", "enum": ["phone", "wechat"], "default": "phone"},
-			},
-			"required": ["friend_id"],
-		},
-	),
-	Tool(
-		name="boss_hr_reply",
-		description="招聘者模式：回复候选人消息",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"friend_id": {"type": "integer", "description": "候选人会话 friend_id"},
-				"message": {"type": "string", "description": "回复消息内容"},
-			},
-			"required": ["friend_id", "message"],
-		},
-	),
-	Tool(
-		name="boss_hr_request_resume",
-		description="招聘者模式：请求候选人分享附件简历",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"friend_id": {"type": "integer", "description": "候选人会话 friend_id"},
-			},
-			"required": ["friend_id"],
-		},
-	),
-	Tool(
-		name="boss_hr_jobs",
-		description="招聘者模式：查看职位列表，或执行上线/下线操作",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"action": {"type": "string", "description": "操作类型", "enum": ["list", "online", "offline"], "default": "list"},
-				"job_id": {"type": "string", "description": "职位 ID（online/offline 时必填）"},
-			},
-			"required": [],
-		},
-	),
-	Tool(
-		name="boss_hr_jobs_detail",
-		description="招聘者模式：查看指定职位的完整详情（包括岗位描述 postDescription）",
-		inputSchema={
-			"type": "object",
-			"properties": {
-				"enc_job_id": {"type": "string", "description": "职位的加密 ID（encryptJobId）"},
-			},
-			"required": ["enc_job_id"],
-		},
-	),
-]
-
-_LOW_RISK_BLOCKED_TOOLS = {
-	tool.name
-	for tool in TOOLS
-	if _is_low_risk_blocked_tool(tool.name)
-}
-TOOLS = [tool for tool in TOOLS if tool.name not in _LOW_RISK_BLOCKED_TOOLS]
-_decorate_tool_descriptions()
-
-
-# ── Tool 调用逻辑 ──────────────────────────────────────────────────
+def _parse_cli_output(args: tuple[str, ...], stdout: str, stderr: str) -> dict[str, Any]:
+	try:
+		parsed = json.loads(stdout)
+	except json.JSONDecodeError:
+		parsed = None
+	if isinstance(parsed, dict):
+		return parsed
+	# CLI 契约保证 stdout 是 JSON 信封对象；拿到别的形状（解析失败或非对象）
+	# 一律按命令失败处理，而不是把非 dict 结果透传给调用方。
+	return _cli_failure(args, "CLI_ERROR", stderr or "命令执行失败")
 
 
 def _run_boss(*args: str) -> dict[str, Any]:
-	"""调用 boss CLI 并返回解析后的 JSON。"""
-	cmd = ["boss", "--json", *args]
-	result = subprocess.run(
-		cmd,
-		capture_output=True,
-		text=True,
-		timeout=120,
-		stdin=subprocess.DEVNULL,
+	"""Synchronous compatibility entrypoint; MCP handlers use the async path."""
+	cmd = [_BOSS_BIN, "--json", *_BOSS_GLOBAL_ARGS, *args]
+	try:
+		result = subprocess.run(
+			cmd,
+			capture_output=True,
+			text=True,
+			timeout=_cli_timeout(args),
+			stdin=subprocess.DEVNULL,
+		)
+	except subprocess.TimeoutExpired:
+		return _cli_failure(args, "WORKFLOW_TIMEOUT", "底层 CLI 超时", outcome_unknown=True)
+	except OSError as exc:
+		return _cli_failure(args, "CLI_ERROR", str(exc))
+	return _parse_cli_output(args, result.stdout, result.stderr)
+
+
+async def _stop_cli_process(
+	process: asyncio.subprocess.Process,
+	output: "asyncio.Task[tuple[bytes, bytes]]",
+) -> tuple[bytes, bytes]:
+	if process.returncode is None:
+		# SIGINT gives wizard/automation their normal interruption checkpoint
+		# path. Never signal the user's attached browser process.
+		try:
+			process.send_signal(signal.SIGINT)
+		except ProcessLookupError:
+			pass
+		except ValueError:
+			try:
+				process.terminate()
+			except ProcessLookupError:
+				pass
+	try:
+		return await asyncio.wait_for(asyncio.shield(output), _CHECKPOINT_GRACE_SECONDS)
+	except asyncio.TimeoutError:
+		if process.returncode is None:
+			try:
+				process.terminate()
+			except ProcessLookupError:
+				pass
+	try:
+		return await asyncio.wait_for(asyncio.shield(output), _TERMINATE_GRACE_SECONDS)
+	except asyncio.TimeoutError:
+		if process.returncode is None:
+			try:
+				process.kill()
+			except ProcessLookupError:
+				pass
+		try:
+			return await asyncio.wait_for(asyncio.shield(output), _TERMINATE_GRACE_SECONDS)
+		except asyncio.TimeoutError:
+			# An inherited pipe held by another process must not turn cleanup into
+			# an unbounded wait after the owned CLI has been killed.
+			output.cancel()
+			await asyncio.gather(output, return_exceptions=True)
+			return b"", b""
+
+
+async def _run_boss_async(*args: str) -> dict[str, Any]:
+	if args and args[0] == "wizard" and not any(flag in args for flag in ("--timeout", "--status", "--stop")):
+		args = (*args, "--timeout", str(_CLI_TIMEOUT_SECONDS))
+	cmd = [_BOSS_BIN, "--json", *_BOSS_GLOBAL_ARGS, *args]
+	spawn = asyncio.create_task(
+		asyncio.create_subprocess_exec(
+			*cmd,
+			stdout=asyncio.subprocess.PIPE,
+			stderr=asyncio.subprocess.PIPE,
+			stdin=asyncio.subprocess.DEVNULL,
+		)
 	)
 	try:
-		return json.loads(result.stdout)
-	except json.JSONDecodeError:
-		return {
-			"ok": False,
-			"error": {"code": "CLI_ERROR", "message": result.stderr or "命令执行失败"},
-		}
+		process = await asyncio.shield(spawn)
+	except OSError as exc:
+		return _cli_failure(args, "CLI_ERROR", str(exc))
+	except asyncio.CancelledError:
+		try:
+			process = await asyncio.shield(spawn)
+		except OSError:
+			return _cli_failure(args, "WORKFLOW_STOPPED", "MCP 调用已取消", outcome_unknown=False)
+		output = asyncio.create_task(process.communicate())
+		await asyncio.shield(_stop_cli_process(process, output))
+		return _cli_failure(args, "WORKFLOW_STOPPED", "MCP 调用已取消", outcome_unknown=True)
+	output = asyncio.create_task(process.communicate())
+	try:
+		stdout, stderr = await asyncio.wait_for(asyncio.shield(output), _cli_timeout(args))
+	except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+		stdout, _ = await asyncio.shield(_stop_cli_process(process, output))
+		code = "WORKFLOW_STOPPED" if isinstance(exc, asyncio.CancelledError) else "WORKFLOW_TIMEOUT"
+		# A child envelope can carry the committed checkpoint/run id. Preserve it
+		# inside the failure; killing a child never proves an action had no effect.
+		try:
+			checkpoint_result = json.loads(stdout)
+		except (json.JSONDecodeError, UnicodeDecodeError):
+			checkpoint_result = None
+		return _cli_failure(
+			args,
+			code,
+			"MCP 调用已取消" if code == "WORKFLOW_STOPPED" else "底层 CLI 超时",
+			outcome_unknown=True,
+			checkpoint_result=checkpoint_result if isinstance(checkpoint_result, dict) else None,
+		)
+	return _parse_cli_output(args, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace"))
 
 
-def _build_args(tool_name: str, arguments: dict) -> list[str]:
-	"""根据 tool name 和参数构建 CLI 参数列表。"""
-	name = tool_name.replace("boss_", "")
-
-	if name == "search":
-		args = [name, arguments["query"]]
-		for opt in ("city", "salary", "experience", "education", "welfare"):
-			if opt in arguments and arguments[opt]:
-				args.extend([f"--{opt}", str(arguments[opt])])
-		if "page" in arguments:
-			args.extend(["--page", str(arguments["page"])])
-		return args
-
-	if name == "recommend":
-		args = [name]
-		if "page" in arguments:
-			args.extend(["--page", str(arguments["page"])])
-		return args
-
-	if name == "detail":
-		args = [name, arguments["security_id"]]
-		if "job_id" in arguments and arguments["job_id"]:
-			args.extend(["--job-id", arguments["job_id"]])
-		return args
-
-	if name == "greet":
-		return [name, arguments["security_id"], arguments["job_id"]]
-
-	if name == "chat":
-		args = [name]
-		if "from_who" in arguments and arguments["from_who"]:
-			args.extend(["--from", arguments["from_who"]])
-		if "days" in arguments:
-			args.extend(["--days", str(arguments["days"])])
-		if "page" in arguments:
-			args.extend(["--page", str(arguments["page"])])
-		return args
-
-	if name == "me":
-		args = [name]
-		if "section" in arguments and arguments["section"]:
-			args.extend(["--section", arguments["section"]])
-		return args
-
-	if name == "chatmsg":
-		args = [name, arguments["security_id"]]
-		if "page" in arguments:
-			args.extend(["--page", str(arguments["page"])])
-		if "count" in arguments:
-			args.extend(["--count", str(arguments["count"])])
-		if arguments.get("raw"):
-			args.append("--raw")
-		return args
-
-	if name == "chat_summary":
-		return ["chat-summary", arguments["security_id"]]
-
-	if name == "mark":
-		args = [name, arguments["security_id"], "--tag", arguments["tag"]]
-		if arguments.get("remove"):
-			args.append("--remove")
-		return args
-
-	if name == "exchange":
-		return [name, arguments["security_id"]]
-
-	if name == "apply":
-		return [name, arguments["security_id"], arguments["job_id"]]
-
-	if name == "batch_greet":
-		args = ["batch-greet", arguments["query"]]
-		if "city" in arguments and arguments["city"]:
-			args.extend(["--city", arguments["city"]])
-		if "limit" in arguments:
-			args.extend(["--limit", str(arguments["limit"])])
-		if arguments.get("dry_run"):
-			args.append("--dry-run")
-		return args
-
-	if name == "show":
-		return [name, str(arguments["number"])]
-
-	if name == "export":
-		args = [name]
-		if arguments.get("query"):
-			args.append(arguments["query"])
-		if arguments.get("url"):
-			args.extend(["--url", arguments["url"]])
-		for opt in ("city", "salary", "experience", "education", "industry", "scale", "stage", "job_type"):
-			if arguments.get(opt):
-				cli_flag = f"--{opt.replace('_', '-')}"
-				args.extend([cli_flag, arguments[opt]])
-		if "count" in arguments:
-			args.extend(["--count", str(arguments["count"])])
-		if arguments.get("format"):
-			args.extend(["--format", arguments["format"]])
-		if arguments.get("output_file"):
-			args.extend(["-o", arguments["output_file"]])
-		if arguments.get("include_private"):
-			args.append("--include-private")
-		return args
-
-	if name == "follow_up":
-		args = ["follow-up"]
-		if "days_stale" in arguments:
-			args.extend(["--days-stale", str(arguments["days_stale"])])
-		return args
-
-	if name == "config":
-		action = arguments.get("action", "list")
-		args = [name, action]
-		if action in ("get", "set", "reset") and "key" in arguments:
-			args.append(arguments["key"])
-		if action == "set" and "value" in arguments:
-			args.append(arguments["value"])
-		return args
-
-	if name == "clean":
-		args = [name]
-		if arguments.get("dry_run"):
-			args.append("--dry-run")
-		if arguments.get("all"):
-			args.append("--all")
-		return args
-
-	if name == "digest":
-		args = [name]
-		if "days_stale" in arguments:
-			args.extend(["--days-stale", str(arguments["days_stale"])])
-		if arguments.get("format"):
-			args.extend(["--format", arguments["format"]])
-		if arguments.get("output"):
-			args.extend(["-o", arguments["output"]])
-		return args
-
-	if name == "stats":
-		args = [name]
-		if "days" in arguments:
-			args.extend(["--days", str(arguments["days"])])
-		return args
-
-	if name == "ai_reply":
-		args = ["ai", "reply", arguments["recruiter_message"]]
-		if arguments.get("context"):
-			args.extend(["--context", arguments["context"]])
-		if arguments.get("resume"):
-			args.extend(["--resume", arguments["resume"]])
-		if arguments.get("tone"):
-			args.extend(["--tone", arguments["tone"]])
-		return args
-
-	if name == "ai_interview_prep":
-		args = ["ai", "interview-prep", arguments["jd_text"]]
-		if arguments.get("resume"):
-			args.extend(["--resume", arguments["resume"]])
-		if "count" in arguments:
-			args.extend(["--count", str(arguments["count"])])
-		return args
-
-	if name == "ai_chat_coach":
-		args = ["ai", "chat-coach", arguments["chat_text"]]
-		if arguments.get("resume"):
-			args.extend(["--resume", arguments["resume"]])
-		if arguments.get("style"):
-			args.extend(["--style", arguments["style"]])
-		return args
-
-	if name == "resume_list":
-		return ["resume", "list"]
-
-	if name == "resume_show":
-		return ["resume", "show", arguments["name"]]
-
-	if name == "ai_analyze_jd":
-		return ["ai", "analyze-jd", arguments["jd_text"], "--resume", arguments["resume"]]
-
-	if name == "ai_optimize":
-		return ["ai", "optimize", arguments["resume"], "--jd", arguments["jd_text"]]
-
-	if name == "ai_suggest":
-		return ["ai", "suggest", arguments["resume"], "--jd", arguments["jd_text"]]
-
-	if name == "watch_list":
-		return ["watch", "list"]
-
-	if name == "watch_run":
-		return ["watch", "run", arguments["name"]]
-
-	if name == "preset_list":
-		return ["preset", "list"]
-
-	if name == "shortlist_list":
-		return ["shortlist", "list"]
-
-	if name == "shortlist_add":
-		return ["shortlist", "add", arguments["security_id"], arguments["job_id"]]
-
-	if name == "shortlist_remove":
-		return ["shortlist", "remove", arguments["security_id"], arguments["job_id"]]
-
-	if name == "preset_add":
-		args = ["preset", "add", arguments["name"], arguments["query"]]
-		for opt in ("city", "salary", "experience", "education", "welfare"):
-			if arguments.get(opt):
-				args.extend([f"--{opt}", str(arguments[opt])])
-		return args
-
-	if name == "preset_remove":
-		return ["preset", "remove", arguments["name"]]
-
-	if name == "watch_add":
-		args = ["watch", "add", arguments["name"], arguments["query"]]
-		for opt in ("city", "salary"):
-			if arguments.get(opt):
-				args.extend([f"--{opt}", str(arguments[opt])])
-		return args
-
-	if name == "watch_remove":
-		return ["watch", "remove", arguments["name"]]
-
-	if name == "hr_applications":
-		args = ["hr", "applications"]
-		if arguments.get("job_id"):
-			args.extend(["--job-id", str(arguments["job_id"])])
-		if "label_id" in arguments:
-			args.extend(["--label-id", str(arguments["label_id"])])
-		if "page" in arguments:
-			args.extend(["--page", str(arguments["page"])])
-		return args
-
-	if name == "hr_candidates":
-		args = ["hr", "candidates"]
-		if arguments.get("query"):
-			args.append(arguments["query"])
-		for opt in ("city", "job_id", "experience", "degree", "age", "school_level", "activeness", "source", "salary"):
-			if arguments.get(opt):
-				args.extend([f"--{opt.replace('_', '-')}", str(arguments[opt])])
-		if arguments.get("select"):
-			args.append("--select")
-		if "page" in arguments:
-			args.extend(["--page", str(arguments["page"])])
-		return args
-
-	if name == "hr_chat":
-		args = ["hr", "chat"]
-		if "page" in arguments:
-			args.extend(["--page", str(arguments["page"])])
-		if arguments.get("job_id"):
-			args.extend(["--job-id", str(arguments["job_id"])])
-		if "label_id" in arguments:
-			args.extend(["--label-id", str(arguments["label_id"])])
-		return args
-
-	if name == "hr_chatmsg":
-		args = ["hr", "chatmsg", str(arguments["friend_id"])]
-		if "count" in arguments:
-			args.extend(["--count", str(arguments["count"])])
-		if arguments.get("max_msg_id"):
-			args.extend(["--max-msg-id", str(arguments["max_msg_id"])])
-		return args
-
-	if name == "hr_last_messages":
-		args = ["hr", "last-messages"]
-		for friend_id in arguments.get("friend_ids") or []:
-			args.extend(["--friend-id", str(friend_id)])
-		if "page" in arguments:
-			args.extend(["--page", str(arguments["page"])])
-		if arguments.get("job_id"):
-			args.extend(["--job-id", str(arguments["job_id"])])
-		if "label_id" in arguments:
-			args.extend(["--label-id", str(arguments["label_id"])])
-		return args
-
-	if name == "hr_resume":
-		args = ["hr", "resume", arguments["geek_id"], "--job-id", str(arguments["job_id"]), "--security-id", str(arguments["security_id"])]
-		if arguments.get("raw"):
-			args.append("--raw")
-		return args
-
-	if name == "hr_exchange":
-		args = ["hr", "resume", "--exchange", "--friend-id", str(arguments["friend_id"])]
-		if arguments.get("type") and arguments["type"] != "phone":
-			args.extend(["--type", str(arguments["type"])])
-		return args
-
-	if name == "hr_reply":
-		return ["hr", "reply", str(arguments["friend_id"]), arguments["message"]]
-
-	if name == "hr_request_resume":
-		return ["hr", "request-resume", str(arguments["friend_id"])]
-
-	if name == "hr_jobs":
-		action = arguments.get("action", "list")
-		args = ["hr", "jobs", action]
-		if action in {"online", "offline"}:
-			args.append(str(arguments["job_id"]))
-		return args
-
-	if name == "hr_jobs_detail":
-		return ["hr", "jobs", "detail", str(arguments["enc_job_id"])]
-
-	# 无参数命令：status, doctor, cities, interviews, history, pipeline
-	return [name]
+# ── Handler 注册（mcp 2.x） ────────────────────────────────────────
+#
+# 2.0 移除了 `@server.list_tools()` / `@server.call_tool()` 装饰器，改为
+# `add_request_handler(method, params_type, handler)`。除注册方式外还有两处变化：
+#   1. handler 签名从「按需取参」变成固定的 `(ctx, params)`；
+#   2. 返回值从裸 list 变成 Result 对象（`ListToolsResult` / `CallToolResult`）。
+# 本段的形状照抄 SDK 自身在 `mcp/server/mcpserver/server.py` 的注册与 handler 写法，
+# 不是从文档推测的。
 
 
-# ── MCP Handlers ───────────────────────────────────────────────────
+async def list_tools(ctx: Any, params: "PaginatedRequestParams | None" = None) -> ListToolsResult:
+	return ListToolsResult(tools=TOOLS)
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-	return TOOLS
+async def call_tool(ctx: Any, params: CallToolRequestParams) -> CallToolResult:
+	args = _build_args(params.name, dict(params.arguments or {}))
+	result = await _run_boss_async(*args)
+	return CallToolResult(content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))])
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-	if name in _LOW_RISK_BLOCKED_TOOLS:
-		result = {
-			"ok": False,
-			"schema_version": "1.0",
-			"command": name.removeprefix("boss_"),
-			"data": None,
-			"pagination": None,
-			"error": {
-				"code": "COMPLIANCE_BLOCKED",
-				"message": LOW_RISK_MODE_DESCRIPTION,
-				"recoverable": False,
-				"recovery_action": COMPLIANCE_BLOCKED_ACTION,
-			},
-			"hints": {
-				"next_actions": [
-					"使用只读或本地辅助工具",
-					"需要写操作或候选人个人信息处理时，请回到平台官网由用户手动完成",
-				],
-			},
-		}
-		return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
-	args = _build_args(name, arguments)
-	result = _run_boss(*args)
-	return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+server.add_request_handler("tools/list", PaginatedRequestParams, list_tools)
+server.add_request_handler("tools/call", CallToolRequestParams, call_tool)
 
 
 # ── 入口 ──────────────────────────────────────────────────────────
 
 
-async def main():
+async def main() -> None:
 	async with stdio_server() as (read_stream, write_stream):
 		await server.run(read_stream, write_stream, server.create_initialization_options())
 
@@ -1129,7 +306,7 @@ def _normalize_path(path: str) -> str:
 	return path
 
 
-def _create_sse_app(*, sse_path: str = DEFAULT_SSE_PATH, message_path: str = DEFAULT_MESSAGE_PATH):
+def _create_sse_app(*, sse_path: str = DEFAULT_SSE_PATH, message_path: str = DEFAULT_MESSAGE_PATH) -> "Starlette":
 	from mcp.server.sse import SseServerTransport
 	from starlette.applications import Starlette
 	from starlette.requests import Request
@@ -1140,7 +317,7 @@ def _create_sse_app(*, sse_path: str = DEFAULT_SSE_PATH, message_path: str = DEF
 	message_path = _normalize_path(message_path)
 	sse = SseServerTransport(message_path)
 
-	async def handle_sse(scope, receive, send):
+	async def handle_sse(scope: "Scope", receive: "Receive", send: "Send") -> Response:
 		async with sse.connect_sse(scope, receive, send) as streams:
 			await server.run(
 				streams[0],
@@ -1161,14 +338,14 @@ def _create_sse_app(*, sse_path: str = DEFAULT_SSE_PATH, message_path: str = DEF
 
 
 class _StreamableHTTPASGIApp:
-	def __init__(self, session_manager):
+	def __init__(self, session_manager: "StreamableHTTPSessionManager") -> None:
 		self.session_manager = session_manager
 
-	async def __call__(self, scope, receive, send) -> None:
+	async def __call__(self, scope: "Scope", receive: "Receive", send: "Send") -> None:
 		await self.session_manager.handle_request(scope, receive, send)
 
 
-def _create_streamable_http_app(*, path: str = DEFAULT_HTTP_PATH):
+def _create_streamable_http_app(*, path: str = DEFAULT_HTTP_PATH) -> "Starlette":
 	from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 	from starlette.applications import Starlette
 	from starlette.routing import Route
@@ -1177,7 +354,10 @@ def _create_streamable_http_app(*, path: str = DEFAULT_HTTP_PATH):
 	session_manager = StreamableHTTPSessionManager(app=server)
 	http_app = _StreamableHTTPASGIApp(session_manager)
 
-	async def lifespan(app):
+	# 必须是 asynccontextmanager：Starlette 对裸 async generator lifespan 会走
+	# 弃用路径并发 DeprecationWarning。
+	@asynccontextmanager
+	async def lifespan(app: "Starlette") -> "AsyncIterator[None]":
 		async with session_manager.run():
 			yield
 
@@ -1187,7 +367,7 @@ def _create_streamable_http_app(*, path: str = DEFAULT_HTTP_PATH):
 	)
 
 
-def _serve_asgi_app(app, *, host: str, port: int) -> None:
+def _serve_asgi_app(app: "Starlette", *, host: str, port: int) -> None:
 	import uvicorn
 
 	uvicorn.run(app, host=host, port=port, log_level="info")
@@ -1216,11 +396,29 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
 	parser.add_argument("--path", default=DEFAULT_HTTP_PATH, help="HTTP streaming 路径")
 	parser.add_argument("--sse-path", default=DEFAULT_SSE_PATH, help="SSE 建链路径")
 	parser.add_argument("--message-path", default=DEFAULT_MESSAGE_PATH, help="SSE 消息回传路径")
+	parser.add_argument("--boss-bin", default=DEFAULT_BOSS_BIN, help="底层 boss CLI 可执行文件路径")
+	parser.add_argument("--data-dir", default=None, help="传给 boss CLI 的数据目录，用于项目级状态隔离")
+	parser.add_argument("--platform", default=None, help="传给 boss CLI 的默认平台，如 zhipin")
+	parser.add_argument("--role", choices=("candidate", "recruiter"), default=None, help="传给 boss CLI 的默认角色")
+	parser.add_argument(
+		"--browser-source",
+		# 取值域只从策略表推导，与 main.py / config_cmd.py 一致；新增来源不必再改这里。
+		choices=tuple(BROWSER_SOURCES),
+		default=None,
+		help="传给 boss CLI 的浏览器通道来源（默认 auto）",
+	)
 	return parser.parse_args(argv)
 
 
 def run(argv: list[str] | None = None) -> None:
 	args = _parse_cli_args(argv)
+	_configure_boss_invocation(
+		boss_bin=args.boss_bin,
+		data_dir=args.data_dir,
+		platform=args.platform,
+		role=args.role,
+		browser_source=args.browser_source,
+	)
 	if args.transport == "stdio":
 		asyncio.run(main())
 		return

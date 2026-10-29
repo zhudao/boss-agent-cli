@@ -91,18 +91,18 @@ def test_try_extract_success_without_stoken_returns_empty_string():
 	assert result["stoken"] == ""
 
 
-def test_try_extract_supports_zhilian_primary_cookie():
+def test_try_extract_supports_custom_domain_without_stoken_cookie():
 	def loader(domain_name=None):
-		return [_fake_cookie("zp_token", "zp-token-value", domain=".zhaopin.com")]
+		return [_fake_cookie("example_token", "example-value", domain=".example.com")]
 
 	result = _try_extract(
 		loader,
-		domain_name=".zhaopin.com",
-		required_cookie="zp_token",
+		domain_name=".example.com",
+		required_cookie="example_token",
 		stoken_cookie="",
 	)
 	assert result is not None
-	assert result["cookies"]["zp_token"] == "zp-token-value"
+	assert result["cookies"]["example_token"] == "example-value"
 	assert result["stoken"] == ""
 
 
@@ -190,18 +190,15 @@ def test_extract_cookies_explicit_browser_with_success():
 	assert result["cookies"]["wt2"] == "specific-chrome"
 
 
-def test_extract_cookies_supports_zhilian_platform():
+def test_extract_cookies_rejects_removed_zhilian_platform():
 	def chrome_loader(domain_name=None):
-		return [_fake_cookie("zp_token", "zp-chrome", domain=".zhaopin.com")]
+		return [_fake_cookie("wt2", "should-not-be-read", domain=".zhipin.com")]
 
 	fake_module = MagicMock()
 	fake_module.chrome = chrome_loader
 
 	with patch.dict("sys.modules", {"browser_cookie3": fake_module}):
-		result = extract_cookies(source="chrome", platform="zhilian")
-
-	assert result is not None
-	assert result["cookies"]["zp_token"] == "zp-chrome"
+		assert extract_cookies(source="chrome", platform="zhilian") is None
 
 
 def test_extract_cookies_returns_none_when_browser_cookie3_not_installed():
@@ -217,3 +214,36 @@ def test_extract_cookies_returns_none_when_browser_cookie3_not_installed():
 	finally:
 		if saved is not None:
 			_sys.modules["browser_cookie3"] = saved
+
+
+# ── 2026-10 扩展浏览器集合（对齐 boss-cli 的 10+ 覆盖） ─────────
+
+
+def test_extract_cookies_supports_extended_browser_set():
+	"""vivaldi / arc / librewolf / safari 均可显式选择，大小写不敏感。"""
+
+	def make_loader(value):
+		def loader(domain_name=None):
+			return [_fake_cookie("wt2", value), _fake_cookie("__zp_stoken__", "s")]
+
+		return loader
+
+	fake_module = MagicMock()
+	for attr, value in (
+		("vivaldi", "from-vivaldi"),
+		("arc", "from-arc"),
+		("librewolf", "from-librewolf"),
+		("safari", "from-safari"),
+	):
+		setattr(fake_module, attr, make_loader(value))
+
+	with patch.dict("sys.modules", {"browser_cookie3": fake_module}):
+		for source, expected in (
+			("vivaldi", "from-vivaldi"),
+			("Arc", "from-arc"),
+			("LibreWolf", "from-librewolf"),
+			("Safari", "from-safari"),
+		):
+			result = extract_cookies(source=source)
+			assert result is not None, source
+			assert result["cookies"]["wt2"] == expected

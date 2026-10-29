@@ -9,7 +9,7 @@ import json
 from click.testing import CliRunner
 
 from boss_agent_cli.main import cli
-from boss_agent_cli.commands.schema import SCHEMA_DATA
+from boss_agent_cli.schema.data import SCHEMA_DATA
 
 
 # ── Schema 输出格式 ─────────────────────────────────────────────────
@@ -37,6 +37,24 @@ def test_schema_output_is_json_envelope():
 	assert "global_options" in data
 	assert isinstance(data["commands"], dict)
 	assert isinstance(data["error_codes"], dict)
+
+
+# ── 双受众信封契约 ──────────────────────────────────────────────────
+
+
+def test_schema_conventions_declare_hints_audiences():
+	"""conventions 必须声明 next_actions / operator_actions 各自的受众。"""
+	hints = SCHEMA_DATA["conventions"]["hints"]
+	assert set(hints) == {"next_actions", "operator_actions"}
+	assert "Agent" in hints["next_actions"]
+	assert "操作者" in hints["operator_actions"]
+
+
+def test_schema_conventions_declare_command_vs_wizard():
+	"""commands 与 wizard_catalog 是两套并行能力面，必须声明何时用哪个。"""
+	declaration = SCHEMA_DATA["conventions"]["command_vs_wizard"]
+	assert "顶层命令" in declaration
+	assert "wizard" in declaration
 
 
 # ── Schema 命令集 == 注册命令集 ─────────────────────────────────────
@@ -78,12 +96,22 @@ def test_schema_commands_have_descriptions():
 	)
 
 
-def test_doctor_schema_documents_bridge_risk_boundary():
-	"""doctor schema 应说明 Bridge 是诊断/登录兼容入口，不是风控绕过入口。"""
+def test_doctor_schema_documents_cdp_risk_boundary():
+	"""doctor schema 只描述保留的 CDP 通道，不提供风控绕过入口。"""
 	description = SCHEMA_DATA["commands"]["doctor"]["description"]
-	assert "Bridge" in description
-	assert "浏览器桥" in description
+	assert "CDP" in description
+	assert "Bridge" not in description
+	assert "浏览器桥" not in description
 	assert "不得用于规避平台风控" in description
+
+
+def test_browser_source_schema_only_describes_supported_channels():
+	description = SCHEMA_DATA["global_options"]["--browser-source"]["description"]
+	assert "Bridge" not in description
+	assert "CDP" in description
+	assert "headless" in description
+	assert "BROWSER_SESSION_NOT_FOUND" in description
+	assert "CDP_UNAVAILABLE" in description
 
 
 # ── 错误码一致性 ────────────────────────────────────────────────────
@@ -99,10 +127,24 @@ def test_schema_error_codes_cover_all_used_codes():
 
 	# 代码中实际使用的所有错误码（通过审计收集）
 	used_codes = {
+		"CONFIRMATION_REQUIRED",
+		"RESUME_ACCEPT_RESULT_UNKNOWN",
+		"GREET_RESULT_UNKNOWN",
+		"ACTION_UNCONFIRMED",
+		"EXCHANGE_NOT_AVAILABLE",
 		"AUTH_EXPIRED",
 		"AUTH_REQUIRED",
 		"RATE_LIMITED",
 		"TOKEN_REFRESH_FAILED",
+		"ENVIRONMENT_RISK",
+		"LOGIN_TIMEOUT",
+		"CDP_UNAVAILABLE",
+		"BROWSER_SESSION_NOT_FOUND",
+		"BROWSER_KERNEL_MISSING",
+		"BROWSER_NAV_TIMEOUT",
+		"LOGIN_RISK_CONTROL",
+		"LOGIN_EXPIRED",
+		"LOGIN_CREDENTIAL_EXTRACTION_FAILED",
 		"ACCOUNT_RISK",
 		"JOB_NOT_FOUND",
 		"ALREADY_GREETED",
@@ -177,3 +219,25 @@ def test_schema_exposes_recruiter_chat_context_commands():
 	subcommands = SCHEMA_DATA["commands"]["hr"]["subcommands"]
 	assert "chatmsg" in subcommands
 	assert "last-messages" in subcommands
+
+
+def test_schema_environment_risk_is_terminal():
+	"""ENVIRONMENT_RISK 必须是不可恢复的终止分支，恢复动作指向停止自动化。"""
+	spec = SCHEMA_DATA["error_codes"]["ENVIRONMENT_RISK"]
+	assert spec["recoverable"] is False
+	assert spec["recovery_action"] == "停止自动化访问；保留原会话，在官方目标业务页确认风险解除后，由用户执行 boss clean --risk-lock 并显式恢复任务，降低访问频率"
+	assert spec["message"] == "访问环境存在异常"
+
+
+def test_schema_documents_browser_source_flag():
+	"""--browser-source 必须进入 schema global_options，choices 为三类来源且标 experimental。"""
+	flag = SCHEMA_DATA["global_options"]["--browser-source"]
+	assert sorted(flag["choices"]) == ["auto", "existing-browser", "stored-cookie"]
+	# choices 只从策略表推导（顺序亦同）：策略表加一行，schema / CLI / MCP 三处同时看到，不会漂移
+	from boss_agent_cli.api.browser_source import POLICIES
+
+	assert flag["choices"] == list(POLICIES)
+	assert "BROWSER_SESSION_NOT_FOUND" in flag["description"]
+	assert "CDP_UNAVAILABLE" in flag["description"]
+	assert flag["default"] == "auto"
+	assert flag["stability"] == "experimental"

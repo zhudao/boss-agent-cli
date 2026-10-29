@@ -48,16 +48,17 @@ Closes #
 
 ## 文档与契约 / Docs & Contracts
 
-- [ ] 如新增命令：已更新 `src/boss_agent_cli/commands/schema.py`
+- [ ] 如新增命令：已更新 `src/boss_agent_cli/schema/data.py`
 - [ ] 如变更 CLI 行为：已更新 `README.md` 和 `docs/capability-matrix.md`
 - [ ] 如新增 MCP 工具：已更新 `mcp-server/server.py` 和 `mcp-server/README.md`
-- [ ] 如新增错误码：已添加到 `schema.py` 的 `error_codes`
+- [ ] 如新增错误码：已添加到 `src/boss_agent_cli/schema/error_codes.py` 的 `ERROR_CODES`
 - [ ] 已更新 `CHANGELOG.md` 的 `[Unreleased]` 段落
-- [ ] 如变更 Agent 主卖点或安装路径：已同步检查 `SKILL.md` / PyPI 版本 / GitHub Release 说明
+- [ ] 如变更 Agent 主卖点或安装路径：已同步更新 README / landing 的 MCP 接入说明、PyPI 版本与 GitHub Release 说明
 
 ## 安全与规范 / Safety & Convention
 
 - [ ] commit message 格式: `type: 中文描述`
+- [ ] 无 `Co-authored-by` 尾注或 AI 署名行
 - [ ] 无敏感信息（Token / 密码 / Cookie / security_id / 手机号 / 微信 / 真实账号）
 - [ ] 如涉及 Cookie、CDP、patchright、请求频率或真实账号，已阅读 `docs/platform-risk.md`
 - [ ] 如涉及发布流程，已阅读 `docs/maintainer/release-checklist.md`

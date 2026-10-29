@@ -1,92 +1,132 @@
-"""Compliance guardrails for platform-sensitive commands."""
+"""Capability metadata and legacy operating-mode compatibility."""
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import click
 
-from boss_agent_cli.display import handle_error_output
+ASSISTED_MODE = "assisted"
+RESEARCH_MODE = "research"
+AVAILABLE_OPERATING_MODES = (ASSISTED_MODE, RESEARCH_MODE)
 
-LOW_RISK_MODE_DESCRIPTION = (
-	"低风险辅助模式：本地辅助、只读优先、用户主动触发、不规避风控、不批量触达、不抓取平台数据。"
-)
+LOW_RISK_MODE_DESCRIPTION = "assisted 模式：保留历史配置名称，所有已实现能力均可调用。"
+RESEARCH_MODE_DESCRIPTION = "research 模式：保留历史配置名称，权限与 assisted 模式一致。"
 
-COMPLIANCE_BLOCKED_ACTION = "保持默认低风险模式；如需处理，请回到平台官网手动完成。"
-_COMPLIANCE_NEXT_ACTIONS = [
-	"使用只读命令确认信息，例如 boss search、boss detail、boss show、boss shortlist",
-	"需要写操作或候选人个人信息处理时，请回到平台官网由用户手动完成",
-]
-_COMPLIANCE_BLOCK_HINTS = {
-	"policy": "low_risk_assistance",
-	"blocked": True,
-	"manual_action_required": True,
-	"allowed_alternatives": ["search", "detail", "show", "shortlist"],
-	"next_actions": _COMPLIANCE_NEXT_ACTIONS,
+COMPLIANCE_BLOCKED_ACTION = "升级到当前版本后重试；该错误码仅为历史协议兼容保留。"
+
+
+@dataclass(frozen=True)
+class CapabilityPolicy:
+	command: str
+	allowed_modes: tuple[str, ...]
+	risk_class: str
+	data_class: str
+	requires_explicit_consent: bool
+	blocked_reason: str
+
+
+_POLICY_DEFINITIONS = {
+	"greet": ("platform_write", "recruiter_contact", "自动打招呼属于平台写操作。"),
+	"batch-greet": ("bulk_outreach", "recruiter_contact", "批量打招呼属于批量触达。"),
+	"apply": ("platform_write", "application", "投递/立即沟通属于平台写操作。"),
+	"recommend": ("platform_collection", "job_listing", "个性化推荐会自动读取平台推荐流。"),
+	"watch-run": ("platform_collection", "job_listing", "增量监控会持续拉取平台职位数据。"),
+	"chat": ("personal_data", "communication", "沟通列表涉及会话数据与个人信息。"),
+	"exchange": ("personal_data_write", "contact", "联系方式交换涉及个人信息处理。"),
+	"mark": ("platform_write", "relationship", "联系人标签涉及平台关系数据写入。"),
+	"chatmsg": ("personal_data", "communication", "聊天记录涉及通信内容与个人信息。"),
+	"chat-summary": ("personal_data", "communication", "聊天摘要依赖聊天记录与通信内容。"),
+	"pipeline": ("personal_data", "candidate_workflow", "候选进度视图依赖平台会话与面试数据。"),
+	"follow-up": ("personal_data", "candidate_workflow", "跟进筛选依赖平台会话与面试数据。"),
+	"digest": ("personal_data", "candidate_workflow", "日报汇总依赖平台会话与面试数据。"),
+	"recruiter-applications": ("personal_data", "application", "投递申请列表涉及候选人个人信息。"),
+	"recruiter-candidates": ("platform_collection", "candidate_profile", "候选人搜索涉及个人信息与平台采集。"),
+	"recruiter-chat": ("personal_data", "communication", "招聘者沟通列表涉及候选人会话数据。"),
+	"recruiter-chatmsg": ("personal_data", "communication", "候选人聊天记录涉及个人信息与通信内容。"),
+	"recruiter-last-messages": ("personal_data", "communication", "候选人最近消息摘要涉及通信内容。"),
+	"recruiter-resume": ("personal_data", "candidate_profile", "候选人在线简历/联系方式涉及个人信息。"),
+	"recruiter-reply": ("platform_write", "communication", "回复候选人属于平台写操作。"),
+	"recruiter-request-resume": ("platform_write", "candidate_profile", "请求候选人附件简历涉及个人信息授权。"),
+	"recruiter-accept-resume": ("personal_data_write", "candidate_profile", "同意候选人发送附件简历涉及个人信息授权。"),
+	"recruiter-download-resume": ("personal_data", "candidate_profile", "下载附件简历会将候选人个人信息保存到本地。"),
+	"recruiter-recommendations": ("personal_data", "candidate_profile", "推荐牛人列表涉及候选人个人信息。"),
+	"recruiter-greet": ("platform_write", "communication", "首次招呼会建立候选人会话并发送消息，不修改已读状态。"),
+	"crawl": ("platform_collection", "job_listing", "批量采集会读取平台职位列表和详情。"),
+	"crawl-cdp": ("browser_debug_protocol", "browser_session_metadata", "采集会启动受隔离的 Chrome 调试会话。"),
+	"crawl-hook": ("page_script_injection", "user_provided_script", "Hook 会向页面注入用户提供的脚本。"),
 }
 
-_SENSITIVE_COMMANDS = {
-	"greet": "自动打招呼属于平台写操作，默认低风险模式不通过 CLI 触达招聘者。",
-	"batch-greet": "批量打招呼属于批量触达，默认低风险模式不执行。",
-	"apply": "投递/立即沟通属于平台写操作，默认低风险模式不通过 CLI 提交。",
-	"recommend": "个性化推荐会自动读取平台推荐流，默认低风险模式不抓取平台数据。",
-	"watch-run": "增量监控会自动批量拉取平台职位数据，默认低风险模式不执行。",
-	"chat": "沟通列表涉及会话数据与个人信息，默认低风险模式不读取。",
-	"exchange": "联系方式交换涉及个人信息处理，默认低风险模式不通过 CLI 发起。",
-	"mark": "联系人标签涉及平台关系数据写入，默认低风险模式不通过 CLI 修改。",
-	"chatmsg": "聊天记录涉及通信内容与个人信息，默认低风险模式不读取。",
-	"chat-summary": "聊天摘要依赖聊天记录与通信内容，默认低风险模式不生成。",
-	"pipeline": "候选进度视图依赖平台会话与面试数据，默认低风险模式不聚合。",
-	"follow-up": "跟进筛选依赖平台会话与面试数据，默认低风险模式不聚合。",
-	"digest": "日报汇总依赖平台会话与面试数据，默认低风险模式不聚合。",
-	"recruiter-applications": "投递申请列表涉及候选人个人信息，默认低风险模式不读取。",
-	"recruiter-candidates": "候选人搜索涉及候选人个人信息与平台数据抓取，默认低风险模式不执行。",
-	"recruiter-chat": "招聘者沟通列表涉及候选人会话数据，默认低风险模式不读取。",
-	"recruiter-chatmsg": "候选人聊天记录涉及个人信息与通信内容，默认低风险模式不读取。",
-	"recruiter-last-messages": "候选人最近消息摘要涉及通信内容，默认低风险模式不读取。",
-	"recruiter-resume": "候选人在线简历/联系方式交换涉及个人信息，默认低风险模式不处理。",
-	"recruiter-reply": "回复候选人属于平台写操作，默认低风险模式不发送。",
-	"recruiter-request-resume": "请求候选人附件简历涉及个人信息授权，默认低风险模式不发起。",
+_CAPABILITY_POLICIES = {
+	command: CapabilityPolicy(
+		command=command,
+		allowed_modes=AVAILABLE_OPERATING_MODES,
+		risk_class=risk_class,
+		data_class=data_class,
+		requires_explicit_consent=False,
+		blocked_reason=blocked_reason,
+	)
+	for command, (risk_class, data_class, blocked_reason) in _POLICY_DEFINITIONS.items()
 }
+
+
+def capability_policy(command: str) -> CapabilityPolicy | None:
+	"""Return the immutable policy for a command, if one is mode-gated."""
+	return _CAPABILITY_POLICIES.get(command)
+
+
+def operating_mode(ctx: click.Context) -> str:
+	"""Return the normalized operating mode for the current command context."""
+	config = ctx.obj.get("config", {}) if ctx and ctx.obj else {}
+	mode = config.get("operating_mode")
+	if mode in AVAILABLE_OPERATING_MODES:
+		return str(mode)
+	return RESEARCH_MODE if config.get("low_risk_mode") is False else ASSISTED_MODE
+
+
+def restricted_commands(mode: str = ASSISTED_MODE) -> set[str]:
+	"""Return commands unavailable in the requested operating mode.
+
+	The parameter and return type are retained for callers that still inspect the
+	historical operating-mode surface. Current modes do not restrict commands.
+	"""
+	return set()
 
 
 def low_risk_blocked_commands() -> set[str]:
-	"""Return command identifiers blocked by default low-risk mode."""
-	return set(_SENSITIVE_COMMANDS)
+	"""Compatibility alias for assisted-mode restricted commands."""
+	return restricted_commands(ASSISTED_MODE)
 
 
 def is_low_risk_mode(ctx: click.Context) -> bool:
-	"""Return whether platform-sensitive commands should be blocked by default."""
-	config = ctx.obj.get("config", {}) if ctx and ctx.obj else {}
-	return bool(config.get("low_risk_mode", True))
+	"""Compatibility predicate for callers using the historical name."""
+	return operating_mode(ctx) == ASSISTED_MODE
 
 
 def require_compliance_allowed(ctx: click.Context, command: str) -> bool:
-	"""Emit a standard error and return False when a sensitive command is blocked."""
-	if not is_low_risk_mode(ctx):
-		return True
+	"""Compatibility guard that allows every registered capability."""
+	return True
 
-	reason = _SENSITIVE_COMMANDS.get(command)
-	if reason is None:
-		return True
 
-	handle_error_output(
-		ctx,
-		command,
-		code="COMPLIANCE_BLOCKED",
-		message=f"{reason} {LOW_RISK_MODE_DESCRIPTION}",
-		recoverable=False,
-		recovery_action=COMPLIANCE_BLOCKED_ACTION,
-		hints=_COMPLIANCE_BLOCK_HINTS,
-	)
-	return False
+def require_capability_mode(mode: str, command: str) -> None:
+	"""Compatibility hook for non-CLI callers; modes no longer gate execution."""
+	return None
 
 
 def compliance_mode_data(ctx: click.Context) -> dict[str, Any]:
-	"""Expose guardrail status for schema and diagnostics."""
+	"""Expose operating-mode and capability policy data for schema and diagnostics."""
+	mode = operating_mode(ctx)
+	blocked = restricted_commands(mode)
 	return {
-		"default_boundary": "low_risk_assistance",
-		"sensitive_commands_blocked": is_low_risk_mode(ctx),
-		"description": LOW_RISK_MODE_DESCRIPTION,
-		"blocked_commands": sorted(low_risk_blocked_commands()),
+		"default_boundary": "open_capabilities",
+		"operating_mode": mode,
+		"available_modes": list(AVAILABLE_OPERATING_MODES),
+		"sensitive_commands_blocked": False,
+		"description": LOW_RISK_MODE_DESCRIPTION if mode == ASSISTED_MODE else RESEARCH_MODE_DESCRIPTION,
+		"blocked_commands": sorted(blocked),
+		"capabilities": {
+			command: {**asdict(policy), "allowed_modes": list(policy.allowed_modes)}
+			for command, policy in sorted(_CAPABILITY_POLICIES.items())
+		},
 	}

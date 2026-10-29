@@ -31,6 +31,8 @@ def _ctx_mock(mock_cls):
 	instance = mock_cls.return_value
 	instance.__enter__ = lambda self: self
 	instance.__exit__ = lambda self, *a: None
+	instance.is_success.side_effect = lambda response: response.get("code", 0) in (0, 200)
+	instance.unwrap_data.side_effect = lambda response: response.get("zpData") if "zpData" in response else response.get("data")
 	return instance
 
 
@@ -42,6 +44,7 @@ def test_welfare_filter_tag_match(mock_auth, mock_client_cls, mock_cache_cls, mo
 	"""福利筛选：标签直接匹配不需要查详情"""
 	mock_cache = _ctx_mock(mock_cache_cls)
 	mock_cache.is_greeted.return_value = False
+	mock_cache.reserve_crawl_budget.return_value = 0.0
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.search_jobs.return_value = {
 		"zpData": {
@@ -71,6 +74,7 @@ def test_welfare_filter_detail_fallback(mock_auth, mock_client_cls, mock_cache_c
 	"""福利筛选：标签不够时并行查详情"""
 	mock_cache = _ctx_mock(mock_cache_cls)
 	mock_cache.is_greeted.return_value = False
+	mock_cache.reserve_crawl_budget.return_value = 0.0
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.search_jobs.return_value = {
 		"zpData": {
@@ -96,6 +100,44 @@ def test_welfare_filter_detail_fallback(mock_auth, mock_client_cls, mock_cache_c
 	assert len(parsed["data"]) == 1
 	# 确认调用了 job_card 查详情
 	mock_client.job_card.assert_called_once()
+
+
+@patch("boss_agent_cli.commands.search.try_save_index")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+@patch("boss_agent_cli.commands.search.AuthManager")
+def test_welfare_filter_data_envelope_detail_fallback(mock_auth, mock_client_cls, mock_cache_cls, mock_save):
+	"""code/data 包络（非 zpData）也应支持 search --welfare 的详情补抓。"""
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.is_greeted.return_value = False
+	mock_cache.reserve_crawl_budget.return_value = 0.0
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.search_jobs.return_value = {
+		"code": 200,
+		"data": {
+			"hasMore": False,
+			"jobList": [
+				_make_job_raw("j1", welfare=[], security_id="sec_1"),
+			],
+		},
+	}
+	mock_client.job_card.return_value = {
+		"code": 200,
+		"data": {
+			"jobCard": {
+				"postDescription": "本岗位提供周末双休和五险一金",
+			},
+		},
+	}
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--json", "search", "golang", "--welfare", "双休"])
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"][0]["job_id"] == "j1"
+	assert "双休(描述)" in parsed["data"][0]["welfare_match"]
+	mock_client.job_card.assert_called_once_with("sec_1", "")
 
 
 def test_search_click_keeps_welfare_option():

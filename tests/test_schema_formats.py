@@ -4,12 +4,14 @@ import json
 
 from click.testing import CliRunner
 
-from boss_agent_cli.commands.schema import (
-	_command_to_json_schema,
-	_format_anthropic_tools,
-	_format_openai_tools,
-	SCHEMA_DATA,
+from boss_agent_cli.schema.data import SCHEMA_DATA
+from boss_agent_cli.schema.formats import (
+	command_to_json_schema,
+	format_anthropic_tools,
+	format_mcp_tools,
+	format_openai_tools,
 )
+from boss_agent_cli.schema.tool_catalog import build_tool_catalog
 from boss_agent_cli.main import cli
 
 
@@ -20,6 +22,7 @@ def test_native_format_is_default():
 	assert result.exit_code == 0
 	data = json.loads(result.output)["data"]
 	assert "commands" in data
+	assert len(data["commands"]) == len(SCHEMA_DATA["commands"])
 	assert "error_codes" in data
 	assert "format" not in data  # native 格式不带 format 字段
 
@@ -32,7 +35,7 @@ def test_openai_tools_format():
 	data = json.loads(result.output)["data"]
 	assert data["format"] == "openai-tools"
 	tools = data["tools"]
-	assert len(tools) == len(SCHEMA_DATA["commands"])
+	assert len(tools) == len(build_tool_catalog())
 	for tool in tools:
 		assert tool["type"] == "function"
 		assert "function" in tool
@@ -51,7 +54,7 @@ def test_anthropic_tools_format():
 	data = json.loads(result.output)["data"]
 	assert data["format"] == "anthropic-tools"
 	tools = data["tools"]
-	assert len(tools) == len(SCHEMA_DATA["commands"])
+	assert len(tools) == len(build_tool_catalog())
 	for tool in tools:
 		assert tool["name"].startswith("boss_")
 		assert tool["description"]
@@ -60,8 +63,8 @@ def test_anthropic_tools_format():
 
 def test_openai_and_anthropic_share_parameters_schema():
 	"""两种格式参数 schema 应一致（只是外层包装不同）。"""
-	oai = _format_openai_tools(SCHEMA_DATA)
-	anth = _format_anthropic_tools(SCHEMA_DATA)
+	oai = format_openai_tools(SCHEMA_DATA)
+	anth = format_anthropic_tools(SCHEMA_DATA)
 
 	oai_search = next(t["function"]["parameters"] for t in oai if t["function"]["name"] == "boss_search")
 	anth_search = next(t["input_schema"] for t in anth if t["name"] == "boss_search")
@@ -70,8 +73,8 @@ def test_openai_and_anthropic_share_parameters_schema():
 
 def test_tool_formats_keep_search_welfare_parameter():
 	"""OpenAI / Anthropic tool schema 都必须暴露 search.welfare 参数。"""
-	oai = _format_openai_tools(SCHEMA_DATA)
-	anth = _format_anthropic_tools(SCHEMA_DATA)
+	oai = format_openai_tools(SCHEMA_DATA)
+	anth = format_anthropic_tools(SCHEMA_DATA)
 
 	oai_search = next(t["function"]["parameters"] for t in oai if t["function"]["name"] == "boss_search")
 	anth_search = next(t["input_schema"] for t in anth if t["name"] == "boss_search")
@@ -79,6 +82,36 @@ def test_tool_formats_keep_search_welfare_parameter():
 	assert "福利筛选" in oai_search["properties"]["welfare"]["description"]
 	assert "welfare" in anth_search["properties"]
 	assert "福利筛选" in anth_search["properties"]["welfare"]["description"]
+
+
+def test_tool_formats_describe_explicit_agent_resume():
+	parameters = [
+		next(tool["function"]["parameters"] for tool in format_openai_tools(SCHEMA_DATA) if tool["function"]["name"] == "boss_agent_run"),
+		next(tool["input_schema"] for tool in format_anthropic_tools(SCHEMA_DATA) if tool["name"] == "boss_agent_run"),
+		next(tool["inputSchema"] for tool in format_mcp_tools(SCHEMA_DATA) if tool["name"] == "boss_agent_run"),
+	]
+	for schema in parameters:
+		resume = schema["properties"]["resume"]
+		assert resume["type"] == "boolean"
+		assert resume["default"] is False
+		assert "官方验证" in resume["description"]
+		assert "操作者明确确认" in resume["description"]
+
+
+def test_tool_formats_expose_callable_shortlist_subcommands():
+	"""导出实际可调用的子命令，不生成运行时不存在的分组工具。"""
+	oai = format_openai_tools(SCHEMA_DATA)
+	tools = {tool["function"]["name"]: tool["function"]["parameters"] for tool in oai}
+	assert "boss_shortlist" not in tools
+	assert {
+		"boss_shortlist_list", "boss_shortlist_add", "boss_shortlist_remove",
+		"boss_shortlist_annotate", "boss_shortlist_compare",
+	} <= tools.keys()
+	assert tools["boss_shortlist_add"]["required"] == ["security_id", "job_id"]
+	assert "tag" in tools["boss_shortlist_compare"]["properties"]
+	for name, schema in tools.items():
+		if name.startswith("boss_shortlist_"):
+			assert {"add", "annotate", "compare"}.isdisjoint(schema["properties"])
 
 
 def test_command_to_json_schema_required_args():
@@ -90,7 +123,7 @@ def test_command_to_json_schema_required_args():
 		],
 		"options": {},
 	}
-	schema = _command_to_json_schema("test", cmd_spec)
+	schema = command_to_json_schema("test", cmd_spec)
 	assert "query" in schema["properties"]
 	assert "opt" in schema["properties"]
 	assert schema["required"] == ["query"]
@@ -106,7 +139,7 @@ def test_command_to_json_schema_type_mapping():
 			"--name": {"type": "string", "default": None, "description": "名称"},
 		},
 	}
-	schema = _command_to_json_schema("test", cmd_spec)
+	schema = command_to_json_schema("test", cmd_spec)
 	assert schema["properties"]["days"]["type"] == "integer"
 	assert schema["properties"]["days"]["default"] == 30
 	assert schema["properties"]["dry_run"]["type"] == "boolean"
@@ -115,7 +148,7 @@ def test_command_to_json_schema_type_mapping():
 
 def test_command_name_dash_to_underscore():
 	"""带横线的命令名（如 batch-greet）应转成下划线。"""
-	oai = _format_openai_tools(SCHEMA_DATA)
+	oai = format_openai_tools(SCHEMA_DATA)
 	names = {t["function"]["name"] for t in oai}
 	assert "boss_batch_greet" in names
 	assert "boss_follow_up" in names
@@ -138,7 +171,7 @@ def test_invalid_format_raises():
 
 def test_openai_tools_output_ready_for_openai_sdk():
 	"""OpenAI Tools 输出应能直接传给 openai SDK 的 tools 参数（结构校验）。"""
-	oai = _format_openai_tools(SCHEMA_DATA)
+	oai = format_openai_tools(SCHEMA_DATA)
 	for tool in oai:
 		# 必需字段：type, function.name, function.description, function.parameters
 		assert set(tool.keys()) == {"type", "function"}

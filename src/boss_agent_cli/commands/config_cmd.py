@@ -8,13 +8,16 @@ from typing import Any
 
 import click
 
-from boss_agent_cli.config import DEFAULTS
+from boss_agent_cli.api.browser_source import POLICIES as BROWSER_SOURCES
+from boss_agent_cli.config import DEFAULTS, validate_request_config
 from boss_agent_cli.display import handle_output, render_simple_list
+from boss_agent_cli.platforms import list_platforms
 
-_PUBLIC_CONFIG_KEYS = tuple(
-	key for key in DEFAULTS
-	if key != "low_risk_mode"
-)
+_CONFIG_CHOICES = {
+	"operating_mode": ("assisted", "research"),
+	"browser_source": tuple(BROWSER_SOURCES),
+}
+_PUBLIC_CONFIG_KEYS = tuple(key for key in DEFAULTS if key != "low_risk_mode")
 _AVAILABLE_CONFIG_MESSAGE = f"可用项: {', '.join(sorted(_PUBLIC_CONFIG_KEYS))}"
 
 
@@ -38,12 +41,14 @@ def config_list_cmd(ctx: click.Context) -> None:
 		default_val = DEFAULTS[key]
 		current_val = cfg.get(key, default_val)
 		is_custom = key in _load_user_overrides(config_path)
-		items.append({
-			"key": key,
-			"value": current_val,
-			"default": default_val,
-			"source": "用户配置" if is_custom else "默认值",
-		})
+		items.append(
+			{
+				"key": key,
+				"value": current_val,
+				"default": default_val,
+				"source": "用户配置" if is_custom else "默认值",
+			}
+		)
 
 	data = {"config_path": str(config_path), "items": items}
 	hints = {
@@ -78,6 +83,7 @@ def config_get_cmd(ctx: click.Context, key: str) -> None:
 	cfg = ctx.obj["config"]
 	if key not in _PUBLIC_CONFIG_KEYS:
 		from boss_agent_cli.output import emit_error
+
 		emit_error(
 			"config",
 			code="INVALID_PARAM",
@@ -102,6 +108,7 @@ def config_set_cmd(ctx: click.Context, key: str, value: str) -> None:
 	"""修改配置项。"""
 	if key not in _PUBLIC_CONFIG_KEYS:
 		from boss_agent_cli.output import emit_error
+
 		emit_error(
 			"config",
 			code="INVALID_PARAM",
@@ -113,8 +120,31 @@ def config_set_cmd(ctx: click.Context, key: str, value: str) -> None:
 	config_path = ctx.obj["data_dir"] / "config.json"
 	user_cfg = _load_user_overrides(config_path)
 
-	parsed_value = _parse_value(value, DEFAULTS[key])
+	try:
+		parsed_value = _parse_value(value, DEFAULTS[key])
+		if key.startswith("request_") or key == "batch_greet_delay":
+			# Validate the edited field without preventing repairs of other bad fields.
+			validate_request_config({**DEFAULTS, key: parsed_value})
+	except (TypeError, ValueError) as exc:
+		from boss_agent_cli.output import emit_error
+
+		emit_error("config", code="INVALID_PARAM", message=str(exc))
+		ctx.exit(1)
+		return
+	choices = list_platforms() if key == "platform" else _CONFIG_CHOICES.get(key)
+	if choices is not None and parsed_value not in choices:
+		from boss_agent_cli.output import emit_error
+
+		emit_error(
+			"config",
+			code="INVALID_PARAM",
+			message=f"{key} 必须是以下值之一: {', '.join(choices)}",
+		)
+		ctx.exit(1)
+		return
 	user_cfg[key] = parsed_value
+	if key == "operating_mode":
+		user_cfg.pop("low_risk_mode", None)
 	_save_user_overrides(config_path, user_cfg)
 
 	data = {"key": key, "value": parsed_value, "previous": ctx.obj["config"].get(key)}
@@ -128,6 +158,7 @@ def config_reset_cmd(ctx: click.Context, key: str) -> None:
 	"""将配置项恢复为默认值。"""
 	if key not in _PUBLIC_CONFIG_KEYS:
 		from boss_agent_cli.output import emit_error
+
 		emit_error(
 			"config",
 			code="INVALID_PARAM",
@@ -149,7 +180,7 @@ def _load_user_overrides(config_path: Path) -> dict[str, Any]:
 	"""加载用户自定义配置（不含默认值）。"""
 	if config_path.exists():
 		try:
-			with open(config_path) as f:
+			with open(config_path, encoding="utf-8") as f:
 				result: dict[str, Any] = json.load(f)
 				return result
 		except (json.JSONDecodeError, OSError):

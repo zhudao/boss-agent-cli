@@ -6,13 +6,17 @@ Pipe mode (Agent): JSON envelope to stdout.
 """
 
 import sys
+import threading
+from collections.abc import Sequence
 from typing import Any, Callable
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
 from boss_agent_cli.output import emit_success
+from boss_agent_cli.schema.error_codes import ERROR_CODES
 
 # Rich output goes to stderr so stdout stays clean for Agent JSON
 console = Console(stderr=True)
@@ -23,7 +27,7 @@ def boss_command_for_ctx(ctx: Any, command: str) -> str:
 	platform_name = "zhipin"
 	if ctx and getattr(ctx, "obj", None):
 		platform_name = ctx.obj.get("platform") or "zhipin"
-	prefix = "boss --platform zhilian" if platform_name == "zhilian" else "boss"
+	prefix = "boss" if platform_name == "zhipin" else f"boss --platform {platform_name}"
 	return f"{prefix} {command}".strip()
 
 
@@ -39,80 +43,132 @@ def error_contract_for_code(
 	fallback_recovery_action: str | None = None,
 ) -> tuple[bool, str | None]:
 	"""Return recoverability metadata for a known error code."""
-	from boss_agent_cli.commands.schema import SCHEMA_DATA
-
-	error_codes = SCHEMA_DATA.get("error_codes", {})
-	spec = error_codes.get(code, {}) if isinstance(error_codes, dict) else {}
-	if not isinstance(spec, dict):
-		spec = {}
+	spec = ERROR_CODES.get(code, {})
 	return (
 		bool(spec.get("recoverable", fallback_recoverable)),
 		spec.get("recovery_action", fallback_recovery_action),
 	)
 
 
-def is_json_mode(ctx) -> bool:
+def is_json_mode(ctx: Any) -> bool:
 	"""Check if --json flag is set or stdout is piped (non-TTY)."""
 	force_json = ctx.obj.get("json_output", False) if ctx and ctx.obj else False
 	return force_json or not sys.stdout.isatty()
 
 
+def render_operator_actions(hints: dict[str, Any] | None) -> None:
+	"""把「人该做什么」渲染到 stderr。
+
+	只渲染 hints.operator_actions（面向真人操作者的自然语言指引）。
+	hints.next_actions 是面向 Agent 的命令通道，TTY 下刻意不渲染——避免给
+	每条命令的输出加噪音。无 operator_actions 时零输出，因此对既有命令的
+	TTY 行为没有影响。
+	"""
+	if not hints:
+		return
+	actions = hints.get("operator_actions")
+	if not actions or not isinstance(actions, (list, tuple)):
+		return
+	console.print()
+	for index, action in enumerate(actions):
+		prefix = "↓ 你需要：" if index == 0 else "　　　　　"
+		console.print(f"[yellow]{prefix}[/yellow]{action}")
+
+
 def handle_output(
-	ctx,
+	ctx: Any,
 	command: str,
 	data: Any,
 	*,
 	render: Callable[[Any], None] | None = None,
-	pagination: dict | None = None,
-	hints: dict | None = None,
+	pagination: dict[str, Any] | None = None,
+	hints: dict[str, Any] | None = None,
 ) -> None:
 	"""Smart output: TTY -> rich render, pipe -> JSON envelope."""
 	if is_json_mode(ctx):
 		emit_success(command, data, pagination=pagination, hints=hints)
 	elif render:
 		render(data)
+		render_operator_actions(hints)
 	else:
 		# Fallback: no render function, emit JSON even in TTY
 		emit_success(command, data, pagination=pagination, hints=hints)
 
 
 def handle_error_output(
-	ctx,
+	ctx: Any,
 	command: str,
 	*,
 	code: str,
 	message: str,
 	recoverable: bool = False,
 	recovery_action: str | None = None,
-	hints: dict | None = None,
+	details: dict[str, Any] | None = None,
+	hints: dict[str, Any] | None = None,
 ) -> None:
 	"""Smart error output: TTY -> rich error, pipe -> JSON error envelope."""
 	from boss_agent_cli.output import emit_error
 
 	if is_json_mode(ctx):
 		emit_error(
-			command, code=code, message=message,
-			recoverable=recoverable, recovery_action=recovery_action,
+			command,
+			code=code,
+			message=message,
+			recoverable=recoverable,
+			recovery_action=recovery_action,
+			details=details,
 			hints=hints,
 		)
 	else:
 		console.print(f"[red]error[/red] [{code}] {message}")
 		if recovery_action:
 			console.print(f"  [dim]recovery: {recovery_action}[/dim]")
+		render_operator_actions(hints)
 		raise SystemExit(1)
 
 
+def handle_not_supported(ctx: Any, command: str, exc: Exception, *, fallback_message: str) -> None:
+	"""命令因平台不支持而抛 NotImplementedError 时的统一错误信封。"""
+	_, recovery_action = error_contract_for_code("NOT_SUPPORTED")
+	handle_error_output(
+		ctx,
+		command,
+		code="NOT_SUPPORTED",
+		message=str(exc) or fallback_message,
+		recoverable=True,
+		recovery_action=recovery_action,
+	)
+
+
 def handle_platform_error_output(
-	ctx,
+	ctx: Any,
 	command: str,
 	platform: Any,
 	response: Any,
 	*,
 	fallback_message: str,
+	unknown_error_code: str | None = None,
 ) -> None:
 	"""Emit a schema-backed error envelope for an unsuccessful platform response."""
 	code, message = platform.parse_error(response)
+	if code == "UNKNOWN" and unknown_error_code is not None:
+		code = unknown_error_code
 	recoverable, recovery_action = error_contract_for_code(code)
+	hints = None
+	if code in RISK_ERROR_CONTRACTS:
+		recovery_action, hints = risk_error_contract(code)
+	details = None
+	if isinstance(response, dict):
+		error = response.get("error")
+		if isinstance(error, dict):
+			raw_details = error.get("details")
+			if isinstance(raw_details, dict):
+				details = raw_details
+		cli_details = response.get("__cli_error_details__")
+		if details is None and isinstance(cli_details, dict) and cli_details:
+			details = cli_details
+		if code in RISK_ERROR_CONTRACTS and response.get("code") in (31, "31", 32, "32", 35, "35", 36, "36", 37, "37"):
+			details = {**(details or {}), "platform_code": response.get("__cli_platform_code__", int(response["code"]))}
 	handle_error_output(
 		ctx,
 		command,
@@ -120,6 +176,8 @@ def handle_platform_error_output(
 		message=message or fallback_message,
 		recoverable=recoverable,
 		recovery_action=recovery_action,
+		details=details,
+		hints=hints,
 	)
 
 
@@ -127,7 +185,7 @@ def handle_platform_error_output(
 
 
 def render_job_table(
-	items: list[dict],
+	items: list[dict[str, Any]],
 	title: str,
 	*,
 	page: int = 1,
@@ -143,6 +201,7 @@ def render_job_table(
 	table.add_column("title", style="bold cyan", max_width=30)
 	table.add_column("company", style="green", max_width=20)
 	table.add_column("salary", style="yellow", max_width=12)
+	table.add_column("type", max_width=8)
 	table.add_column("exp", max_width=10)
 	table.add_column("edu", max_width=8)
 	table.add_column("city", style="blue", max_width=12)
@@ -153,6 +212,7 @@ def render_job_table(
 			job.get("title", job.get("jobName", "-")),
 			job.get("company", job.get("brandName", "-")),
 			job.get("salary", job.get("salaryDesc", "-")),
+			job.get("employment_type") or "-",
 			job.get("experience", job.get("jobExperience", "-")),
 			job.get("education", job.get("jobDegree", "-")),
 			job.get("city", job.get("cityName", "-")),
@@ -164,7 +224,7 @@ def render_job_table(
 		console.print(f"  [dim]{hint_next}[/dim]")
 
 
-def render_job_detail(data: dict, *, greet_command: str | None = None) -> None:
+def render_job_detail(data: dict[str, Any], *, greet_command: str | None = None) -> None:
 	"""Render job detail as a rich panel."""
 	title = data.get("title", "-")
 	salary = data.get("salary", "-")
@@ -200,21 +260,29 @@ def render_job_detail(data: dict, *, greet_command: str | None = None) -> None:
 	sid = data.get("security_id", "")
 	jid = data.get("job_id", "")
 	if sid and jid:
-		greet_command = greet_command or "回到平台官网由用户手动投递或沟通"
+		greet_command = greet_command or "boss greet <security_id> <job_id>"
 		console.print(f"  [dim]next: {greet_command}[/dim]")
 
 
-def render_status(data: dict, *, login_action: str = "boss login") -> None:
+def render_status(data: dict[str, Any], *, login_action: str = "boss login") -> None:
 	"""Render login status."""
 	if data.get("logged_in"):
 		name = data.get("user_name", "unknown")
 		console.print(f"[green]logged in[/green] as [bold]{name}[/bold]")
 	else:
 		console.print(f"[yellow]not logged in[/yellow] - run: {login_action}")
+	lock = data.get("cdp_risk_lock")
+	if isinstance(lock, dict) and lock.get("locked"):
+		since = lock.get("locked_at") or "unknown"
+		reason = lock.get("reason") or "ENVIRONMENT_RISK"
+		console.print(
+			f"[yellow]BOSS 本地风控锁定中[/yellow]（{since} 起，{reason}）：确认官方目标业务页已恢复后，"
+			"由用户执行 boss clean --risk-lock 再显式恢复任务；令牌变化不会自动解锁"
+		)
 
 
 def render_simple_list(
-	items: list[dict],
+	items: list[dict[str, Any]],
 	title: str,
 	columns: list[tuple[str, str, str]],
 ) -> None:
@@ -243,7 +311,7 @@ def render_simple_list(
 # ── Additional renderers ────────────────────────────────────────────
 
 
-def render_message_panel(data: dict, *, title: str = "result") -> None:
+def render_message_panel(data: dict[str, Any], *, title: str = "result") -> None:
 	"""Render a simple key-value result as a panel."""
 	lines = []
 	for k, v in data.items():
@@ -252,7 +320,7 @@ def render_message_panel(data: dict, *, title: str = "result") -> None:
 	console.print(panel)
 
 
-def render_batch_operation_summary(data: dict, *, title: str = "batch result") -> None:
+def render_batch_operation_summary(data: dict[str, Any], *, title: str = "batch result") -> None:
 	"""Render batch operation summary (greeted/failed counts + items)."""
 	greeted = data.get("greeted", [])
 	failed = data.get("failed", [])
@@ -277,7 +345,7 @@ def render_batch_operation_summary(data: dict, *, title: str = "batch result") -
 		console.print(f"  [yellow]stopped: {data['stopped_reason']}[/yellow]")
 
 
-def render_sectioned_record(data: dict, *, title: str = "info") -> None:
+def render_sectioned_record(data: dict[str, Any], *, title: str = "info") -> None:
 	"""Render multi-section record (e.g., me command) as panels."""
 	for section, content in data.items():
 		if isinstance(content, dict):
@@ -303,7 +371,7 @@ def render_string_grid(items: list[str], title: str, *, columns: int = 4) -> Non
 		table.add_column(max_width=20)
 
 	for i in range(0, len(items), columns):
-		row = items[i:i + columns]
+		row = items[i : i + columns]
 		while len(row) < columns:
 			row.append("")
 		table.add_row(*row)
@@ -311,7 +379,7 @@ def render_string_grid(items: list[str], title: str, *, columns: int = 4) -> Non
 	console.print(table)
 
 
-def render_export_summary(data: dict) -> None:
+def render_export_summary(data: dict[str, Any]) -> None:
 	"""Render export result summary."""
 	path = data.get("path", "")
 	count = data.get("count", 0)
@@ -322,7 +390,211 @@ def render_export_summary(data: dict) -> None:
 		console.print(f"[green]exported[/green] {count} jobs ({fmt})")
 
 
+def render_next_steps(actions: "Sequence[str] | None") -> None:
+	"""把「下一步可以敲什么」渲染给真人。
+
+	与 ``render_operator_actions`` 的分工：后者渲染 ``hints.operator_actions``
+	（需要离开终端才能完成的动作，如扫码），由 ``handle_output`` 自动调用；
+	本函数由各命令自己的 renderer 主动调用，把该命令的后继命令提示出来。
+
+	这样既满足「空数据态要给可执行下一步」，又不改变 hints 双通道语义
+	——``next_actions`` 仍然只是 Agent 通道，不会被自动渲染到 TTY。
+	"""
+	if not actions:
+		return
+	console.print("\n  [bold]下一步：[/bold]")
+	for action in actions:
+		console.print(f"    [dim]{action}[/dim]")
+
+
+def render_action_result(
+	data: dict[str, Any],
+	*,
+	title: str,
+	next_steps: "Sequence[str] | None" = None,
+) -> None:
+	"""动作类命令（add / remove / init / export ...）的统一确认渲染。
+
+	替代直接回显 JSON：结果字段走面板，后继命令走 next_steps。
+	"""
+	render_message_panel(data, title=title)
+	render_next_steps(next_steps)
+
+
+def render_list_result(
+	items: list[dict[str, Any]],
+	title: str,
+	columns: list[tuple[str, str, str]],
+	*,
+	next_steps: "Sequence[str] | None" = None,
+) -> None:
+	"""列表类命令的统一渲染：表格 + 下一步；空列表也会给出下一步（AC4）。"""
+	render_simple_list(items, title, columns)
+	render_next_steps(next_steps)
+
+
+def render_record_result(
+	data: dict[str, Any],
+	*,
+	title: str,
+	next_steps: "Sequence[str] | None" = None,
+) -> None:
+	"""多段记录类命令（resume show / export）的统一渲染：分段面板 + 下一步。"""
+	render_sectioned_record(data, title=title)
+	render_next_steps(next_steps)
+
+
+def _ai_value_lines(value: Any) -> list[str]:
+	"""把单个 AI 返回值摊成可打印的行；全部转义，不截断。"""
+	if isinstance(value, list):
+		lines = []
+		for item in value:
+			if isinstance(item, dict):
+				inline = "  ".join(f"{k}={v}" for k, v in item.items())
+				lines.append(f"  · {escape(str(inline))}")
+			else:
+				lines.append(f"  · {escape(str(item))}")
+		return lines
+	if isinstance(value, dict):
+		return [f"  [bold]{escape(str(k))}:[/bold] {escape(str(v))}" for k, v in value.items()]
+	return [f"  {escape(str(value))}"]
+
+
+def render_ai_result(
+	data: dict[str, Any],
+	*,
+	title: str,
+	next_steps: "Sequence[str] | None" = None,
+) -> None:
+	"""AI 命令结果的渲染：键名作小标题，长文本整段展示。
+
+	AI 返回结构由 prompt 决定、跨命令不一致，因此不假设任何具体键名，
+	只按值类型决定呈现方式。所有值经 ``escape`` 处理——AI 输出里的方括号
+	不能被当成 Rich 标记解析。
+	"""
+	body: list[str] = []
+	for key, value in data.items():
+		body.append(f"[bold cyan]{escape(str(key))}[/bold cyan]")
+		body.extend(_ai_value_lines(value))
+		body.append("")
+	console.print(Panel("\n".join(body).rstrip() or "[dim]empty[/dim]", title=title, border_style="magenta"))
+	render_next_steps(next_steps)
+
+
+class SearchProgress:
+	"""``search`` 长任务的 TTY 进度（鸭子类型兼容 ``output.Logger``）。
+
+	只在 TTY 下注入；管道 / ``--json`` 路径仍传原 Logger，行为与改造前完全一致。
+
+	为什么走 logger 注入而不是降低全局日志级别：``output.Logger`` 用裸
+	``print(file=sys.stderr)``，与 Rich 抢同一个流；而详情补抓跑在
+	``ThreadPoolExecutor`` 里，无锁裸 print 会交错。这里统一走 Rich Console
+	（内部有锁）并自带计数锁。
+
+	消息分类依赖 ``search_filters`` 的进度文案标记，该耦合由
+	``test_search_pipeline_progress_markers_contract`` 锁定。
+	"""
+
+	_PAGE_PREFIX = "正在搜索第"
+	_MATCH_MARK = "✅"
+	_EXCLUDE_MARKS = ("❌", "预筛排除")
+
+	def __init__(self, title: str, *, max_pages: int = 1) -> None:
+		self._title = title
+		self._max_pages = max(1, max_pages)
+		self._lock = threading.Lock()
+		self.pages = 0
+		self.matched = 0
+		self.excluded = 0
+
+	# ── Logger 接口 ────────────────────────────────────────
+
+	def info(self, message: str) -> None:
+		text = message.strip()
+		if text.startswith(self._PAGE_PREFIX):
+			with self._lock:
+				self.pages += 1
+			return
+		if text.startswith(self._MATCH_MARK):
+			with self._lock:
+				self.matched += 1
+			console.print(f"  [green]✓[/green] {escape(text.lstrip(self._MATCH_MARK).strip())}")
+			return
+		if any(text.startswith(mark) for mark in self._EXCLUDE_MARKS):
+			# 逐条排除只计数不打印——刷屏会把真正有用的匹配结果冲掉
+			with self._lock:
+				self.excluded += 1
+			return
+
+	def debug(self, message: str) -> None:
+		"""调试细节不进 TTY 进度。"""
+
+	def warning(self, message: str) -> None:
+		console.print(f"  [yellow]{escape(message.strip())}[/yellow]")
+
+	def error(self, message: str) -> None:
+		console.print(f"  [red]{escape(message.strip())}[/red]")
+
+	# ── 状态行 ─────────────────────────────────────────────
+
+	def status_text(self) -> str:
+		with self._lock:
+			parts = [f"第 {self.pages}/{self._max_pages} 页" if self.pages else "准备中"]
+			parts.append(f"匹配 {self.matched}")
+			if self.excluded:
+				parts.append(f"排除 {self.excluded}")
+		return " · ".join(parts)
+
+	def start(self) -> None:
+		console.print(f"[bold]{escape(self._title)}[/bold]")
+
+	def finish(self) -> None:
+		console.print(f"  [dim]{escape(self.status_text())}[/dim]")
+
+	def waiting(self, seconds: float) -> None:
+		"""节流等待前的一次性提示（取整秒，不做倒计时刷屏）。"""
+		console.print(f"  [dim]节流等待 {seconds:.0f}s…[/dim]")
+
+
 # ── Auth error decorator ─────────────────────────────────────────────
+
+
+#: 风控类错误码的信封契约：recovery_action 与 hints 的唯一真源。
+#: ``handle_auth_errors`` 的单次命令路径与 batch-greet 等执行器的停批信封共用同一份，
+#: 保证同一个码在两条路径上给 Agent 的恢复指引逐字一致（Issue #419）。
+RISK_ERROR_CONTRACTS: dict[str, dict[str, Any]] = {
+	"ACCOUNT_RISK": {
+		"recovery_action": ERROR_CODES["ACCOUNT_RISK"]["recovery_action"],
+		"next_actions": [
+			"不要通过 CDP、patchright 或其他通道重试该操作",
+			"锁未解除时只使用本地辅助和离线状态命令；官方目标业务页恢复后由用户显式清除本地锁",
+		],
+	},
+	"ENVIRONMENT_RISK": {
+		"recovery_action": ERROR_CODES["ENVIRONMENT_RISK"]["recovery_action"],
+		"next_actions": [
+			"不要刷新 Token、重新登录或自动重试该请求",
+			"由用户在原会话确认官方目标业务页恢复后，显式清除本地锁并恢复任务",
+		],
+	},
+	"ENVIRONMENT_RISK_LOCKED": {
+		"recovery_action": ERROR_CODES["ENVIRONMENT_RISK_LOCKED"]["recovery_action"],
+		"next_actions": [
+			"不要刷新 Token、重新登录或换通道重试；本次请求未发出",
+			"由用户在原会话确认官方目标业务页恢复后，执行 boss clean --risk-lock 并显式恢复任务；令牌变化不放行",
+			"boss doctor — 查看本地风控锁状态",
+		],
+	},
+}
+
+
+def risk_error_contract(code: str) -> tuple[str, dict[str, list[str]]]:
+	"""Return ``(recovery_action, hints)`` for a platform risk error code."""
+	spec = RISK_ERROR_CONTRACTS.get(code)
+	if spec is None:
+		_, recovery = error_contract_for_code(code, fallback_recovery_action="停止自动化访问")
+		return recovery or "停止自动化访问", {}
+	return str(spec["recovery_action"]), {"next_actions": list(spec["next_actions"])}
 
 
 def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -338,52 +610,150 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 	def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
 		@wraps(func)
 		def wrapper(ctx: Any, *args: Any, **kwargs: Any) -> Any:
-			from boss_agent_cli.api.browser_client import RecruiterChatTabRequired
-			from boss_agent_cli.api.client import AccountRiskError
+			from boss_agent_cli.api.browser_client import BrowserNavigationError, RecruiterChatTabRequired
+			from boss_agent_cli.api._base_client import BrowserChannelRequired
+			from boss_agent_cli.api.browser_source import BrowserSourceUnavailable, BrowserSourceUnsupported
+			from boss_agent_cli.api.client import PlatformRiskError
+			from boss_agent_cli.api.request_budget import RequestBudgetExceeded
 			from boss_agent_cli.auth.manager import AuthRequired, TokenRefreshFailed
+
 			try:
 				return func(ctx, *args, **kwargs)
+			except BrowserSourceUnsupported as e:
+				# recoverable / recovery_action 以真源契约为准，不覆盖；
+				# 针对浏览器来源的具体建议走 hints.operator_actions。
+				recoverable, not_supported_recovery = error_contract_for_code("NOT_SUPPORTED")
+				handle_error_output(
+					ctx,
+					command_name,
+					code="NOT_SUPPORTED",
+					message=str(e),
+					recoverable=recoverable,
+					recovery_action=not_supported_recovery,
+					hints={
+						"operator_actions": [
+							"该平台没有浏览器通道，改用默认 --browser-source auto 或切换到 zhipin",
+						]
+					},
+				)
+			except BrowserSourceUnavailable as e:
+				hints: dict[str, list[str]] = {}
+				if e.policy.operator_actions:
+					hints["operator_actions"] = list(e.policy.operator_actions)
+				if e.policy.next_actions:
+					hints["next_actions"] = list(e.policy.next_actions)
+				handle_error_output(
+					ctx,
+					command_name,
+					code=e.code,
+					message=str(e),
+					recoverable=True,
+					recovery_action=e.policy.recovery_action,
+					hints=hints or None,
+				)
+			except BrowserChannelRequired as e:
+				recoverable, not_supported_recovery = error_contract_for_code("NOT_SUPPORTED")
+				handle_error_output(
+					ctx,
+					command_name,
+					code="NOT_SUPPORTED",
+					message=str(e),
+					recoverable=recoverable,
+					recovery_action=not_supported_recovery,
+					hints={
+						"operator_actions": [
+							"CDP 模式下所有平台请求只走浏览器通道；该操作暂无浏览器实现，请在 BOSS 直聘官方页面手动完成",
+						]
+					},
+				)
 			except RecruiterChatTabRequired as e:
 				handle_error_output(
-					ctx, command_name, code="RECRUITER_CHAT_TAB_REQUIRED",
+					ctx,
+					command_name,
+					code="RECRUITER_CHAT_TAB_REQUIRED",
 					message=str(e),
 					recoverable=True,
 					recovery_action="回到 BOSS 直聘官方招聘者页面手动处理",
-					hints={"next_actions": [
-						"在 BOSS 直聘官方页面确认候选人和沟通上下文",
-						"保持 CLI 默认低风险模式，不通过自动化链路发送消息或请求简历",
-					]},
+					hints={
+						"next_actions": [
+							"在 BOSS 直聘官方页面确认候选人和沟通上下文",
+							"保持 CLI 默认低风险模式，不通过自动化链路发送消息或请求简历",
+						]
+					},
 				)
 			except AuthRequired:
 				login_action = login_action_for_ctx(ctx)
 				handle_error_output(
-					ctx, command_name, code="AUTH_REQUIRED",
+					ctx,
+					command_name,
+					code="AUTH_REQUIRED",
 					message=f"未登录，请先执行 {login_action}",
-					recoverable=True, recovery_action=login_action,
+					recoverable=True,
+					recovery_action=login_action,
 				)
 			except TokenRefreshFailed:
 				login_action = login_action_for_ctx(ctx)
 				handle_error_output(
-					ctx, command_name, code="TOKEN_REFRESH_FAILED",
+					ctx,
+					command_name,
+					code="TOKEN_REFRESH_FAILED",
 					message="Token 刷新失败，请重新登录",
-					recoverable=True, recovery_action=login_action,
+					recoverable=True,
+					recovery_action=login_action,
 				)
-			except AccountRiskError as e:
+			except PlatformRiskError as e:
+				recovery_action, hints = risk_error_contract(e.code)
 				handle_error_output(
-					ctx, command_name, code="ACCOUNT_RISK",
+					ctx,
+					command_name,
+					code=e.code,
 					message=str(e),
 					recoverable=False,
-					recovery_action="停止自动化访问；回到 BOSS 直聘官方页面手动处理，必要时联系 BOSS 直聘客服",
-					hints={"next_actions": [
-						"不要通过 CDP、patchright 或 Bridge 重试该操作",
-						"只保留本地辅助和用户主动触发的只读命令",
-					]},
+					recovery_action=recovery_action,
+					details=e.details or None,
+					hints=hints or None,
+				)
+			except RequestBudgetExceeded as e:
+				budget_recoverable, budget_recovery = error_contract_for_code(e.code)
+				handle_error_output(
+					ctx,
+					command_name,
+					code=e.code,
+					message=str(e),
+					recoverable=budget_recoverable,
+					recovery_action=budget_recovery,
+					details=e.details,
+					hints={"operator_actions": ["等待冷却并检查并发任务；确认后显式恢复，不自动清理风险锁"]},
+				)
+			except BrowserNavigationError as e:
+				nav_recoverable, nav_recovery = error_contract_for_code(e.code)
+				handle_error_output(
+					ctx,
+					command_name,
+					code=e.code,
+					message=str(e),
+					recoverable=nav_recoverable,
+					recovery_action=nav_recovery,
+					details=e.details(),
+					hints={
+						"next_actions": ["boss doctor", "boss login"],
+						"operator_actions": [
+							"浏览器通道会先打开 https://www.zhipin.com/ 再请求接口；--url 只解析筛选条件，不会改走搜索页",
+							"首页在自动化下偶发加载卡住，CLI 已跳到空白页并重试。仍失败时，用带调试端口的 Chrome 打开官网并确认首页能加载，再执行 boss --cdp-url http://127.0.0.1:9222 <命令>",
+							"若 boss status 显示登录态 degraded 或 stoken 很久未更新，先执行 boss login",
+						],
+					},
 				)
 			except Exception as e:
 				handle_error_output(
-					ctx, command_name, code="NETWORK_ERROR",
+					ctx,
+					command_name,
+					code="NETWORK_ERROR",
 					message=f"{command_name} 失败: {e}",
-					recoverable=True, recovery_action="重试",
+					recoverable=True,
+					recovery_action="重试",
 				)
+
 		return wrapper
+
 	return decorator
