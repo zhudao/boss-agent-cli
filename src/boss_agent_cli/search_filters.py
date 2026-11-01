@@ -14,10 +14,19 @@ from urllib.parse import parse_qs, urlparse
 from boss_agent_cli.api import endpoints
 from boss_agent_cli.api.client import PlatformRiskError
 from boss_agent_cli.api.request_budget import RequestBudgetExceeded, is_request_stop, request_control, request_controls_active
-from boss_agent_cli.api.models import BOSS_INTERNSHIP_RESPONSE_JOB_TYPE, JobItem, is_boss_online
+from boss_agent_cli.api.models import BOSS_INTERNSHIP_RESPONSE_JOB_TYPE, JobItem, field_list, is_boss_online
 from boss_agent_cli.services.job_identity import deduplicate_job_result
 
 # ── Ordinal lookups for threshold comparisons ───────────────────────
+
+# 城市码表里的「全国」是平台的不限城市码，不是具体城市
+NATIONWIDE_CITY = "全国"
+
+
+def city_constraint(city: str | None) -> str | None:
+	"""本地比较用的城市条件；全国视为没有城市条件。"""
+	return None if city == NATIONWIDE_CITY else city
+
 
 _EXPERIENCE_ORDER: dict[str, int] = {
 	"应届": 0,
@@ -484,10 +493,11 @@ def prefilter_job(
 	reasons: list[str] = []
 
 	# City filter
-	if criteria.city:
+	city = city_constraint(criteria.city)
+	if city:
 		item_city = raw_item.get("cityName", "")
-		if item_city and criteria.city not in item_city:
-			reasons.append(f"城市不匹配: {item_city} != {criteria.city}")
+		if item_city and city not in item_city:
+			reasons.append(f"城市不匹配: {item_city} != {city}")
 
 	# Salary filter — reject only if candidate max is below required min
 	if criteria.salary:
@@ -583,7 +593,8 @@ def compute_match_score(item: dict[str, Any], welfare_results: list[str], criter
 		elif result.endswith("(描述)"):
 			score += 8
 
-	if criteria.city and criteria.city in str(item.get("city", "")):
+	city = city_constraint(criteria.city)
+	if city and city in str(item.get("city", "")):
 		score += 12
 
 	if criteria.salary:
@@ -666,7 +677,7 @@ def _fetch_and_check(
 	need_active=True 时总是取一次新详情（描述缓存只省福利那部分）。
 	list_welfare 是列表标签已经命中的福利结果，此时只需要补活跃度。
 	"""
-	welfare_list = raw_item.get("welfareList", [])
+	welfare_list = field_list(raw_item, "welfareList")
 	outcome = _DetailOutcome()
 	desc = ""
 	card_active = ""
@@ -1020,7 +1031,7 @@ def run_search_pipeline(
 					details = error["details"]
 			raise SearchPipelinePlatformError(code, message or "搜索结果获取失败", details=details)
 		platform_data = _unwrap_platform_data(client, raw)
-		job_list = platform_data.get("jobList", [])
+		job_list = field_list(platform_data, "jobList")
 		last_page_scanned = current_page
 		stats.pages_scanned += 1
 		stats.jobs_seen += len(job_list)
@@ -1062,7 +1073,7 @@ def run_search_pipeline(
 					need_active = decision == "detail"
 				match_results: list[str] = []
 				if welfare_conditions:
-					match_results = match_all_welfare(welfare_conditions, raw_item.get("welfareList", []), "")
+					match_results = match_all_welfare(welfare_conditions, field_list(raw_item, "welfareList"), "")
 				if need_active or (welfare_conditions and not match_results):
 					need_detail.append(_DetailTask(
 						raw_item,

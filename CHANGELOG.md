@@ -5,7 +5,12 @@
 ## [Unreleased]
 
 ### Added
+- `--city` 新增「全国」（平台的不限城市码 `100010000`）和嘉兴、徐州、香港，共 44 个城市。「全国」的码在 jackwener/boss-cli 与 ThisZhouS/jobwork 中一致，后者在真实搜索请求里用过；另外三个取自 jackwener/boss-cli，其城市表与本项目共有的 38 项完全一致。本地预筛与匹配评分把「全国」当作没有城市条件：此前就算平台支持，本地预筛也会因为职位城市名不含「全国」而把结果全部排除，评分里也会给每个职位记一条「城市不匹配」。
 - `boss login --cookie-source <浏览器>` 没提取到时，stderr 会说明是读取失败（附异常类型与原因）还是该浏览器没有登录 Cookie。拿不到解密密钥时按平台说明原因（macOS 钥匙串未授权、Windows 上新版 Chrome / Edge 的 App-Bound 加密、Linux 密钥环未解锁），并提示改用 `--cdp` 或 `--curl-file`。自动探测全部落空时，只汇总无法解密的浏览器。参考 jackwener/boss-cli 的提取诊断及其 #9、#15。
+
+### Changed
+- 命令兜底不再把 `TypeError` / `AttributeError` / `KeyError` / `IndexError` 报成 `NETWORK_ERROR`（`recoverable: true`、建议「重试」）。这类错误来自 CLI 缺陷或平台返回了未预期的数据结构，同样的输入必然得到同样的结果；重试的若是平台请求，还会白白消耗请求预算。现在归为新错误码 `INTERNAL_ERROR`（不可恢复，`error.message` 带异常类型），`--exit-codes sysexits` 下退出码为 70（EX_SOFTWARE）。命令装饰器、wizard 运行器与 `me` 的兜底都已区分；其他异常仍为 `NETWORK_ERROR`，行为不变。
+- Agent 集成文档（`docs/agent-quickstart.md`、Claude Code、Codex、Cursor、Windsurf、Shell Agent）默认改为只读流程：搜岗、看详情、整理本地候选池、导出与基于已确认事实写草稿。`boss apply` / `boss greet` / `boss batch-greet` 等平台写操作，只在用户当前对话点名具体岗位、并在操作前再次确认时执行一次；不建外发队列、不无人值守批量、不复用同一话术、不重试结果不明的写操作；遇到风控、验证页或限流时保存 checkpoint 并停止。`tests/test_agent_host_examples.py` 断言各宿主文档都写明这条边界。(#480)
 
 ### Fixed
 - `--experience` 的经验码整体错位一档：`1年以内` 原发 `101`（平台含义为「经验不限」），`1-3年` 原发 `103`（实为「1 年以内」），依此类推。现按 zhipin.com 搜索页 `experience=` 参数改为 `1年以内=103` … `10年以上=107`，`应届=102`，并新增 `在校生=108`、`经验不限=101`。参考 jackwener/boss-cli#6。
@@ -15,6 +20,10 @@
 - `--industry` 的行业码表大面积错误：25 个标签里只有「互联网」对得上平台，例如「人工智能」发出的 `100901` 实为「机械设备/机电/重工」，「金融」发出的 `100101` 实为「广告/公关/会展」，整百的类目码则与标签整体错开一个大类。现改为平台行业码：职位数据里 `industry` 与 `brandIndustry` 成对出现的 96 条取值，`industry=` 搜索参数接受同一套码，取自 ThisZhouS/jobwork 从真实职位列表整理并在线探测过的结果。无法对应到这套码的 14 个旧标签（金融、软件/信息服务、区块链、证券/基金、教育培训、房地产、汽车、物流/运输、广告/传媒、消费品、制造业、能源/环保、政府/非营利、农业）已移除，用到它们的预设与 watch 会返回 `INVALID_PARAM`，而不是继续静默搜出别的行业；仍可直接传数字行业码或用 `--url`。`search` / `batch-greet` 在 schema 中的 `--industry` 可选值改为直接取自码表；`batch-greet` / `preset` / `watch` 的 help 不再展开整张表。
 - 未知的筛选标签（行业、薪资、经验等）报错时附上字面最接近的可选值，例如 `未知行业类型: 汽车，相近的可选值: 汽车零部件、汽车经销商…`。
 - `boss login` 在 CDP 不可用时不再先走「QR 纯 httpx」通道。该通道只在终端打印二维码 ID，从不展示可扫描的二维码，任何一次登录都不可能经由它完成，却会先向登录服务发出 randkey / getqrcode 请求；过期提示里提到的 `boss login --qr` 选项也并不存在。纯 httpx 扫码即使走通，也拿不到页面 JS 生成的 `__zp_stoken__`（参考 jackwener/boss-cli#2、#16）。现在 CDP 不可用时直接打开浏览器扫码；`auth/qr_login.py` 随之删除，YAML 中的 QR 端点保留为声明。
+- 按文档配置 `boss ai config --provider openai --model gpt-5` 后，`boss ai` 的请求全部被拒（HTTP 400）：请求体固定带 `max_tokens` 和 `temperature: 0.7`，而 OpenAI 推理模型（o 系列、gpt-5 及之后）要求 `max_completion_tokens`，temperature 只接受默认值。现在按模型名切换：这些模型改发 `max_completion_tokens`、不发 `temperature`；Kimi K2.5 及之后的型号（temperature 由平台固定）也不再发送 `temperature`；经 OpenRouter 的 `vendor/model` 形式仍发 `max_tokens`。HTTP 错误的 `error.message` 带上服务端返回的原因（遮掉疑似密钥、截断到 200 字），`recovery_action` 按 401/403、400/404/422、429、5xx 给出对应的下一步，不再一律提示检查网络和密钥。(#499)
+- 模型返回 `content: null` 时（例如 vLLM 开 `--reasoning-parser` 后思考阶段就用完输出上限），`boss ai` 各命令与 `boss ai local smoke` 抛出 traceback、stdout 没有 JSON 信封；招聘自动化的 `run_automation_cycle` 被 `AttributeError` 打断，排在后面的会话都没有处理。现在 `AIService.chat` 只返回字符串：正文为 null，或因 `finish_reason=length` 为空时抛 `AIServiceError`，命令输出 `AI_API_ERROR` 信封，自动化按「本地 AI 不可用」回退模板、在原因里写明，并继续处理后面的会话；返回 200 但响应体不是 JSON 时同样输出 `AI_API_ERROR`。`ai local smoke`、自动化回复与 wizard 的 AI 步骤改为使用 `boss ai config` 配置的输出上限（smoke 原先写死 32、自动化写死 512，wizard 还忽略了 temperature 配置），「调大 max_tokens」的建议才对它们生效。(#500)
+- macOS 上只在非默认浏览器配置（如 Chrome 的 Profile 1）里登录 BOSS 时，Cookie 提取永远读不到：browser-cookie3 只读每个浏览器的第一个配置（通常是 Default）。#494 的预检已经确认其他配置有登录记录，loader 却仍读 Default，`--cookie-source` 还会误报「没有登录 Cookie」。现在把含登录记录的 Cookie 库直接交给 loader：按 browser-cookie3 的顺序（稳定版先于测试版，Default 先于 Profile N）取第一个，Default 有登录记录时行为不变；钥匙串仍只读一次，成功时 stderr 注明读的是哪个配置。参考 jackwener/boss-cli#12、#14。
+- 平台响应里的字段为显式 null 时（如 `"jobList": null`、`"welfareList": null`、`"bossInfo": null`），多个命令会崩溃，并被兜底成提示「重试」的 `NETWORK_ERROR`：`search`（含 `--welfare`、`--with-score`）、`recommend`、`history`、`interviews` 在列表为 null 时报错；`detail` 遇到 `bossInfo` 或 `brandComInfo` 为 null 时，会吞掉快速通道的解析异常、改走浏览器通道再请求一次平台，最后误报 `JOB_NOT_FOUND`。现在平台数据在边界处统一归一化（新增 `api.models.field_text` / `field_list` / `field_dict`）：null 列表当作空结果，null 文本字段输出空串，输出信封里的职位字段保持字符串 / 列表类型。
 
 ## [3.1.0] - 2026-10-30
 

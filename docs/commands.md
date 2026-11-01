@@ -29,7 +29,7 @@ boss <命令> --help                      # 查看单个命令选项
 
 TTY 下只把 `operator_actions` 渲染到 stderr；`next_actions` 是纯 Agent 通道，不渲染。Agent 拿到 `operator_actions` 时应转述给操作者，而不是自己编措辞。
 
-**信封与退出码**：每条命令在 stdout 只输出一个七键 JSON 信封；默认 `exit 0` ⇔ `ok=true`、`exit 1` ⇔ `ok=false`。可选全局 `--exit-codes sysexits` 按错误类别返回语义化退出码（77 认证；75 限流/预算/超时；78 参数/配置；69 风控/平台不支持；其余 1），供脚本按失败类型分支；信封内容不变。全局选项（`--json`、`--data-dir`、`--platform`、`--cdp-url` 等）必须写在子命令之前，例如 `boss --json search 关键词`；写在子命令后面会返回 `INVALID_PARAM`，并说明该选项是全局的。
+**信封与退出码**：每条命令在 stdout 只输出一个七键 JSON 信封；默认 `exit 0` ⇔ `ok=true`、`exit 1` ⇔ `ok=false`。可选全局 `--exit-codes sysexits` 按错误类别返回语义化退出码（77 认证；75 限流/预算/超时；78 参数/配置；69 风控/平台不支持；70 内部错误；其余 1），供脚本按失败类型分支；信封内容不变。全局选项（`--json`、`--data-dir`、`--platform`、`--cdp-url` 等）必须写在子命令之前，例如 `boss --json search 关键词`；写在子命令后面会返回 `INVALID_PARAM`，并说明该选项是全局的。
 
 ## 基础操作
 
@@ -52,7 +52,7 @@ BOSS 的 code `31`（IP/环境限制）/ `32`（账号限制）/ `35` / `36`、�
 
 ### 浏览器 Cookie 提取与 macOS 钥匙串
 
-`boss login` 默认先从本机浏览器提取 BOSS Cookie，按 chrome、firefox、edge、brave、opera、chromium、vivaldi、arc、librewolf、safari 的顺序尝试，`--cookie-source` 可只指定一个。macOS 上 Chromium 系浏览器的 Cookie 由钥匙串里的「<浏览器> Safe Storage」加密，读取时系统会弹出授权框。CLI 会先以只读方式查看 Cookie 库中明文的域名和名称两列：确认某个浏览器没有 `zhipin.com` 的 `wt2` 登录记录，就直接跳过它，不读取钥匙串；找不到 Cookie 库或无法读取时，仍按原方式交给 browser-cookie3。这一步不读取任何 Cookie 值。`boss doctor` 默认不读取浏览器 Cookie，`--probe-cookies` 走同一套逻辑。显式用 `--cookie-source` 指定浏览器却没提取到时，stderr 会说明是读取失败还是该浏览器没有登录 Cookie；拿不到解密密钥（macOS 钥匙串未授权、Windows 上新版 Chrome / Edge 的 App-Bound 加密、Linux 密钥环未解锁）时，提示改用 `--cdp` 或 `--curl-file`。自动探测全部落空时，只汇总无法解密的浏览器。
+`boss login` 默认先从本机浏览器提取 BOSS Cookie，按 chrome、firefox、edge、brave、opera、chromium、vivaldi、arc、librewolf、safari 的顺序尝试，`--cookie-source` 可只指定一个。macOS 上 Chromium 系浏览器的 Cookie 由钥匙串里的「<浏览器> Safe Storage」加密，读取时系统会弹出授权框。CLI 会先以只读方式查看 Cookie 库中明文的域名和名称两列：确认某个浏览器没有 `zhipin.com` 的 `wt2` 登录记录，就直接跳过它，不读取钥匙串；找不到 Cookie 库或无法读取时，仍按原方式交给 browser-cookie3。这一步不读取任何 Cookie 值。同一浏览器有多个配置（Default、Profile 1……）时，macOS 上直接读取含登录记录的那个配置（按 Default、Profile N、测试版的顺序取第一个），钥匙串仍只读一次；其他系统仍由 browser-cookie3 读取默认配置。`boss doctor` 默认不读取浏览器 Cookie，`--probe-cookies` 走同一套逻辑。显式用 `--cookie-source` 指定浏览器却没提取到时，stderr 会说明是读取失败还是该浏览器没有登录 Cookie；拿不到解密密钥（macOS 钥匙串未授权、Windows 上新版 Chrome / Edge 的 App-Bound 加密、Linux 密钥环未解锁）时，提示改用 `--cdp` 或 `--curl-file`。自动探测全部落空时，只汇总无法解密的浏览器。
 
 ### 从浏览器 cURL 导入登录态
 
@@ -76,7 +76,7 @@ pbpaste | boss login --curl-file -
 | `boss recommend` | 获取个性化推荐职位 |
 | `boss detail <security_id>` | 职位详情（`--job-id` 走快速通道） |
 | `boss show <#>` | 按编号查看上次搜索结果 |
-| `boss cities` | 40 个支持城市 |
+| `boss cities` | 44 个支持城市（含不限城市的「全国」） |
 
 `recommend` 的 `pagination.has_more` 只在平台返回布尔 `hasMore` 时取 `true` 或 `false`；缺失或类型不明确时为 `null`，`has_more_source=unknown`，不会给出下一页执行提示。仅 `true` 提示翻页；`false` 与 `null` 不触发额外探测。兼容字段 `total` 仍是本次返回条数，`total_kind=returned_page_count`，不代表全量职位数。
 
@@ -280,7 +280,7 @@ HTTP `429` 或业务 code `9` 会保存共享冷却，支持 `Retry-After` 的�
 
 ```bash
 boss search "golang" \
-  --city 广州 \             # 城市（40 个可选）
+  --city 广州 \             # 城市（44 个可选，含「全国」）
   --salary 20-50K \         # 薪资范围
   --experience 3-5年,5-10年 \ # 经验要求（支持逗号多选）
   --education 本科,硕士 \    # 学历要求（支持逗号多选）
