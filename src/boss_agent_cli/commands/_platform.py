@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from boss_agent_cli.auth.identity import account_scope
 from boss_agent_cli.config import DEFAULT_REQUEST_DELAY
 from boss_agent_cli.platforms import Platform
 from boss_agent_cli.platforms.factory import build_platform_instance
@@ -48,4 +49,4 @@ def get_platform_instance(ctx: "click.Context", auth: "AuthManager") -> Platform
 	)
 
 
-__all__ = ["get_platform_instance"]
+__all__ = ["account_scope", "get_platform_instance"]

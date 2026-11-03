@@ -9,6 +9,11 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"recoverable": True,
 		"recovery_action": "确认操作目标与内容后重新执行并加 --yes",
 	},
+	"HOOK_BLOCKED": {
+		"message": "操作被本地钩子阻止",
+		"recoverable": True,
+		"recovery_action": "检查 greet_before 钩子的返回内容，调整或移除阻止后重试",
+	},
 	"RESUME_ACCEPT_RESULT_UNKNOWN": {
 		"message": "同意附件简历请求的结果未确认，禁止自动重试",
 		"recoverable": False,
@@ -18,6 +23,21 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"message": "页面动作已执行，但未确认是否发送成功，禁止自动重试",
 		"recoverable": False,
 		"recovery_action": "动作可能已生效，请先 `boss hr chatmsg <friend_id>` 核实，勿直接重试",
+	},
+	"LOCAL_STATE_WRITE_FAILED": {
+		"message": "平台操作已完成，但本地状态保存失败，禁止自动重发",
+		"recoverable": False,
+		"recovery_action": "先在官方页面核对本次操作是否已生效；不要自动重发，确认磁盘空间与缓存目录权限后再继续",
+	},
+	"LOCAL_IO_ERROR": {
+		"message": "本地文件读写失败",
+		"recoverable": False,
+		"recovery_action": "不要自动重试：确认目标路径是可写目录（而不是同名的已有文件）、目录权限与磁盘空间正常，修正后再执行",
+	},
+	"AUTOMATION_STATE_INVALID": {
+		"message": "招聘自动化状态文件损坏",
+		"recoverable": True,
+		"recovery_action": "修正或删除数据目录下的 automation/state.json 后重试；删除会丢失自动化去重与历史进度，建议先备份该文件",
 	},
 	"EXCHANGE_NOT_AVAILABLE": {
 		"message": "换电话/换微信按钮未解锁（招聘者尚未在会话中发过消息），本次未发出任何请求",
@@ -38,6 +58,11 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"message": "未登录",
 		"recoverable": True,
 		"recovery_action": "boss login",
+	},
+	"LOGOUT_FAILED": {
+		"message": "退出登录失败",
+		"recoverable": True,
+		"recovery_action": "检查数据目录权限与磁盘空间后重试 boss logout",
 	},
 	"RATE_LIMITED": {
 		"message": "请求频率过高",
@@ -154,6 +179,11 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"recoverable": True,
 		"recovery_action": "重试",
 	},
+	"UNKNOWN": {
+		"message": "平台返回了未识别的错误",
+		"recoverable": False,
+		"recovery_action": "不要自动重试：先在 BOSS 官方页面核对本次操作是否生效，并用 boss doctor 检查登录态、浏览器通道与网络；确认后重新执行一次，仍失败请附上命令与 error.message 提交 issue",
+	},
 	"CRAWL_UNAVAILABLE": {
 		"message": "DrissionPage crawl 运行环境或 Hook 注入不可用",
 		"recoverable": True,
@@ -172,7 +202,7 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 	"WORKFLOW_TIMEOUT": {
 		"message": "workflow 超过调用方设置的超时",
 		"recoverable": True,
-		"recovery_action": "使用返回的 run_id 恢复 workflow",
+		"recovery_action": "使用返回的 run_id 执行 boss wizard --resume <run_id> 恢复 workflow",
 	},
 	"WORKFLOW_PLAN_MISMATCH": {
 		"message": "run_id 已绑定到不同的 workflow plan",
@@ -229,6 +259,31 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"recoverable": True,
 		"recovery_action": "boss ai config --provider <provider> --model <model> --api-key <key>",
 	},
+	"CONFIRM_DOWNLOAD_REQUIRED": {
+		"message": "下载模型权重需要显式确认",
+		"recoverable": True,
+		"recovery_action": "确认模型与下载量后重新执行并加 --confirm-download",
+	},
+	"LOCAL_MODEL_PULL_FAILED": {
+		"message": "Ollama 拉取模型失败",
+		"recoverable": True,
+		"recovery_action": "确认 Ollama 已安装并可访问网络后重试",
+	},
+	"MODEL_SOURCE_NOT_FOUND": {
+		"message": "本地模型源文件或目录不存在",
+		"recoverable": True,
+		"recovery_action": "检查 --path 指向的模型文件或目录后重试",
+	},
+	"MODEL_REGISTRY_INVALID": {
+		"message": "本地模型登记表损坏",
+		"recoverable": True,
+		"recovery_action": "修正或删除数据目录下的 models/registry.json 后重试；模型文件仍在磁盘上，重新导入即可重建登记",
+	},
+	"SAVED_SEARCH_INVALID": {
+		"message": "本地预设的参数损坏",
+		"recoverable": True,
+		"recovery_action": "执行 boss preset remove <名称>（watch 用 boss watch remove）后重新添加；参数只存在本地缓存，删除不影响平台数据",
+	},
 	"AI_API_ERROR": {
 		"message": "AI 服务调用失败",
 		"recoverable": True,
@@ -243,6 +298,16 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"message": "缓存数据缺失",
 		"recoverable": True,
 		"recovery_action": "执行对应的数据获取命令以填充缓存",
+	},
+	"CACHE_RECORD_INVALID": {
+		"message": "本地任务记录损坏，断点无法恢复",
+		"recoverable": True,
+		"recovery_action": "该 run 的记录只存在本地缓存：重新创建任务（crawl 用 boss crawl start，workflow 用 boss wizard --input-json）后重试；已导出的文件不会自动删除",
+	},
+	"CACHE_DATABASE_INVALID": {
+		"message": "本地缓存数据库损坏或不是 SQLite 文件",
+		"recoverable": True,
+		"recovery_action": "缓存库只存本地数据：先备份 cache/boss_agent.db（--data-dir 指定时在对应目录下），再删除该文件后重试，命令会自动重建一个空库",
 	},
 	"RECRUITER_NOT_AUTHORIZED": {
 		"message": "当前账号非招聘者账号",
@@ -292,7 +357,7 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 	"CIRCUIT_BREAKER_OPEN": {
 		"message": "招聘自动化熔断已打开",
 		"recoverable": True,
-		"recovery_action": "人工确认平台状态后恢复",
+		"recovery_action": "人工确认平台状态并核实未确认动作后，执行 boss agent run --resume 显式恢复",
 	},
 	"PLATFORM_VERIFICATION_REQUIRED": {
 		"message": "平台要求人工验证",

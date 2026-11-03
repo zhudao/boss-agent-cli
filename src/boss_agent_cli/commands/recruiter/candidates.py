@@ -4,7 +4,7 @@ import click
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._recruiter_platform import get_recruiter_platform_instance
-from boss_agent_cli.display import handle_auth_errors, handle_output, handle_platform_error_output
+from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_output, handle_platform_error_output
 from boss_agent_cli.wizard.actions import execute_recruiter_candidate_search
 
 
@@ -20,7 +20,7 @@ from boss_agent_cli.wizard.actions import execute_recruiter_candidate_search
 @click.option("--source", default=None, help="来源编码（默认 4）")
 @click.option("--salary", default=None, help="薪资范围，如 -1,3")
 @click.option("--select", is_flag=True, default=False, help="是否带 select=true")
-@click.option("--page", default=1, type=int, help="页码")
+@click.option("--page", default=1, type=click.IntRange(min=1), help="页码")
 @click.pass_context
 @handle_auth_errors("recruiter-candidates")
 def candidates_cmd(ctx: click.Context, query: str, city: str | None, job_id: str | None, experience: str | None, degree: str | None, age: str | None, school_level: str | None, activeness: str | None, source: str | None, salary: str | None, select: bool, page: int) -> None:
@@ -54,7 +54,7 @@ def candidates_cmd(ctx: click.Context, query: str, city: str | None, job_id: str
 		handle_output(
 			ctx, "recruiter-candidates", data,
 			hints={"next_actions": [
-				"boss hr resume <geek_id> --job-id <id> --security-id <id> — 查看简历",
-				"boss hr chat — 查看沟通",
+				boss_command_for_ctx(ctx, "hr resume <geek_id> --job-id <id> --security-id <id>"),
+				boss_command_for_ctx(ctx, "hr chat"),
 			]},
 		)

@@ -2,32 +2,41 @@
 
 from __future__ import annotations
 
-import socket
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, NoReturn
 
 from boss_agent_cli.config import DEFAULT_REQUEST_DELAY
+from boss_agent_cli.auth.identity import account_scope
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.api.endpoints import CITY_CODES
 from boss_agent_cli.ai.config import AIConfigStore
 from boss_agent_cli.ai.service import AIService, AIServiceError, recovery_action_for
-from boss_agent_cli.cache.store import CacheStore
+from boss_agent_cli.cache.store import CacheStore, SavedSearchParamsError
 from boss_agent_cli.platforms.factory import build_platform_instance, build_recruiter_platform_instance
 from boss_agent_cli.services.contact_lookup import FriendLookupLimitExceeded, find_friend
+from boss_agent_cli.services.output_path import prepare_output_path
 from boss_agent_cli.crawler.operations import crawl_status
-from boss_agent_cli.crawler.service import CrawlBudget, CrawlService, CrawlSettings
+from boss_agent_cli.crawler.service import (
+	CrawlBudget,
+	CrawlService,
+	CrawlSettings,
+	crawl_cdp_port,
+	crawl_chrome_path,
+	crawl_int_setting,
+	unused_local_port,
+)
 from boss_agent_cli.crawler.transport import DrissionCrawlerSession
 from boss_agent_cli.digest import build_digest
-from boss_agent_cli.display import RISK_ERROR_CONTRACTS, risk_error_contract
+from boss_agent_cli.display import RISK_ERROR_CONTRACTS, risk_error_contract, risk_error_message
 from boss_agent_cli.output import Logger
 from boss_agent_cli.pipeline_state import build_pipeline_items, select_follow_up_candidates
 from boss_agent_cli.resume.models import resume_to_text
 from boss_agent_cli.resume.store import ResumeStore
 from boss_agent_cli.schema.error_codes import ERROR_CODES
 from boss_agent_cli.search_filters import SearchFilterCriteria, client_is_browser_only, detail_filter_max_pages, resolve_active_level, resolve_welfare_keywords, run_search_pipeline
-from boss_agent_cli.wizard.models import StepResult, WorkflowStatus
+from boss_agent_cli.wizard.models import StepResult, WorkflowInputError, WorkflowStatus
 from boss_agent_cli.wizard.runner import Action, WorkflowActionError, WorkflowControl
 
 PlatformFactory = Callable[[str, AuthManager, tuple[float, float], str | None, str | None], Any]
@@ -111,6 +120,9 @@ def execute_candidate_search(
 		raw_params=dict(inputs.get("raw_params") or {}),
 	)
 	extra: dict[str, Any] = {"active": active} if active else {}
+	account = str(inputs.get("account") or "")
+	if account:
+		extra["account"] = account
 	browser_detail = inputs.get("detail_channel") == "browser" or client_is_browser_only(platform)
 	if active or browser_detail:
 		# 只有 --active 或 CDP 模式时才透传详情节流 / 通道，保持其他调用方（含测试替身）签名不变
@@ -128,8 +140,10 @@ def execute_candidate_search(
 		cache,
 		logger,
 		criteria=criteria,
-		start_page=int(inputs.get("page") or 1),
-		max_pages=int(inputs.get("max_pages") or detail_filter_max_pages(welfare_conditions, active)),
+		start_page=_int_input(inputs, "page", 1, minimum=1),
+		max_pages=_int_input(
+			inputs, "max_pages", detail_filter_max_pages(welfare_conditions, active), minimum=1
+		),
 		welfare_conditions=welfare_conditions,
 		before_list_request=inputs.get("before_list_request"),
 		**extra,
@@ -141,7 +155,7 @@ def execute_recruiter_candidate_search(platform: Any, inputs: Mapping[str, Any])
 	return platform.search_geeks(
 		str(inputs.get("query") or ""),
 		city=_optional_str(inputs.get("city")),
-		page=int(inputs.get("page") or 1),
+		page=_int_input(inputs, "page", 1, minimum=1),
 		job_id=_optional_str(inputs.get("job_id")),
 		experience=_optional_str(inputs.get("experience")),
 		degree=_optional_str(inputs.get("degree")),
@@ -204,16 +218,58 @@ def _optional_str(value: Any) -> str | None:
 	return str(value) if value is not None and value != "" else None
 
 
+def _coerce_int(raw: Any, name: str) -> int:
+	"""把 wizard 输入转成整数；类型错误必须点名字段。
+
+	wizard inputs 来自 `--input-json` / MCP，写成非数字字符串时 `int()` 抛的裸
+	ValueError 会落到 runner 的通用兜底，被映射成 NETWORK_ERROR +「重试当前
+	run_id」——同一条输入重试多少次都是同一个错误。bool 与小数同样不是「页码 /
+	条数」的合法取值：`int(True)` 会静默当成 1，`int(2.5)` 会静默截断成 2。
+	"""
+	if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+		raise WorkflowInputError(f"wizard 输入 {name} 必须是整数，收到 {raw!r}")
+	try:
+		return int(raw)
+	except (TypeError, ValueError) as exc:
+		raise WorkflowInputError(f"wizard 输入 {name} 必须是整数，收到 {raw!r}") from exc
+
+
+def _check_minimum(value: int, raw: Any, name: str, minimum: int) -> int:
+	if value < minimum:
+		raise WorkflowInputError(f"wizard 输入 {name} 必须是不小于 {minimum} 的整数，收到 {raw!r}")
+	return value
+
+
+def _int_input(inputs: Mapping[str, Any], name: str, default: int, *, minimum: int = 0) -> int:
+	"""读取整数输入并校验下界。
+
+	下游把这些值直接当页码 / 翻页次数 / 条数用：`max_pages=-3` 会让
+	`range(max_pages)` 一次都不循环，workflow 以「成功」收尾但结果为空；
+	负数页码则会原样作为 page 参数发给平台。这类输入重试多少次都是同一个结果。
+	"""
+	raw = inputs.get(name)
+	# 只有「没给」才用默认值；显式写的 0 不能被当成缺省悄悄换成默认值
+	# （`0 or default` 会让 `count: 0` 变成 20 条）。
+	if raw is None or raw == "":
+		return default
+	return _check_minimum(_coerce_int(raw, name), raw, name, minimum)
+
+
 def _required(inputs: Mapping[str, Any], name: str) -> Any:
 	value = inputs.get(name)
 	if value is None or value == "":
 		raise WorkflowActionError(
 			"WIZARD_INPUT_REQUIRED",
-			f"workflow input {name!r} is required",
+			f"workflow 缺少输入 {name}",
 			recoverable=True,
 			recovery_action=f"在 inputs 中提供 {name} 后用同一 run_id 重试",
 		)
 	return value
+
+
+def _required_int(inputs: Mapping[str, Any], name: str, *, minimum: int = 0) -> int:
+	raw = _required(inputs, name)
+	return _check_minimum(_coerce_int(raw, name), raw, name, minimum)
 
 
 def _classify_action_error(code: str, message: str) -> tuple[str, bool, str]:
@@ -261,6 +317,9 @@ def _unwrap(platform: Any, response: dict[str, Any], fallback: str) -> Any:
 	code, message = platform.parse_error(response)
 	text = message or fallback
 	code, recoverable, recovery = _classify_action_error(code, text)
+	if code in RISK_ERROR_CONTRACTS:
+		# 风控响应原文可能带临时凭据，不进 workflow 结果；停止指引由 recovery_action 承载。
+		text = risk_error_message(code)
 	details = response.get("__cli_error_details__") if isinstance(response, dict) else None
 	raise WorkflowActionError(
 		code,
@@ -268,6 +327,7 @@ def _unwrap(platform: Any, response: dict[str, Any], fallback: str) -> Any:
 		recoverable=recoverable,
 		recovery_action=recovery,
 		details=details if isinstance(details, dict) and details else None,
+		replay_safe=code != "ACTION_UNCONFIRMED",
 	)
 
 
@@ -278,6 +338,7 @@ def execute_candidate_detail(
 	job_id: str | None = None,
 	lid: str = "",
 	data_dir: Path | None = None,
+	account: str = "",
 ) -> dict[str, Any]:
 	"""Fetch job detail with the same httpx → job_card fallback as `boss detail`.
 
@@ -290,7 +351,7 @@ def execute_candidate_detail(
 	greeted = False
 	if data_dir is not None:
 		with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
-			greeted = cache.is_greeted(security_id)
+			greeted = cache.is_greeted(security_id, job_id=job_id or "", account=account)
 
 	last_error: WorkflowActionError | None = None
 	if job_id:
@@ -386,14 +447,15 @@ def _auth_status(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 
 def _candidate_search(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	_required(inputs, "query")
+	account = account_scope(context.auth())
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		with context.candidate_platform() as platform:
-			result = execute_candidate_search(platform, cache, context.logger, inputs)
+			result = execute_candidate_search(platform, cache, context.logger, {**inputs, "account": account})
 	return StepResult(
 		{
 			"items": result.items,
 			"pagination": {
-				"page": int(inputs.get("page") or 1),
+				"page": _int_input(inputs, "page", 1, minimum=1),
 				"has_more": result.has_more,
 				"total": result.total or len(result.items),
 			},
@@ -403,7 +465,7 @@ def _candidate_search(context: ActionContext, inputs: Mapping[str, Any], prior: 
 
 def _candidate_recommend(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	with context.candidate_platform() as platform:
-		data = _unwrap(platform, platform.recommend_jobs(page=int(inputs.get("page") or 1)), "推荐职位获取失败")
+		data = _unwrap(platform, platform.recommend_jobs(page=_int_input(inputs, "page", 1, minimum=1)), "推荐职位获取失败")
 	items = _extract_list_items(data, ("recommendList", "jobList", "list", "items", "result"))
 	return StepResult(_with_items({"result": data}, items))
 
@@ -422,33 +484,63 @@ def _candidate_detail(context: ActionContext, inputs: Mapping[str, Any], prior: 
 				job_id=job_id,
 				lid=lid,
 				data_dir=context.data_dir,
+				account=account_scope(context.auth()),
 			)
 	return StepResult({"job": data, "result": data})
+
+
+def _raise_local_state_write_failed(message: str, details: dict[str, Any]) -> NoReturn:
+	"""平台已确认成功、本地记账失败：不得回成可重试的 NETWORK_ERROR。"""
+	contract = ERROR_CODES["LOCAL_STATE_WRITE_FAILED"]
+	raise WorkflowActionError(
+		"LOCAL_STATE_WRITE_FAILED",
+		message,
+		recoverable=bool(contract["recoverable"]),
+		recovery_action=str(contract["recovery_action"]),
+		details=details,
+		replay_safe=False,
+	)
 
 
 def _candidate_apply(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	security_id = str(_required(inputs, "security_id"))
 	job_id = str(_required(inputs, "job_id"))
+	account = account_scope(context.auth())
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
-		if cache.is_applied(security_id, job_id):
+		if cache.is_applied(security_id, job_id, account=account):
 			raise WorkflowActionError("ALREADY_APPLIED", "已对该职位发起过投递/立即沟通")
 		with context.candidate_platform() as platform:
 			data = _unwrap(platform, platform.apply(security_id, job_id, lid=str(inputs.get("lid") or "")), "投递失败")
-		cache.record_apply(security_id, job_id)
+		try:
+			cache.record_apply(security_id, job_id, account=account)
+		except Exception:
+			# 重试或 --resume 会绕过 is_applied 检查，把同一次投递再提交一遍。
+			_raise_local_state_write_failed(
+				"投递/立即沟通已提交，但本地状态保存失败；不要自动重发",
+				{"security_id": security_id, "job_id": job_id, "applied": True, "recorded": False},
+			)
 	return StepResult({"security_id": security_id, "job_id": job_id, "result": data})
 
 
 def _candidate_greet(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	security_id = str(_required(inputs, "security_id"))
 	job_id = str(_required(inputs, "job_id"))
+	account = account_scope(context.auth())
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
-		if cache.is_greeted(security_id):
+		if cache.is_greeted(security_id, job_id=job_id, account=account):
 			raise WorkflowActionError("ALREADY_GREETED", "已向该招聘者打过招呼")
 		with context.candidate_platform() as platform:
 			data = _unwrap(
 				platform, platform.greet(security_id, job_id, str(inputs.get("message") or "")), "打招呼失败"
 			)
-		cache.record_greet(security_id, job_id)
+		try:
+			cache.record_greet(security_id, job_id, account=account)
+		except Exception:
+			# 重试或 --resume 会绕过 is_greeted 检查，把同一个招呼再发一次。
+			_raise_local_state_write_failed(
+				"已向该招聘者打招呼，但本地状态保存失败；不要自动重发",
+				{"security_id": security_id, "job_id": job_id, "greeted": True, "recorded": False},
+			)
 	return StepResult({"security_id": security_id, "job_id": job_id, "result": data})
 
 
@@ -509,7 +601,7 @@ def _candidate_mark(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 	label = str(_required(inputs, "label"))
 	label_id = int(label) if label.isdigit() else _LABEL_IDS.get(label)
 	if label_id is None:
-		raise WorkflowActionError("INVALID_PARAM", f"unknown label: {label}")
+		raise WorkflowActionError("INVALID_PARAM", f"未知标签: {label}（可选: 新招呼、沟通中、已约面、已获取简历、不合适、收藏）")
 	with context.candidate_platform() as platform:
 		friend = _candidate_friend(platform, identifier)
 		uid = str(friend.get("uid") or "")
@@ -533,7 +625,7 @@ def _candidate_mark(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 
 def _candidate_chat(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	with context.candidate_platform() as platform:
-		data = _unwrap(platform, platform.friend_list(page=int(inputs.get("page") or 1)), "沟通列表获取失败")
+		data = _unwrap(platform, platform.friend_list(page=_int_input(inputs, "page", 1, minimum=1)), "沟通列表获取失败")
 	items = _extract_list_items(data, ("result", "friendList", "list", "items"))
 	return StepResult(_with_items({"result": data}, items))
 
@@ -546,8 +638,8 @@ def _candidate_chat_history(context: ActionContext, inputs: Mapping[str, Any], p
 		response = platform.chat_history(
 			gid,
 			security_id,
-			page=int(inputs.get("page") or 1),
-			count=int(inputs.get("count") or 20),
+			page=_int_input(inputs, "page", 1, minimum=1),
+			count=_int_input(inputs, "count", 20, minimum=1),
 		)
 		data = _unwrap(platform, response, "聊天记录获取失败")
 	items = _extract_list_items(data, ("messageList", "messages", "list", "items", "result"))
@@ -573,8 +665,8 @@ def _candidate_pipeline_data(context: ActionContext, inputs: Mapping[str, Any]) 
 	return build_pipeline_items(
 		chat_items=chat_items,
 		interview_items=interview_items,
-		now_ts_ms=int(inputs.get("now_ts_ms") or time.time() * 1000),
-		stale_days=int(inputs.get("days_stale") or 3),
+		now_ts_ms=_int_input(inputs, "now_ts_ms", int(time.time() * 1000)),
+		stale_days=_int_input(inputs, "days_stale", 3),
 	)
 
 
@@ -648,12 +740,15 @@ def _candidate_export(context: ActionContext, inputs: Mapping[str, Any], prior: 
 
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		with context.candidate_platform() as platform:
-			result = execute_candidate_search(platform, cache, context.logger, inputs)
+			# 与 candidate_search / candidate_watch 一致：导出时的 greeted 标记
+			# 必须按当前账号计算，否则登录态下会把所有职位都标成未打招呼。
+			result = execute_candidate_search(
+				platform, cache, context.logger, {**inputs, "account": account_scope(context.auth())}
+			)
 	fmt = str(inputs.get("format") or "json")
 	if fmt not in {"json", "csv"}:
 		raise WorkflowActionError("INVALID_PARAM", "wizard export format 仅支持 json/csv")
-	output = Path(str(inputs.get("output") or context.data_dir / "exports" / f"wizard-jobs.{fmt}"))
-	output.parent.mkdir(parents=True, exist_ok=True)
+	output = prepare_output_path(inputs.get("output") or context.data_dir / "exports" / f"wizard-jobs.{fmt}")
 	items = prepare_export_items(result.items, include_private=bool(inputs.get("include_private", False)))
 	write_export_file(items, fmt, str(output))
 	return StepResult({"path": str(output), "format": fmt, "count": len(items)}, artifacts=(str(output),))
@@ -663,47 +758,64 @@ def _candidate_watch(context: ActionContext, inputs: Mapping[str, Any], prior: M
 	action = str(inputs.get("action") or "list")
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		if action == "list":
-			items = cache.list_saved_searches()
-			return StepResult({"items": items, "total": len(items)})
+			items, corrupt = cache.list_saved_searches_with_corrupt()
+			data: dict[str, Any] = {"items": items, "total": len(items)}
+			if corrupt:
+				data["corrupt"] = corrupt
+			return StepResult(data)
 		name = str(_required(inputs, "name"))
 		if action == "add":
-			params = {
-				key: inputs.get(key)
-				for key in (
-					"query",
-					"city",
-					"salary",
-					"experience",
-					"education",
-					"industry",
-					"scale",
-					"stage",
-					"job_type",
-					"welfare",
-				)
-			}
+			params: dict[str, Any] = {}
+			for key in (
+				"query",
+				"city",
+				"salary",
+				"experience",
+				"education",
+				"industry",
+				"scale",
+				"stage",
+				"job_type",
+				"welfare",
+			):
+				value = inputs.get(key)
+				if key == "welfare" and isinstance(value, (list, tuple)):
+					# 存储格式与 CLI `watch add --welfare` 一致（逗号分隔字符串）：
+					# 直接写数组会让后续 `watch run` 在 `.split(",")` 上抛 AttributeError。
+					value = ",".join(str(item).strip() for item in value if str(item).strip())
+				elif value is not None and not isinstance(value, str):
+					raise WorkflowActionError(
+						"INVALID_PARAM", f"watch 参数 {key} 必须是字符串（收到 {type(value).__name__}）"
+					)
+				params[key] = value
 			if inputs.get("active"):
-				params["active"] = inputs.get("active")
+				try:
+					params["active"] = resolve_active_level(str(inputs.get("active")))
+				except ValueError as exc:
+					raise WorkflowActionError("INVALID_PARAM", str(exc)) from exc
 			_required(inputs, "query")
 			cache.save_saved_search(name, params)
 			return StepResult({"action": "add", "name": name, "params": params})
 		if action == "remove":
 			return StepResult({"action": "remove", "name": name, "removed": cache.delete_saved_search(name)})
 		if action != "run":
-			raise WorkflowActionError("INVALID_PARAM", f"unknown watch action: {action}")
-		record = cache.get_saved_search(name)
+			raise WorkflowActionError("INVALID_PARAM", f"未知的 watch 动作: {action}（可选: add、remove、run）")
+		try:
+			record = cache.get_saved_search(name)
+		except SavedSearchParamsError as exc:
+			raise WorkflowActionError(
+				"SAVED_SEARCH_INVALID",
+				str(exc),
+				recoverable=True,
+				recovery_action=f"boss watch remove {name} 后重新 watch add {name} <关键词>",
+			) from exc
 		if record is None:
 			raise WorkflowActionError("JOB_NOT_FOUND", f"未找到 watch: {name}")
+		account = account_scope(context.auth())
 		with context.candidate_platform() as platform:
-			result = execute_candidate_search(platform, cache, context.logger, record["params"])
-		watch_result = cache.record_watch_results(name, result.items)
+			result = execute_candidate_search(platform, cache, context.logger, {**record["params"], "account": account})
+		watch_result = cache.record_watch_results(name, result.items, account=account)
 		return StepResult({"name": name, **watch_result})
-
-
-def _unused_port() -> int:
-	with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
-		connection.bind(("127.0.0.1", 0))
-		return int(connection.getsockname()[1])
 
 
 def _crawl_seed_session(context: ActionContext) -> tuple[dict[str, str], str]:
@@ -783,14 +895,14 @@ def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> Step
 	if outcome.status == "timeout_stopped":
 		raise WorkflowActionError(
 			"WORKFLOW_TIMEOUT",
-			outcome.error or "workflow exceeded its timeout",
+			outcome.error or "workflow 超过设定时限",
 			recoverable=True,
 			recovery_action=f"boss crawl resume {outcome.run_id}",
 		)
 	if outcome.status in {"workflow_stopped", "stopped"} and "stop requested" in str(outcome.error or ""):
 		raise WorkflowActionError(
 			"WORKFLOW_STOPPED",
-			outcome.error or "crawl stopped",
+			outcome.error or "crawl 已停止",
 			recoverable=True,
 			recovery_action=f"boss crawl resume {outcome.run_id}",
 		)
@@ -829,7 +941,7 @@ def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> Step
 	if outcome.status != "completed":
 		raise WorkflowActionError(
 			"NETWORK_ERROR",
-			outcome.error or f"crawl stopped with status {outcome.status}",
+			outcome.error or f"crawl 以状态 {outcome.status} 停止",
 			recoverable=True,
 			recovery_action=f"boss crawl resume {outcome.run_id}",
 		)
@@ -852,24 +964,64 @@ def _crawl_start(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 	city = str(_required(inputs, "city"))
 	city_code = CITY_CODES.get(city, city if city.isdigit() else None)
 	if city_code is None:
-		raise WorkflowActionError("INVALID_PARAM", f"unknown city: {city}")
-	settings = CrawlSettings(
-		query=str(_required(inputs, "query")),
-		city_code=city_code,
-		pages=int(inputs.get("pages") or 5),
-		with_detail=bool(inputs.get("with_detail", False)),
-		profile_path=context.data_dir / "crawl" / "chrome-profile",
-		chrome_path=crawl_config.get("chrome_path"),
-		cdp_port=int(crawl_config.get("cdp_port") or _unused_port()),
-		hook_profile=str(inputs.get("hook_profile") or "none"),
-		max_requests=int(crawl_config.get("max_requests") or 20),
-		max_details=int(crawl_config.get("max_details") or 50),
-		max_seconds=int(crawl_config.get("max_seconds") or 600),
-		max_retries=int(crawl_config.get("max_retries") or 1),
-	)
+		raise WorkflowActionError("INVALID_PARAM", f"未知城市: {city}")
+	hook_profile = str(inputs.get("hook_profile") or "none")
+	if hook_profile != "none":
+		# 向导没有 hook-dir 输入，screenshot-full 在这里必然失败；提前按参数错误返回，
+		# 而不是让 create_and_run 里的 ValueError 落成可重试的 NETWORK_ERROR。
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			f"向导采集不支持 hook_profile={hook_profile!r}：workflow 没有 hook-dir 输入，请显式运行 boss crawl run/start",
+			recovery_action="boss crawl run <query> --city <城市> --hook-profile screenshot-full --hook-dir <脚本目录>",
+		)
+	raw_pages = inputs.get("pages")
+	pages = 5 if raw_pages is None else _positive_int(raw_pages, name="pages")
+	raw_port = crawl_config.get("cdp_port")
+	try:
+		settings = CrawlSettings(
+			query=str(_required(inputs, "query")),
+			city_code=city_code,
+			pages=pages,
+			with_detail=bool(inputs.get("with_detail", False)),
+			profile_path=context.data_dir / "crawl" / "chrome-profile",
+			chrome_path=crawl_chrome_path(crawl_config.get("chrome_path")),
+			cdp_port=unused_local_port() if raw_port is None else crawl_cdp_port(raw_port),
+			hook_profile=hook_profile,
+			max_requests=crawl_int_setting(crawl_config, "max_requests", 20),
+			max_details=crawl_int_setting(crawl_config, "max_details", 50),
+			max_seconds=crawl_int_setting(crawl_config, "max_seconds", 600),
+			max_retries=crawl_int_setting(crawl_config, "max_retries", 1, minimum=0),
+		)
+	except (TypeError, ValueError) as exc:
+		# 手工编辑 config.json 写坏 crawl 段时不能落成可重试的 NETWORK_ERROR：
+		# 重试同一个 run_id 永远修不好配置。与 CLI 路径一致，指向 config reset。
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			f"crawl 配置无效: {exc}",
+			recovery_action="boss config reset crawl",
+		) from exc
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		outcome = _crawl_service(context, cache).create_and_run(settings)
 		return _crawl_outcome_result(outcome, cache)
+
+
+def _positive_int(value: Any, *, name: str) -> int:
+	"""解析 workflow 输入的正整数；非法值按参数错误返回，不落成可重试的网络错误。"""
+	try:
+		parsed = int(value)
+	except (TypeError, ValueError) as exc:
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			f"{name} 必须是整数: {value!r}",
+			recovery_action=f"传入 1 以上的整数 {name}",
+		) from exc
+	if parsed < 1:
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			f"{name} 必须大于等于 1: {parsed}",
+			recovery_action=f"传入 1 以上的整数 {name}",
+		)
+	return parsed
 
 
 def _crawl_status(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
@@ -885,11 +1037,13 @@ def _crawl_status(context: ActionContext, inputs: Mapping[str, Any], prior: Mapp
 
 def _crawl_resume(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	run_id = str(_required(inputs, "run_id"))
+	raw_pages = inputs.get("pages")
+	pages = None if raw_pages is None else _positive_int(raw_pages, name="pages")
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		try:
 			outcome = _crawl_service(context, cache).resume(
 				run_id,
-				pages=int(inputs["pages"]) if inputs.get("pages") else None,
+				pages=pages,
 				with_detail=bool(inputs.get("with_detail", False)),
 				clear_stop=True,
 			)
@@ -935,8 +1089,8 @@ def _recruiter_applications(context: ActionContext, inputs: Mapping[str, Any], p
 	return _recruiter_call(
 		context,
 		lambda platform: platform.friend_list(
-			page=int(inputs.get("page") or 1),
-			label_id=int(inputs.get("label_id") or 0),
+			page=_int_input(inputs, "page", 1, minimum=1),
+			label_id=_int_input(inputs, "label_id", 0),
 			job_id=_optional_str(inputs.get("job_id")),
 		),
 		"投递申请获取失败",
@@ -965,8 +1119,8 @@ def _recruiter_last_messages(context: ActionContext, inputs: Mapping[str, Any], 
 		friend_data = _unwrap(
 			platform,
 			platform.friend_list(
-				page=int(inputs.get("page") or 1),
-				label_id=int(inputs.get("label_id") or 0),
+				page=_int_input(inputs, "page", 1, minimum=1),
+				label_id=_int_input(inputs, "label_id", 0),
 				job_id=_optional_str(inputs.get("job_id")),
 			),
 			"沟通列表获取失败",
@@ -1007,7 +1161,7 @@ def _recruiter_last_messages(context: ActionContext, inputs: Mapping[str, Any], 
 
 
 def _recruiter_reply(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	friend_id = int(_required(inputs, "friend_id"))
+	friend_id = _required_int(inputs, "friend_id", minimum=1)
 	message = str(_required(inputs, "message"))
 	return _recruiter_call(
 		context, lambda platform: platform.send_message_by_friend(friend_id, message), "消息发送失败"
@@ -1015,13 +1169,13 @@ def _recruiter_reply(context: ActionContext, inputs: Mapping[str, Any], prior: M
 
 
 def _recruiter_chat_history(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	friend_id = int(_required(inputs, "friend_id"))
+	friend_id = _required_int(inputs, "friend_id", minimum=1)
 	return _recruiter_call(
 		context,
 		lambda platform: platform.chat_history(
 			friend_id,
-			count=int(inputs.get("count") or 20),
-			max_msg_id=int(inputs["max_msg_id"]) if inputs.get("max_msg_id") else None,
+			count=_int_input(inputs, "count", 20, minimum=1),
+			max_msg_id=_int_input(inputs, "max_msg_id", 0) if inputs.get("max_msg_id") else None,
 		),
 		"聊天记录获取失败",
 		list_keys=("messageList", "messages", "list", "items", "result"),
@@ -1031,7 +1185,7 @@ def _recruiter_chat_history(context: ActionContext, inputs: Mapping[str, Any], p
 def _recruiter_request_resume(
 	context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]
 ) -> StepResult:
-	friend_id = int(_required(inputs, "friend_id"))
+	friend_id = _required_int(inputs, "friend_id", minimum=1)
 	return _recruiter_call(
 		context,
 		lambda platform: platform.exchange_request_by_friend(friend_id, exchange_type=4),
@@ -1042,7 +1196,7 @@ def _recruiter_request_resume(
 def _recruiter_exchange_contact(
 	context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]
 ) -> StepResult:
-	friend_id = int(_required(inputs, "friend_id"))
+	friend_id = _required_int(inputs, "friend_id", minimum=1)
 	exchange_type = 2 if str(inputs.get("type") or "phone") == "wechat" else 1
 	return _recruiter_call(
 		context,

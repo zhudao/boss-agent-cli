@@ -1,4 +1,7 @@
 import json
+import os
+
+import pytest
 
 from boss_agent_cli.resume.models import ResumeData, PersonalInfoSection, PersonalInfoItem, ResumeModule
 from boss_agent_cli.resume.store import ResumeStore
@@ -149,3 +152,42 @@ def test_save_preserves_full_data(tmp_path):
 	assert loaded.personal_info.items[1].icon == "mdi:email"
 	assert loaded.modules[0].icon == "mdi:briefcase"
 	assert loaded.avatar == "https://example.com/avatar.jpg"
+
+
+def test_list_all_skips_unreadable_or_non_object_files(tmp_path):
+	"""一个坏文件（非 UTF-8 / 顶层不是对象）不该让整份简历列表都报错。"""
+	store = ResumeStore(tmp_path / "resumes")
+	store.save(ResumeData(name="张三", title="Python 开发"))
+	(store._dir / "gbk.json").write_bytes('{"name": "李四"}'.encode("gbk"))
+	(store._dir / "array.json").write_text('["x"]', encoding="utf-8")
+	(store._dir / "broken.json").write_text('{"name":', encoding="utf-8")
+
+	items = store.list_all()
+	assert [item["name"] for item in items] == ["张三"]
+
+
+def test_get_returns_none_for_unreadable_resume(tmp_path):
+	store = ResumeStore(tmp_path / "resumes")
+	(store._dir / "gbk.json").write_bytes('{"name": "李四"}'.encode("gbk"))
+	(store._dir / "bad_shape.json").write_text('{"name": "王五", "personal_info": [1]}', encoding="utf-8")
+
+	assert store.get("gbk") is None
+	assert store.get("bad_shape") is None
+
+
+def test_save_failure_keeps_previous_resume(tmp_path, monkeypatch):
+	"""保存中断（磁盘满、替换失败）不能把上一版简历写成半截 JSON。"""
+	store = ResumeStore(tmp_path / "resumes")
+	store.save(ResumeData(name="张三", title="Python 开发"))
+	path = store._dir / "张三.json"
+	original = path.read_bytes()
+
+	def fail_replace(source, destination):
+		raise OSError("disk full")
+
+	monkeypatch.setattr(os, "replace", fail_replace)
+	with pytest.raises(OSError):
+		store.save(ResumeData(name="张三", title="Go 开发"))
+
+	assert path.read_bytes() == original
+	assert store.get("张三") is not None

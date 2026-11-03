@@ -21,7 +21,7 @@ from boss_agent_cli.ai.service import AIService, AIServiceError, recovery_action
 from rich.table import Table
 
 from boss_agent_cli import display
-from boss_agent_cli.display import handle_error_output, handle_output, render_action_result, render_next_steps
+from boss_agent_cli.display import error_contract_for_code, handle_error_output, handle_output, render_action_result, render_next_steps
 
 
 def _render_local_status(data: dict[str, Any]) -> None:
@@ -130,18 +130,32 @@ def local_pull_cmd(ctx: click.Context, model: str, confirm_download: bool) -> No
 			recoverable=True,
 			recovery_action=f"boss ai local pull --model {model} --confirm-download",
 		)
-	result = subprocess.run(
-		["ollama", "pull", model],
-		check=False,
-		capture_output=True,
-		text=True,
-	)
+	try:
+		result = subprocess.run(
+			["ollama", "pull", model],
+			check=False,
+			capture_output=True,
+			text=True,
+		)
+	except OSError as exc:
+		# 没装 ollama 时 subprocess 抛 FileNotFoundError，顶层 OSError 网兜会把它归成
+		# LOCAL_IO_ERROR（不可恢复、指引去检查目标路径是否可写），而这里已有专门的拉取
+		# 失败契约：按 LOCAL_MODEL_PULL_FAILED 返回，指引装好 Ollama 后再试。
+		handle_error_output(
+			ctx,
+			"ai.local.pull",
+			code="LOCAL_MODEL_PULL_FAILED",
+			message=f"无法启动 ollama：{exc}",
+			recoverable=True,
+			recovery_action="确认已安装 Ollama 且 ollama 在 PATH 中，然后重新执行",
+		)
+		return
 	if result.returncode != 0:
 		handle_error_output(
 			ctx,
 			"ai.local.pull",
 			code="LOCAL_MODEL_PULL_FAILED",
-			message=result.stderr.strip() or "ollama pull failed",
+			message=result.stderr.strip() or "ollama pull 未返回错误输出，退出码非零",
 			recoverable=True,
 			recovery_action="确认 Ollama 已安装并可访问网络后重试",
 		)
@@ -162,13 +176,14 @@ def local_import_cmd(ctx: click.Context, source_path: Path, model: str) -> None:
 	try:
 		imported = import_local_model(ctx.obj["data_dir"], source_path, model)
 	except LocalModelManifestError as exc:
+		recoverable, recovery_action = error_contract_for_code(exc.code)
 		handle_error_output(
 			ctx,
 			"ai.local.import",
 			code=exc.code,
 			message=exc.message,
-			recoverable=True,
-			recovery_action="检查模型路径和 manifest 后重试",
+			recoverable=recoverable,
+			recovery_action=recovery_action,
 		)
 	store = AIConfigStore(ctx.obj["data_dir"])
 	store.save_config(ai_provider="custom", ai_model=model, ai_base_url=None)

@@ -111,7 +111,9 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		return ["chat-summary", arguments["security_id"]]
 
 	if name == "mark":
-		args = [name, arguments["security_id"], "--tag", arguments["tag"]]
+		# MCP 侧参数名是 tag，CLI 的选项名是 --label；两者不是同一个词，写错会让
+		# Click 以 NoSuchOption 拒绝整个工具调用。
+		args = [name, arguments["security_id"], "--label", arguments["tag"]]
 		if arguments.get("remove"):
 			args.append("--remove")
 		return args
@@ -126,8 +128,9 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		args = ["batch-greet", arguments["query"]]
 		if "city" in arguments and arguments["city"]:
 			args.extend(["--city", arguments["city"]])
-		if "limit" in arguments:
-			args.extend(["--limit", str(arguments["limit"])])
+		# MCP 侧参数名是 limit，CLI 选项名是 --count。默认值要显式下发：不传就落到
+		# CLI 的默认 10，比工具声明的 5 多打一倍招呼。
+		args.extend(["--count", str(arguments.get("limit", 5))])
 		if arguments.get("dry_run"):
 			args.append("--dry-run")
 		return args

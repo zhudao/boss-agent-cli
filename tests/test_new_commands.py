@@ -3,6 +3,9 @@ import json
 from unittest.mock import patch, MagicMock
 
 from click.testing import CliRunner
+import pytest
+
+from boss_agent_cli.display import error_contract_for_code, risk_error_message
 from boss_agent_cli.main import cli
 
 
@@ -262,7 +265,7 @@ def test_mark_reports_error_when_platform_rejects(mock_auth_cls, mock_client_cls
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is False
 	assert parsed["error"]["code"] == "ACCOUNT_RISK"
-	assert parsed["error"]["message"] == "account risk"
+	assert parsed["error"]["message"] == risk_error_message("ACCOUNT_RISK")
 	assert parsed["error"]["recoverable"] is False
 	assert parsed["error"]["recovery_action"] == "停止自动化访问，回到平台官网手动处理；确认目标业务页风险解除后，由用户执行 boss clean --risk-lock 并显式恢复任务，必要时联系客服"
 
@@ -439,7 +442,7 @@ def test_exchange_reports_friend_list_error(mock_auth_cls, mock_client_cls):
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "ACCOUNT_RISK"
-	assert parsed["error"]["message"] == "account risk"
+	assert parsed["error"]["message"] == risk_error_message("ACCOUNT_RISK")
 	assert parsed["error"]["recoverable"] is False
 	assert parsed["error"]["recovery_action"] == "停止自动化访问，回到平台官网手动处理；确认目标业务页风险解除后，由用户执行 boss clean --risk-lock 并显式恢复任务，必要时联系客服"
 
@@ -672,6 +675,53 @@ def test_me_reports_user_info_error(mock_auth_cls, mock_client_cls):
 
 @patch("boss_agent_cli.commands.me.get_platform_instance")
 @patch("boss_agent_cli.commands.me.AuthManager")
+@pytest.mark.parametrize("error_cls,code", [
+	("AccountRiskError", "ACCOUNT_RISK"),
+	("EnvironmentRiskError", "ENVIRONMENT_RISK"),
+	("EnvironmentRiskLockedError", "ENVIRONMENT_RISK_LOCKED"),
+])
+def test_me_risk_uses_stop_contract(mock_auth_cls, mock_client_cls, error_cls, code):
+	"""me 没有 @handle_auth_errors：风控必须显式按停止契约输出，不能变成 NETWORK_ERROR。"""
+	from boss_agent_cli.api.client import AccountRiskError, EnvironmentRiskError, EnvironmentRiskLockedError
+
+	errors = {
+		"AccountRiskError": AccountRiskError,
+		"EnvironmentRiskError": EnvironmentRiskError,
+		"EnvironmentRiskLockedError": EnvironmentRiskLockedError,
+	}
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.user_info.side_effect = errors[error_cls]("private-token")
+	runner = CliRunner()
+	result = runner.invoke(cli, ["me", "--section", "user"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == code
+	assert parsed["error"]["recoverable"] is False
+	assert parsed["error"]["recovery_action"] == error_contract_for_code(code)[1]
+	assert parsed["hints"]["next_actions"]
+	assert "private-token" not in result.output
+
+
+@patch("boss_agent_cli.commands.me.get_platform_instance")
+@patch("boss_agent_cli.commands.me.AuthManager")
+def test_me_budget_stop_uses_contract(mock_auth_cls, mock_client_cls):
+	"""me 没有 @handle_auth_errors：预算/时限停止不能降级成可重试的 NETWORK_ERROR。"""
+	from boss_agent_cli.api.request_budget import RequestBudgetExceeded
+
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.user_info.side_effect = RequestBudgetExceeded("fixture budget stop")
+	runner = CliRunner()
+	result = runner.invoke(cli, ["me", "--section", "user"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "REQUEST_BUDGET_EXHAUSTED"
+	assert (parsed["error"]["recoverable"], parsed["error"]["recovery_action"]) == error_contract_for_code(
+		"REQUEST_BUDGET_EXHAUSTED"
+	)
+
+
+@patch("boss_agent_cli.commands.me.get_platform_instance")
+@patch("boss_agent_cli.commands.me.AuthManager")
 def test_me_resume_reports_not_supported(mock_auth_cls, mock_client_cls):
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.resume_baseinfo.side_effect = NotImplementedError("resume_baseinfo is not supported")
@@ -761,6 +811,32 @@ def test_history_success(mock_auth_cls, mock_client_cls):
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
+
+
+@patch("boss_agent_cli.commands.history.get_platform_instance")
+@patch("boss_agent_cli.commands.history.AuthManager")
+def test_history_hints_omit_next_page_when_no_more(mock_auth_cls, mock_client_cls):
+	"""hasMore=false 时不能建议 --page N+1：Agent 照着执行只会拿到空页。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.job_history.return_value = {"code": 0, "zpData": {"hasMore": False, "jobList": []}}
+	runner = CliRunner()
+	result = runner.invoke(cli, ["history", "--page", "3"])
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert all("--page" not in action for action in parsed["hints"]["next_actions"])
+
+
+@patch("boss_agent_cli.commands.history.get_platform_instance")
+@patch("boss_agent_cli.commands.history.AuthManager")
+def test_history_hints_include_next_page_when_has_more(mock_auth_cls, mock_client_cls):
+	"""hasMore=true 时保留下一页提示，页码基于当前页 +1。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.job_history.return_value = {"code": 0, "zpData": {"hasMore": True, "jobList": []}}
+	runner = CliRunner()
+	result = runner.invoke(cli, ["history", "--page", "2"])
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert any("history --page 3" in action for action in parsed["hints"]["next_actions"])
 
 
 @patch("boss_agent_cli.commands.history.get_platform_instance")
@@ -859,7 +935,7 @@ def test_interviews_reports_platform_error(mock_auth_cls, mock_client_cls):
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "ACCOUNT_RISK"
-	assert parsed["error"]["message"] == "account risk"
+	assert parsed["error"]["message"] == risk_error_message("ACCOUNT_RISK")
 	assert parsed["error"]["recoverable"] is False
 	assert parsed["error"]["recovery_action"] == "停止自动化访问，回到平台官网手动处理；确认目标业务页风险解除后，由用户执行 boss clean --risk-lock 并显式恢复任务，必要时联系客服"
 

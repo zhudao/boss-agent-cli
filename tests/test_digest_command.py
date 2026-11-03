@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from click.testing import CliRunner
 
+from boss_agent_cli.display import risk_error_message
 from boss_agent_cli.main import cli
 
 
@@ -130,13 +131,22 @@ def test_digest_is_exposed_in_schema():
 	assert "digest" in parsed["data"]["commands"]
 
 
+def test_digest_rejects_overflowing_days_stale():
+	"""`--days-stale` 是无界整数时会在时间运算里溢出，必须按参数错误提前拒绝。"""
+	result = CliRunner().invoke(cli, ["digest", "--days-stale", "9" * 400])
+	assert result.exit_code == 1
+	payload = json.loads(result.output)
+	assert payload["ok"] is False
+	assert payload["error"]["code"] == "INVALID_PARAM"
+
+
 # ── --format md 支持 ────────────────────────────────────────
 
 
 @patch("boss_agent_cli.commands.digest.get_platform_instance")
 @patch("boss_agent_cli.commands.digest.AuthManager")
 def test_digest_format_md_writes_markdown_to_stdout(mock_auth_cls, mock_client_cls, legacy_args):
-	"""--format md 未指定 -o 时把 Markdown 写到 stdout，不套 JSON 信封"""
+	"""未指定 -o 且未强制 --json 时把 Markdown 写到 stdout，供管道重定向，不套 JSON 信封"""
 	_setup_digest_mocks(mock_client_cls)
 
 	runner = CliRunner()
@@ -148,6 +158,24 @@ def test_digest_format_md_writes_markdown_to_stdout(mock_auth_cls, mock_client_c
 	assert "## 面试" in result.output
 	# 不是 JSON 信封
 	assert not result.output.lstrip().startswith("{")
+
+
+@patch("boss_agent_cli.commands.digest.get_platform_instance")
+@patch("boss_agent_cli.commands.digest.AuthManager")
+def test_digest_format_md_with_json_flag_returns_envelope(mock_auth_cls, mock_client_cls, legacy_args):
+	"""--json 下 stdout 必须是信封：MCP 总是带 --json 调用，直出 Markdown 只会被判成 CLI_ERROR。"""
+	_setup_digest_mocks(mock_client_cls)
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--json", *legacy_args, "digest", "--format", "md"])
+	assert result.exit_code == 0
+
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["format"] == "md"
+	assert parsed["data"]["content"].startswith("# 每日求职摘要")
+	assert "## 待跟进" in parsed["data"]["content"]
+	assert parsed["data"]["bytes"] == len(parsed["data"]["content"].encode("utf-8"))
 
 
 @patch("boss_agent_cli.commands.digest.get_platform_instance")
@@ -171,6 +199,25 @@ def test_digest_format_md_with_output_path_writes_file(mock_auth_cls, mock_clien
 	assert content.startswith("# 每日求职摘要")
 	assert "TestCo" in content
 	assert "Go 开发" in content
+
+
+@patch("boss_agent_cli.commands.digest.get_platform_instance")
+@patch("boss_agent_cli.commands.digest.AuthManager")
+def test_digest_output_path_expands_tilde_and_creates_parent(mock_auth_cls, mock_client_cls, tmp_path, monkeypatch, legacy_args):
+	"""MCP 子进程调用不经 shell，`~` 不会被展开；-o 必须自己展开并建父目录。"""
+	_setup_digest_mocks(mock_client_cls)
+	monkeypatch.setenv("HOME", str(tmp_path))
+	monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+	result = CliRunner().invoke(cli, [
+		"--json", *legacy_args, "digest", "--format", "md", "-o", "~/nested/digest.md",
+	])
+
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	expected = tmp_path / "nested" / "digest.md"
+	assert parsed["data"]["path"] == str(expected)
+	assert expected.read_text(encoding="utf-8").startswith("# 每日求职摘要")
 
 
 @patch("boss_agent_cli.commands.digest.get_platform_instance")
@@ -228,7 +275,7 @@ def test_digest_reports_interview_error(mock_auth_cls, mock_client_cls, legacy_a
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "ACCOUNT_RISK"
-	assert parsed["error"]["message"] == "account risk"
+	assert parsed["error"]["message"] == risk_error_message("ACCOUNT_RISK")
 
 
 @patch("boss_agent_cli.commands.digest.get_platform_instance")

@@ -1,6 +1,7 @@
 """config 命令测试 — 覆盖查看、设置、重置配置项。"""
 
 import json
+import os
 from typing import Any
 
 import pytest
@@ -173,12 +174,201 @@ def test_config_set_browser_source_validates_choice(tmp_path):
 	assert parsed["data"]["value"] == "auto"
 
 
+def test_config_set_role_validates_choice(tmp_path):
+	"""role 进 _CONFIG_CHOICES：写进非法值时命令本身就该失败。
+
+	以前 `config set role admin` 返回 ok=true，落盘后每条命令都在启动阶段
+	返回 INVALID_PARAM，连 `config reset role` 也一样（只能靠 `--role` 覆盖）。
+	"""
+	code, parsed = _invoke("config", "set", "role", "recruiter", tmp_path=tmp_path)
+	assert code == 0
+	assert parsed["data"]["value"] == "recruiter"
+	assert json.loads((tmp_path / "config.json").read_text())["role"] == "recruiter"
+
+	code, parsed = _invoke("config", "set", "role", "admin", tmp_path=tmp_path)
+	assert code == 1
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "candidate, recruiter" in parsed["error"]["message"]
+	# 非法值没有落盘：之后的命令（含 config reset）仍然可用。
+	assert json.loads((tmp_path / "config.json").read_text())["role"] == "recruiter"
+	code, parsed = _invoke("config", "get", "role", tmp_path=tmp_path)
+	assert code == 0
+	assert parsed["data"]["value"] == "recruiter"
+
+
+def test_config_set_log_level_validates_choice(tmp_path):
+	"""log_level 进 _CONFIG_CHOICES：Logger 对未知级别静默回退到 error 阈值，
+	所以写入期必须拒绝拼错的级别，而不是报成功却什么都不记。"""
+	code, parsed = _invoke("config", "set", "log_level", "debug", tmp_path=tmp_path)
+	assert code == 0
+	assert parsed["data"]["value"] == "debug"
+
+	code, parsed = _invoke("config", "set", "log_level", "verbose", tmp_path=tmp_path)
+	assert code == 1
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "error, warning, info, debug" in parsed["error"]["message"]
+	assert json.loads((tmp_path / "config.json").read_text())["log_level"] == "debug"
+
+
+def test_config_choices_cover_enum_valued_defaults():
+	"""有固定取值域的配置项都要进 _CONFIG_CHOICES，否则 config set 能把非法值写进配置。"""
+	from boss_agent_cli.commands.config_cmd import _CONFIG_CHOICES
+
+	assert {"operating_mode", "browser_source", "role", "log_level"} <= set(_CONFIG_CHOICES)
+
+
+@pytest.mark.parametrize("value", [5, True, ["auto"], {"name": "auto"}])
+def test_non_string_browser_source_in_config_returns_envelope(tmp_path, value):
+	"""config.json 里 browser_source 不是字符串时不能 traceback，要按参数错误给信封。"""
+	(tmp_path / "config.json").write_text(json.dumps({"browser_source": value}), encoding="utf-8")
+
+	code, parsed = _invoke("config", "list", tmp_path=tmp_path)
+
+	assert code == 1
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	message = parsed["error"]["message"]
+	assert "不支持的浏览器通道" in message
+	assert repr(value) in message
+	assert "auto" in message
+
+
+def test_browser_source_override_recovers_from_non_string_config(tmp_path):
+	"""启动期校验挡住坏配置时，--browser-source 覆盖仍要能执行修复命令。"""
+	(tmp_path / "config.json").write_text(json.dumps({"browser_source": 5}), encoding="utf-8")
+
+	runner = CliRunner()
+	result = runner.invoke(
+		cli,
+		["--data-dir", str(tmp_path), "--browser-source", "auto", "config", "reset", "browser_source"],
+	)
+
+	assert result.exit_code == 0, result.output
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert json.loads((tmp_path / "config.json").read_text(encoding="utf-8")) == {}
+
+
+@pytest.mark.parametrize("value", [9, True, ["http://127.0.0.1:9222"]])
+def test_non_string_cdp_url_in_config_returns_envelope(tmp_path, value):
+	"""config.json 的 cdp_url 不是字符串时，doctor 等命令不能抛 shlex TypeError。"""
+	(tmp_path / "config.json").write_text(json.dumps({"cdp_url": value}), encoding="utf-8")
+
+	code, parsed = _invoke("doctor", tmp_path=tmp_path)
+
+	assert code == 1
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	message = parsed["error"]["message"]
+	assert "--cdp-url" in message
+	assert "调试地址字符串或 null" in message
+	assert repr(value) in message
+
+
+def test_cdp_url_override_recovers_from_non_string_config(tmp_path):
+	"""坏 cdp_url 挡住启动时，--cdp-url 覆盖仍要能执行修复命令。"""
+	(tmp_path / "config.json").write_text(json.dumps({"cdp_url": 9}), encoding="utf-8")
+
+	runner = CliRunner()
+	result = runner.invoke(
+		cli,
+		["--data-dir", str(tmp_path), "--cdp-url", "http://127.0.0.1:9222", "config", "reset", "cdp_url"],
+	)
+
+	assert result.exit_code == 0, result.output
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert json.loads((tmp_path / "config.json").read_text(encoding="utf-8")) == {}
+
+
+@pytest.mark.parametrize("value", [5, "admin", ["recruiter"]])
+def test_invalid_role_in_config_returns_envelope(tmp_path, value):
+	"""config.json 的 role 写成数字或无效值时，doctor 等命令不能抛 shlex TypeError。"""
+	(tmp_path / "config.json").write_text(json.dumps({"role": value}), encoding="utf-8")
+
+	code, parsed = _invoke("doctor", tmp_path=tmp_path)
+
+	assert code == 1
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	message = parsed["error"]["message"]
+	assert "--role" in message
+	assert repr(value) in message
+	assert "candidate" in message
+	assert "recruiter" in message
+
+
+def test_valid_role_in_config_is_accepted(tmp_path):
+	"""config.json 里的角色值要与 --role 的取值域一致，合法值不应被启动期校验拦住。"""
+	(tmp_path / "config.json").write_text(json.dumps({"role": "recruiter"}), encoding="utf-8")
+
+	code, parsed = _invoke("config", "get", "role", tmp_path=tmp_path)
+
+	assert code == 0
+	assert parsed["data"]["value"] == "recruiter"
+
+
+def test_role_override_recovers_from_invalid_config(tmp_path):
+	"""坏 role 挡住启动时，--role 覆盖仍要能执行修复命令。"""
+	(tmp_path / "config.json").write_text(json.dumps({"role": 5}), encoding="utf-8")
+
+	runner = CliRunner()
+	result = runner.invoke(
+		cli,
+		["--data-dir", str(tmp_path), "--role", "candidate", "config", "reset", "role"],
+	)
+
+	assert result.exit_code == 0, result.output
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert json.loads((tmp_path / "config.json").read_text(encoding="utf-8")) == {}
+
+
 def test_parse_value_int_from_default_type():
 	"""_parse_value 按 int 默认值类型转换输入。"""
 	from boss_agent_cli.commands.config_cmd import _parse_value
-	result = _parse_value("5", 10)
+	result = _parse_value("request_max_per_minute", "5", 10)
 	assert result == 5
 	assert isinstance(result, int)
+
+
+@pytest.mark.parametrize(
+	("key", "raw", "default", "fragment"),
+	[
+		("request_max_per_minute", "abc", 10, "必须是整数"),
+		("request_wait_timeout", "abc", 30.0, "必须是数值"),
+		("request_delay", "1.5;3", [1.5, 3.0], "必须是逗号分隔的数值列表"),
+	],
+)
+def test_parse_value_reports_chinese_message_with_key(key, raw, default, fragment):
+	"""转换失败要点名配置项并给中文说明，而不是裸 int()/float() 的英文报错。"""
+	from boss_agent_cli.commands.config_cmd import _parse_value
+
+	with pytest.raises(ValueError) as excinfo:
+		_parse_value(key, raw, default)
+
+	message = str(excinfo.value)
+	assert key in message
+	assert raw in message
+	assert fragment in message
+
+
+@pytest.mark.parametrize(
+	("key", "value"),
+	[
+		("request_max_per_minute", "abc"),
+		("request_wait_timeout", "abc"),
+		("request_delay", "abc"),
+	],
+)
+def test_config_set_numeric_parse_error_returns_chinese_envelope(tmp_path, key, value):
+	"""数值配置项写错时信封里的 message 是中文，且点名配置项。"""
+	code, parsed = _invoke("config", "set", key, value, tmp_path=tmp_path)
+
+	assert code == 1
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	message = parsed["error"]["message"]
+	assert key in message
+	assert value in message
+	assert "could not convert" not in message
+	assert "invalid literal" not in message
 
 
 def test_config_set_list_value(tmp_path):
@@ -196,6 +386,105 @@ def test_config_set_null_value(tmp_path):
 	code, parsed = _invoke("config", "set", "cdp_url", "null", tmp_path=tmp_path)
 	assert code == 0
 	assert parsed["data"]["value"] is None
+
+
+@pytest.mark.parametrize("key", ["automation", "crawl"])
+@pytest.mark.parametrize("value", ["foo", "[]", "42", "null"])
+def test_config_set_structured_value_requires_json_object(tmp_path, key, value):
+	"""structured key 不接受标量文本：写进去会让后续读取方在 .get() 上崩溃。"""
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "config", "set", key, value])
+	parsed = _assert_single_stdout_json_error(result, command="config", code="INVALID_PARAM")
+	assert "JSON object" in parsed["error"]["message"]
+	assert not (tmp_path / "config.json").exists()
+
+
+def test_config_set_structured_value_accepts_json_object(tmp_path):
+	code, parsed = _invoke("config", "set", "automation", '{"mode": "training"}', tmp_path=tmp_path)
+	assert code == 0
+	assert parsed["data"]["value"] == {"mode": "training"}
+	saved = json.loads((tmp_path / "config.json").read_text())
+	assert saved["automation"] == {"mode": "training"}
+
+
+@pytest.mark.parametrize(
+	"value",
+	[
+		'{"mode": "nonsense"}',
+		'{"reply_strategy": "nonsense"}',
+		'{"human_review_threshold": "high"}',
+		'{"auto_execute_threshold": -1}',
+		'{"max_per_tab": -1}',
+		'{"allowed_actions": 5}',
+	],
+)
+def test_config_set_automation_rejects_invalid_values(tmp_path, value):
+	"""枚举 / 数值字段写错时不能先落盘，否则 agent run/train 运行时才炸。"""
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "config", "set", "automation", value])
+	parsed = _assert_single_stdout_json_error(result, command="config", code="INVALID_PARAM")
+	assert "automation 配置无效" in parsed["error"]["message"]
+	assert not (tmp_path / "config.json").exists()
+
+
+def test_config_set_automation_accepts_partial_object(tmp_path):
+	"""缺省字段由解析器补默认值，内容校验不能误伤部分配置。"""
+	code, parsed = _invoke("config", "set", "automation", '{"max_per_tab": 5}', tmp_path=tmp_path)
+	assert code == 0
+	assert parsed["data"]["value"] == {"max_per_tab": 5}
+
+
+@pytest.mark.parametrize(
+	"value",
+	[
+		'{"max_requests": 0}',
+		'{"max_requests": [1]}',
+		'{"max_retries": -1}',
+		'{"cdp_port": 70000}',
+		'{"cdp_port": "abc"}',
+		'{"chrome_path": 5}',
+	],
+)
+def test_config_set_crawl_rejects_invalid_values(tmp_path, value):
+	"""采集配置写错时不能先落盘，否则每次 crawl run/start 都要报一次 INVALID_PARAM。"""
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "config", "set", "crawl", value])
+	parsed = _assert_single_stdout_json_error(result, command="config", code="INVALID_PARAM")
+	assert "crawl 配置无效" in parsed["error"]["message"]
+	assert not (tmp_path / "config.json").exists()
+
+
+def test_config_set_crawl_accepts_partial_object(tmp_path):
+	"""显式 0 重试与部分对象都必须保留，不能被默认值覆盖。"""
+	code, parsed = _invoke("config", "set", "crawl", '{"max_retries": 0}', tmp_path=tmp_path)
+	assert code == 0
+	assert parsed["data"]["value"] == {"max_retries": 0}
+	saved = json.loads((tmp_path / "config.json").read_text())
+	assert saved["crawl"] == {"max_retries": 0}
+
+
+def test_agent_run_rejects_non_object_automation_config(tmp_path):
+	"""手工编辑 config.json 写成字符串时，agent 也要给信封与修复入口，而不是 traceback。"""
+	(tmp_path / "config.json").write_text('{"automation": "foo"}', encoding="utf-8")
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "agent", "run", "--dry-run"])
+	parsed = _assert_single_stdout_json_error(result, command="agent.run", code="INVALID_PARAM")
+	assert "JSON object" in parsed["error"]["message"]
+	assert parsed["error"]["recoverable"] is True
+	assert "config reset automation" in (parsed["error"]["recovery_action"] or "")
+
+
+@pytest.mark.parametrize(
+	("args", "command"),
+	[
+		(("agent", "run", "--dry-run"), "agent.run"),
+		(("agent", "train"), "agent.train"),
+	],
+)
+def test_agent_rejects_invalid_automation_value(tmp_path, args, command):
+	"""手工写入非法枚举值时，agent run/train 同样要给信封而不是 traceback。"""
+	(tmp_path / "config.json").write_text('{"automation": {"mode": "nonsense"}}', encoding="utf-8")
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), *args])
+	parsed = _assert_single_stdout_json_error(result, command=command, code="INVALID_PARAM")
+	assert "automation 配置无效" in parsed["error"]["message"]
+	assert parsed["error"]["recoverable"] is True
+	assert "config reset automation" in (parsed["error"]["recovery_action"] or "")
 
 
 def test_config_set_unknown_key(tmp_path):
@@ -243,6 +532,80 @@ def test_config_reset_unknown_key(tmp_path):
 	result = runner.invoke(cli, ["--data-dir", str(tmp_path), "config", "reset", "bad_key"])
 	parsed = _assert_single_stdout_json_error(result, command="config", code="INVALID_PARAM")
 	assert "可用项" in parsed["error"]["message"]
+
+
+def test_unreadable_config_file_returns_envelope_instead_of_traceback(tmp_path):
+	"""config.json 读不出来时，连 config list 都要给信封和修复路径。"""
+	(tmp_path / "config.json").mkdir()
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "config", "list"])
+	parsed = _assert_single_stdout_json_error(result, command="boss", code="INVALID_PARAM")
+	assert "无法读取" in parsed["error"]["message"]
+	assert "config.json" in parsed["error"]["message"]
+
+
+def test_corrupt_config_json_names_the_file_and_position(tmp_path):
+	"""语法坏掉的 config.json 会挡住所有命令，消息必须给出要修的文件与行列。"""
+	config_file = tmp_path / "config.json"
+	config_file.write_text('{"log_level":', encoding="utf-8")
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "config", "reset", "log_level"])
+	parsed = _assert_single_stdout_json_error(result, command="boss", code="INVALID_PARAM")
+	message = parsed["error"]["message"]
+	assert str(config_file) in message
+	assert "不是合法 JSON" in message
+	assert "第 1 行" in message
+	assert "删除" in message
+
+
+@pytest.mark.parametrize("content", ["[]", '"debug"', "null", "42"])
+def test_non_object_config_json_names_the_file(tmp_path, content):
+	config_path = tmp_path / "config.json"
+	config_path.write_text(content, encoding="utf-8")
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "config", "list"])
+	parsed = _assert_single_stdout_json_error(result, command="boss", code="INVALID_PARAM")
+	assert "必须是 JSON 对象" in parsed["error"]["message"]
+	assert str(config_path) in parsed["error"]["message"]
+
+
+_READ_ONLY_UNSUPPORTED = os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0)
+
+
+@pytest.mark.skipif(_READ_ONLY_UNSUPPORTED, reason="只读目录在 Windows 与 root 下不生效")
+@pytest.mark.parametrize(
+	"args",
+	[
+		("set", "log_level", "debug"),
+		("reset", "log_level"),
+	],
+)
+def test_config_write_failure_returns_local_io_error(tmp_path, args):
+	"""配置文件写不进去时报本地 IO 错误（不可自动重试），而不是 traceback。"""
+	data_dir = tmp_path / "readonly"
+	data_dir.mkdir()
+	data_dir.chmod(0o500)
+	try:
+		result = CliRunner().invoke(cli, ["--data-dir", str(data_dir), "config", *args])
+	finally:
+		data_dir.chmod(0o700)
+	parsed = _assert_single_stdout_json_error(result, command="config", code="LOCAL_IO_ERROR")
+	assert "写入" in parsed["error"]["message"]
+	assert parsed["error"]["recoverable"] is False
+	assert "不要自动重试" in parsed["error"]["recovery_action"]
+
+
+def test_config_write_failure_keeps_previous_file(tmp_path, monkeypatch):
+	"""原子写失败时保留原配置：半截 config.json 会让所有命令都卡在启动阶段。"""
+	config_file = tmp_path / "config.json"
+	config_file.write_text('{"log_level": "debug"}\n', encoding="utf-8")
+	original = config_file.read_bytes()
+
+	def fail_replace(source, destination):
+		raise OSError("disk full")
+
+	monkeypatch.setattr(os, "replace", fail_replace)
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "config", "set", "log_level", "info"])
+
+	_assert_single_stdout_json_error(result, command="config", code="LOCAL_IO_ERROR")
+	assert config_file.read_bytes() == original
 
 
 # ── JSON 信封格式 ──────────────────────────────────────────────────

@@ -4,13 +4,13 @@ import click
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._recruiter_platform import get_recruiter_platform_instance
-from boss_agent_cli.display import handle_auth_errors, handle_output, handle_platform_error_output
+from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_output, handle_platform_error_output
 
 
 @click.command("applications")
 @click.option("--job-id", default=None, help="按职位筛选")
-@click.option("--label-id", default=0, type=int, help="按标签筛选（0=全部, 1=新招呼, 2=沟通中）")
-@click.option("--page", default=1, type=int, help="页码")
+@click.option("--label-id", default=0, type=click.IntRange(min=0), help="按标签筛选（0=全部, 1=新招呼, 2=沟通中）")
+@click.option("--page", default=1, type=click.IntRange(min=1), help="页码")
 @click.pass_context
 @handle_auth_errors("recruiter-applications")
 def applications_cmd(ctx: click.Context, job_id: str | None, label_id: int, page: int) -> None:
@@ -31,7 +31,7 @@ def applications_cmd(ctx: click.Context, job_id: str | None, label_id: int, page
 		handle_output(
 			ctx, "recruiter-applications", data,
 			hints={"next_actions": [
-				"boss hr resume <geek_id> --job-id <id> --security-id <id> — 查看候选人简历",
-				"boss hr chat — 查看沟通列表",
+				boss_command_for_ctx(ctx, "hr resume <geek_id> --job-id <id> --security-id <id>"),
+				boss_command_for_ctx(ctx, "hr chat"),
 			]},
 		)

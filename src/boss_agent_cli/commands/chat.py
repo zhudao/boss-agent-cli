@@ -8,12 +8,13 @@ from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._platform import get_platform_instance
 from boss_agent_cli.services.chat_export import render_export
+from boss_agent_cli.services.output_path import prepare_output_path
 from boss_agent_cli.services.chat_snapshot import save_snapshot_and_diff, load_snapshot
 from boss_agent_cli.services.chat_utils import (
 	RELATION_LABELS, FROM_FILTER, MSG_STATUS_LABELS,
 	sanitize_csv_cell, escape_md_cell,
 )
-from boss_agent_cli.display import handle_auth_errors, handle_error_output, handle_not_supported, handle_output, handle_platform_error_output, render_simple_list
+from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_error_output, handle_not_supported, handle_output, handle_platform_error_output, render_simple_list
 
 # 向后兼容别名（旧测试引用 chat._sanitize_csv_cell 等）
 _RELATION_LABELS = RELATION_LABELS
@@ -25,10 +26,10 @@ _escape_md_cell = escape_md_cell
 
 
 @click.command("chat")
-@click.option("--page", default=1, help="页码")
+@click.option("--page", default=1, type=click.IntRange(min=1), help="页码")
 @click.option("--from", "from_who", default=None, type=click.Choice(["boss", "me"]),
 	help="筛选发起方：boss=对方主动联系 / me=我主动打招呼")
-@click.option("--days", default=None, type=int, help="只显示最近 N 天的记录")
+@click.option("--days", default=None, type=click.IntRange(min=0, max=36500), help="只显示最近 N 天的记录")
 @click.option("--export", "export_fmt", default=None,
 	type=click.Choice(["html", "md", "csv", "json"]),
 	help="导出格式：html=HTML / md=Markdown / csv=CSV / json=JSON")
@@ -120,6 +121,19 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 				today = datetime.date.today().isoformat()
 				# 优先读 config 中的 export_dir，否则 fallback 到 data_dir/chat-export
 				export_dir = ctx.obj.get("config", {}).get("export_dir")
+				if export_dir and not isinstance(export_dir, str):
+					# config.json 被手改成数字 / 数组时 os.path.expanduser 会抛 TypeError：
+					# 按参数错误给信封，并指出只改这一项的修复命令。
+					handle_error_output(
+						ctx,
+						"chat",
+						code="INVALID_PARAM",
+						message=f"export_dir 必须是目录路径字符串或 null，收到 {export_dir!r}",
+						recoverable=True,
+						recovery_action=boss_command_for_ctx(ctx, "config reset export_dir"),
+					)
+					ctx.exit(1)
+					return
 				if export_dir:
 					export_dir = os.path.expanduser(export_dir)
 				else:
@@ -127,24 +141,12 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 				os.makedirs(export_dir, exist_ok=True)
 				output_path = os.path.join(export_dir, f"沟通列表-{today}.{export_fmt}")
 
-			# 路径安全校验：禁止 .. 跳转
-			resolved = os.path.realpath(output_path)
-			try:
-				relative_output = os.path.relpath(resolved, os.getcwd())
-			except ValueError:
-				relative_output = resolved
-			if ".." in relative_output:
-				safe_dir = os.path.realpath(export_dir if 'export_dir' in dir() else data_dir)
-				if not resolved.startswith(safe_dir) and not resolved.startswith(os.path.realpath(os.getcwd())):
-					handle_error_output(
-						ctx, "chat", code="INVALID_PARAM",
-						message=f"输出路径不安全: {output_path}",
-					)
-					return
-
-			os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-			with open(output_path, "w", encoding="utf-8", newline="") as f:
+			# 显式指定的写入位置由用户负责，这里只展开 ~ 并建好父目录，
+			# 与 digest / stats / resume export 共用同一套 -o 语义。
+			target = prepare_output_path(output_path)
+			with open(target, "w", encoding="utf-8", newline="") as f:
 				f.write(content)
+			output_path = str(target)
 			handle_output(
 				ctx, "chat",
 				{
@@ -158,8 +160,8 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 					f"已导出 {d['count']} 条到 {d['path']}", err=True
 				),
 					hints={"next_actions": [
-						"boss detail <security_id> — 查看职位详情",
-						"boss chatmsg <uid> — 查看消息后继续沟通（uid 见上方输出）",
+						boss_command_for_ctx(ctx, "detail <security_id>"),
+						boss_command_for_ctx(ctx, "chatmsg <uid>"),
 				]},
 			)
 			return
@@ -195,8 +197,8 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 			ctx, "chat", friends,
 			render=_render,
 				hints={"next_actions": [
-					"boss detail <security_id> — 查看职位详情",
-					"boss chatmsg <uid> — 查看消息后继续沟通（uid 见上方输出）",
+					boss_command_for_ctx(ctx, "detail <security_id>"),
+					boss_command_for_ctx(ctx, "chatmsg <uid>"),
 			]},
 		)
 

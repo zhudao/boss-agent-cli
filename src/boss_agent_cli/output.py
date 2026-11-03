@@ -5,6 +5,11 @@ from typing import Any
 
 import click
 
+from boss_agent_cli.schema.error_codes import ERROR_CODES
+
+#: 日志级别取值域：`--log-level` 的 Choice 与 `config set log_level` 共用，
+#: 未知级别不会被 Logger 拒绝，而是静默回退到 error 阈值。
+LOG_LEVELS: tuple[str, ...] = ("error", "warning", "info", "debug")
 _LEVEL_ORDER = {"debug": 0, "info": 1, "warning": 2, "error": 3}
 _REDACTED = "[REDACTED]"
 _SENSITIVE_KEY_PARTS = (
@@ -51,6 +56,27 @@ def _is_error_code_metadata(value: Any) -> bool:
 		"recoverable",
 		"recovery_action",
 	})
+
+
+_FILESYSTEM_ERROR_TYPES: tuple[type[OSError], ...] = (
+	FileNotFoundError,
+	PermissionError,
+	FileExistsError,
+	IsADirectoryError,
+	NotADirectoryError,
+)
+
+
+def is_local_io_error(exc: BaseException) -> bool:
+	"""判断异常来自本地文件系统，还是套接字层。
+
+	`OSError` 同时覆盖文件和网络：`ConnectionError` / `TimeoutError` / `socket.gaierror`
+	/ `ssl.SSLError` 是网络问题，重试有意义；`open()` / `os.makedirs()` 抛出的
+	`PermissionError` / `IsADirectoryError` 等带 `filename`，重试同一条命令只会再失败一次。
+	"""
+	if not isinstance(exc, OSError) or isinstance(exc, (ConnectionError, TimeoutError)):
+		return False
+	return isinstance(exc, _FILESYSTEM_ERROR_TYPES) or getattr(exc, "filename", None) is not None
 
 
 def redact_sensitive(value: Any) -> Any:
@@ -125,11 +151,18 @@ def envelope_error(
 	*,
 	code: str,
 	message: str,
-	recoverable: bool = False,
+	recoverable: bool | None = None,
 	recovery_action: str | None = None,
 	details: dict[str, Any] | None = None,
 	hints: dict[str, Any] | None = None,
 ) -> str:
+	# 调用方未显式给出时按错误码登记表补齐，保证信封元数据与 schema 真源一致。
+	# None 表示「未声明」，显式 False 仍表示不可恢复，不会被登记表覆盖。
+	spec = ERROR_CODES.get(code, {})
+	if recoverable is None:
+		recoverable = bool(spec.get("recoverable", False))
+	if recovery_action is None:
+		recovery_action = spec.get("recovery_action")
 	error = {
 		"code": code,
 		"message": redact_sensitive_text(message),

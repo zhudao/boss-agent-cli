@@ -1,6 +1,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from boss_agent_cli.main import cli
@@ -44,7 +45,8 @@ def test_init_with_template(tmp_path):
 	assert parsed["hints"]["next_actions"] == [
 		"boss resume show myresume",
 		"boss resume edit myresume --field title --value <新标题>",
-		"boss me 然后用 boss resume import 导入平台真实简历",
+		"boss me",
+		"boss resume import <path>",
 	]
 
 
@@ -66,6 +68,20 @@ def test_init_already_exists(tmp_path):
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is False
 	assert parsed["error"]["code"] == "RESUME_ALREADY_EXISTS"
+
+
+def test_init_rejects_blank_name(tmp_path):
+	"""空名称的简历没法点名，`resume show ` 缺参数，必须在写盘前拒绝。"""
+	runner = CliRunner()
+	for name in ("", "   "):
+		result = _invoke(runner, tmp_path, ["init", "--name", name, "--template", "default"])
+		assert result.exit_code == 1, result.output
+		parsed = json.loads(result.output)
+		assert parsed["error"]["code"] == "INVALID_PARAM"
+		assert "名称" in parsed["error"]["message"]
+
+	listed = json.loads(_invoke(runner, tmp_path, ["list"]).output)
+	assert listed["data"] == []
 
 
 # ── list ──────────────────────────────────────────────────────
@@ -174,6 +190,31 @@ def test_delete_existing(tmp_path):
 	assert show_result.exit_code == 1
 
 
+def test_delete_resume_clears_job_links(tmp_path):
+	"""删除简历时一并清理职位关联，同名重建的简历不继承旧投递状态。
+
+	关联表没有外键约束；不同步清理的话，`resume delete default` 再 `resume init`
+	（默认名就是 default）之后，`resume applications default` 会把旧简历投过的职位
+	连同 `applied` 状态一起报出来。
+	"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "default", "--template", "default"])
+	_invoke(runner, tmp_path, ["link", "default", "sid-001", "jid-001", "--title", "后端", "--company", "公司甲"])
+
+	from boss_agent_cli.cache.store import CacheStore
+
+	with CacheStore(tmp_path / "cache" / "boss_agent.db") as cache:
+		assert cache.update_job_link_status("default", "sid-001", "jid-001", "applied", "已投递") is True
+
+	delete_result = _invoke(runner, tmp_path, ["delete", "default"])
+	assert delete_result.exit_code == 0, delete_result.output
+
+	_invoke(runner, tmp_path, ["init", "--template", "default"])
+	result = _invoke(runner, tmp_path, ["applications", "default"])
+	assert json.loads(result.output)["data"] == []
+	assert json.loads(delete_result.output)["data"]["removed_links"] == 1
+
+
 def test_delete_not_found(tmp_path):
 	runner = CliRunner()
 	result = _invoke(runner, tmp_path, ["delete", "nope"])
@@ -194,6 +235,19 @@ def test_export_json(tmp_path):
 	assert parsed["ok"] is True
 	assert "version" in parsed["data"]
 	assert parsed["data"]["data"]["name"] == "exportme"
+
+
+def test_export_json_creates_parent_directories(tmp_path):
+	"""`-o` 指向尚不存在的目录时自动建父目录（与 digest / stats 一致）。"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "exportme", "--template", "default"])
+	out = tmp_path / "deep" / "nested" / "export.json"
+
+	result = _invoke(runner, tmp_path, ["export", "exportme", "--format", "json", "-o", str(out)])
+
+	assert result.exit_code == 0
+	assert out.exists()
+	assert json.loads(out.read_text(encoding="utf-8"))["data"]["name"] == "exportme"
 
 
 def test_export_pdf_success(tmp_path):
@@ -255,6 +309,42 @@ def test_import_valid(tmp_path):
 	assert parsed["hints"]["next_actions"] == ["boss resume show imported"]
 
 
+def test_import_refuses_to_overwrite_existing_resume(tmp_path):
+	"""文件里的 name 与已有简历同名时默认拒绝，不静默覆盖本地编辑。
+
+	`import_file` 最终走整份 `save()`：导入一份旧备份会把用户后来的编辑全部丢掉，
+	而 `resume init` / `resume clone` 遇到同名都是 `RESUME_ALREADY_EXISTS`。
+	"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "mine", "--template", "default"])
+	_invoke(runner, tmp_path, ["edit", "mine", "--field", "title", "--value", "本地改过的标题"])
+
+	src = tmp_path / "backup.json"
+	src.write_text('{"name": "mine", "title": "备份里的旧标题"}', encoding="utf-8")
+	result = _invoke(runner, tmp_path, ["import", str(src)])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "RESUME_ALREADY_EXISTS")
+	assert "--force" in parsed["error"]["recovery_action"]
+
+	show = json.loads(_invoke(runner, tmp_path, ["show", "mine"]).output)
+	assert show["data"]["title"] == "本地改过的标题"
+
+
+def test_import_force_overwrites_existing_resume(tmp_path):
+	"""显式 --force 时才覆盖同名简历。"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "mine", "--template", "default"])
+
+	src = tmp_path / "backup.json"
+	src.write_text('{"name": "mine", "title": "备份里的旧标题"}', encoding="utf-8")
+	result = _invoke(runner, tmp_path, ["import", str(src), "--force"])
+	assert result.exit_code == 0, result.output
+
+	show = json.loads(_invoke(runner, tmp_path, ["show", "mine"]).output)
+	assert show["data"]["title"] == "备份里的旧标题"
+
+
 def test_import_invalid_file(tmp_path):
 	runner = CliRunner()
 	bad_file = tmp_path / "bad.json"
@@ -271,6 +361,42 @@ def test_import_file_not_found(tmp_path):
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is False
+
+
+def test_import_non_utf8_file_returns_invalid_param(tmp_path):
+	"""GBK 保存的 JSON、误选的 PDF/图片都会读成非 UTF-8：要给信封和转码指引，而不是 traceback。"""
+	bad_file = tmp_path / "gbk.json"
+	bad_file.write_bytes('{"name": "张三"}'.encode("gbk"))
+	result = _invoke(CliRunner(), tmp_path, ["import", str(bad_file)])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "INVALID_PARAM")
+	assert str(bad_file) in parsed["error"]["message"]
+	assert "UTF-8" in parsed["error"]["message"]
+
+
+@pytest.mark.parametrize("content", ["[]", '"just a string"', "42", "null"])
+def test_import_non_object_json_returns_invalid_param(tmp_path, content):
+	"""顶层不是 JSON 对象时不能到模型解析层才抛 AttributeError。"""
+	bad_file = tmp_path / "not_object.json"
+	bad_file.write_text(content, encoding="utf-8")
+	result = _invoke(CliRunner(), tmp_path, ["import", str(bad_file)])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "INVALID_PARAM")
+	assert "顶层必须是 JSON 对象" in parsed["error"]["message"]
+
+
+@pytest.mark.parametrize("content", ["{}", '{"name": 123}', '{"name": "  "}'])
+def test_import_missing_name_returns_invalid_param(tmp_path, content):
+	"""name 缺失或不是字符串时，save() 里的 _safe_filename 会崩在 int.replace 上。"""
+	bad_file = tmp_path / "no_name.json"
+	bad_file.write_text(content, encoding="utf-8")
+	result = _invoke(CliRunner(), tmp_path, ["import", str(bad_file)])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "INVALID_PARAM")
+	assert "name" in parsed["error"]["message"]
 
 
 # ── clone ─────────────────────────────────────────────────────
@@ -292,6 +418,21 @@ def test_clone_source_not_found(tmp_path):
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "RESUME_NOT_FOUND"
+
+
+def test_clone_rejects_blank_new_name(tmp_path):
+	"""空新名称会复制出一份无法点名的简历，必须在写盘前拒绝。"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "original", "--template", "default"])
+	for new_name in ("", "   "):
+		result = _invoke(runner, tmp_path, ["clone", "original", new_name])
+		assert result.exit_code == 1, result.output
+		parsed = json.loads(result.output)
+		assert parsed["error"]["code"] == "INVALID_PARAM"
+		assert "名称" in parsed["error"]["message"]
+
+	listed = json.loads(_invoke(runner, tmp_path, ["list"]).output)
+	assert [item["name"] for item in listed["data"]] == ["original"]
 
 
 def test_clone_target_already_exists(tmp_path):
@@ -360,6 +501,20 @@ def test_link_resume_not_found(tmp_path):
 	assert parsed["error"]["code"] == "RESUME_NOT_FOUND"
 
 
+def test_link_rejects_blank_identifiers(tmp_path):
+	"""空 security_id / job_id 会存下一条无法点名的空关联，必须在写盘前拒绝。"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "blanktest", "--template", "default"])
+	result = _invoke(runner, tmp_path, ["link", "blanktest", "", "  "])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "security_id" in parsed["error"]["message"]
+
+	applications = _invoke(runner, tmp_path, ["applications", "blanktest"])
+	assert json.loads(applications.output)["data"] == []
+
+
 def test_applications_list(tmp_path):
 	runner = CliRunner()
 	_invoke(runner, tmp_path, ["init", "--name", "apptest", "--template", "default"])
@@ -376,6 +531,32 @@ def test_applications_list(tmp_path):
 	assert all(item["resume_name"] == "apptest" for item in parsed["data"])
 	assert all(item["status"] == "prepared" for item in parsed["data"])
 	assert parsed["hints"]["next_actions"] == ["boss resume show apptest"]
+
+
+def test_relink_resume_keeps_title_company_and_tracking(tmp_path):
+	"""重复 `resume link` 同一职位不抹掉已有标题、公司和投递状态。
+
+	第二次关联只给必要参数（不带 `--title` / `--company`）时，旧实现会用空串覆盖
+	职位名与公司名，并把状态打回 `prepared`。
+	"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "relink", "--template", "default"])
+	_invoke(runner, tmp_path, ["link", "relink", "sid-001", "jid-001", "--title", "后端工程师", "--company", "测试公司"])
+
+	from boss_agent_cli.cache.store import CacheStore
+
+	with CacheStore(tmp_path / "cache" / "boss_agent.db") as cache:
+		assert cache.update_job_link_status("relink", "sid-001", "jid-001", "applied", "已投递") is True
+
+	result = _invoke(runner, tmp_path, ["link", "relink", "sid-001", "jid-001"])
+	assert result.exit_code == 0, result.output
+
+	result = _invoke(runner, tmp_path, ["applications", "relink"])
+	items = json.loads(result.output)["data"]
+	assert items[0]["job_title"] == "后端工程师"
+	assert items[0]["company"] == "测试公司"
+	assert items[0]["status"] == "applied"
+	assert items[0]["notes"] == "已投递"
 
 
 def test_applications_resume_not_found(tmp_path):
@@ -399,6 +580,7 @@ def test_schema_contains_resume():
 	assert "subcommands" in cmd
 	assert "init" in cmd["subcommands"]
 	assert "diff" in cmd["subcommands"]
+	assert cmd["options"]["import"]["--force"]["default"] is False
 
 
 def test_schema_contains_resume_error_codes():

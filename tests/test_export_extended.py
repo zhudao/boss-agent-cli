@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 from boss_agent_cli.main import cli
 
@@ -53,6 +54,24 @@ def _api_response(jobs: list[dict], has_more: bool = False) -> dict:
 
 
 # ── 文件输出 · CSV ────────────────────────────────────────────────────
+
+
+@patch("boss_agent_cli.commands.export.get_platform_instance")
+@patch("boss_agent_cli.commands.export.AuthManager")
+def test_export_output_path_expands_tilde_and_creates_parent(mock_auth_cls, mock_client_cls, tmp_path: Path, monkeypatch):
+	"""MCP 子进程调用不经 shell，`~` 不会被展开；-o 必须自己展开并建父目录。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.search_jobs.return_value = _api_response([_make_raw_job("Go")])
+	monkeypatch.setenv("HOME", str(tmp_path))
+	monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+	result = CliRunner().invoke(cli, ["export", "golang", "--count", "1", "-o", "~/nested/jobs.csv"])
+
+	assert result.exit_code == 0
+	payload = json.loads(result.output)
+	expected = tmp_path / "nested" / "jobs.csv"
+	assert payload["data"]["path"] == str(expected)
+	assert expected.exists()
 
 
 @patch("boss_agent_cli.commands.export.get_platform_instance")
@@ -261,6 +280,49 @@ def test_export_html_to_file(mock_auth_cls, mock_client_cls, tmp_path: Path):
 	assert "双休" in content
 	# 共 1 条应显示
 	assert "共 1 条" in content
+
+
+@patch("boss_agent_cli.commands.export.get_platform_instance")
+@patch("boss_agent_cli.commands.export.AuthManager")
+def test_export_html_without_output_writes_html_to_stdout(mock_auth_cls, mock_client_cls):
+	"""`--format html` 不指定 -o 时应直出 HTML，而不是退化成职位记录数组。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.search_jobs.return_value = _api_response([_make_raw_job("Full-Stack", skills=["Python"])])
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["export", "fullstack", "--count", "1", "--format", "html"])
+
+	assert result.exit_code == 0
+	assert result.output.lstrip().startswith("<!DOCTYPE html>")
+	assert "Full-Stack" in result.output
+	assert "TestCo" in result.output
+	assert "20K" not in result.output
+	# 直出路径下 stdout 是报表本身，不是 JSON 信封。
+	with pytest.raises(json.JSONDecodeError):
+		json.loads(result.output)
+
+
+@patch("boss_agent_cli.commands.export.get_platform_instance")
+@patch("boss_agent_cli.commands.export.AuthManager")
+def test_export_html_with_json_flag_returns_envelope(mock_auth_cls, mock_client_cls):
+	"""--json 是硬契约：HTML 正文要进 data.content，stdout 只留信封。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.search_jobs.return_value = _api_response([_make_raw_job("Full-Stack", skills=["Python"])])
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--json", "export", "fullstack", "--count", "1", "--format", "html"])
+
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["format"] == "html"
+	assert parsed["data"]["count"] == 1
+	assert parsed["data"]["private_fields"] == "omitted"
+	content = parsed["data"]["content"]
+	assert content.lstrip().startswith("<!DOCTYPE html>")
+	assert "Full-Stack" in content
+	assert "20K" not in content
+	assert parsed["data"]["bytes"] == len(content.encode("utf-8"))
 
 
 @patch("boss_agent_cli.commands.export.get_platform_instance")
@@ -533,5 +595,44 @@ def test_export_without_query_returns_actionable_recovery():
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is False
 	assert parsed["error"]["code"] == "INVALID_PARAM"
-	assert parsed["error"]["recoverable"] is True
+	# 用法错误不可恢复：原样重试只会再次失败，应按 recovery_action 修正参数
+	assert parsed["error"]["recoverable"] is False
 	assert "boss export" in parsed["error"]["recovery_action"]
+
+
+# ── 平台错误契约 ─────────────────────────────────────────────────────
+
+
+@patch("boss_agent_cli.commands.export.get_platform_instance")
+@patch("boss_agent_cli.commands.export.AuthManager")
+def test_export_search_auth_expired_is_recoverable(mock_auth_cls, mock_client_cls, tmp_path: Path):
+	"""登录过期是用户可恢复的错误，不能硬编码成不可恢复。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.search_jobs.return_value = {"code": 401, "message": "expired"}
+	mock_client.parse_error.return_value = ("AUTH_EXPIRED", "expired")
+
+	result = CliRunner().invoke(cli, ["export", "golang", "-o", str(tmp_path / "jobs.csv")])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "AUTH_EXPIRED"
+	assert parsed["error"]["recoverable"] is True
+	assert parsed["error"]["recovery_action"] == "boss login"
+
+
+@patch("boss_agent_cli.commands.export.get_platform_instance")
+@patch("boss_agent_cli.commands.export.AuthManager")
+def test_export_search_risk_uses_stop_contract(mock_auth_cls, mock_client_cls, tmp_path: Path):
+	"""搜索阶段命中风控时信封必须是停止指引，而不是可恢复的普通失败。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.search_jobs.return_value = {"code": 36, "message": "risk"}
+	mock_client.parse_error.return_value = ("ACCOUNT_RISK", "risk")
+
+	result = CliRunner().invoke(cli, ["export", "golang", "-o", str(tmp_path / "jobs.csv")])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "ACCOUNT_RISK"
+	assert parsed["error"]["recoverable"] is False
+	assert "停止自动化访问" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"]

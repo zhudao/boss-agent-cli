@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
+from boss_agent_cli.display import risk_error_message
 from boss_agent_cli.main import cli
 from boss_agent_cli.platforms.zhipin_recruiter import BossRecruiterPlatform
 from boss_agent_cli.schema.error_codes import ERROR_CODES
@@ -43,8 +44,8 @@ def test_recruiter_candidates_supports_data_envelope(mock_auth_cls, mock_platfor
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	assert parsed["data"]["geekList"][0]["name"] == "候选人A"
-	assert parsed["hints"]["next_actions"][0] == "boss hr resume <geek_id> --job-id <id> --security-id <id> — 查看简历"
-	assert parsed["hints"]["next_actions"][1] == "boss hr chat — 查看沟通"
+	assert parsed["hints"]["next_actions"][0] == "boss hr resume <geek_id> --job-id <id> --security-id <id>"
+	assert parsed["hints"]["next_actions"][1] == "boss hr chat"
 
 
 @patch("boss_agent_cli.commands.recruiter.candidates.get_recruiter_platform_instance")
@@ -135,7 +136,7 @@ def test_recruiter_chat_supports_data_envelope(mock_auth_cls, mock_platform_cls)
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["data"]["friendList"][0]["name"] == "候选人B"
-	assert parsed["hints"]["next_actions"][0] == "boss hr resume <geek_id> --job-id <id> --security-id <id> — 查看候选人简历"
+	assert parsed["hints"]["next_actions"][0] == "boss hr resume <geek_id> --job-id <id> --security-id <id>"
 
 
 @patch("boss_agent_cli.commands.recruiter.chat.get_recruiter_platform_instance")
@@ -281,8 +282,8 @@ def test_recruiter_applications_supports_data_envelope(mock_auth_cls, mock_platf
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["data"]["friendList"][0]["name"] == "候选人C"
-	assert parsed["hints"]["next_actions"][0] == "boss hr resume <geek_id> --job-id <id> --security-id <id> — 查看候选人简历"
-	assert parsed["hints"]["next_actions"][1] == "boss hr chat — 查看沟通列表"
+	assert parsed["hints"]["next_actions"][0] == "boss hr resume <geek_id> --job-id <id> --security-id <id>"
+	assert parsed["hints"]["next_actions"][1] == "boss hr chat"
 
 
 @patch("boss_agent_cli.commands.recruiter.applications.get_recruiter_platform_instance")
@@ -297,7 +298,7 @@ def test_recruiter_applications_reports_error_when_platform_rejects(mock_auth_cl
 	_assert_error_contract(
 		parsed,
 		code="ACCOUNT_RISK",
-		message="account risk",
+		message=risk_error_message("ACCOUNT_RISK"),
 		recoverable=False,
 		recovery_action="停止自动化访问，回到平台官网手动处理；确认目标业务页风险解除后，由用户执行 boss clean --risk-lock 并显式恢复任务，必要时联系客服",
 	)
@@ -408,7 +409,7 @@ def test_recruiter_resume_exchange_supports_data_envelope(mock_auth_cls, mock_pl
 	parsed = json.loads(result.output)
 	assert parsed["data"]["exchangeStatus"] == "sent"
 	assert "联系方式交换请求已发送" == parsed["data"]["message"]
-	assert parsed["hints"]["next_actions"][0] == "boss hr applications — 返回候选人列表"
+	assert parsed["hints"]["next_actions"][0] == "boss hr applications"
 	mock_platform.exchange_request_by_friend.assert_called_once_with(1, exchange_type=1)
 
 
@@ -497,7 +498,7 @@ def test_recruiter_resume_parse_supports_data_envelope(mock_auth_cls, mock_platf
 	parsed = json.loads(result.output)
 	assert parsed["data"]["basic"]["name"] == "张三"
 	assert parsed["data"]["expectation"]["position"] == "后端工程师"
-	assert parsed["hints"]["next_actions"][0] == "boss hr applications — 返回候选人列表"
+	assert parsed["hints"]["next_actions"][0] == "boss hr applications"
 
 
 @patch("boss_agent_cli.commands.recruiter.resume.get_recruiter_platform_instance")
@@ -570,7 +571,7 @@ def test_recruiter_request_resume_reports_error_when_platform_rejects(mock_auth_
 	_assert_error_contract(
 		parsed,
 		code="ACCOUNT_RISK",
-		message="account risk",
+		message=risk_error_message("ACCOUNT_RISK"),
 		recoverable=False,
 		recovery_action="停止自动化访问，回到平台官网手动处理；确认目标业务页风险解除后，由用户执行 boss clean --risk-lock 并显式恢复任务，必要时联系客服",
 	)
@@ -638,4 +639,4 @@ def test_hr_group_rejects_removed_zhilian_platform():
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is False
 	assert parsed["error"]["code"] == "INVALID_PARAM"
-	assert "unknown platform" in parsed["error"]["message"]
+	assert "不支持的平台" in parsed["error"]["message"]

@@ -92,6 +92,8 @@ boss crawl resume <run_id>
 boss crawl stop <run_id>
 ```
 
+配置值在开始运行时按类型与范围校验：`max_requests` / `max_details` / `max_seconds` 必须 ≥ 1，`max_retries` 可以设为 `0` 表示不重试，`cdp_port` 必须在 1-65535 之间，`chrome_path` 必须是字符串或 `null`。`config set crawl` 在写入时即按同一组规则校验并拒绝非法值（不落盘）；手工编辑写入的错误类型 / 越界值由 `crawl run` / `start` 与 `boss wizard` 的采集动作返回 `INVALID_PARAM` 并指出配置项，不会悄悄套用默认值或落到 `INTERNAL_ERROR`。向导的采集动作只接受 `hook_profile=none`（自定义 Hook 需显式运行 `boss crawl run --hook-profile screenshot-full --hook-dir`），`pages` 输入（含恢复）要求 ≥ 1 的整数，非法值返回 `INVALID_PARAM`。
+
 | 命令 | 说明 |
 |------|------|
 | `boss crawl configure [--chrome-path PATH] [--port N] [--max-* N]` | 设置 crawl 专用 Chrome 和请求、详情、墙钟、重试预算；profile 固定为 `<data-dir>/crawl/chrome-profile` |
@@ -113,7 +115,7 @@ boss crawl stop <run_id>
 | 命令 | 说明 |
 |------|------|
 | `boss greet <sid> <jid>` | 向指定招聘者打招呼；重复记录返回 `ALREADY_GREETED` |
-| `boss batch-greet <query>` | 搜索后按显式 `--limit` 批量打招呼，支持 `--dry-run`；命中 `ACCOUNT_RISK` / `ENVIRONMENT_RISK` 立即停批并返回 `ok:false`，已成功项随 `error.details.greeted` 带回 |
+| `boss batch-greet <query>` | 搜索后按显式 `--count` 批量打招呼，支持 `--dry-run`；命中 `ACCOUNT_RISK` / `ENVIRONMENT_RISK` 立即停批并返回 `ok:false`，已成功项随 `error.details.greeted` 带回 |
 | `boss apply <sid> <jid>` | 发起投递或立即沟通；重复记录返回 `ALREADY_APPLIED` |
 | `boss exchange <uid-or-sid>` | 请求交换手机号或微信；优先使用 `boss chat` 输出的稳定 `uid` |
 
@@ -176,9 +178,9 @@ boss crawl stop <run_id>
 
 ### 自动化停止与显式恢复
 
-`boss agent stop --reason <原因>` 保存独立的停止标志，运行中的旧状态快照不能覆盖它。招聘者自动化在动作边界重新读取停止状态，每个已确认动作及时保存防重结果；风险、正常超时或中断时保存已取得的 checkpoint。平台请求已提交但没有确认结果时，先在官方页面核对，禁止自动重发。
+`boss agent stop --reason <原因>` 保存独立的停止标志，运行中的旧状态快照不能覆盖它。招聘者自动化在动作边界重新读取停止状态，每个已确认动作及时保存防重结果；风险、正常超时或中断时保存已取得的 checkpoint。平台请求已提交但没有确认结果时，先在官方页面核对，禁止自动重发。自动化的页面写动作返回 `ACTION_UNCONFIRMED` 时，本轮事件记为 `PLATFORM_VERIFICATION_REQUIRED` 并打开熔断，对应待执行项标记为 `verification-required` 退出 `pending` 队列；`--resume` 不会把它变回待执行，避免重发可能已生效的动作。
 
-在同一浏览器、同一账号完成官方验证并确认原先受阻页面正常后，由操作者明确恢复：`boss --role recruiter agent run --resume`。该选项解除本地停止状态并复用已确认动作与队列，不代表平台风险已经解除；普通 `agent run` 不解锁。MCP `boss_agent_run` 的 `resume` 默认 `false`，Agent 只有收到操作者明确恢复指令后才可设置为 `true`。wizard 和 crawl 的可恢复 run 继续使用各自的 `--resume <run_id>` / `crawl resume <run_id>`；已被 `wizard --stop` 置为 `stopped` 的 run 保持终止，应新建 workflow 或恢复其内部任务。
+在同一浏览器、同一账号完成官方验证并确认原先受阻页面正常后，由操作者明确恢复：`boss --role recruiter agent run --resume`。该选项解除本地停止状态并复用已确认动作与队列，不代表平台风险已经解除；普通 `agent run` 不解锁。MCP `boss_agent_run` 的 `resume` 默认 `false`，Agent 只有收到操作者明确恢复指令后才可设置为 `true`。wizard 和 crawl 的可恢复 run 继续使用各自的 `--resume <run_id>` / `crawl resume <run_id>`；已被 `wizard --stop` 置为 `stopped` 的 run 保持终止，应新建 workflow 或恢复其内部任务。结果未知的写动作（`ACTION_UNCONFIRMED`，或平台已成功但本地记账失败）会把 `replay_safe: false` 写入步骤错误；`--resume` 不会重跑该步骤，只返回原失败与核对指引，确认平台实际状态后应新建 workflow。
 
 MCP 的长运行使用异步子进程，运行期间仍能调用停止/状态工具。取消或超时会尝试中断并回收子进程；强制终止后可能有未知副作用，`error.details.outcome_unknown=true` 时不可自动重试。正常返回的 wizard 超时保留可恢复结果，MCP 等待覆盖其显式超时及保存进度的宽限期。
 
@@ -248,6 +250,8 @@ boss config set platform zhipin
 ```bash
 boss --platform zhipin config set platform zhipin
 ```
+
+结构化配置项 `automation`、`crawl` 必须以 JSON object 传值，例如 `boss config set automation '{"mode": "training"}'`；标量文本会被拒绝并返回 `INVALID_PARAM`，不会写入配置文件。`automation` 的内容还会按运行时解析器校验，非法枚举或数值（如 `mode` 拼错、阈值不是数字）同样返回 `INVALID_PARAM` 且不落盘。手工编辑 `config.json` 造成该键不是对象或 `automation` 内容非法时，`boss agent run` / `train` 返回 `INVALID_PARAM` 并给出 `boss config reset automation` 修复入口，不再以 traceback 退出。`config.json` 本身读不出来（权限不足、路径被同名目录占用）时，任何命令都在启动阶段返回 `INVALID_PARAM` 并在消息里给出文件路径；写配置失败（目录只读、磁盘已满）返回 `LOCAL_IO_ERROR`，同样不落盘、不以 traceback 退出。文件内容不是合法 JSON 或不是对象时同样在启动阶段返回 `INVALID_PARAM`，消息给出文件路径与出错行列；这类损坏需要手动修正或删除该文件（删除后所有配置回到默认值），`config set/reset` 本身也依赖可读取的配置文件。
 
 ### 共享请求预算与冷却
 

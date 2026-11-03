@@ -169,6 +169,17 @@ def test_cli_export_html(tmp_path):
 	assert out_file.exists()
 
 
+def test_cli_export_html_expands_tilde_in_output_path(tmp_path, monkeypatch):
+	"""`~` 不经 shell 时（MCP 子进程、引号包裹）也必须展开到用户目录。"""
+	monkeypatch.setenv("HOME", str(tmp_path))
+	monkeypatch.setenv("USERPROFILE", str(tmp_path))
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "tildetest", "--template", "default"])
+	result = _invoke(runner, tmp_path, ["export", "tildetest", "--format", "html", "-o", "~/out/resume.html"])
+	assert result.exit_code == 0
+	assert (tmp_path / "out" / "resume.html").exists()
+
+
 def test_cli_export_html_default_path(tmp_path, monkeypatch):
 	"""When no -o is given, export defaults to <name>.html (in cwd, isolated here)."""
 	monkeypatch.chdir(tmp_path)
@@ -199,12 +210,37 @@ def test_cli_export_pdf_chromium_unavailable(tmp_path):
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is False
 	assert parsed["error"]["code"] == "EXPORT_FAILED"
+	# 导出用 patchright 渲染，恢复指引必须指向 patchright 而不是 playwright
+	from boss_agent_cli.schema.error_codes import ERROR_CODES
+
+	action = parsed["error"]["recovery_action"]
+	assert action == ERROR_CODES["EXPORT_FAILED"]["recovery_action"]
+	assert "playwright install" not in action
 
 
 def test_cli_export_not_found(tmp_path):
 	"""Exporting a non-existent resume returns RESUME_NOT_FOUND."""
 	runner = CliRunner()
 	result = _invoke(runner, tmp_path, ["export", "ghost", "--format", "html"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "RESUME_NOT_FOUND"
+
+
+def test_cli_export_json_corrupt_resume_reports_not_found(tmp_path):
+	"""文件在但读不出来时不能报成 LOCAL_IO_ERROR：磁盘/权限指引会把人带偏。
+
+	`store.export_json` 内部的 `get()` 返回 None 后抛 `FileNotFoundError`，
+	顶层 OSError 网兜会把它说成「本地文件读写失败」；而其它子命令对同一份坏文件
+	一律返回 RESUME_NOT_FOUND。json 导出应与其一致。
+	"""
+	resumes = tmp_path / "resumes"
+	resumes.mkdir(parents=True)
+	(resumes / "broken.json").write_text("{", encoding="utf-8")
+
+	runner = CliRunner()
+	result = _invoke(runner, tmp_path, ["export", "broken", "--format", "json"])
+
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "RESUME_NOT_FOUND"

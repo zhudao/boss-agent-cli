@@ -242,8 +242,16 @@ httpx 带着从 Chrome 拷出来的 Cookie，把 `__zp_stoken__` 当查询参数
 | `ACTION_UNCONFIRMED` | 招聘者交换联系方式或求简历的页面动作已执行，但未确认是否发出 | 动作可能已生效，先用 `boss hr chatmsg <friend_id>` 核实，勿直接重试；`error.details` 里有页面日志和 WS 统计 |
 | `EXCHANGE_NOT_AVAILABLE` | 换电话/换微信按钮还没解锁（你还没在这个会话里发过消息），本次未发出任何请求 | 先回复候选人（`boss hr reply <friend_id> <消息>` 或 `boss hr request-resume <friend_id>`），再重新交换；`error.details` 里有命中的禁用信号 |
 | `GREET_RESULT_UNKNOWN` | 已预约发送，但结果未确认 | 用 `boss hr chat --job-id <id>` 核对会话，禁止自动重发；本地保留预约，必要时在官方页面处理 |
+| `LOCAL_STATE_WRITE_FAILED` | 平台操作已完成，但本地状态保存失败 | 先在官方页面核对本次操作是否已生效；不要自动重发，确认磁盘空间与缓存目录权限后再继续 |
+| `LOCAL_IO_ERROR` | 本地文件读写失败（导出路径、`config.json`、缓存等） | 不要自动重试：确认目标路径是可写目录（而不是同名的已有文件）、权限与磁盘空间正常后再执行 |
+| `MODEL_REGISTRY_INVALID` | 本地模型登记表 `models/registry.json` 损坏（写一半被中断、手工编辑写坏） | 修正或删除该文件后重试；删除只会丢失已导入模型的登记，模型文件仍在磁盘上，重新执行 `boss ai local import` 即可重建 |
+| `AUTOMATION_STATE_INVALID` | 招聘自动化状态 `automation/state.json` 损坏，`boss agent run` / `stats` 无法读取（`stop.json` 损坏时按已熔断处理） | 修正或删除该文件后重试；删除会丢失自动化去重与历史进度，建议先备份 |
+| `SAVED_SEARCH_INVALID` | 本地预设 / watch 的参数损坏（`saved_searches.params` 不是 JSON 对象），`boss search --preset`、`boss watch run` 无法执行 | 执行 `boss preset remove <名称>`（watch 用 `boss watch remove`）后重新添加；参数只存在本地缓存，删除不影响平台数据 |
+| `CACHE_RECORD_INVALID` | 本地 crawl / workflow 任务记录损坏（`crawl_runs`、`crawl_jobs`、`workflow_runs`、`workflow_steps` 的 JSON 列读不出来），断点无法恢复 | 重新创建任务（crawl 用 `boss crawl start`，workflow 用 `boss wizard --input-json`）；记录只存在本地缓存，已导出的文件不会自动删除，`boss wizard` 的任务列表会跳过坏记录并点名 |
+| `CACHE_DATABASE_INVALID` | 本地缓存库 `cache/boss_agent.db` 损坏或被别的文件占位（`file is not a database`），几乎所有读写本地状态的命令都受影响 | 先备份该文件，再删除后重试，命令会自动重建空库；库里的候选池、预设、watch 历史与任务断点会一起作废，平台数据不受影响。并发锁等可重试错误不会报这个码 |
 | `GREET_LIMIT` | 今日次数用完 | 告知用户 |
 | `NETWORK_ERROR` | 网络错误 | 重试 |
+| `UNKNOWN` | 平台返回了未识别的错误（无法按登录过期 / 限流 / 风控归类） | 不自动重试：先在官方页面核对本次操作是否生效，用 `boss doctor` 检查登录态与网络，确认后再执行一次；仍失败请附上命令与 `error.message` 提交 issue |
 | `INTERNAL_ERROR` | CLI 内部错误或平台返回了未预期的数据结构 | 不要重试；升级到最新版本，仍出现时附上命令与 error.message 提交 issue |
 | `AI_NOT_CONFIGURED` | AI 未配置 | `boss ai config` |
 | `PLATFORM_NOT_SUPPORTED` | 当前平台不支持该角色或子命令 | 切换到支持的平台 |

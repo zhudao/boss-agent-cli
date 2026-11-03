@@ -209,7 +209,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				"properties": {
 					"section": {
 						"type": "string",
-						"enum": ["info", "resume", "expect", "deliver"],
+						"enum": ["user", "resume", "expect", "deliver"],
 						"description": "指定查看的部分",
 					},
 				},
@@ -319,7 +319,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_export",
-			description="导出搜索结果为 CSV / JSON / HTML 文件，支持 BOSS 直聘搜索页 URL 复用筛选条件。默认脱敏 job_id/security_id/boss_name，HTML 始终省略平台标识、招聘者姓名和薪资。",
+			description="导出搜索结果为 CSV / JSON / HTML 文件，支持 BOSS 直聘搜索页 URL 复用筛选条件。默认脱敏 job_id/security_id/boss_name，HTML 始终省略平台标识、招聘者姓名和薪资。不传 output_file 时 csv/json 在信封内返回 jobs 列表，html 在 data.content 返回报表正文。",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -335,7 +335,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"job_type": {"type": "string", "description": "职位类型，支持逗号分隔多选"},
 					"count": {"type": "integer", "description": "导出数量", "default": 50},
 					"format": {"type": "string", "enum": ["csv", "json", "html"], "description": "输出格式", "default": "csv"},
-					"output_file": {"type": "string", "description": "输出文件路径；不传则在 stdout 信封内 inline 返回 jobs 列表"},
+					"output_file": {"type": "string", "description": "输出文件路径；不传时 csv/json 在信封内返回 jobs 列表，html 在 data.content 返回 HTML 正文"},
 					"include_private": {"type": "boolean", "description": "CSV/JSON/stdout 保留 job_id/security_id/boss_name 明文；HTML 始终省略平台标识、招聘者姓名和薪资", "default": False},
 				},
 				"required": [],
@@ -417,7 +417,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 						"description": "只演练决策，不执行真实平台动作",
 						"default": True,
 					},
-					"limit": {"type": "integer", "description": "本轮最多处理多少个会话"},
+					"limit": {"type": "integer", "minimum": 1, "description": "本轮最多处理多少个会话"},
 					"resume": {
 						"type": "boolean",
 						"default": False,
@@ -433,7 +433,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 			input_schema={
 				"type": "object",
 				"properties": {
-					"limit": {"type": "integer", "description": "本轮最多处理多少个会话"},
+					"limit": {"type": "integer", "minimum": 1, "description": "本轮最多处理多少个会话"},
 				},
 				"required": [],
 			},
@@ -1016,6 +1016,8 @@ def build_tool_catalog(data: dict[str, Any] | None = None) -> list[ToolDefinitio
 	for tool in _tool_definitions(schema):
 		availability = tool_availability(tool.name, schema)
 		if availability:
-			tool = replace(tool, description=f"{tool.description} [可用性: {availability_note(availability)}]")
+			# availability_note 自带「可用性: 」前缀，这里不能再拼一次，
+			# 否则导出给 Agent 的描述会出现「可用性: 可用性: ...」。
+			tool = replace(tool, description=f"{tool.description} [{availability_note(availability)}]")
 		tools.append(tool)
 	return tools

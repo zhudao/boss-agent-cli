@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -14,12 +13,20 @@ import click
 from boss_agent_cli.api.cdp_risk_lock import UNLOCK_OPERATOR_ACTIONS, raise_if_locked
 from boss_agent_cli.api.endpoints import CITY_CODES
 from boss_agent_cli.auth.manager import AuthManager, AuthRequired
-from boss_agent_cli.cache.store import CacheStore
+from boss_agent_cli.cache.store import CacheRecordInvalid, CacheStore
 from boss_agent_cli.compliance import operating_mode, require_compliance_allowed
 from boss_agent_cli.config import DEFAULTS
 from boss_agent_cli.crawler.operations import crawl_results, crawl_status, import_crawl_shortlist
-from boss_agent_cli.crawler.service import CrawlService, CrawlSettings
+from boss_agent_cli.crawler.service import (
+	CrawlService,
+	CrawlSettings,
+	crawl_cdp_port,
+	crawl_chrome_path,
+	crawl_int_setting,
+	unused_local_port,
+)
 from boss_agent_cli.crawler.transport import DrissionCrawlerSession
+from boss_agent_cli.services.json_files import write_json_atomic
 from boss_agent_cli.display import (
 	handle_auth_errors,
 	handle_error_output,
@@ -52,15 +59,15 @@ def _save_crawl_config(data_dir: Path, updates: dict[str, Any]) -> dict[str, Any
 			loaded = json.loads(config_path.read_text(encoding="utf-8"))
 			if isinstance(loaded, dict):
 				user_cfg = loaded
-		except (OSError, json.JSONDecodeError):
+		except (OSError, json.JSONDecodeError, UnicodeDecodeError):
 			pass
 	crawl_cfg = user_cfg.get("crawl", {})
 	if not isinstance(crawl_cfg, dict):
 		crawl_cfg = {}
 	crawl_cfg.update({key: value for key, value in updates.items() if value is not None})
 	user_cfg["crawl"] = crawl_cfg
-	config_path.parent.mkdir(parents=True, exist_ok=True)
-	config_path.write_text(json.dumps(user_cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+	# 原子写：写一半被中断的 config.json 会让所有命令卡在启动阶段。
+	write_json_atomic(config_path, user_cfg, trailing_newline=True)
 	return crawl_cfg
 
 
@@ -100,28 +107,27 @@ def _settings_from_context(
 	resolved_hook = hook_profile or "none"
 	if resolved_hook not in _HOOK_CHOICES:
 		raise ValueError(f"unknown hook profile: {resolved_hook}")
+	resolved_chrome = crawl_chrome_path(chrome_path or cfg.get("chrome_path"))
+	resolved_port = cdp_port
+	if resolved_port is None:
+		raw_port = cfg.get("cdp_port")
+		resolved_port = unused_local_port() if raw_port is None else crawl_cdp_port(raw_port)
 	return CrawlSettings(
 		query=query,
 		city_code=_city_code(city),
 		pages=pages,
 		with_detail=with_detail,
 		profile_path=Path(resolved_profile),
-		chrome_path=chrome_path or cfg.get("chrome_path"),
-		cdp_port=int(cdp_port or cfg.get("cdp_port") or _unused_local_port()),
+		chrome_path=resolved_chrome,
+		cdp_port=resolved_port,
 		hook_profile=resolved_hook,
 		hook_dir=Path(hook_dir).expanduser() if hook_dir else None,
-		max_requests=int(cfg.get("max_requests") or 20),
-		max_details=int(cfg.get("max_details") or 50),
-		max_seconds=int(cfg.get("max_seconds") or 600),
-		max_retries=int(cfg.get("max_retries") or 1),
+		max_requests=crawl_int_setting(cfg, "max_requests", 20),
+		max_details=crawl_int_setting(cfg, "max_details", 50),
+		max_seconds=crawl_int_setting(cfg, "max_seconds", 600),
+		max_retries=crawl_int_setting(cfg, "max_retries", 1, minimum=0),
 		operating_mode=operating_mode(ctx),
 	)
-
-
-def _unused_local_port() -> int:
-	with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
-		connection.bind(("127.0.0.1", 0))
-		return int(connection.getsockname()[1])
 
 
 def _session_seed(ctx: click.Context) -> tuple[dict[str, str], str]:
@@ -161,6 +167,17 @@ def _transport_factory(
 	)
 
 
+def _report_corrupt_run(ctx: click.Context, command: str, run_id: str, exc: CacheRecordInvalid) -> None:
+	"""本地 run 记录写坏：断点读不出来，给「重新创建任务」指引而不是 traceback。"""
+	handle_error_output(
+		ctx,
+		command,
+		code="CACHE_RECORD_INVALID",
+		message=str(exc),
+		hints={"next_actions": ["boss crawl start <关键词>", f"boss crawl status {run_id}"]},
+	)
+
+
 def _run_service(ctx: click.Context, service_call: Any) -> None:
 	try:
 		raise_if_locked(Path(ctx.obj["data_dir"]))
@@ -178,6 +195,9 @@ def _run_service(ctx: click.Context, service_call: Any) -> None:
 			outcome = service_call(service)
 	except KeyError as exc:
 		handle_error_output(ctx, "crawl", code="JOB_NOT_FOUND", message=f"未找到 crawl run: {exc.args[0]}")
+		return
+	except CacheRecordInvalid as exc:
+		_report_corrupt_run(ctx, "crawl", exc.record_id, exc)
 		return
 	except ValueError as exc:
 		handle_error_output(ctx, "crawl", code="INVALID_PARAM", message=str(exc))
@@ -211,7 +231,10 @@ def _run_service(ctx: click.Context, service_call: Any) -> None:
 	elif outcome.status != "completed":
 		hints = {"next_actions": [f"boss crawl resume {outcome.run_id}"]}
 	else:
-		hints = {"next_actions": ["查看 output_paths 中的 JSON、CSV 或 XLSX 结果文件"]}
+		hints = {
+			"next_actions": [],
+			"operator_actions": ["查看 output_paths 中的 JSON、CSV 或 XLSX 结果文件"],
+		}
 	handle_output(
 		ctx,
 		"crawl",
@@ -390,7 +413,11 @@ def start_cmd(
 	except OSError as exc:
 		if run_id is not None:
 			with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
-				run = cache.get_crawl_run(run_id)
+				try:
+					run = cache.get_crawl_run(run_id)
+				except CacheRecordInvalid:
+					# 记录已损坏时无法回写状态：下面仍按启动失败回报，重建任务即可。
+					run = None
 				if run is not None:
 					cache.update_crawl_run(
 						run_id,
@@ -399,13 +426,19 @@ def start_cmd(
 						error=f"无法启动后台任务: {exc}",
 						list_finished=bool(run["list_finished"]),
 					)
+		# operating_mode 在新版本不再限制能力，指引应指向真正的启动失败原因。
+		recovery_action = (
+			f"检查磁盘空间与数据目录权限后执行 boss crawl resume {run_id} 重试"
+			if run_id is not None
+			else "检查磁盘空间与数据目录权限后重新执行 boss crawl start"
+		)
 		handle_error_output(
 			ctx,
 			"crawl.start",
 			code="CRAWL_UNAVAILABLE",
 			message=f"无法启动 crawl 后台任务: {exc}",
 			recoverable=True,
-			recovery_action="设置 operating_mode=research 后执行 boss crawl resume <run_id> 重试",
+			recovery_action=recovery_action,
 		)
 		return
 	handle_output(
@@ -446,14 +479,23 @@ def resume_cmd(
 		return
 	raise_if_locked(Path(ctx.obj["data_dir"]))
 	if background:
+		already_complete = False
 		try:
 			with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 				run = cache.get_crawl_run(run_id)
 				if run is None:
 					raise KeyError(run_id)
 				status = str(run["status"])
-			should_launch = status not in {"queued", "running"}
-			if should_launch:
+				# 与 CrawlService.resume 的前置条件保持一致：完成的 run 只有在
+				# 请求了更多页或还有待补详情时才有可恢复的工作。
+				needs_more_pages = (
+					not bool(run["list_finished"]) and pages is not None and pages >= int(run["next_page"])
+				)
+				pending_details = with_detail and any(
+					not item["detail_done"] for item in cache.list_crawl_jobs(run_id)
+				)
+				already_complete = status == "completed" and not (needs_more_pages or pending_details)
+			if not already_complete and status not in {"queued", "running"}:
 				_launch_background_resume(
 					Path(ctx.obj["data_dir"]),
 					run_id,
@@ -463,14 +505,28 @@ def resume_cmd(
 		except KeyError:
 			handle_error_output(ctx, "crawl.resume", code="JOB_NOT_FOUND", message=f"未找到 crawl run: {run_id}")
 			return
+		except CacheRecordInvalid as exc:
+			_report_corrupt_run(ctx, "crawl.resume", run_id, exc)
+			return
 		except OSError as exc:
+			# 与 crawl start 同一类失败：OSError 多来自磁盘满或目录权限，直接重试不会好转。
 			handle_error_output(
 				ctx,
 				"crawl.resume",
 				code="CRAWL_UNAVAILABLE",
 				message=f"无法启动 crawl 后台任务: {exc}",
 				recoverable=True,
-				recovery_action=f"执行 boss crawl resume {run_id} 重试",
+				recovery_action=f"检查磁盘空间与数据目录权限后执行 boss crawl resume {run_id} 重试",
+			)
+			return
+		if already_complete:
+			# 拉起一个没有工作的后台进程只会让它立即退出，却让调用方以为任务重新排队。
+			handle_output(
+				ctx,
+				"crawl.resume",
+				{"run_id": run_id, "status": "completed", "background": True},
+				render=lambda d: render_action_result(d, title="crawl resume", next_steps=[f"boss crawl results {run_id}"]),
+				hints={"next_actions": [f"boss crawl results {run_id}"]},
 			)
 			return
 		handle_output(
@@ -504,13 +560,31 @@ def status_cmd(ctx: click.Context, run_id: str) -> None:
 	except KeyError:
 		handle_error_output(ctx, "crawl.status", code="JOB_NOT_FOUND", message=f"未找到 crawl run: {run_id}")
 		return
+	except CacheRecordInvalid as exc:
+		_report_corrupt_run(ctx, "crawl.status", run_id, exc)
+		return
+	hints: dict[str, list[str]] | None = None
+	if payload["status"] == "risk_stopped":
+		# 风险锁会先于浏览器构造阻断 resume：直接照 checkpoint.resume_command
+		# 重试只会再次撞锁。解锁必须由用户确认官方页面恢复后显式执行。
+		hints = {
+			"operator_actions": [
+				*UNLOCK_OPERATOR_ACTIONS,
+				f"完成人工恢复后，显式执行 {payload['checkpoint']['resume_command']} 从原断点继续",
+			],
+		}
 	handle_output(
 		ctx,
 		"crawl.status",
 		payload,
 		render=lambda d: render_record_result(
-			d, title="crawl status", next_steps=[f"boss crawl results {run_id}", f"boss crawl stop {run_id}"]
+			d,
+			title="crawl status",
+			next_steps=[f"boss crawl results {run_id}"]
+			if payload["status"] == "risk_stopped"
+			else [f"boss crawl results {run_id}", f"boss crawl stop {run_id}"],
 		),
+		hints=hints,
 	)
 
 
@@ -543,6 +617,9 @@ def results_cmd(ctx: click.Context, run_id: str, page: int | None, detail_status
 			payload = crawl_results(cache, run_id, page=page, detail_status=detail_status)
 	except KeyError:
 		handle_error_output(ctx, "crawl.results", code="JOB_NOT_FOUND", message=f"未找到 crawl run: {run_id}")
+		return
+	except CacheRecordInvalid as exc:
+		_report_corrupt_run(ctx, "crawl.results", run_id, exc)
 		return
 	handle_output(
 		ctx,
@@ -589,6 +666,9 @@ def shortlist_cmd(
 			)
 	except KeyError:
 		handle_error_output(ctx, "crawl.shortlist", code="JOB_NOT_FOUND", message=f"未找到 crawl run: {run_id}")
+		return
+	except CacheRecordInvalid as exc:
+		_report_corrupt_run(ctx, "crawl.shortlist", run_id, exc)
 		return
 	except ValueError as exc:
 		handle_error_output(ctx, "crawl.shortlist", code="INVALID_PARAM", message=str(exc))

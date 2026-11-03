@@ -1,15 +1,28 @@
 import click
 
-from boss_agent_cli.api.client import AuthError
+from boss_agent_cli.api.client import AuthError, PlatformRiskError
+from boss_agent_cli.api.request_budget import RequestBudgetExceeded
 from boss_agent_cli.auth.manager import AuthManager, AuthRequired, TokenRefreshFailed
 from boss_agent_cli.commands._platform import get_platform_instance
-from boss_agent_cli.display import INTERNAL_ERROR_TYPES, boss_command_for_ctx, error_contract_for_code, handle_error_output, handle_not_supported, handle_output, handle_platform_error_output, login_action_for_ctx, render_sectioned_record
+from boss_agent_cli.display import (
+	INTERNAL_ERROR_TYPES,
+	boss_command_for_ctx,
+	error_contract_for_code,
+	handle_error_output,
+	handle_not_supported,
+	handle_output,
+	handle_platform_error_output,
+	login_action_for_ctx,
+	platform_error_contract,
+	render_sectioned_record,
+	risk_error_message,
+)
 
 
 @click.command("me")
 @click.option("--section", default=None, type=click.Choice(["user", "resume", "expect", "deliver"]),
 	help="只获取指定部分（不指定则获取全部）")
-@click.option("--deliver-page", default=1, type=int, help="投递记录页码")
+@click.option("--deliver-page", default=1, type=click.IntRange(min=1), help="投递记录页码")
 @click.pass_context
 def me_cmd(ctx: click.Context, section: str | None, deliver_page: int) -> None:
 	"""获取当前登录用户的个人信息、简历、求职期望、投递记录"""
@@ -108,6 +121,26 @@ def me_cmd(ctx: click.Context, section: str | None, deliver_page: int) -> None:
 		handle_error_output(ctx, "me", code="AUTH_REQUIRED", message="未登录", recoverable=True, recovery_action=login_action_for_ctx(ctx))
 	except AuthError:
 		handle_error_output(ctx, "me", code="AUTH_EXPIRED", message="登录态过期", recoverable=True, recovery_action=login_action_for_ctx(ctx))
+	except PlatformRiskError as e:
+		# me 没有 @handle_auth_errors 包裹：风控异常原本会掉进下面的
+		# NETWORK_ERROR 兜底，变成 recoverable=true +「重试」，违反风控硬边界。
+		recoverable, recovery_action, hints = platform_error_contract(e.code)
+		handle_error_output(
+			ctx,
+			"me",
+			code=e.code,
+			message=risk_error_message(e.code),
+			recoverable=recoverable,
+			recovery_action=recovery_action,
+			details=e.details or None,
+			hints=hints,
+		)
+	except RequestBudgetExceeded as e:
+		recoverable, recovery_action = error_contract_for_code(e.code)
+		handle_error_output(
+			ctx, "me", code=e.code, message=str(e), recoverable=recoverable,
+			recovery_action=recovery_action, details=e.details,
+		)
 	except INTERNAL_ERROR_TYPES as e:
 		recoverable, recovery_action = error_contract_for_code("INTERNAL_ERROR")
 		handle_error_output(ctx, "me", code="INTERNAL_ERROR", message=f"{type(e).__name__}: {e}", recoverable=recoverable, recovery_action=recovery_action)

@@ -7,14 +7,15 @@ import click
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._platform import get_platform_instance
+from boss_agent_cli.services.output_path import prepare_output_path
 from boss_agent_cli.services.friend_list_pages import collect_friend_list_items
 from boss_agent_cli.digest import build_digest, render_digest_markdown
-from boss_agent_cli.display import handle_auth_errors, handle_output, handle_platform_error_output, render_message_panel
+from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_output, handle_platform_error_output, json_forced, render_message_panel
 from boss_agent_cli.pipeline_state import build_pipeline_items, select_follow_up_candidates
 
 
 @click.command("digest")
-@click.option("--days-stale", default=3, type=int, help="超过 N 天未推进则视为 follow_up")
+@click.option("--days-stale", default=3, type=click.IntRange(min=0, max=36500), help="超过 N 天未推进则视为 follow_up")
 @click.option("--now-ts-ms", default=None, type=int, help="测试用：覆盖当前时间戳（毫秒）")
 @click.option(
 	"--format", "output_format",
@@ -26,7 +27,7 @@ from boss_agent_cli.pipeline_state import build_pipeline_items, select_follow_up
 	"-o", "--output", "output_path",
 	type=click.Path(dir_okay=False, writable=True, path_type=Path),
 	default=None,
-	help="Markdown 输出路径（仅 --format md 时有效，未指定时写到 stdout）",
+	help="Markdown 输出路径（仅 --format md 时有效，未指定时写到 stdout；--json 时放进信封 data.content）",
 )
 @click.pass_context
 @handle_auth_errors("digest")
@@ -68,12 +69,24 @@ def digest_cmd(ctx: click.Context, days_stale: int, now_ts_ms: int | None, outpu
 	if output_format == "md":
 		md_text = render_digest_markdown(data)
 		if output_path:
-			output_path.write_text(md_text, encoding="utf-8")
+			target = prepare_output_path(output_path)
+			target.write_text(md_text, encoding="utf-8")
 			handle_output(
 				ctx,
 				"digest",
-				{"format": "md", "path": str(output_path), "bytes": len(md_text.encode("utf-8"))},
-				hints={"next_actions": [f"open {output_path}", "cat 或邮件客户端直接发送"]},
+				{"format": "md", "path": str(target), "bytes": len(md_text.encode("utf-8"))},
+				hints={"next_actions": [f"open {target}"],
+					"operator_actions": ["用 cat 或邮件客户端直接发送该文件"]},
+			)
+		elif json_forced(ctx):
+			# `--json` 要求 stdout 只有一个信封（MCP 总是这样调用）；把正文放进
+			# data.content，而不是让 Agent 拿到一段解析不了的 Markdown。
+			handle_output(
+				ctx,
+				"digest",
+				{"format": "md", "content": md_text, "bytes": len(md_text.encode("utf-8"))},
+				hints={"next_actions": [boss_command_for_ctx(ctx, "digest --format md -o <path>")],
+					"operator_actions": ["把 data.content 写成 .md 文件或直接发送"]},
 			)
 		else:
 			sys.stdout.write(md_text)

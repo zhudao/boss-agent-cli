@@ -96,6 +96,8 @@ boss crawl resume <run_id>
 boss crawl stop <run_id>
 ```
 
+Settings are validated by type and range when a run starts: `max_requests` / `max_details` / `max_seconds` must be at least 1, `max_retries` may be `0` to disable retries, `cdp_port` must be within 1-65535, and `chrome_path` must be a string or `null`. `config set crawl` applies the same rules at write time and rejects invalid values without saving them; wrong types or out-of-range values in a hand-edited file are reported as `INVALID_PARAM` by `crawl run` / `start` and the `boss wizard` crawl action, naming the setting instead of silently applying defaults or falling back to `INTERNAL_ERROR`. The wizard crawl action accepts only `hook_profile=none` (custom hooks require an explicit `boss crawl run --hook-profile screenshot-full --hook-dir`), and its `pages` input, including on resume, requires an integer of at least 1; invalid values return `INVALID_PARAM`.
+
 | Command | Description |
 |---------|-------------|
 | `boss crawl configure [--chrome-path PATH] [--port N] [--max-* N]` | Configure the crawl-only Chrome and request, detail, wall-clock, and retry budgets; the profile is fixed at `<data-dir>/crawl/chrome-profile` |
@@ -117,7 +119,7 @@ After every page, `<data-dir>/crawl/runs/<run_id>/jobs.json`, `jobs.csv`, and a 
 | Command | Description |
 |---------|-------------|
 | `boss greet <sid> <jid>` | Greet a recruiter; duplicates return `ALREADY_GREETED` |
-| `boss batch-greet <query>` | Search and greet up to an explicit `--limit`; supports `--dry-run`; on `ACCOUNT_RISK` / `ENVIRONMENT_RISK` the batch stops immediately with `ok:false`, and already-greeted items are returned in `error.details.greeted` |
+| `boss batch-greet <query>` | Search and greet up to an explicit `--count`; supports `--dry-run`; on `ACCOUNT_RISK` / `ENVIRONMENT_RISK` the batch stops immediately with `ok:false`, and already-greeted items are returned in `error.details.greeted` |
 | `boss apply <sid> <jid>` | Apply or start a conversation; duplicates return `ALREADY_APPLIED` |
 | `boss exchange <uid-or-sid>` | Request a phone-number or WeChat exchange; prefer the stable `uid` returned by `boss chat` |
 
@@ -170,9 +172,9 @@ The `hr chat` list endpoint only returns basic conversation info (friendId, name
 
 ### Automation stop and explicit recovery
 
-`boss agent stop --reason <reason>` persists an independent stop flag that an older business-state snapshot cannot overwrite. Recruiter automation reads stop state at action boundaries and saves each confirmed action's deduplication result immediately. Risk, normal timeouts and interrupts preserve the available checkpoint. Submitted actions without confirmation require checking the official page before any resubmission.
+`boss agent stop --reason <reason>` persists an independent stop flag that an older business-state snapshot cannot overwrite. Recruiter automation reads stop state at action boundaries and saves each confirmed action's deduplication result immediately. Risk, normal timeouts and interrupts preserve the available checkpoint. Submitted actions without confirmation require checking the official page before any resubmission. When an automation page write returns `ACTION_UNCONFIRMED`, the cycle records a `PLATFORM_VERIFICATION_REQUIRED` event and opens the circuit breaker; the corresponding pending item becomes `verification-required` and leaves the `pending` queue. `--resume` does not return it to the queue, so a possibly effective action is never replayed.
 
-After completing official verification in the same browser and account and checking the blocked page, the operator can explicitly resume with `boss --role recruiter agent run --resume`. This clears the local stop state while preserving confirmed actions and queues; it does not establish that platform risk is resolved. Ordinary `agent run` never unlocks it. The MCP `boss_agent_run` parameter `resume` defaults to `false` and requires an explicit operator instruction before setting it to `true`. Resumable wizard/crawl runs keep `--resume <run_id>` and `crawl resume <run_id>`; runs marked `stopped` by `wizard --stop` remain terminal, requiring another workflow or recovery of their internal task.
+After completing official verification in the same browser and account and checking the blocked page, the operator can explicitly resume with `boss --role recruiter agent run --resume`. This clears the local stop state while preserving confirmed actions and queues; it does not establish that platform risk is resolved. Ordinary `agent run` never unlocks it. The MCP `boss_agent_run` parameter `resume` defaults to `false` and requires an explicit operator instruction before setting it to `true`. Resumable wizard/crawl runs keep `--resume <run_id>` and `crawl resume <run_id>`; runs marked `stopped` by `wizard --stop` remain terminal, requiring another workflow or recovery of their internal task. Write actions with an unknown outcome (`ACTION_UNCONFIRMED`, or a platform success whose local bookkeeping failed) record `replay_safe: false` in the step error; `--resume` never re-runs that step, returning the original failure and verification guidance instead. Start a new workflow after confirming the actual platform state.
 
 Long MCP calls use asynchronous subprocesses so stop/status tools remain responsive. Cancellation or a deadline attempts graceful interruption and process cleanup. Forced termination can leave unknown side effects; never retry automatically when `error.details.outcome_unknown=true`. A wizard's normal timeout retains a resumable result; MCP waits for its requested timeout plus a checkpoint grace period.
 
@@ -230,6 +232,8 @@ If an older configuration already contains an unsupported platform, explicitly s
 ```bash
 boss --platform zhipin config set platform zhipin
 ```
+
+Structured settings `automation` and `crawl` require a JSON object, e.g. `boss config set automation '{"mode": "training"}'`; scalar text is rejected with `INVALID_PARAM` and nothing is written. The `automation` contents are also validated with the runtime parser, so invalid enum values or numbers (a misspelled `mode`, a non-numeric threshold) are rejected with `INVALID_PARAM` without writing anything. If a hand-edited `config.json` holds a non-object value or invalid `automation` contents, `boss agent run` / `train` return `INVALID_PARAM` with a `boss config reset automation` repair path instead of exiting with a traceback. If `config.json` itself cannot be read (permissions, or the path is occupied by a directory), every command returns `INVALID_PARAM` at startup with the file path in the message; a failed write (read-only directory, full disk) returns `LOCAL_IO_ERROR`, writes nothing, and never exits with a traceback. Content that is not valid JSON, or not an object, also returns `INVALID_PARAM` at startup, naming the file and the failing line and column; that kind of damage has to be fixed or the file deleted by hand (deleting it restores all defaults), because `config set/reset` itself needs a readable configuration file.
 
 ### Shared request budget and cooldown
 

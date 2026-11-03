@@ -15,7 +15,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-from boss_agent_cli.output import emit_success
+from boss_agent_cli.output import emit_success, is_local_io_error
 from boss_agent_cli.schema.error_codes import ERROR_CODES
 
 # Rich output goes to stderr so stdout stays clean for Agent JSON
@@ -50,10 +50,53 @@ def error_contract_for_code(
 	)
 
 
+def platform_error_contract(code: str) -> tuple[bool, str | None, dict[str, Any] | None]:
+	"""Return ``(recoverable, recovery_action, hints)`` for a platform error code.
+
+	风控码的恢复指引与 ``next_actions`` 一律以 ``RISK_ERROR_CONTRACTS`` 为准，
+	避免各命令手工拼装出互相矛盾的停止指令。
+	"""
+	recoverable, recovery_action = error_contract_for_code(code)
+	if code in RISK_ERROR_CONTRACTS:
+		recovery_action, hints = risk_error_contract(code)
+		return recoverable, recovery_action, hints
+	return recoverable, recovery_action, None
+
+
+def risk_error_message(code: str) -> str:
+	"""Return a stop-oriented message for a risk code.
+
+	风控信封不透传异常或平台响应文本（可能带临时凭据），只暴露稳定错误码与
+	登记表文案；具体停止指引由 ``recovery_action`` / ``hints`` 承载。
+	"""
+	label = str(ERROR_CODES.get(code, {}).get("message") or "命中平台风控")
+	return f"{label}；停止自动化访问并在官方页面处理"
+
+
+def platform_error_message(code: str, message: str | None, fallback_message: str) -> str:
+	"""Return the envelope message for a platform error code.
+
+	风控码只输出登记表文案：平台响应原文可能带临时凭据，不进信封。
+	"""
+	if code in RISK_ERROR_CONTRACTS:
+		return risk_error_message(code)
+	return message or fallback_message
+
+
+def json_forced(ctx: Any) -> bool:
+	"""Only the explicit ``--json`` flag, not merely piped stdout.
+
+	``digest --format md`` 与 ``stats --format html`` 刻意把正文直出到管道，
+	方便用户 ``> 文件``；那是人工路径，不能改成信封。但 ``--json`` 是硬契约
+	（MCP 子进程总是带 ``--json`` 调用 CLI），这两条直出路径必须让位给信封，
+	否则 stdout 不是 JSON，MCP 侧只能报 CLI_ERROR。
+	"""
+	return bool(ctx.obj.get("json_output", False)) if ctx and ctx.obj else False
+
+
 def is_json_mode(ctx: Any) -> bool:
 	"""Check if --json flag is set or stdout is piped (non-TTY)."""
-	force_json = ctx.obj.get("json_output", False) if ctx and ctx.obj else False
-	return force_json or not sys.stdout.isatty()
+	return json_forced(ctx) or not sys.stdout.isatty()
 
 
 def render_operator_actions(hints: dict[str, Any] | None) -> None:
@@ -101,13 +144,21 @@ def handle_error_output(
 	*,
 	code: str,
 	message: str,
-	recoverable: bool = False,
+	recoverable: bool | None = None,
 	recovery_action: str | None = None,
 	details: dict[str, Any] | None = None,
 	hints: dict[str, Any] | None = None,
 ) -> None:
 	"""Smart error output: TTY -> rich error, pipe -> JSON error envelope."""
 	from boss_agent_cli.output import emit_error
+
+	# 调用方未显式声明时按登记表补齐，TTY 与 JSON 两条路径看到同一份恢复契约。
+	if recoverable is None or recovery_action is None:
+		registered_recoverable, registered_recovery_action = error_contract_for_code(code)
+		if recoverable is None:
+			recoverable = registered_recoverable
+		if recovery_action is None:
+			recovery_action = registered_recovery_action
 
 	if is_json_mode(ctx):
 		emit_error(
@@ -148,15 +199,18 @@ def handle_platform_error_output(
 	*,
 	fallback_message: str,
 	unknown_error_code: str | None = None,
+	extra_hints: dict[str, Any] | None = None,
 ) -> None:
-	"""Emit a schema-backed error envelope for an unsuccessful platform response."""
+	"""Emit a schema-backed error envelope for an unsuccessful platform response.
+
+	``extra_hints`` 承载命令自身的诊断字段（如 status 的 ``auth_health``）；
+	风控码的 ``next_actions`` 由 ``RISK_ERROR_CONTRACTS`` 覆盖，调用方不能改写。
+	"""
 	code, message = platform.parse_error(response)
 	if code == "UNKNOWN" and unknown_error_code is not None:
 		code = unknown_error_code
-	recoverable, recovery_action = error_contract_for_code(code)
-	hints = None
-	if code in RISK_ERROR_CONTRACTS:
-		recovery_action, hints = risk_error_contract(code)
+	recoverable, recovery_action, risk_hints = platform_error_contract(code)
+	hints = {**(extra_hints or {}), **(risk_hints or {})} or None
 	details = None
 	if isinstance(response, dict):
 		error = response.get("error")
@@ -173,7 +227,7 @@ def handle_platform_error_output(
 		ctx,
 		command,
 		code=code,
-		message=message or fallback_message,
+		message=platform_error_message(code, message, fallback_message),
 		recoverable=recoverable,
 		recovery_action=recovery_action,
 		details=details,
@@ -582,7 +636,7 @@ RISK_ERROR_CONTRACTS: dict[str, dict[str, Any]] = {
 		"next_actions": [
 			"不要刷新 Token、重新登录或换通道重试；本次请求未发出",
 			"由用户在原会话确认官方目标业务页恢复后，执行 boss clean --risk-lock 并显式恢复任务；令牌变化不放行",
-			"boss doctor — 查看本地风控锁状态",
+			"boss doctor",
 		],
 	},
 }
@@ -623,7 +677,7 @@ def _with_httpx_only_hint(ctx: Any, hints: dict[str, list[str]] | None) -> dict[
 
 # 解析平台数据或 CLI 自身的缺陷：同样的输入必然得到同样的结果。归为 NETWORK_ERROR
 # 并建议「重试」会让 Agent 反复重试，重试的若是平台请求，还会白白消耗请求预算。
-INTERNAL_ERROR_TYPES: tuple[type[Exception], ...] = (TypeError, AttributeError, KeyError, IndexError)
+INTERNAL_ERROR_TYPES: tuple[type[Exception], ...] = (TypeError, AttributeError, KeyError, IndexError, OverflowError)
 
 
 def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -704,7 +758,7 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					recoverable=True,
 					recovery_action="回到 BOSS 直聘官方招聘者页面手动处理",
 					hints={
-						"next_actions": [
+						"operator_actions": [
 							"在 BOSS 直聘官方页面确认候选人和沟通上下文",
 							"保持 CLI 默认低风险模式，不通过自动化链路发送消息或请求简历",
 						]
@@ -736,7 +790,8 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					ctx,
 					command_name,
 					code=e.code,
-					message=str(e),
+					# 风控信封不透传平台响应文本（可能带临时凭据），只给登记表文案。
+					message=risk_error_message(e.code),
 					recoverable=False,
 					recovery_action=recovery_action,
 					details=e.details or None,
@@ -785,6 +840,26 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					recoverable=internal_recoverable,
 					recovery_action=internal_recovery,
 				)
+			except OSError as e:
+				if is_local_io_error(e):
+					# 路径不可写、目标被同名文件占用、磁盘满：重试同一条命令永远修不好，
+					# 落成可重试的 NETWORK_ERROR 只会让 Agent 无限重试。
+					handle_error_output(
+						ctx,
+						command_name,
+						code="LOCAL_IO_ERROR",
+						message=f"{command_name} 本地文件读写失败: {e}",
+					)
+				else:
+					handle_error_output(
+						ctx,
+						command_name,
+						code="NETWORK_ERROR",
+						message=f"{command_name} 失败: {e}",
+						recoverable=True,
+						recovery_action="重试",
+						hints=_with_httpx_only_hint(ctx, None),
+					)
 			except Exception as e:
 				handle_error_output(
 					ctx,

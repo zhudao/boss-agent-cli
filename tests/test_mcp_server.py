@@ -1,4 +1,5 @@
 """模型上下文协议服务测试 — 覆盖工具定义、参数构建和调用逻辑。"""
+import asyncio
 import inspect
 import json
 import re
@@ -7,6 +8,7 @@ import types
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import click
 import pytest
 
 
@@ -50,6 +52,7 @@ from server import (  # noqa: E402
 from boss_agent_cli.schema.availability import inject_availability  # noqa: E402
 from boss_agent_cli.schema.data import SCHEMA_DATA  # noqa: E402
 from boss_agent_cli.schema.formats import format_mcp_tools  # noqa: E402
+from boss_agent_cli.mcp_tools import _decorate_tool_descriptions  # noqa: E402
 from boss_agent_cli.compliance import low_risk_blocked_commands  # noqa: E402
 from boss_agent_cli.main import cli  # noqa: E402
 
@@ -150,6 +153,8 @@ def test_all_tool_schemas_are_well_formed_objects():
 def test_candidate_tool_description_includes_availability():
 	search = next(t for t in TOOLS if t.name == "boss_search")
 	assert "可用性:" in search.description
+	assert search.description.count("可用性:") == 1
+	assert "可用性: 可用性:" not in search.description
 	assert "roles=candidate" in search.description
 	assert "zhilian" not in search.description
 	assert "zhipin" in search.description
@@ -158,8 +163,23 @@ def test_candidate_tool_description_includes_availability():
 def test_recruiter_tool_description_includes_availability():
 	tool = next(t for t in TOOLS if t.name == "boss_hr_jobs")
 	assert "可用性:" in tool.description
+	assert tool.description.count("可用性:") == 1
+	assert "可用性: 可用性:" not in tool.description
 	assert "roles=recruiter" in tool.description
 	assert "zhipin-recruiter" in tool.description
+
+
+def test_no_tool_description_repeats_availability_prefix():
+	"""可用性前缀由 availability_note 自带，装饰时不能再拼一次。"""
+	broken = [tool.name for tool in TOOLS if "可用性: 可用性:" in tool.description]
+	assert not broken, "可用性前缀重复：" + ", ".join(broken)
+
+
+def test_decorate_tool_descriptions_is_idempotent():
+	"""兼容入口重复调用不得叠加可用性说明。"""
+	before = {tool.name: tool.description for tool in TOOLS}
+	_decorate_tool_descriptions()
+	assert {tool.name: tool.description for tool in TOOLS} == before
 
 
 def test_all_tools_have_input_schema():
@@ -254,6 +274,155 @@ def test_every_tool_maps_to_registered_command():
 		args = _build_args(tool.name, arguments)
 		assert args, tool.name
 		assert args[0] in registered_commands, tool.name
+
+
+def _resolve_click_command(argv: list[str]):
+	"""沿 argv 走到最深一层的 Click 命令，返回 (命令, 名称, 剩余参数)。"""
+	command = cli
+	name = command.name
+	remaining = list(argv)
+	while isinstance(command, click.Group) and remaining and not remaining[0].startswith("-"):
+		candidate = remaining[0]
+		if candidate not in command.commands:
+			break
+		command = command.commands[candidate]
+		name = candidate
+		remaining = remaining[1:]
+	return command, name, remaining
+
+
+def test_every_tool_generated_argv_parses_on_click_tree():
+	"""工具生成的 argv 必须能被 Click 实际解析，而不只是首个子命令名存在。
+
+	boss_mark 曾把 CLI 的 `--label` 写成 `--tag`：只查 args[0] 的测试看不出问题，
+	任何一次真实工具调用都会被 Click 以 NoSuchOption 拒绝。
+	"""
+	for tool in TOOLS:
+		args = _build_args(tool.name, _required_arguments(tool))
+		command, name, remaining = _resolve_click_command(args)
+		try:
+			command.make_context(name, remaining)
+		except click.UsageError as exc:
+			pytest.fail(f"{tool.name} 生成的 argv {args} 无法被 Click 解析：{exc}")
+
+
+# 部分操作类型会要求额外参数；校验枚举值时补上，避免把条件必填误报成取值非法。
+_CONDITIONAL_ARGS = {
+	("boss_wizard", "action"): {"run_id": "run-1"},
+	("boss_hr_jobs", "action"): {"job_id": "job-1"},
+	("boss_config", "action"): {"key": "platform", "value": "zhipin"},
+}
+
+
+def test_every_tool_enum_value_parses_on_click_tree():
+	"""工具 schema 声明的每个枚举值都必须能被对应 CLI 接受。
+
+	boss_me 曾把 `--section user` 写成 `info`：客户端按 schema 选第一个枚举值就会被
+	Click 拒绝。只校验必填参数或首个枚举值都看不出这类漂移。
+	"""
+	for tool in TOOLS:
+		properties = tool.input_schema.get("properties", {})
+		for name, schema in properties.items():
+			for value in schema.get("enum") or ():
+				arguments = {
+					**_required_arguments(tool),
+					**_CONDITIONAL_ARGS.get((tool.name, name), {}),
+					name: value,
+				}
+				args = _build_args(tool.name, arguments)
+				command, command_name, remaining = _resolve_click_command(args)
+				try:
+					command.make_context(command_name, remaining)
+				except click.UsageError as exc:
+					pytest.fail(
+						f"{tool.name}.{name}={value!r} 生成的 argv {args} 无法被 Click 解析：{exc}"
+					)
+
+
+@pytest.mark.parametrize(
+	("tool_name", "arguments", "missing"),
+	[
+		("boss_wizard", {"action": "status"}, "run_id"),
+		("boss_hr_jobs", {"action": "offline"}, "job_id"),
+	],
+)
+def test_call_tool_reports_missing_conditional_argument(monkeypatch, tool_name, arguments, missing):
+	"""漏传条件必填参数时返回 INVALID_PARAM 工具错误，而不是 JSON-RPC 内部错误。"""
+	from types import SimpleNamespace
+
+	from boss_agent_cli import mcp_server
+	from mcp.types import CallToolRequestParams
+
+	# 本文件顶部的 mcp 替身只用来让 import 成立，TextContent 是 MagicMock 实例，
+	# 调用它不会保留 kwargs；换成可读的轻量替身来断言结果形状。
+	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
+	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
+
+	result = asyncio.run(mcp_server.call_tool(None, CallToolRequestParams(name=tool_name, arguments=arguments)))
+
+	assert result.is_error is True
+	payload = json.loads(result.content[0].text)
+	assert payload["ok"] is False
+	assert payload["error"]["code"] == "INVALID_PARAM"
+	assert missing in payload["error"]["message"]
+	assert payload["error"]["recoverable"] is False
+	assert payload["error"]["recovery_action"] == "修正参数"
+
+
+@pytest.mark.parametrize(("ok", "expected"), [(True, False), (False, True)])
+def test_call_tool_is_error_mirrors_envelope_ok(monkeypatch, ok, expected):
+	"""CLI 返回 ok:false 时，工具结果必须标成 is_error，否则客户端会当成成功调用。"""
+	from types import SimpleNamespace
+
+	from boss_agent_cli import mcp_server
+	from mcp.types import CallToolRequestParams
+
+	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
+	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
+
+	async def fake_run(*args):
+		return {"ok": ok, "error": None if ok else {"code": "AUTH_REQUIRED"}}
+
+	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
+
+	result = asyncio.run(mcp_server.call_tool(None, CallToolRequestParams(name="boss_status", arguments={})))
+
+	assert result.is_error is expected
+	assert json.loads(result.content[0].text)["ok"] is ok
+
+
+def test_call_tool_rejects_unknown_arguments(monkeypatch):
+	"""未知参数必须拒绝，不能被静默丢弃。
+
+	`boss_apply` 的 schema 没有 `dry_run`，过去多传这个参数会被忽略并真实提交投递。
+	"""
+	from types import SimpleNamespace
+
+	from boss_agent_cli import mcp_server
+	from mcp.types import CallToolRequestParams
+
+	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
+	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
+
+	async def fake_run(*args):
+		raise AssertionError("未知参数不应触达 CLI")
+
+	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
+
+	result = asyncio.run(
+		mcp_server.call_tool(
+			None,
+			CallToolRequestParams(
+				name="boss_apply",
+				arguments={"security_id": "s", "job_id": "j", "dry_run": True},
+			),
+		)
+	)
+
+	payload = json.loads(result.content[0].text)
+	assert result.is_error is True
+	assert payload["error"]["code"] == "INVALID_PARAM"
+	assert "dry_run" in payload["error"]["message"]
 
 
 def test_search_tool_requires_query():
@@ -460,8 +629,9 @@ def test_build_args_chat_summary():
 
 
 def test_build_args_mark():
+	"""MCP 参数名是 tag，CLI 选项名是 --label，映射必须落到真实选项上。"""
 	args = _build_args("boss_mark", {"security_id": "s1", "tag": "收藏"})
-	assert args == ["mark", "s1", "--tag", "收藏"]
+	assert args == ["mark", "s1", "--label", "收藏"]
 
 
 def test_build_args_mark_remove():
@@ -478,11 +648,12 @@ def test_build_args_apply():
 
 
 def test_build_args_batch_greet():
+	"""MCP 的 limit 要落到 CLI 的 --count，并按 schema 默认值显式下发。"""
 	args = _build_args("boss_batch_greet", {"query": "python", "limit": 3, "dry_run": True})
-	assert "batch-greet" in args
-	assert "python" in args
-	assert "--limit" in args
-	assert "--dry-run" in args
+	assert args == ["batch-greet", "python", "--count", "3", "--dry-run"]
+
+	default_args = _build_args("boss_batch_greet", {"query": "python"})
+	assert default_args == ["batch-greet", "python", "--count", "5"]
 
 
 def test_build_args_show():

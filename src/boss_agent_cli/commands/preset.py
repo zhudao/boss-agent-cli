@@ -1,7 +1,7 @@
 import click
+from typing import Any
 
 from boss_agent_cli.api.endpoints import (
-	CITY_CODES,
 	INDUSTRY_CODES,
 	JOB_TYPE_CODES,
 	SCALE_CODES,
@@ -9,7 +9,13 @@ from boss_agent_cli.api.endpoints import (
 )
 from boss_agent_cli.cache.store import CacheStore
 from boss_agent_cli.display import handle_error_output, handle_output, render_action_result, render_list_result
-from boss_agent_cli.search_filters import ACTIVE_LEVELS, build_search_params, resolve_active_level
+from boss_agent_cli.search_filters import (
+	ACTIVE_LEVELS,
+	build_search_params,
+	ensure_supported_city,
+	resolve_active_level,
+	resolve_search_code_params,
+)
 
 
 def _build_params(
@@ -61,8 +67,22 @@ def preset_add_cmd(
 	welfare: str | None,
 	active: str | None,
 ) -> None:
-	if city and city not in CITY_CODES:
-		handle_error_output(ctx, "preset", code="INVALID_PARAM", message=f"未知城市: {city}")
+	# 空字符串是合法 argv，但存下来的预设既没法点名（`boss search --preset ""`），
+	# 也没法搜到目标（空关键词等于不筛选）。必须在写盘前拒绝。
+	if not name.strip() or not query.strip():
+		handle_error_output(ctx, "preset", code="INVALID_PARAM", message="preset 名称与搜索关键词不能为空")
+		return
+	# 与 `watch add` 一致：保存时就把筛选条件校验掉。未知薪资 / 经验 / 学历
+	# 写进预设后，`search --preset` 每次都要先在参数解析处失败，而预设本身
+	# 仍显示为「已保存」，用户很难看出该改的是这条本地记录。
+	try:
+		ensure_supported_city(city)
+		resolve_search_code_params(
+			salary=salary, experience=experience, education=education,
+			industry=industry, scale=scale, stage=stage, job_type=job_type,
+		)
+	except ValueError as exc:
+		handle_error_output(ctx, "preset", code="INVALID_PARAM", message=str(exc))
 		return
 	try:
 		active_level = resolve_active_level(active)
@@ -91,7 +111,14 @@ def preset_add_cmd(
 @click.pass_context
 def preset_list_cmd(ctx: click.Context) -> None:
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
-		items = cache.list_saved_searches()
+		items, corrupt = cache.list_saved_searches_with_corrupt()
+	hints: dict[str, Any] = {"next_actions": ["boss search --preset <name>", "boss preset remove <name>"]}
+	if corrupt:
+		# 坏条目不能假装不存在：列表照常返回可用项，同时指明该删哪个。
+		hints["corrupt"] = corrupt
+		hints["operator_actions"] = [
+			f"以下预设的参数已损坏，先执行 boss preset remove <名称> 再重新 preset add：{', '.join(corrupt)}"
+		]
 	handle_output(
 		ctx,
 		"preset",
@@ -100,12 +127,12 @@ def preset_list_cmd(ctx: click.Context) -> None:
 			d,
 			"presets",
 			[("名称", "name", "bold cyan"), ("条件", "params", "green"), ("创建时间", "created_at", "dim")],
-			next_steps=["boss preset add <name> --query <关键词>"] if not d else [
+			next_steps=["boss preset add <name> <关键词>"] if not d else [
 				"boss search --preset <name>",
 				"boss preset remove <name>",
 			],
 		),
-		hints={"next_actions": ["boss search --preset <name>", "boss preset remove <name>"]},
+		hints=hints,
 	)
 
 

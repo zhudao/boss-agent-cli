@@ -4,12 +4,18 @@
 并验证代码中使用的每个错误码都在 schema 中声明。
 """
 
+import ast
 import json
+import re
+from pathlib import Path
+from typing import Any
 
+import click
 from click.testing import CliRunner
 
 from boss_agent_cli.main import cli
 from boss_agent_cli.schema.data import SCHEMA_DATA
+from boss_agent_cli.schema.error_codes import ERROR_CODES
 
 
 # ── Schema 输出格式 ─────────────────────────────────────────────────
@@ -96,6 +102,196 @@ def test_schema_commands_have_descriptions():
 	)
 
 
+# ── 子命令声明 == 实际注册子命令 ─────────────────────────────────────
+
+_SUBCOMMAND_LIST_PATTERN = re.compile(r"子命令：([^）)]+)")
+
+
+def test_schema_subcommand_lists_match_click_tree():
+	"""description 里「子命令：a/b/c」的声明必须与实际 Click 组一致。
+
+	crawl 曾漏掉 shortlist：`boss schema` 是 Agent 的能力真源，声明不全
+	等于把导入候选池的能力藏了起来。
+	"""
+	problems: list[str] = []
+	for name, spec in SCHEMA_DATA["commands"].items():
+		match = _SUBCOMMAND_LIST_PATTERN.search(str(spec.get("description", "")))
+		if match is None:
+			continue
+		declared = sorted(item.strip() for item in match.group(1).split("/"))
+		command = cli.commands.get(name)
+		actual = sorted(getattr(command, "commands", {}) or {})
+		if declared != actual:
+			problems.append(f"{name}: 声明 {declared} != 实际 {actual}")
+
+	assert not problems, "schema 子命令声明与实际注册不一致:\n" + "\n".join(problems)
+
+
+def test_schema_hr_subcommands_match_click_tree():
+	"""hr 的结构化 subcommands 必须是实际子命令的完整镜像。"""
+	declared = set(SCHEMA_DATA["commands"]["hr"]["subcommands"])
+	actual = set(cli.commands["hr"].commands)
+	assert declared == actual, (
+		f"hr subcommands 声明与实际不一致: 缺 {sorted(actual - declared)} 多 {sorted(declared - actual)}"
+	)
+
+
+def test_schema_struct_subcommands_match_click_tree():
+	"""结构化 subcommands 的键集合必须与实际一级子命令一致。
+
+	`boss schema` 是能力真源。`watch` / `preset` 原先没有 `subcommands`，
+	`watch list` / `preset list` 在 options 里也缺席，Agent 据此枚举只能看到
+	add/remove，列不出已保存的条件。agent 用平铺的「review list」形式描述
+	嵌套子命令，不适用集合比较，跳过。
+	"""
+	problems: list[str] = []
+	for name, spec in SCHEMA_DATA["commands"].items():
+		declared = spec.get("subcommands")
+		if not isinstance(declared, dict):
+			continue
+		if any(" " in str(key) for key in declared):
+			continue
+		command = cli.commands.get(name)
+		if command is None:
+			continue
+		actual = set(getattr(command, "commands", {}) or {})
+		if set(declared) != actual:
+			problems.append(
+				f"{name}: 声明 {sorted(declared)} != 实际 {sorted(actual)}"
+			)
+
+	assert not problems, "schema 结构化子命令声明与实际注册不一致:\n" + "\n".join(problems)
+
+
+def test_schema_options_declare_every_subcommand():
+	"""每个已注册子命令都必须在 options 里出现（无参数时用空对象占位）。
+
+	Agent 通过 options 的非选项键枚举可执行子命令。`shortlist` / `config` /
+	`resume` 的 list、`agent` 的 control/pending/stats、`ai local` 的
+	status/smoke、`hr whoami` 原先只在 `subcommands` 描述里出现，遍历 options
+	的调用方会漏掉这些能力。
+	"""
+	problems: list[str] = []
+
+	def walk(path: str, node: Any, options: dict[str, Any]) -> None:
+		for sub_name, sub_node in (getattr(node, "commands", {}) or {}).items():
+			if sub_name not in options:
+				problems.append(f"{path}.{sub_name}")
+				continue
+			sub_spec = options[sub_name]
+			if isinstance(sub_spec, dict):
+				walk(f"{path}.{sub_name}", sub_node, sub_spec)
+
+	for name, spec in SCHEMA_DATA["commands"].items():
+		node = cli.commands.get(name)
+		options = spec.get("options")
+		if node is not None and isinstance(options, dict):
+			walk(name, node, options)
+
+	assert not problems, "schema 未在 options 中声明子命令: " + ", ".join(problems)
+
+
+# ── 选项声明 == 实际可执行选项 ───────────────────────────────────────
+
+
+def _click_param_options(node: Any) -> set[str]:
+	names: set[str] = set()
+	for param in getattr(node, "params", ()):
+		if isinstance(param, click.Argument):
+			continue
+		for opt in getattr(param, "opts", ()):
+			names.add(opt)
+			if "/" in opt:
+				names.add("--" + opt.rsplit("/", 1)[-1].lstrip("-"))
+		for opt in getattr(param, "secondary_opts", ()):
+			names.add(opt)
+	return names
+
+
+def _schema_option_spellings(key: str) -> set[str]:
+	"""把 `-o, --output` / `--output` 拆成 Click 使用的拼写形式。"""
+	return {part.strip() for part in key.split(",") if part.strip().startswith("-")}
+
+
+#: 刻意不进入 native schema 的可执行选项：内部隐藏 / 历史兼容 / 测试专用 / 与全局重复。
+#: 键是 Click 命令路径（`命令.分组.子分组`），值是该路径下允许未声明的选项。
+_UNDECLARED_SCHEMA_OPTIONS: dict[str, set[str]] = {
+	"login": {"--ignore-risk-lock"},  # 历史兼容，已明确不再跳过本地风控锁
+	"wizard": {"--json"},  # 与全局 --json 重复
+	"pipeline": {"--now-ts-ms"},  # 测试专用时间戳覆盖
+	"follow-up": {"--now-ts-ms"},
+	"digest": {"--now-ts-ms"},
+	"crawl.resume": {"--from-queue"},  # 后台恢复子进程内部使用，Click hidden
+	"agent.crawl": {"--allow-crawl"},  # 历史兼容，当前版本无需传入
+}
+
+
+def test_schema_option_declarations_are_executable():
+	"""schema 的 options 必须与 Click 命令树双向一致。
+
+	声明的选项要真的落在对应命令/子命令上（Agent 照 schema 构造 argv 不能
+	被 Click 拒绝）；可执行的公开选项也必须声明（否则 Agent 从 schema 里
+	看不到能力）。分组按 CLI 子命令名递归，`hr jobs list --page` 这种深层
+	选项要写进 `jobs.list`，不能平铺在 `jobs` 上。
+
+	`agent` 曾把 `agent run` 的三个选项写成 `agent` 的命令级选项：Agent 按
+	schema 构造 `boss agent --resume` 会直接被 Click 拒绝。
+	"""
+	problems: list[str] = []
+
+	def walk(path: str, node: Any, group: dict[str, Any]) -> None:
+		declared: set[str] = set()
+		subgroups: dict[str, dict[str, Any]] = {}
+		for key, value in group.items():
+			if not isinstance(value, dict):
+				continue
+			if str(key).startswith("-"):
+				declared |= _schema_option_spellings(str(key))
+			else:
+				subgroups[str(key)] = value
+
+		actual = _click_param_options(node)
+		allowed = _UNDECLARED_SCHEMA_OPTIONS.get(path, set())
+		undeclared = actual - declared - allowed
+		if undeclared:
+			problems.append(f"{path}: 可执行但未声明 {sorted(undeclared)}")
+		unexecutable = declared - actual
+		if unexecutable:
+			problems.append(f"{path}: 声明了不可执行 {sorted(unexecutable)}")
+
+		subcommands = getattr(node, "commands", {}) or {}
+		for key, value in subgroups.items():
+			sub = subcommands.get(key)
+			if sub is None:
+				problems.append(f"{path}: 选项分组 {key!r} 不是已注册子命令")
+				continue
+			walk(f"{path}.{key}", sub, value)
+		for sub_name, sub in subcommands.items():
+			if sub_name not in subgroups:
+				walk(f"{path}.{sub_name}", sub, {})
+
+	for name, spec in SCHEMA_DATA["commands"].items():
+		node = cli.commands.get(name)
+		if node is not None:
+			walk(name, node, spec.get("options") or {})
+
+	# 豁免项若已经声明，说明豁免清单过期，应删掉而不是继续跳过
+	for path, options in _UNDECLARED_SCHEMA_OPTIONS.items():
+		group: Any = SCHEMA_DATA["commands"].get(path.split(".")[0], {}).get("options")
+		for token in path.split(".")[1:]:
+			group = group.get(token) if isinstance(group, dict) else None
+		declared = {
+			spelling
+			for key in (group or {})
+			if str(key).startswith("-")
+			for spelling in _schema_option_spellings(str(key))
+		}
+		for option in sorted(options & declared):
+			problems.append(f"豁免项 {path} {option} 已可声明，请从 _UNDECLARED_SCHEMA_OPTIONS 删除")
+
+	assert not problems, "schema 选项声明与 Click 命令树不一致:\n" + "\n".join(problems)
+
+
 def test_doctor_schema_documents_cdp_risk_boundary():
 	"""doctor schema 只描述保留的 CDP 通道，不提供风控绕过入口。"""
 	description = SCHEMA_DATA["commands"]["doctor"]["description"]
@@ -114,57 +310,150 @@ def test_browser_source_schema_only_describes_supported_channels():
 	assert "CDP_UNAVAILABLE" in description
 
 
+# ── 位置参数声明 == 实际可执行参数 ───────────────────────────────────
+
+
+def _click_param_args(node: Any) -> list[tuple[str, bool]]:
+	return [(param.name, param.required) for param in getattr(node, "params", ()) if isinstance(param, click.Argument)]
+
+
+def _schema_arg_entries(spec: dict[str, Any]) -> list[tuple[str, bool]]:
+	return [
+		(str(entry.get("name")), bool(entry.get("required")))
+		for entry in spec.get("args", [])
+		if isinstance(entry, dict)
+	]
+
+
+#: 刻意不进入 native schema 的位置参数（内部隐藏 / 测试专用）。
+_UNDECLARED_SCHEMA_ARGS: dict[str, set[str]] = {}
+
+
+def _schema_subcommand_specs(spec: dict[str, Any]) -> dict[str, dict[str, Any]]:
+	"""返回某个规范节点下直接挂着的子命令分组。
+
+	schema 有两种形状：命令级 `options` 下的非选项键（`crawl.run`、`watch.add`），
+	以及不带 `options` 的分组里直接挂子命令（`hr.jobs`、`agent.review`、
+	`ai.local`）。两种都要递归，否则深层位置参数会漏检。
+	"""
+	if isinstance(spec.get("options"), dict):
+		return {
+			str(key): value
+			for key, value in spec["options"].items()
+			if not str(key).startswith("-") and isinstance(value, dict)
+		}
+	reserved = {"description", "args", "options", "subcommands", "mcp_tools"}
+	return {
+		str(key): value
+		for key, value in spec.items()
+		if str(key) not in reserved and not str(key).startswith("-") and isinstance(value, dict)
+	}
+
+
+def test_schema_arg_declarations_are_executable():
+	"""schema 的 args 必须与 Click 命令树双向一致。
+
+	位置参数按声明顺序绑定，Agent 照 schema 构造 `boss watch add <name> <query>`
+	时顺序或必填性错了都会被 Click 拒绝。声明的参数必须真的落在对应命令上；
+	可执行的位置参数也必须声明；两者顺序与 required 都要一致。
+	"""
+	problems: list[str] = []
+
+	def walk(path: str, node: Any, spec: dict[str, Any]) -> None:
+		declared = _schema_arg_entries(spec)
+		actual = _click_param_args(node)
+		allowed = _UNDECLARED_SCHEMA_ARGS.get(path, set())
+
+		declared_names = [name for name, _ in declared]
+		actual_names = [name for name, _ in actual]
+		if declared_names != actual_names:
+			problems.append(f"{path}: schema args {declared_names} != click args {actual_names}")
+		for name, required in declared:
+			actual_required = dict(actual).get(name)
+			if actual_required is not None and actual_required != required:
+				problems.append(f"{path}: 参数 {name} required 声明为 {required}，实际为 {actual_required}")
+		for name in actual_names:
+			if name not in declared_names and name not in allowed:
+				problems.append(f"{path}: 可执行但未声明位置参数 {name}")
+
+		subcommands = getattr(node, "commands", {}) or {}
+		children = _schema_subcommand_specs(spec)
+		for key, value in children.items():
+			sub = subcommands.get(key)
+			if sub is None:
+				continue  # 未注册分组由选项一致性测试报告
+			walk(f"{path}.{key}", sub, value)
+		for sub_name, sub in subcommands.items():
+			if sub_name not in children:
+				walk(f"{path}.{sub_name}", sub, {})
+
+	for name, spec in SCHEMA_DATA["commands"].items():
+		node = cli.commands.get(name)
+		if node is not None:
+			walk(name, node, spec)
+
+	assert not problems, "schema 位置参数声明与 Click 命令树不一致:\n" + "\n".join(problems)
+
+
 # ── 错误码一致性 ────────────────────────────────────────────────────
+
+_SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "boss_agent_cli"
+_ERROR_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+
+#: 源码中形如错误码、但不属于 CLI 信封错误码的全大写字面量。
+#: 新增环境变量名等会触发扫描失败；确认不是错误码后加到这里。
+_NON_ERROR_CODE_LITERALS = {
+	"ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY",  # 代理环境变量名
+	"BOSS_AGENT_MACHINE_ID", "BOSS_BROWSER_VERBOSE", "BOSS_DATA_DIR", "BOSS_EGRESS_PROBE_URL",  # 环境变量名
+	"CLI_ERROR",  # MCP 层「CLI 输出不可解析」分类，不进入 CLI 信封
+	"CREATE_NO_WINDOW",  # Windows 子进程常量
+	"DRY_RUN",  # 招聘自动化事件状态，不是错误码
+	"HOOK_SCRIPT_NAMES",  # crawler 常量名
+	"PYTEST_CURRENT_TEST",  # pytest 环境变量
+	"SERVER_INSTRUCTIONS",  # MCP server 常量名
+	"UID_OR_SECURITY_ID",  # click metavar
+}
+
+
+def _literal_error_codes() -> set[str]:
+	"""收集源码中形如错误码的字符串字面量（错误码定义文件自身除外）。"""
+	codes: set[str] = set()
+	for path in sorted(_SOURCE_ROOT.rglob("*.py")):
+		if path == _SOURCE_ROOT / "schema" / "error_codes.py":
+			continue
+		tree = ast.parse(path.read_text(encoding="utf-8"))
+		for node in ast.walk(tree):
+			if (
+				isinstance(node, ast.Constant)
+				and isinstance(node.value, str)
+				and _ERROR_CODE_PATTERN.match(node.value)
+			):
+				codes.add(node.value)
+	return codes
 
 
 def test_schema_error_codes_cover_all_used_codes():
-	"""代码中实际使用的错误码应全部在 schema error_codes 中声明。
+	"""源码中出现的错误码字面量应全部在 schema error_codes 中声明。
 
-	已知例外:
-	- HOOK_BLOCKED: 仅在启用钩子系统时出现，属于扩展机制，不在公开 schema 中声明。
+	扫描源码而非维护手工清单：任何新增错误码只要以字面量出现在生产代码里，
+	这里就会失败，避免 HOOK_BLOCKED / MODEL_SOURCE_NOT_FOUND 那类漏登记复发。
 	"""
 	schema_codes = set(SCHEMA_DATA["error_codes"].keys())
+	used_codes = _literal_error_codes() - _NON_ERROR_CODE_LITERALS
 
-	# 代码中实际使用的所有错误码（通过审计收集）
-	used_codes = {
-		"CONFIRMATION_REQUIRED",
-		"RESUME_ACCEPT_RESULT_UNKNOWN",
-		"GREET_RESULT_UNKNOWN",
-		"ACTION_UNCONFIRMED",
-		"EXCHANGE_NOT_AVAILABLE",
-		"AUTH_EXPIRED",
-		"AUTH_REQUIRED",
-		"RATE_LIMITED",
-		"TOKEN_REFRESH_FAILED",
-		"ENVIRONMENT_RISK",
-		"LOGIN_TIMEOUT",
-		"CDP_UNAVAILABLE",
-		"BROWSER_SESSION_NOT_FOUND",
-		"BROWSER_KERNEL_MISSING",
-		"BROWSER_NAV_TIMEOUT",
-		"LOGIN_RISK_CONTROL",
-		"LOGIN_EXPIRED",
-		"LOGIN_CREDENTIAL_EXTRACTION_FAILED",
-		"ACCOUNT_RISK",
-		"JOB_NOT_FOUND",
-		"ALREADY_GREETED",
-		"ALREADY_APPLIED",
-		"GREET_LIMIT",
-		"NETWORK_ERROR",
-		"INVALID_PARAM",
-		"NOT_SUPPORTED",
-		"COMPLIANCE_BLOCKED",
-		"HOOK_BLOCKED",
-	}
-
-	# HOOK_BLOCKED 是内部扩展机制，允许不在公开 schema 中
-	allowed_internal = {"HOOK_BLOCKED"}
-	must_be_in_schema = used_codes - allowed_internal
-
-	missing = must_be_in_schema - schema_codes
+	missing = used_codes - schema_codes
 	assert not missing, (
-		f"以下错误码在代码中使用但未在 schema 中声明: {missing}"
+		f"以下错误码在代码中使用但未在 schema 中声明: {sorted(missing)}"
 	)
+
+	# 豁免项若同时是已登记错误码，说明真实错误码被悄悄跳过
+	overlap = _NON_ERROR_CODE_LITERALS & schema_codes
+	assert not overlap, (
+		f"以下豁免项已登记为错误码，不应出现在 _NON_ERROR_CODE_LITERALS: {sorted(overlap)}"
+	)
+
+	# 扫描器有效性自检：这些码必须以字面量出现在生产代码中
+	assert {"INVALID_PARAM", "HOOK_BLOCKED", "MODEL_SOURCE_NOT_FOUND"} <= used_codes
 
 
 def test_schema_error_codes_all_have_message():
@@ -252,3 +541,238 @@ def test_industry_choices_derive_from_lookup_table():
 	commands = SCHEMA_DATA["commands"]
 	for name in ("search", "batch-greet"):
 		assert commands[name]["options"]["--industry"]["choices"] == list(INDUSTRY_CODES), name
+
+
+def test_cli_error_envelope_metadata_matches_registry():
+	"""端到端：命令只传 code / message 时，信封元数据由登记表补齐。
+
+	曾经的缺口：命令层大量 `INVALID_PARAM` 调用点不传 `recoverable` /
+	`recovery_action`，信封里两者落成 `false` / `null`，Agent 拿不到
+	`schema.error_codes` 中已经声明好的「修正参数」指引。
+	"""
+	result = CliRunner().invoke(cli, ["--json", "export", "--url", "https://example.com/not-boss"])
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["error"]["recoverable"] is ERROR_CODES["INVALID_PARAM"]["recoverable"]
+	assert parsed["error"]["recovery_action"] == ERROR_CODES["INVALID_PARAM"]["recovery_action"]
+
+
+# 恢复指引里的 `boss` 命令片段：只吃 ASCII 命令 token，遇到选项 / 占位符 /
+# 中文自然语言即停止，避免把整句中文当成命令的一部分。
+_BOSS_COMMAND_PATTERN = re.compile(r"\bboss((?: (?:--platform \S+|--json|[a-z][a-z0-9-]*))*)")
+_BACKTICK_FRAGMENT_PATTERN = re.compile(r"`([^`]+)`")
+
+
+def _resolve_command(tokens: list[str]) -> Any:
+	"""按 Click 命令树解析 token，返回 (完整路径, 叶子命令, 未知 token)。"""
+	node: Any = cli
+	path: list[str] = []
+	for token in tokens:
+		if token == "--json":
+			continue
+		if token == "--platform":
+			# 平台名之后无法继续按命令树校验，视为已解析。
+			return path, node, None
+		commands = getattr(node, "commands", None)
+		if commands is None:
+			return path, node, None
+		sub = commands.get(token)
+		if sub is None:
+			return path, node, token
+		node = sub
+		path.append(token)
+	return path, node, None
+
+
+def _option_names(command: Any) -> set[str]:
+	names: set[str] = set()
+	for param in getattr(command, "params", ()):
+		for opt in getattr(param, "opts", ()):
+			names.add(opt)
+			if "/" in opt:
+				names.add("--" + opt.rsplit("/", 1)[-1].lstrip("-"))
+	return names
+
+
+def _recovery_command_problems() -> list[str]:
+	problems: list[str] = []
+	for code, spec in ERROR_CODES.items():
+		action = str(spec.get("recovery_action") or "")
+		for match in _BOSS_COMMAND_PATTERN.finditer(action):
+			tokens = match.group(1).split()
+			if tokens[:1] == ["--platform"]:
+				tokens = tokens[2:]
+			_, _, unknown = _resolve_command(tokens)
+			if unknown is not None:
+				problems.append(f"{code}: 未知命令 {unknown!r}（{action}）")
+		# 选项只在反引号包裹的完整命令片段里校验：自然语言里裸写的 --xxx
+		# 可能属于别的上下文，误报会逼着文案迁就测试。
+		for fragment in _BACKTICK_FRAGMENT_PATTERN.findall(action):
+			fragment = fragment.strip()
+			if not fragment.startswith("boss "):
+				continue
+			tokens = fragment.split()[1:]
+			if tokens[:1] == ["--platform"]:
+				tokens = tokens[2:]
+			_, leaf, unknown = _resolve_command(tokens)
+			if unknown is not None:
+				problems.append(f"{code}: 未知命令 {unknown!r}（{fragment}）")
+				continue
+			options = _option_names(leaf)
+			for token in tokens:
+				if token.startswith("--") and token not in options:
+					problems.append(f"{code}: 未知选项 {token!r}（{fragment}）")
+	return problems
+
+
+def test_error_recovery_actions_reference_real_commands_and_options():
+	"""恢复指引必须能被照做：引用的 boss 命令 / 选项都存在。
+
+	#540 的两条无效指引（要求设置已无作用的 operating_mode、提示
+	`uv run playwright install chromium` 而实际用 patchright）说明登记表
+	文案会随命令演进而失效。这里把 `boss ...` 引用钉在 Click 命令树上。
+	"""
+	problems = _recovery_command_problems()
+	assert not problems, "恢复指引引用了不存在或已改名的命令/选项:\n" + "\n".join(problems)
+
+def test_resume_schema_marks_uid_gid_deprecated():
+	"""`--uid` / `--gid` 自 #217 起被忽略，schema 不能再说「交换联系方式时需要」。
+
+	Agent 以 `boss schema` 为真源构造 argv：照旧描述会先传 `--uid` / `--gid`，
+	然后收到「交换联系方式需要 --friend-id」的参数错误，白跑一次。
+	"""
+	options = SCHEMA_DATA["commands"]["hr"]["options"]["resume"]
+	for name in ("--uid", "--gid"):
+		description = options[name]["description"]
+		assert "已弃用" in description, f"{name} 应标明已弃用: {description}"
+		assert "需要" not in description, f"{name} 不应再声称是必需参数: {description}"
+
+def test_schema_option_ranges_match_click_ranges():
+	"""schema 的 `minimum` / `maximum` 必须与 Click 的 `IntRange` / `FloatRange` 双向一致。
+
+	`boss schema` 是能力真源：不写下界，Agent 就会尝试 `--page -1`，换回一个
+	`INVALID_PARAM`；不写上界（`--port 70000`、`--summary-limit 999`）同样会
+	在解析阶段被拒。下界或上界写错（schema 允许 0、Click 只收 1）则让 schema
+	本身不可信。缺界、多界、数值不一致都算失败。
+	"""
+	problems: list[str] = []
+
+	def walk(path: str, node: Any, group: dict[str, Any]) -> None:
+		params: dict[str, click.Parameter] = {}
+		for param in getattr(node, "params", ()):
+			if isinstance(param, click.Argument):
+				continue
+			for opt in getattr(param, "opts", ()):
+				params[opt] = param
+				if "/" in opt:
+					params["--" + opt.rsplit("/", 1)[-1].lstrip("-")] = param
+			for opt in getattr(param, "secondary_opts", ()):
+				params[opt] = param
+
+		subgroups: dict[str, dict[str, Any]] = {}
+		for key, value in group.items():
+			if not isinstance(value, dict):
+				continue
+			if not str(key).startswith("-"):
+				subgroups[str(key)] = value
+				continue
+			for spelling in _schema_option_spellings(str(key)):
+				param = params.get(spelling)
+				if param is None:
+					continue
+				param_type = param.type
+				if not isinstance(param_type, (click.IntRange, click.FloatRange)):
+					continue
+				for bound, click_value in (("minimum", param_type.min), ("maximum", param_type.max)):
+					if click_value is None:
+						if bound in value:
+							problems.append(f"{path} {spelling}: schema 声明了 {bound}，Click 没有")
+						continue
+					if bound not in value:
+						problems.append(f"{path} {spelling}: 缺少 {bound}（Click 取值 {click_value}）")
+					elif value[bound] != click_value:
+						problems.append(f"{path} {spelling}: {bound}={value[bound]} 与 Click 取值 {click_value} 不一致")
+
+		subcommands = getattr(node, "commands", {}) or {}
+		for key, value in subgroups.items():
+			if key in subcommands:
+				walk(f"{path}.{key}", subcommands[key], value)
+		for name, sub in subcommands.items():
+			if name not in subgroups:
+				walk(f"{path}.{name}", sub, {})
+
+	for name, spec in SCHEMA_DATA["commands"].items():
+		node = cli.commands.get(name)
+		if node is not None:
+			walk(name, node, spec.get("options") or {})
+
+	assert not problems, "schema 取值域与 Click 不一致:\n" + "\n".join(problems)
+
+def test_schema_choice_options_match_click_choices():
+	"""Click 用 `Choice` 限制的选项，schema 必须声明同一组取值。
+
+	digest / stats 的 `--format` 在 Click 层只接受固定取值，schema 却没写
+	`enum`：Agent 照 schema 可能构造 `--format markdown`，换回一个
+	`INVALID_PARAM`。schema 声明的取值可以比 Click 更宽（如 `search --city`
+	由 `search_filters` 在运行时校验），这类只做单向检查。
+	"""
+	problems: list[str] = []
+
+	def walk(path: str, node: Any, group: dict[str, Any]) -> None:
+		params: dict[str, click.Parameter] = {}
+		for param in getattr(node, "params", ()):
+			if isinstance(param, click.Argument):
+				continue
+			for opt in getattr(param, "opts", ()):
+				params[opt] = param
+				if "/" in opt:
+					params["--" + opt.rsplit("/", 1)[-1].lstrip("-")] = param
+			for opt in getattr(param, "secondary_opts", ()):
+				params[opt] = param
+
+		subgroups: dict[str, dict[str, Any]] = {}
+		for key, value in group.items():
+			if not isinstance(value, dict):
+				continue
+			if not str(key).startswith("-"):
+				subgroups[str(key)] = value
+				continue
+			for spelling in _schema_option_spellings(str(key)):
+				param = params.get(spelling)
+				if param is None:
+					continue
+				click_choices = list(param.type.choices) if isinstance(param.type, click.Choice) else None
+				schema_choices = value.get("choices") or value.get("enum")
+				if click_choices is None:
+					continue
+				if schema_choices is None:
+					problems.append(f"{path} {spelling}: Click 限制为 {click_choices}，schema 未声明")
+				elif list(schema_choices) != click_choices:
+					problems.append(f"{path} {spelling}: schema {list(schema_choices)} 与 Click {click_choices} 不一致")
+
+		subcommands = getattr(node, "commands", {}) or {}
+		for key, value in subgroups.items():
+			if key in subcommands:
+				walk(f"{path}.{key}", subcommands[key], value)
+		for name, sub in subcommands.items():
+			if name not in subgroups:
+				walk(f"{path}.{name}", sub, {})
+
+	for name, spec in SCHEMA_DATA["commands"].items():
+		node = cli.commands.get(name)
+		if node is not None:
+			walk(name, node, spec.get("options") or {})
+
+	assert not problems, "schema 枚举与 Click Choice 不一致:\n" + "\n".join(problems)
+
+
+def test_schema_global_delay_default_matches_runtime():
+	"""`boss schema` 的 --delay 默认值必须反映实际生效的配置默认值。
+
+	schema 长期写着 1.5-3.0，而 config.DEFAULT_REQUEST_DELAY 早已改为 30-60；
+	Agent 会把 1.5-3.0 当成默认节奏，低估真实请求间隔。
+	"""
+	from boss_agent_cli.config import DEFAULT_REQUEST_DELAY
+
+	low, high = DEFAULT_REQUEST_DELAY
+	assert SCHEMA_DATA["global_options"]["--delay"]["default"] == f"{low:g}-{high:g}"

@@ -7,6 +7,7 @@ from typing import Any, Callable, Protocol
 
 from boss_agent_cli.api.client import PlatformRiskError
 from boss_agent_cli.api.zhipin_errors import raise_platform_risk_response, response_message
+from boss_agent_cli.display import risk_error_message
 
 from boss_agent_cli.automation.models import (
 	ActionResult,
@@ -141,7 +142,8 @@ class BossRecruiterAutomationPlatform:
 			response = operation()
 			raise_platform_risk_response(response)
 		except PlatformRiskError as exc:
-			self._warning = str(exc) or exc.code
+			# 风控消息来自平台响应原文，可能带临时凭据；只保留登记表文案。
+			self._warning = risk_error_message(exc.code)
 			self._risk = exc
 			raise
 		if require_success and not (response.get("code") == 0 or response.get("ok") is True):
@@ -214,4 +216,8 @@ def _action_result(response: dict[str, Any]) -> ActionResult:
 	code = response.get("code")
 	if code == 0 or response.get("ok") is True:
 		return ActionResult("executed", {"response": response})
+	if response.get("__cli_error_code__") == "ACTION_UNCONFIRMED":
+		# 页面动作可能已经生效：这不是「确定没发出」的普通失败，
+		# 标成 blocked 会让待执行队列在下一轮自动重发。
+		return ActionResult("unconfirmed", {"reason": "ACTION_UNCONFIRMED"})
 	return ActionResult("blocked", {"reason": str(response.get("message", code))})

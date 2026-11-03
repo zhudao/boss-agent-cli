@@ -18,8 +18,8 @@ _MSG_TYPE_MAP = {
 
 @click.command("chatmsg")
 @click.argument("security_id", metavar="UID_OR_SECURITY_ID")
-@click.option("--page", default=1, help="页码")
-@click.option("--count", default=20, help="每页消息数量")
+@click.option("--page", default=1, type=click.IntRange(min=1), help="页码")
+@click.option("--count", default=20, type=click.IntRange(min=1), help="每页消息数量")
 @click.option("--raw", "show_raw", is_flag=True, default=False, help="输出保真结构化消息字段")
 @click.pass_context
 @handle_auth_errors("chatmsg")
@@ -87,8 +87,8 @@ def chatmsg_cmd(ctx: click.Context, security_id: str, page: int, count: int, sho
 			ctx, "chatmsg", result,
 			render=_render,
 			hints={"next_actions": [
-				f"{boss_command_for_ctx(ctx, 'chat')} — 返回沟通列表",
-				f"{boss_command_for_ctx(ctx, f'detail {fresh_security_id}')} — 查看职位详情",
+				boss_command_for_ctx(ctx, "chat"),
+				boss_command_for_ctx(ctx, f"detail {fresh_security_id}"),
 			]},
 		)
 

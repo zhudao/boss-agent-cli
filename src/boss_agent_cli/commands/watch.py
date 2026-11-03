@@ -2,20 +2,22 @@ import click
 from typing import Any
 
 from boss_agent_cli.api.endpoints import (
-	CITY_CODES,
 	INDUSTRY_CODES,
 	JOB_TYPE_CODES,
 	SCALE_CODES,
 	STAGE_CODES,
 )
 from boss_agent_cli.auth.manager import AuthManager
-from boss_agent_cli.cache.store import CacheStore
+from boss_agent_cli.cache.store import CacheStore, SavedSearchParamsError
 from boss_agent_cli.compliance import require_compliance_allowed
-from boss_agent_cli.commands._platform import get_platform_instance
+from boss_agent_cli.commands._platform import account_scope, get_platform_instance
 from boss_agent_cli.display import (
+	RISK_ERROR_CONTRACTS,
 	handle_auth_errors,
 	handle_error_output,
 	handle_output,
+	platform_error_contract,
+	platform_error_message,
 	render_action_result,
 	render_list_result,
 	render_message_panel,
@@ -27,6 +29,8 @@ from boss_agent_cli.search_filters import (
 	build_search_params,
 	detail_channel_for,
 	detail_filter_max_pages,
+	ensure_supported_city,
+	resolve_search_code_params,
 	resolve_welfare_keywords,
 	run_search_pipeline,
 )
@@ -84,8 +88,22 @@ def watch_add_cmd(
 	job_type: str | None,
 	welfare: str | None,
 ) -> None:
-	if city and city not in CITY_CODES:
-		handle_error_output(ctx, "watch", code="INVALID_PARAM", message=f"未知城市: {city}")
+	# 空字符串是合法 argv，但存下来的记录既没法点名（`boss watch run ` 缺参数），
+	# 也没法搜到目标（空关键词等于不筛选）。必须在写盘前拒绝。
+	if not name.strip() or not query.strip():
+		handle_error_output(ctx, "watch", code="INVALID_PARAM", message="watch 名称与搜索关键词不能为空")
+		return
+	# 保存时就把筛选条件校验掉：watch run 直接把存下来的参数交给平台客户端，
+	# 未知薪资 / 经验 / 学历在 `*_CODES.get(...)` 处返回 None，参数被静默丢弃，
+	# 之后每次 run 都在「没有筛选」的结果上报告新职位。
+	try:
+		ensure_supported_city(city)
+		resolve_search_code_params(
+			salary=salary, experience=experience, education=education,
+			industry=industry, scale=scale, stage=stage, job_type=job_type,
+		)
+	except ValueError as exc:
+		handle_error_output(ctx, "watch", code="INVALID_PARAM", message=str(exc))
 		return
 
 	params, _ = _parse_watch_filters(query, city, salary, experience, education, industry, scale, stage, job_type, welfare)
@@ -105,7 +123,13 @@ def watch_add_cmd(
 @click.pass_context
 def watch_list_cmd(ctx: click.Context) -> None:
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
-		items = cache.list_saved_searches()
+		items, corrupt = cache.list_saved_searches_with_corrupt()
+	hints: dict[str, Any] = {"next_actions": ["boss watch run <name>", "boss watch remove <name>"]}
+	if corrupt:
+		hints["corrupt"] = corrupt
+		hints["operator_actions"] = [
+			f"以下条目的参数已损坏，先执行 boss watch remove <名称> 再重新 watch add：{', '.join(corrupt)}"
+		]
 	handle_output(
 		ctx,
 		"watch",
@@ -114,11 +138,11 @@ def watch_list_cmd(ctx: click.Context) -> None:
 			d,
 			"watches",
 			[("名称", "name", "bold cyan"), ("条件", "params", "green"), ("创建时间", "created_at", "dim")],
-			next_steps=["boss watch add <name> --query <关键词>"]
+			next_steps=["boss watch add <name> <关键词>"]
 			if not d
 			else ["boss watch run <name>", "boss watch remove <name>"],
 		),
-		hints={"next_actions": ["boss watch run <name>", "boss watch remove <name>"]},
+		hints=hints,
 	)
 
 
@@ -170,6 +194,7 @@ def _execute_single_watch(ctx: click.Context, cache: Any, name: str) -> dict[str
 	data_dir = ctx.obj["data_dir"]
 	logger = ctx.obj["logger"]
 	auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
+	account = account_scope(auth)
 	active = params.get("active")
 	extra: dict[str, Any] = {}
 	detail_channel = detail_channel_for(ctx.obj)
@@ -189,9 +214,10 @@ def _execute_single_watch(ctx: click.Context, cache: Any, name: str) -> dict[str
 			max_pages=detail_filter_max_pages(welfare_conditions, active),
 			welfare_conditions=welfare_conditions,
 			active=active,
+			account=account,
 			**extra,
 		)
-	watch_result = cache.record_watch_results(name, pipeline_result.items)
+	watch_result = cache.record_watch_results(name, pipeline_result.items, account=account)
 	return {
 		"name": name,
 		"new_count": watch_result["new_count"],
@@ -214,22 +240,50 @@ def watch_run_cmd(ctx: click.Context, name: str | None, run_all: bool) -> None:
 
 	with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
 		if run_all:
-			records = cache.list_saved_searches()
+			# 参数损坏的条目不能静默跳过：--all 返回 ok: true 却少跑一个 watch，
+			# 用户看不出任何异常。与 `watch list` 一样单独列出，并给出删除重建指引。
+			records, corrupt = cache.list_saved_searches_with_corrupt()
 			watches: list[dict[str, Any]] = []
+			risk_error: SearchPipelinePlatformError | None = None
+			stopped_watch: str | None = None
 			for record in records:
 				try:
 					summary = _execute_single_watch(ctx, cache, record["name"])
 				except SearchPipelinePlatformError as exc:
+					if exc.code in RISK_ERROR_CONTRACTS:
+						# 风控是整条 workflow 的硬边界：停止后续 watch，
+						# 不再向平台发起请求；已完成的部分随 details 带回。
+						risk_error = exc
+						stopped_watch = record["name"]
+						break
 					summary = {"name": record["name"], "error": exc.code, "message": exc.message}
 				if summary is not None:
 					watches.append(summary)
+			if risk_error is not None:
+				recoverable, recovery_action, risk_hints = platform_error_contract(risk_error.code)
+				handle_error_output(
+					ctx, "watch",
+					code=risk_error.code,
+					message=platform_error_message(risk_error.code, risk_error.message, "搜索触发平台风控"),
+					recoverable=recoverable,
+					recovery_action=recovery_action,
+					details={"watches": watches, "stopped_watch": stopped_watch},
+					hints=risk_hints,
+				)
+				return
+			all_hints: dict[str, Any] = {"next_actions": ["boss watch list", "boss detail <security_id>"]}
+			if corrupt:
+				all_hints["corrupt"] = corrupt
+				all_hints["operator_actions"] = [
+					f"以下 watch 的参数已损坏、本次未执行，先执行 boss watch remove <名称> 再重新 watch add：{', '.join(corrupt)}"
+				]
 			handle_output(
 				ctx, "watch",
-				{"mode": "all", "watches": watches, "total": len(watches)},
+				{"mode": "all", "watches": watches, "total": len(watches), "skipped": corrupt},
 				render=lambda d: render_message_panel(
 					{"模式": "全部", "监控数": d.get("total", 0)}, title="watch run"
 				),
-				hints={"next_actions": ["boss watch list", "boss detail <security_id>"]},
+				hints=all_hints,
 			)
 			return
 
@@ -244,12 +298,28 @@ def watch_run_cmd(ctx: click.Context, name: str | None, run_all: bool) -> None:
 
 		try:
 			summary = _execute_single_watch(ctx, cache, name)
-		except SearchPipelinePlatformError as exc:
+		except SavedSearchParamsError as exc:
+			# 参数写坏的是本地记录：给删除重建指引，不能兜成 NETWORK_ERROR 让它重试。
 			handle_error_output(
-				ctx, "watch",
+				ctx,
+				"watch",
+				code="SAVED_SEARCH_INVALID",
+				message=str(exc),
+				hints={"next_actions": [f"boss watch remove {name}", f"boss watch add {name} <关键词>"]},
+			)
+			return
+		except SearchPipelinePlatformError as exc:
+			# 与 search 一致：风控码给停止指引，登录过期等可恢复错误给恢复动作。
+			recoverable, recovery_action, hints = platform_error_contract(exc.code)
+			handle_error_output(
+				ctx,
+				"watch",
 				code=exc.code,
-				message=exc.message or "搜索结果获取失败",
-				recoverable=False,
+				message=platform_error_message(exc.code, exc.message, "搜索结果获取失败"),
+				recoverable=recoverable,
+				recovery_action=recovery_action,
+				details=exc.details,
+				hints=hints,
 			)
 			return
 

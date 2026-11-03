@@ -7,7 +7,7 @@ from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, han
 
 
 @click.command("history")
-@click.option("--page", default=1, help="页码")
+@click.option("--page", default=1, type=click.IntRange(min=1), help="页码")
 @click.pass_context
 @handle_auth_errors("history")
 def history_cmd(ctx: click.Context, page: int) -> None:
@@ -38,14 +38,16 @@ def history_cmd(ctx: click.Context, page: int) -> None:
 		"has_more": platform_data.get("hasMore", False),
 		"total": len(items),
 	}
-	hints = {
-		"next_actions": [
-			f"使用 {boss_command_for_ctx(ctx, 'detail <security_id>')} 查看职位详情",
-			f"使用 {boss_command_for_ctx(ctx, 'apply <security_id> <job_id>')} 投递，"
-			f"或 {boss_command_for_ctx(ctx, 'greet <security_id> <job_id>')} 沟通",
-			f"使用 {boss_command_for_ctx(ctx, f'history --page {page + 1}')} 查看下一页",
-		],
-	}
+	next_actions = [
+		boss_command_for_ctx(ctx, "detail <security_id>"),
+		boss_command_for_ctx(ctx, "apply <security_id> <job_id>"),
+		boss_command_for_ctx(ctx, "greet <security_id> <job_id>"),
+	]
+	# 没有下一页时不能建议 --page N+1：Agent 照着执行只会拿到空页，
+	# 与 TTY 的 hint_next 守卫（hasMore 为假时不显示 more）保持一致。
+	if pagination["has_more"]:
+		next_actions.append(boss_command_for_ctx(ctx, f"history --page {page + 1}"))
+	hints = {"next_actions": next_actions}
 
 	handle_output(
 		ctx, "history", items,
@@ -54,7 +56,7 @@ def history_cmd(ctx: click.Context, page: int) -> None:
 			page=page,
 			hint_next=(
 				f"more: {boss_command_for_ctx(ctx, f'history --page {page + 1}')}"
-				if platform_data.get("hasMore") else ""
+				if pagination["has_more"] else ""
 			),
 		),
 		pagination=pagination, hints=hints,

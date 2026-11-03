@@ -4,7 +4,10 @@ from typing import Any
 
 import click
 
+from boss_agent_cli.cache.store import CacheStore
 from boss_agent_cli.display import (
+	boss_command_for_ctx,
+	error_contract_for_code,
 	handle_error_output,
 	handle_output,
 	render_action_result,
@@ -12,7 +15,8 @@ from boss_agent_cli.display import (
 	render_record_result,
 )
 from boss_agent_cli.resume.models import ResumeData, PersonalInfoSection, resume_to_dict
-from boss_agent_cli.resume.store import ResumeStore
+from boss_agent_cli.resume.store import ResumeAlreadyExistsError, ResumeImportError, ResumeStore
+from boss_agent_cli.services.output_path import prepare_output_path
 
 
 def _get_store(ctx: click.Context) -> ResumeStore:
@@ -83,6 +87,11 @@ def resume_init_cmd(ctx: click.Context, name: str | None, template: str | None) 
 		template = "default"
 	if name is None:
 		name = "default"
+	# 空名称的简历能被写出来，却没法点名：`resume show ` / `resume edit ` 都缺参数，
+	# `resume list` 里也只显示一行没有名字的记录。
+	if not name.strip():
+		handle_error_output(ctx, "resume", code="INVALID_PARAM", message="简历名称不能为空")
+		return
 	if store.exists(name):
 		handle_error_output(
 			ctx, "resume",
@@ -103,7 +112,8 @@ def resume_init_cmd(ctx: click.Context, name: str | None, template: str | None) 
 		hints={"next_actions": [
 			f"boss resume show {name}",
 			f"boss resume edit {name} --field title --value <新标题>",
-			"boss me 然后用 boss resume import 导入平台真实简历",
+			boss_command_for_ctx(ctx, "me"),
+			boss_command_for_ctx(ctx, "resume import <path>"),
 		]},
 	)
 
@@ -199,9 +209,15 @@ def resume_delete_cmd(ctx: click.Context, name: str) -> None:
 		ctx.exit(1)
 		return
 	store.delete(name)
+	# 关联表以简历名为外键，但没有任何外键约束：不同步清理的话，之后用同一个名字
+	# 重建简历（`resume init` 默认就叫 default）会继承旧简历的职位关联，包括已经
+	# 标成 applied 的状态和备注，`resume applications` 也就报出这份简历从没关联过的职位。
+	removed_links = 0
+	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
+		removed_links = cache.remove_resume_links(name)
 	handle_output(
 		ctx, "resume",
-		{"action": "delete", "name": name, "deleted": True},
+		{"action": "delete", "name": name, "deleted": True, "removed_links": removed_links},
 		render=lambda d: render_action_result(d, title="resume delete", next_steps=["boss resume list"]),
 		hints={"next_actions": ["boss resume list"]},
 	)
@@ -212,22 +228,22 @@ def resume_delete_cmd(ctx: click.Context, name: str) -> None:
 @click.option("--format", "fmt", default="json", type=click.Choice(["pdf", "json", "html"]), help="导出格式")
 @click.option("-o", "--output", "output_path", default=None, help="输出文件路径")
 @click.pass_context
-def resume_export_cmd(ctx: click.Context, name: str, fmt: str, output_path: Path | None) -> None:
+def resume_export_cmd(ctx: click.Context, name: str, fmt: str, output_path: str | None) -> None:
 	"""导出简历"""
 	store = _get_store(ctx)
-	if not store.exists(name):
+	# 文件存在但读不出来（手写坏、字段类型写错）与「不存在」走同一个契约：
+	# 其它子命令都是这样。json 导出若交给 export_json 内部的 FileNotFoundError，
+	# 会被顶层 OSError 网兜报成 LOCAL_IO_ERROR「本地文件读写失败」，指引用户去查
+	# 磁盘与权限，而真正该做的是重建这份简历。
+	resume = store.get(name)
+	if resume is None:
 		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
 		ctx.exit(1)
 		return
 	if fmt in ("pdf", "html"):
-		resume = store.get(name)
-		if resume is None:
-			handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
-			ctx.exit(1)
-			return
 		if output_path is None:
-			output_path = Path(f"{name}.{fmt}")
-		out = Path(output_path)
+			output_path = f"{name}.{fmt}"
+		out = prepare_output_path(output_path)
 		try:
 			from boss_agent_cli.resume.export import export_html, export_pdf
 			if fmt == "html":
@@ -235,12 +251,13 @@ def resume_export_cmd(ctx: click.Context, name: str, fmt: str, output_path: Path
 			else:
 				export_pdf(resume, out)
 		except Exception as exc:
+			recoverable, recovery_action = error_contract_for_code("EXPORT_FAILED")
 			handle_error_output(
 				ctx, "resume",
 				code="EXPORT_FAILED",
 				message=f"{fmt.upper()} 导出失败: {exc}",
-				recoverable=True,
-				recovery_action="请确认 patchright 已安装并执行 uv run playwright install chromium",
+				recoverable=recoverable,
+				recovery_action=recovery_action,
 			)
 			ctx.exit(1)
 			return
@@ -254,7 +271,7 @@ def resume_export_cmd(ctx: click.Context, name: str, fmt: str, output_path: Path
 	json_str = store.export_json(name)
 	export_data = json.loads(json_str)
 	if output_path:
-		Path(output_path).write_text(json_str, encoding="utf-8")
+		prepare_output_path(output_path).write_text(json_str, encoding="utf-8")
 	handle_output(
 		ctx, "resume", export_data,
 		render=lambda d: render_record_result(
@@ -266,8 +283,9 @@ def resume_export_cmd(ctx: click.Context, name: str, fmt: str, output_path: Path
 
 @resume_group.command("import")
 @click.argument("file_path", type=click.Path())
+@click.option("--force", is_flag=True, help="覆盖同名简历（会丢弃本地已有的编辑）")
 @click.pass_context
-def resume_import_cmd(ctx: click.Context, file_path: Path) -> None:
+def resume_import_cmd(ctx: click.Context, file_path: Path, force: bool) -> None:
 	"""导入 JSON 简历"""
 	path = Path(file_path)
 	if not path.exists():
@@ -280,12 +298,31 @@ def resume_import_cmd(ctx: click.Context, file_path: Path) -> None:
 		return
 	store = _get_store(ctx)
 	try:
-		resume = store.import_file(path)
-	except (json.JSONDecodeError, KeyError, TypeError) as exc:
+		resume = store.import_file(path, overwrite=force)
+	except ResumeAlreadyExistsError as exc:
+		handle_error_output(
+			ctx, "resume",
+			code="RESUME_ALREADY_EXISTS",
+			message=f"简历 '{exc.name}' 已存在",
+			recovery_action="修改文件里的 name 字段后重试，或加 --force 覆盖（会丢弃本地已有的编辑）",
+		)
+		ctx.exit(1)
+		return
+	except ResumeImportError as exc:
 		handle_error_output(
 			ctx, "resume",
 			code="INVALID_PARAM",
-			message=f"文件解析失败: {exc}",
+			message=f"文件 '{file_path}' 导入失败: {exc}",
+		)
+		ctx.exit(1)
+		return
+	except (KeyError, TypeError, AttributeError, ValueError) as exc:
+		# 结构不对的 JSON（字段类型写错、嵌套层不是对象）只在模型解析时暴露：
+		# 这是用户输入边界，兜底成 INVALID_PARAM，而不是把 traceback 甩出去。
+		handle_error_output(
+			ctx, "resume",
+			code="INVALID_PARAM",
+			message=f"文件 '{file_path}' 解析失败: {exc}",
 		)
 		ctx.exit(1)
 		return
@@ -304,6 +341,10 @@ def resume_import_cmd(ctx: click.Context, file_path: Path) -> None:
 def resume_clone_cmd(ctx: click.Context, name: str, new_name: str) -> None:
 	"""复制简历为新版本"""
 	store = _get_store(ctx)
+	# 空新名称会复制出一份无法点名的简历，`resume show ` 缺参数。
+	if not new_name.strip():
+		handle_error_output(ctx, "resume", code="INVALID_PARAM", message="新简历名称不能为空")
+		return
 	if not store.exists(name):
 		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
 		ctx.exit(1)
@@ -375,7 +416,11 @@ def resume_link_cmd(ctx: click.Context, name: str, security_id: str, job_id: str
 		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
 		ctx.exit(1)
 		return
-	from boss_agent_cli.cache.store import CacheStore
+	# 空字符串仍是合法 argv，但不构成一条职位关联：存进去之后 `resume applications`
+	# 会多出一行空 ID，提示里的 `boss apply  ` 也没有可执行参数。
+	if not security_id.strip() or not job_id.strip():
+		handle_error_output(ctx, "resume", code="INVALID_PARAM", message="security_id 与 job_id 不能为空")
+		return
 	cache = CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db")
 	cache.link_resume_to_job(name, security_id, job_id, title, company)
 	cache.close()
@@ -399,7 +444,6 @@ def resume_applications_cmd(ctx: click.Context, name: str) -> None:
 		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
 		ctx.exit(1)
 		return
-	from boss_agent_cli.cache.store import CacheStore
 	cache = CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db")
 	items = cache.get_resume_applications(name)
 	cache.close()

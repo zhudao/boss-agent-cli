@@ -5,7 +5,7 @@ from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._recruiter_platform import get_recruiter_platform_instance
 from boss_agent_cli.services.resume_parser import parse_resume
-from boss_agent_cli.display import handle_auth_errors, handle_error_output, handle_output, handle_platform_error_output
+from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_error_output, handle_output, handle_platform_error_output
 
 
 @click.command("resume")
@@ -14,9 +14,9 @@ from boss_agent_cli.display import handle_auth_errors, handle_error_output, hand
 @click.option("--security-id", default=None, help="安全 ID")
 @click.option("--exchange", "exchange_contact", is_flag=True, default=False, help="请求交换联系方式")
 @click.option("--type", "exchange_type", default="phone", type=click.Choice(["phone", "wechat"]), help="交换类型：phone=手机号 / wechat=微信")
-@click.option("--uid", default=None, type=int, help="候选人 uid（交换联系方式时需要）")
-@click.option("--gid", default=None, type=int, help="会话 gid（交换联系方式时需要）")
-@click.option("--friend-id", default=None, type=int, help="候选人 friendId（交换联系方式新路径; issue #217）")
+@click.option("--uid", default=None, type=int, help="已弃用：旧的交换联系方式参数，当前被忽略；请改用 --friend-id")
+@click.option("--gid", default=None, type=int, help="已弃用：旧的交换联系方式参数，当前被忽略；请改用 --friend-id")
+@click.option("--friend-id", default=None, type=click.IntRange(min=1), help="候选人 friendId（交换联系方式新路径; issue #217）")
 @click.option("--raw", "show_raw", is_flag=True, default=False, help="输出原始 API 数据（不解析）")
 @click.pass_context
 @handle_auth_errors("recruiter-resume")
@@ -70,6 +70,6 @@ def resume_cmd(ctx: click.Context, geek_id: str | None, job_id: str, security_id
 		handle_output(
 			ctx, "recruiter-resume", data,
 			hints={"next_actions": [
-				"boss hr applications — 返回候选人列表",
+				boss_command_for_ctx(ctx, "hr applications"),
 			]},
 		)

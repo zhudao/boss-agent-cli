@@ -161,6 +161,56 @@ def test_run_rejects_unknown_city_before_touching_the_browser(tmp_path, monkeypa
 	assert "城市" in error["message"]
 
 
+def test_run_honors_configured_zero_max_retries(tmp_path, monkeypatch):
+	"""configure 接受 --max-retries 0；运行时不能被 `or` 悄悄改回 1。"""
+	from boss_agent_cli.commands import crawl as crawl_module
+
+	captured = {}
+
+	class _Outcome:
+		run_id = "run-ok"
+		status = "completed"
+
+		def as_dict(self):
+			return {"run_id": self.run_id, "status": self.status, "output_paths": {}}
+
+	def _capture(self, settings):
+		captured["settings"] = settings
+		return _Outcome()
+
+	monkeypatch.setattr(crawl_module.CrawlService, "create_and_run", _capture)
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+	configured = _invoke(runner, tmp_path, "crawl", "configure", "--max-retries", "0")
+	assert configured.exit_code == 0, configured.output
+	result = _invoke(runner, tmp_path, "crawl", "run", "AI", "--city", "杭州")
+	assert result.exit_code == 0, result.output
+	assert captured["settings"].max_retries == 0
+
+
+@pytest.mark.parametrize(
+	("crawl_config", "field"),
+	[
+		({"max_requests": [1]}, "max_requests"),
+		({"max_requests": 0}, "max_requests"),
+		({"max_retries": -1}, "max_retries"),
+		({"cdp_port": "abc"}, "cdp_port"),
+		({"cdp_port": 70000}, "cdp_port"),
+		({"chrome_path": 5}, "chrome_path"),
+	],
+)
+def test_run_rejects_invalid_crawl_config(tmp_path, crawl_config, field):
+	"""手工 / config set 写入的错误值要按 INVALID_PARAM 返回，而不是 INTERNAL_ERROR。"""
+	_save_crawl_config(tmp_path, crawl_config)
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+	result = _invoke(runner, tmp_path, "crawl", "run", "AI", "--city", "杭州")
+	assert result.exit_code == 1
+	error = _envelope(result)["error"]
+	assert error["code"] == "INVALID_PARAM"
+	assert field in error["message"]
+
+
 def test_run_maps_service_runtime_error_to_crawl_unavailable(tmp_path, monkeypatch):
 	from boss_agent_cli.commands import crawl as crawl_module
 
@@ -213,7 +263,7 @@ def test_run_hints_point_at_output_files_when_completed(tmp_path, monkeypatch):
 	_enable_research(runner, tmp_path)
 	result = _invoke(runner, tmp_path, "crawl", "run", "AI", "--city", "杭州")
 	assert result.exit_code == 0, result.output
-	assert "output_paths" in _envelope(result)["hints"]["next_actions"][0]
+	assert "output_paths" in _envelope(result)["hints"]["operator_actions"][0]
 
 
 # ── start ─────────────────────────────────────────────────────────────
@@ -231,10 +281,14 @@ def test_start_marks_run_stopped_when_background_launch_fails(tmp_path, monkeypa
 	error = _envelope(result)["error"]
 	assert error["code"] == "CRAWL_UNAVAILABLE"
 	assert error["recoverable"] is True
+	# operating_mode 已不再限制能力，恢复指引不能要求用户改它。
+	assert "operating_mode" not in error["recovery_action"]
 
 	with CacheStore(tmp_path / "cache" / "boss_agent.db") as cache:
-		runs = [cache.get_crawl_run(run_id) for run_id in _all_run_ids(tmp_path)]
+		run_ids = _all_run_ids(tmp_path)
+		runs = [cache.get_crawl_run(run_id) for run_id in run_ids]
 	assert runs and runs[0] is not None
+	assert f"boss crawl resume {run_ids[0]}" in error["recovery_action"]
 	assert runs[0]["status"] == "stopped", "后台拉起失败必须把 run 落成 stopped，否则会留下永久 queued 的幽灵任务"
 	assert "无法启动后台任务" in runs[0]["error"]
 
@@ -286,6 +340,53 @@ def test_resume_background_does_not_relaunch_an_already_running_job(tmp_path, mo
 	assert launched == [], "已在运行的任务重复拉起会产生并发采集，属风控风险"
 
 
+def test_resume_background_returns_completed_without_relaunch(tmp_path, monkeypatch):
+	launched: list[str] = []
+	monkeypatch.setattr(
+		"boss_agent_cli.commands.crawl._launch_background_resume",
+		lambda data_dir, run_id, **kwargs: launched.append(run_id),
+	)
+	_seed_run(tmp_path, "run-done", status="completed")
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+	result = _invoke(runner, tmp_path, "crawl", "resume", "run-done", "--background")
+	assert result.exit_code == 0, result.output
+	payload = _envelope(result)
+	assert payload["data"] == {"run_id": "run-done", "status": "completed", "background": True}
+	assert payload["hints"]["next_actions"] == ["boss crawl results run-done"]
+	assert launched == [], "已完成的 run 没有可恢复的工作，拉起后台进程只会立即退出并谎报 queued"
+
+
+def test_resume_background_relaunches_completed_run_when_detail_pending(tmp_path, monkeypatch):
+	launched: list[tuple[str, bool]] = []
+	monkeypatch.setattr(
+		"boss_agent_cli.commands.crawl._launch_background_resume",
+		lambda data_dir, run_id, **kwargs: launched.append((run_id, bool(kwargs.get("with_detail")))),
+	)
+	_seed_run(tmp_path, "run-done", status="completed", jobs=2)
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+	result = _invoke(runner, tmp_path, "crawl", "resume", "run-done", "--background", "--with-detail")
+	assert result.exit_code == 0, result.output
+	assert _envelope(result)["data"]["status"] == "queued"
+	assert launched == [("run-done", True)], "还有待补详情时必须真正恢复"
+
+
+def test_resume_background_relaunches_completed_run_when_more_pages_requested(tmp_path, monkeypatch):
+	launched: list[tuple[str, int | None]] = []
+	monkeypatch.setattr(
+		"boss_agent_cli.commands.crawl._launch_background_resume",
+		lambda data_dir, run_id, **kwargs: launched.append((run_id, kwargs.get("pages"))),
+	)
+	_seed_run(tmp_path, "run-done", status="completed")
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+	result = _invoke(runner, tmp_path, "crawl", "resume", "run-done", "--background", "--pages", "10")
+	assert result.exit_code == 0, result.output
+	assert _envelope(result)["data"]["status"] == "queued"
+	assert launched == [("run-done", 10)], "列表未采完且请求了更多页时必须真正恢复"
+
+
 # ── status / stop / results ───────────────────────────────────────────
 
 
@@ -304,6 +405,28 @@ def test_status_reports_job_not_found(tmp_path):
 	result = _invoke(CliRunner(), tmp_path, "crawl", "status", "missing")
 	assert result.exit_code == 1
 	assert _envelope(result)["error"]["code"] == "JOB_NOT_FOUND"
+
+
+def test_status_risk_stopped_reports_operator_unlock(tmp_path):
+	"""risk_stopped 的 checkpoint 不能只给 resume 命令：风险锁会先阻断它。"""
+	_seed_run(tmp_path, "run-1", status="risk_stopped")
+	payload = _envelope(_invoke(CliRunner(), tmp_path, "crawl", "status", "run-1"))
+	data = payload["data"]
+	assert data["status"] == "risk_stopped"
+	assert data["checkpoint"]["resume_requires_operator_unlock"] is True
+	assert data["checkpoint"]["resume_command"] == "boss crawl resume run-1"
+
+	actions = payload["hints"]["operator_actions"]
+	assert any("boss clean --risk-lock" in action for action in actions)
+	assert any("boss crawl resume run-1" in action for action in actions)
+	assert "next_actions" not in payload["hints"]
+
+
+def test_status_completed_has_no_unlock_flag(tmp_path):
+	_seed_run(tmp_path, "run-1")
+	payload = _envelope(_invoke(CliRunner(), tmp_path, "crawl", "status", "run-1"))
+	assert "resume_requires_operator_unlock" not in payload["data"]["checkpoint"]
+	assert "hints" not in payload or "operator_actions" not in (payload.get("hints") or {})
 
 
 def test_stop_reports_job_not_found(tmp_path):
@@ -511,3 +634,91 @@ def test_resume_background_maps_launch_failure_to_crawl_unavailable(tmp_path, mo
 	assert error["code"] == "CRAWL_UNAVAILABLE"
 	assert error["recoverable"] is True
 	assert "boss crawl resume run-1" in error["recovery_action"]
+	# OSError 多来自磁盘满或目录权限，指引必须先查这两项，与 crawl start 一致。
+	assert "检查磁盘空间与数据目录权限" in error["recovery_action"]
+
+
+# ── 本地记录损坏 ──────────────────────────────────────────────────────
+
+
+def _break_column(
+	tmp_path: Path, table: str, column: str, run_id: str = "run-1", *, value: str = "{not json"
+) -> None:
+	db_path = tmp_path / "cache" / "boss_agent.db"
+	with sqlite3.connect(db_path) as conn:
+		conn.execute(f"UPDATE {table} SET {column} = ? WHERE run_id = ?", (value, run_id))
+
+
+@pytest.mark.parametrize(
+	"command",
+	[
+		("crawl", "status", "run-1"),
+		("crawl", "results", "run-1"),
+		("crawl", "resume", "run-1", "--background"),
+		("crawl", "shortlist", "run-1", "--all"),
+	],
+)
+def test_corrupt_run_params_reports_envelope_instead_of_traceback(tmp_path, command):
+	"""run 的 params 写坏后，每个只读子命令都要给信封，而不是 json.loads traceback。"""
+	_seed_run(tmp_path, "run-1", status="stopped")
+	_break_column(tmp_path, "crawl_runs", "params")
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+	result = _invoke(runner, tmp_path, *command)
+	assert result.exit_code == 1, result.output
+	error = _envelope(result)["error"]
+	assert error["code"] == "CACHE_RECORD_INVALID"
+	assert error["recoverable"] is True
+	assert "params" in error["message"]
+	assert _envelope(result)["hints"]["next_actions"][0] == "boss crawl start <关键词>"
+
+
+def test_corrupt_hook_results_reports_envelope(tmp_path):
+	_seed_run(tmp_path, "run-1")
+	_break_column(tmp_path, "crawl_runs", "hook_results")
+	result = _invoke(CliRunner(), tmp_path, "crawl", "status", "run-1")
+	assert result.exit_code == 1, result.output
+	assert _envelope(result)["error"]["code"] == "CACHE_RECORD_INVALID"
+
+
+def test_corrupt_job_payload_reports_envelope(tmp_path):
+	"""职位行写坏时 results 也要给信封：payload 是唯一真源，读不出就不能假装成功。"""
+	_seed_run(tmp_path, "run-1")
+	db_path = tmp_path / "cache" / "boss_agent.db"
+	with sqlite3.connect(db_path) as conn:
+		conn.execute("UPDATE crawl_jobs SET payload = ? WHERE rowid = 1", ("{not json",))
+	result = _invoke(CliRunner(), tmp_path, "crawl", "results", "run-1")
+	assert result.exit_code == 1, result.output
+	error = _envelope(result)["error"]
+	assert error["code"] == "CACHE_RECORD_INVALID"
+	assert "payload" in error["message"]
+
+
+def test_corrupt_run_record_in_foreground_resume_is_not_invalid_param(tmp_path, monkeypatch):
+	"""CacheRecordInvalid 是 ValueError 子类，必须排在 INVALID_PARAM 兜底之前。"""
+	_seed_run(tmp_path, "run-1", status="stopped")
+	_break_column(tmp_path, "crawl_runs", "params")
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+	result = _invoke(runner, tmp_path, "crawl", "resume", "run-1")
+	assert result.exit_code == 1, result.output
+	assert _envelope(result)["error"]["code"] == "CACHE_RECORD_INVALID"
+
+
+def test_structurally_drifted_params_reports_envelope(tmp_path):
+	"""合法 JSON 但不是 object 时，后续 .get() 会抛 AttributeError，同样必须在读取边界拦下。"""
+	_seed_run(tmp_path, "run-1")
+	_break_column(tmp_path, "crawl_runs", "params", value='"not-an-object"')
+	result = _invoke(CliRunner(), tmp_path, "crawl", "status", "run-1")
+	assert result.exit_code == 1, result.output
+	error = _envelope(result)["error"]
+	assert error["code"] == "CACHE_RECORD_INVALID"
+	assert "JSON object" in error["message"]
+
+
+def test_structurally_drifted_hook_results_reports_envelope(tmp_path):
+	_seed_run(tmp_path, "run-1")
+	_break_column(tmp_path, "crawl_runs", "hook_results", value='{"not": "a list"}')
+	result = _invoke(CliRunner(), tmp_path, "crawl", "status", "run-1")
+	assert result.exit_code == 1, result.output
+	assert "JSON array" in _envelope(result)["error"]["message"]

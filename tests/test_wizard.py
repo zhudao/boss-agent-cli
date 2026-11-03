@@ -2,9 +2,11 @@ import json
 import os
 import pty
 import select
+import sqlite3
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,6 +20,8 @@ from boss_agent_cli.cache.store import CacheStore
 from boss_agent_cli.crawler.service import CrawlOutcome
 from boss_agent_cli.resume.models import ResumeData
 from boss_agent_cli.resume.store import ResumeStore
+from boss_agent_cli.display import risk_error_message
+from boss_agent_cli.schema.error_codes import ERROR_CODES
 from boss_agent_cli.wizard.models import StepResult, WorkflowInputError, WorkflowPlan, WorkflowStatus, WizardInput
 from boss_agent_cli.wizard.catalog import GOALS, build_plan, catalog_data
 from boss_agent_cli.wizard.actions import ActionContext, DEFAULT_ACTIONS, execute_candidate_search
@@ -33,6 +37,7 @@ from boss_agent_cli.wizard.prompts import (
 	WizardCancelled,
 	WizardControl,
 	WizardReturnHome,
+	_collect_control,
 	_main_menu_options,
 	ask_continue_session,
 	collect_entity_follow_up,
@@ -153,6 +158,41 @@ def test_catalog_rejects_platform_and_missing_inputs():
 		)
 
 
+def test_catalog_unknown_goal_lists_available_goals():
+	"""未知 goal 的报错要带可选值，Agent 不必再调一次 boss schema 才能猜对。"""
+	with pytest.raises(WorkflowInputError) as excinfo:
+		build_plan(
+			WizardInput.from_mapping(
+				{"role": "candidate", "platform": "zhipin", "goal": "bogus", "inputs": {}}
+			)
+		)
+	message = str(excinfo.value)
+	assert "不支持 goal 'bogus'" in message
+	assert "可选:" in message
+	assert "job_search" in message
+	assert "crawl_start" in message
+
+
+def test_catalog_unknown_steps_list_valid_steps():
+	"""requested_steps 写错时同时列出该 goal 的合法步骤。"""
+	with pytest.raises(WorkflowInputError) as excinfo:
+		build_plan(
+			WizardInput.from_mapping(
+				{
+					"role": "candidate",
+					"platform": "zhipin",
+					"goal": "job_search",
+					"inputs": {"query": "Python"},
+					"requested_steps": ["bogus_step"],
+				}
+			)
+		)
+	message = str(excinfo.value)
+	assert "bogus_step" in message
+	assert "可选:" in message
+	assert "candidate_search" in message
+
+
 def test_catalog_goals_reference_exactly_the_registered_actions():
 	catalog_steps = {step for goals in GOALS.values() for goal in goals.values() for step in goal.steps}
 	assert catalog_steps == set(DEFAULT_ACTIONS)
@@ -229,6 +269,26 @@ def test_schema_exposes_wizard_catalog_for_headless_agents(tmp_path):
 	assert payload["data"]["wizard_catalog"] == catalog_data()
 	assert "job_search" in payload["data"]["wizard_catalog"]["roles"]["candidate"]["goals"]
 	assert "jobs_list" in payload["data"]["wizard_catalog"]["roles"]["recruiter"]["goals"]
+
+
+def test_wizard_unknown_goal_envelope_lists_goals_and_schema_hint(tmp_path):
+	"""非交互模式输入未知 goal：消息列出可选 goal，hints 给出可执行的 boss schema。"""
+	result = CliRunner().invoke(
+		cli,
+		[
+			"--json",
+			"--data-dir",
+			str(tmp_path),
+			"wizard",
+			"--input-json",
+			json.dumps({"role": "candidate", "platform": "zhipin", "goal": "bogus"}),
+		],
+	)
+	assert result.exit_code == 1
+	payload = json.loads(result.stdout)
+	assert payload["error"]["code"] == "INVALID_PARAM"
+	assert "job_search" in payload["error"]["message"]
+	assert payload["hints"]["next_actions"] == ["boss schema"]
 
 
 class _FakeCandidatePlatform:
@@ -316,6 +376,95 @@ def test_candidate_write_actions_persist_idempotence_records(tmp_path):
 	]
 
 
+def test_candidate_write_actions_mark_local_state_failure_as_not_retryable(tmp_path, monkeypatch):
+	"""平台确认成功、本地记账失败时不能回成可重试的 NETWORK_ERROR。"""
+	platform = _FakeCandidatePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	def fail_record(*args, **kwargs):
+		raise OSError("disk full")
+
+	monkeypatch.setattr(CacheStore, "record_apply", fail_record)
+	with pytest.raises(WorkflowActionError) as applied:
+		DEFAULT_ACTIONS["candidate_apply"](context, {"security_id": "sec-1", "job_id": "job-1"}, {})
+	assert applied.value.code == "LOCAL_STATE_WRITE_FAILED"
+	assert applied.value.recoverable is False
+	assert applied.value.replay_safe is False
+	assert applied.value.recovery_action == ERROR_CODES["LOCAL_STATE_WRITE_FAILED"]["recovery_action"]
+	assert applied.value.details == {
+		"security_id": "sec-1",
+		"job_id": "job-1",
+		"applied": True,
+		"recorded": False,
+	}
+
+	monkeypatch.setattr(CacheStore, "record_greet", fail_record)
+	with pytest.raises(WorkflowActionError) as greeted:
+		DEFAULT_ACTIONS["candidate_greet"](
+			context, {"security_id": "sec-2", "job_id": "job-2", "message": "你好"}, {}
+		)
+	assert greeted.value.code == "LOCAL_STATE_WRITE_FAILED"
+	assert greeted.value.recoverable is False
+	assert greeted.value.replay_safe is False
+	assert greeted.value.details == {
+		"security_id": "sec-2",
+		"job_id": "job-2",
+		"greeted": True,
+		"recorded": False,
+	}
+
+	# 平台动作各只发生一次，失败只来自本地记账。
+	assert platform.calls == [
+		("apply", "sec-1", "job-1", ""),
+		("greet", "sec-2", "job-2", "你好"),
+	]
+
+
+def test_candidate_export_scopes_search_to_current_account(tmp_path):
+	"""导出动作必须把账号指纹传给搜索管线，否则 greeted 标记会全部失真。"""
+	platform = _FakeCandidatePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+	captured: dict = {}
+
+	class _Result:
+		items: list = []
+
+	def fake_search(platform_arg, cache, logger, inputs):
+		captured.update(inputs)
+		return _Result()
+
+	with (
+		patch("boss_agent_cli.wizard.actions.account_scope", return_value="acct-1"),
+		patch("boss_agent_cli.wizard.actions.execute_candidate_search", side_effect=fake_search),
+	):
+		result = DEFAULT_ACTIONS["candidate_export"](
+			context, {"query": "golang", "output": str(tmp_path / "out.json")}, {}
+		)
+
+	assert captured["account"] == "acct-1"
+	assert result.data["count"] == 0
+
+
+def test_candidate_export_expands_tilde_in_output_path(tmp_path, monkeypatch):
+	"""wizard 的 output 来自 JSON 输入（MCP），`~` 不会经 shell 展开。"""
+	platform = _FakeCandidatePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+	monkeypatch.setenv("HOME", str(tmp_path))
+	monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+	class _Result:
+		items: list = []
+
+	with patch("boss_agent_cli.wizard.actions.execute_candidate_search", return_value=_Result()):
+		result = DEFAULT_ACTIONS["candidate_export"](
+			context, {"query": "golang", "output": "~/wizard/out.json"}, {}
+		)
+
+	expected = tmp_path / "wizard" / "out.json"
+	assert result.data["path"] == str(expected)
+	assert expected.exists()
+
+
 def test_candidate_contact_actions_refresh_rotating_security_id(tmp_path):
 	platform = _FakeCandidatePlatform()
 	context = _action_context(tmp_path, candidate=platform)
@@ -355,10 +504,12 @@ def test_local_and_ai_actions_return_structured_recovery(tmp_path):
 
 	added = DEFAULT_ACTIONS["candidate_watch"](
 		context,
-		{"action": "add", "name": "daily", "query": "Python", "welfare": ["双休"]},
+		{"action": "add", "name": "daily", "query": "Python", "welfare": ["双休", "五险一金"]},
 		{},
 	)
-	assert added.data["params"]["welfare"] == ["双休"]
+	# 存储格式与 CLI `watch add --welfare` 一致：逗号分隔字符串。写成数组会让
+	# 之后 `boss watch run` 在 `.split(",")` 上抛 AttributeError。
+	assert added.data["params"]["welfare"] == "双休,五险一金"
 	listed = DEFAULT_ACTIONS["candidate_watch"](context, {"action": "list"}, {})
 	assert listed.data["items"][0]["name"] == "daily"
 
@@ -367,6 +518,45 @@ def test_local_and_ai_actions_return_structured_recovery(tmp_path):
 		DEFAULT_ACTIONS["ai_assist"](context, {"resume": "default", "prompt": "优化"}, {})
 	assert exc_info.value.code == "AI_NOT_CONFIGURED"
 	assert exc_info.value.recoverable is True
+
+
+def test_candidate_watch_stores_string_params(tmp_path):
+	"""wizard 写入的 watch 参数必须是字符串，坏类型在写入时就拒绝。"""
+	context = _action_context(tmp_path)
+	DEFAULT_ACTIONS["candidate_watch"](
+		context, {"action": "add", "name": "daily", "query": "Python", "welfare": ["双休"]}, {}
+	)
+	with CacheStore(tmp_path / "cache" / "boss_agent.db") as cache:
+		record = cache.get_saved_search("daily")
+	assert record is not None
+	assert record["params"]["welfare"] == "双休"
+	assert all(isinstance(v, (str, type(None))) for v in record["params"].values())
+
+	with pytest.raises(WorkflowActionError) as exc_info:
+		DEFAULT_ACTIONS["candidate_watch"](
+			context, {"action": "add", "name": "bad", "query": ["Python"]}, {}
+		)
+	assert exc_info.value.code == "INVALID_PARAM"
+	assert "query" in str(exc_info.value)
+
+
+def test_candidate_watch_corrupt_params_reports_recovery(tmp_path):
+	"""wizard 复用本地 watch 时参数写坏要给删除重建指引，而不是 NETWORK_ERROR。"""
+	context = _action_context(tmp_path)
+	DEFAULT_ACTIONS["candidate_watch"](context, {"action": "add", "name": "daily", "query": "Python"}, {})
+	conn = sqlite3.connect(tmp_path / "cache" / "boss_agent.db")
+	conn.execute("UPDATE saved_searches SET params = ? WHERE name = ?", ("{not json", "daily"))
+	conn.commit()
+	conn.close()
+
+	listed = DEFAULT_ACTIONS["candidate_watch"](context, {"action": "list"}, {})
+	assert listed.data["total"] == 0
+	assert listed.data["corrupt"] == ["daily"]
+
+	with pytest.raises(WorkflowActionError) as exc_info:
+		DEFAULT_ACTIONS["candidate_watch"](context, {"action": "run", "name": "daily"}, {})
+	assert exc_info.value.code == "SAVED_SEARCH_INVALID"
+	assert "boss watch remove daily" in exc_info.value.recovery_action
 
 
 def _crawl_outcome(run_id, status="completed"):
@@ -432,6 +622,82 @@ def test_crawl_actions_use_fixture_service_and_persist_stop(tmp_path, monkeypatc
 	assert stopped.data == {"run_id": "crawl-existing", "status": "stop_requested"}
 	with CacheStore(tmp_path / "cache" / "boss_agent.db") as cache:
 		assert cache.get_crawl_run("crawl-existing")["stop_requested"] is True
+
+
+def test_crawl_action_honors_configured_zero_max_retries(tmp_path, monkeypatch):
+	service = _FakeCrawlService()
+	monkeypatch.setattr("boss_agent_cli.wizard.actions._crawl_service", lambda context, cache: service)
+	context = replace(
+		_action_context(tmp_path),
+		config={"crawl": {"max_retries": 0, "cdp_port": 9333, "chrome_path": "/opt/chrome"}},
+	)
+	DEFAULT_ACTIONS["crawl_start"](context, {"query": "Python", "city": "北京"}, {})
+	settings = service.created_settings
+	assert settings is not None
+	assert settings.max_retries == 0
+	assert settings.cdp_port == 9333
+	assert settings.chrome_path == "/opt/chrome"
+
+
+@pytest.mark.parametrize(
+	("crawl_config", "field"),
+	[
+		({"max_requests": [1]}, "max_requests"),
+		({"max_requests": 0}, "max_requests"),
+		({"max_retries": -1}, "max_retries"),
+		({"cdp_port": "abc"}, "cdp_port"),
+		({"cdp_port": 70000}, "cdp_port"),
+		({"chrome_path": 5}, "chrome_path"),
+	],
+)
+def test_crawl_action_rejects_invalid_config(tmp_path, monkeypatch, crawl_config, field):
+	service = _FakeCrawlService()
+	monkeypatch.setattr("boss_agent_cli.wizard.actions._crawl_service", lambda context, cache: service)
+	context = replace(_action_context(tmp_path), config={"crawl": crawl_config})
+	with pytest.raises(WorkflowActionError) as excinfo:
+		DEFAULT_ACTIONS["crawl_start"](context, {"query": "Python", "city": "北京"}, {})
+	assert excinfo.value.code == "INVALID_PARAM"
+	assert field in str(excinfo.value)
+	assert excinfo.value.recovery_action == "boss config reset crawl"
+	assert service.created_settings is None
+
+
+@pytest.mark.parametrize("pages", ["abc", 0])
+def test_crawl_action_rejects_invalid_pages(tmp_path, pages):
+	context = replace(_action_context(tmp_path), config={})
+	with pytest.raises(WorkflowActionError) as excinfo:
+		DEFAULT_ACTIONS["crawl_start"](context, {"query": "Python", "city": "北京", "pages": pages}, {})
+	assert excinfo.value.code == "INVALID_PARAM"
+	assert "pages" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("hook_profile", ["screenshot-full", "weird"])
+def test_crawl_action_rejects_unsupported_hook_profile(tmp_path, monkeypatch, hook_profile):
+	service = _FakeCrawlService()
+	monkeypatch.setattr("boss_agent_cli.wizard.actions._crawl_service", lambda context, cache: service)
+	context = _action_context(tmp_path)
+	with pytest.raises(WorkflowActionError) as excinfo:
+		DEFAULT_ACTIONS["crawl_start"](
+			context,
+			{"query": "Python", "city": "北京", "hook_profile": hook_profile},
+			{},
+		)
+	assert excinfo.value.code == "INVALID_PARAM"
+	assert "hook_profile" in str(excinfo.value)
+	assert "boss crawl run" in str(excinfo.value.recovery_action)
+	assert service.created_settings is None
+
+
+@pytest.mark.parametrize("pages", ["abc", 0])
+def test_crawl_resume_rejects_invalid_pages(tmp_path, monkeypatch, pages):
+	service = _FakeCrawlService()
+	monkeypatch.setattr("boss_agent_cli.wizard.actions._crawl_service", lambda context, cache: service)
+	context = _action_context(tmp_path)
+	with pytest.raises(WorkflowActionError) as excinfo:
+		DEFAULT_ACTIONS["crawl_resume"](context, {"run_id": "crawl-existing", "pages": pages}, {})
+	assert excinfo.value.code == "INVALID_PARAM"
+	assert "pages" in str(excinfo.value)
+	assert service.resumed == []
 
 
 class _FakeRecruiterPlatform:
@@ -700,6 +966,84 @@ def test_runner_normalizes_auth_and_network_failures(tmp_path):
 	}
 
 
+def test_runner_reports_invalid_input_as_invalid_param(tmp_path):
+	"""inputs 类型写错时不能兜成 NETWORK_ERROR：重试同一条输入必然复现。"""
+
+	def bad_input(context, inputs, prior):
+		raise WorkflowInputError("wizard 输入 page 必须是整数，收到 'abc'")
+
+	with WorkflowStore(tmp_path) as store:
+		run = WorkflowRunner(store, {"bad_input": bad_input}).run(
+			_plan("bad_input"),
+			object(),
+			run_id="invalid-input-run",
+		)
+	assert run["status"] == "failed"
+	assert run["error"]["code"] == "INVALID_PARAM"
+	assert "page" in run["error"]["message"]
+
+
+def test_recruiter_search_rejects_non_integer_page_input():
+	"""`--input-json` 把 page 写成字符串时，错误要指向 inputs 而不是被当成平台故障。"""
+	from boss_agent_cli.wizard.actions import execute_recruiter_candidate_search
+
+	class _Platform:
+		def search_geeks(self, *args, **kwargs):
+			raise AssertionError("输入校验失败时不应调用平台")
+
+	with pytest.raises(WorkflowInputError, match="page"):
+		execute_recruiter_candidate_search(_Platform(), {"query": "Python", "page": "abc"})
+
+
+@pytest.mark.parametrize("page", [0, -1])
+def test_recruiter_search_rejects_non_positive_page_input(page):
+	"""页码 0 / 负数会被原样发给平台；这类输入重试多少次都是同一个结果。"""
+	from boss_agent_cli.wizard.actions import execute_recruiter_candidate_search
+
+	class _Platform:
+		def search_geeks(self, *args, **kwargs):
+			raise AssertionError("输入校验失败时不应调用平台")
+
+	with pytest.raises(WorkflowInputError, match="page"):
+		execute_recruiter_candidate_search(_Platform(), {"query": "Python", "page": page})
+
+
+@pytest.mark.parametrize("max_pages", [0, -3])
+def test_candidate_search_rejects_non_positive_max_pages(max_pages):
+	"""`max_pages=-3` 会让 `range(max_pages)` 一次都不循环：workflow 以成功收尾但结果为空。"""
+	from boss_agent_cli.wizard.actions import execute_candidate_search
+
+	def _pipeline(*args, **kwargs):
+		raise AssertionError("输入校验失败时不应发起搜索请求")
+
+	with pytest.raises(WorkflowInputError, match="max_pages"):
+		execute_candidate_search(
+			object(),
+			None,  # type: ignore[arg-type]
+			object(),  # type: ignore[arg-type]
+			{"query": "Python", "max_pages": max_pages},
+			pipeline=_pipeline,
+		)
+
+
+def test_int_input_does_not_turn_explicit_zero_into_default():
+	"""显式写的 0 不能被当成缺省悄悄换成默认值（`0 or default` 会让 count: 0 变成 20 条）。"""
+	from boss_agent_cli.wizard.actions import _int_input
+
+	assert _int_input({"days_stale": 0}, "days_stale", 3) == 0
+	assert _int_input({}, "days_stale", 3) == 3
+	with pytest.raises(WorkflowInputError, match="count"):
+		_int_input({"count": 0}, "count", 20, minimum=1)
+
+
+@pytest.mark.parametrize("value", ["abc", True, 2.5])
+def test_int_input_rejects_non_integer_values(value):
+	from boss_agent_cli.wizard.actions import _int_input
+
+	with pytest.raises(WorkflowInputError, match="page"):
+		_int_input({"page": value}, "page", 1, minimum=1)
+
+
 def test_wizard_models_import_on_python_310_compatible_surface():
 	result = subprocess.run(
 		[
@@ -786,6 +1130,39 @@ def test_runner_persists_recoverable_failure_and_resumes_completed_steps(tmp_pat
 
 	assert second["status"] == "completed"
 	assert calls == ["done", "fail", "done"]
+
+
+def test_runner_resume_does_not_replay_unconfirmed_write_step(tmp_path):
+	calls = []
+
+	def done(context, inputs, prior):
+		calls.append("done")
+		return StepResult({"ok": True})
+
+	def unconfirmed(context, inputs, prior):
+		calls.append("unconfirmed")
+		raise WorkflowActionError(
+			"ACTION_UNCONFIRMED",
+			"发送结果未确认",
+			recoverable=False,
+			recovery_action="先核对平台实际记录；不要重试",
+			replay_safe=False,
+		)
+
+	with WorkflowStore(tmp_path) as store:
+		first = WorkflowRunner(store, {"one": done, "two": unconfirmed}).run(
+			_plan("one", "two"), object(), run_id="run-unconfirmed"
+		)
+		assert first["status"] == "failed"
+		assert first["steps"][1]["error"]["replay_safe"] is False
+		second = WorkflowRunner(store, {"one": done, "two": done}).run(
+			_plan("one", "two"), object(), run_id="run-unconfirmed"
+		)
+
+	assert second["status"] == "failed"
+	assert second["error"]["code"] == "ACTION_UNCONFIRMED"
+	assert second["error"]["recovery_action"] == "先核对平台实际记录；不要重试"
+	assert calls == ["done", "unconfirmed"]
 
 
 def test_runner_rejects_mismatched_plan_for_existing_run_id(tmp_path):
@@ -1199,6 +1576,50 @@ def test_main_menu_shows_resume_and_retry_for_failed_runs():
 	labels = [item.label for item in options]
 	assert "恢复已有任务" in labels
 	assert "重试失败任务" in labels
+
+
+def _blocked_failed_run(run_id: str = "f") -> dict:
+	"""动作可能已生效、结果未确认的失败 run（--resume 只会返回原失败）。"""
+	return {
+		"run_id": run_id,
+		"status": "failed",
+		"steps": [
+			{
+				"step_name": "candidate_apply",
+				"status": "failed",
+				"error": {"code": "LOCAL_STATE_WRITE_FAILED", "replay_safe": False},
+			}
+		],
+	}
+
+
+def test_main_menu_hides_resume_and_retry_when_only_blocked_failed_runs():
+	options = _main_menu_options([_blocked_failed_run()])
+	labels = [item.label for item in options]
+	assert "恢复已有任务" not in labels
+	assert "重试失败任务" not in labels
+	assert "查看任务状态" in labels
+
+
+def test_main_menu_keeps_resume_when_a_replayable_failed_run_exists():
+	options = _main_menu_options([_blocked_failed_run(), {"run_id": "ok", "status": "failed"}])
+	labels = [item.label for item in options]
+	assert "恢复已有任务" in labels
+	assert "重试失败任务" in labels
+
+
+def test_collect_control_excludes_blocked_runs_from_resume_picker():
+	menu = _ScriptedMenu(["ok"])
+	control = _collect_control(menu, "resume", [_blocked_failed_run(), {"run_id": "ok", "status": "failed"}])
+	assert control.run_id == "ok"
+	assert [option.value for option in menu.menus[0][1]] == ["ok"]
+
+
+def test_collect_control_status_view_marks_blocked_run_for_manual_check():
+	menu = _ScriptedMenu(["f"])
+	control = _collect_control(menu, "status", [_blocked_failed_run()])
+	assert control.run_id == "f"
+	assert "人工核对" in menu.menus[0][1][0].description
 
 
 def test_entity_follow_up_offers_greet_after_job_detail():
@@ -1780,6 +2201,19 @@ def test_error_message_prefers_platform_chinese_text():
 
 	assert error_message("NETWORK_ERROR", "缺少必要参数") == "缺少必要参数"
 	assert "换一条" in (recovery_message("INVALID_PARAM") or "")
+
+
+def test_wizard_risk_recovery_requires_explicit_unlock_command():
+	"""风控锁不会自动解除：向导恢复文案必须给出本人执行的显式解锁命令。
+
+	登记表对 ACCOUNT_RISK / ENVIRONMENT_RISK / ENVIRONMENT_RISK_LOCKED 都要求
+	`boss clean --risk-lock`；向导文案若只说「等几分钟后再继续」，用户会在锁
+	未解除时反复重试同一个必然失败的步骤。
+	"""
+	from boss_agent_cli.wizard.renderer import RECOVERY_LABELS
+
+	for code in ("ACCOUNT_RISK", "ENVIRONMENT_RISK", "ENVIRONMENT_RISK_LOCKED"):
+		assert "boss clean --risk-lock" in RECOVERY_LABELS[code], code
 
 
 def _gate_logged_in(monkeypatch):
@@ -2543,6 +2977,24 @@ def test_gate_blocks_on_missing_browser_kernel_without_opening_browser(tmp_path,
 	assert login_calls == [], "内核缺失时不得尝试打开浏览器"
 
 
+def test_gate_login_risk_stops_without_offering_retry(tmp_path, monkeypatch):
+	"""风控是硬边界：登录门展示停止指引后退出，不再回到「重试登录」菜单。"""
+	from boss_agent_cli.api.client import AccountRiskError
+	from boss_agent_cli.wizard import preflight
+
+	monkeypatch.setattr("boss_agent_cli.auth.manager.AuthManager.check_status", lambda self: None)
+	monkeypatch.setattr(preflight, "_browser_kernel_status", lambda: ("ok", ""))
+
+	def _boom(self, **kw):
+		raise AccountRiskError("fixture risk", is_cdp=True)
+
+	monkeypatch.setattr("boss_agent_cli.auth.manager.AuthManager.login", _boom)
+
+	menu = _ScriptedMenu(["login", "exit"])
+	assert preflight.ensure_login(_gate_ctx(tmp_path), menu=menu) == preflight.GATE_EXIT
+	assert len(menu.menus) == 1, "风控后不应再给重试登录的菜单"
+
+
 def test_gate_login_failure_shows_operator_actions_and_retries(tmp_path, monkeypatch, capsys):
 	"""登录失败复用 R5 的双通道文案，且可回菜单重试。"""
 	from boss_agent_cli.wizard import preflight
@@ -3008,6 +3460,8 @@ def test_runner_platform_risk_is_terminal_and_never_retried(tmp_path):
 		assert attempts == 1, "风控异常不得重试"
 		assert run["status"] == "failed"
 		assert run["error"]["code"] == code
+		assert run["error"]["message"] == risk_error_message(code)
+		assert "平台风控" not in run["error"]["message"]
 		assert run["error"]["recoverable"] is False
 		assert "停止自动化访问" in run["error"]["recovery_action"]
 		assert run["error"]["recovery_action"] != "重试当前 run_id"
@@ -3066,6 +3520,40 @@ def test_classify_action_error_uses_risk_contract_for_risk_codes():
 		assert recoverable is False
 		assert "停止自动化访问" in recovery
 		assert "稍后重试" not in recovery
+
+
+def test_unwrap_risk_response_uses_registry_message():
+	from boss_agent_cli.wizard.actions import _unwrap
+
+	platform = MagicMock()
+	platform.is_success.return_value = False
+	platform.parse_error.return_value = ("ENVIRONMENT_RISK", "fixture-platform-response-token")
+	with pytest.raises(WorkflowActionError) as caught:
+		_unwrap(platform, {"code": 37, "message": "fixture-platform-response-token"}, "最近消息获取失败")
+	assert caught.value.code == "ENVIRONMENT_RISK"
+	assert str(caught.value) == risk_error_message("ENVIRONMENT_RISK")
+	assert "fixture-platform-response-token" not in str(caught.value)
+	assert caught.value.recoverable is False
+
+
+def test_unwrap_marks_action_unconfirmed_as_not_replay_safe():
+	from boss_agent_cli.wizard.actions import _unwrap
+
+	platform = MagicMock()
+	platform.is_success.return_value = False
+	platform.parse_error.return_value = ("ACTION_UNCONFIRMED", "发送结果未确认")
+	response = {
+		"code": -1,
+		"message": "发送结果未确认",
+		"__cli_error_code__": "ACTION_UNCONFIRMED",
+		"__cli_error_details__": {"outcome": "unknown", "replay_safe": False},
+	}
+	with pytest.raises(WorkflowActionError) as caught:
+		_unwrap(platform, response, "消息发送失败")
+	assert caught.value.code == "ACTION_UNCONFIRMED"
+	assert caught.value.recoverable is False
+	assert caught.value.replay_safe is False
+	assert caught.value.to_dict()["replay_safe"] is False
 
 
 def test_classify_action_error_keeps_action_unconfirmed_no_retry_contract():
@@ -3128,7 +3616,7 @@ def test_resume_rejects_run_saved_with_removed_platform(tmp_path):
 	assert payload["ok"] is False
 	assert payload["error"]["code"] == "INVALID_PARAM"
 	assert "zhilian" in payload["error"]["message"]
-	assert "supported: zhipin" in payload["error"]["message"]
+	assert "可选: zhipin" in payload["error"]["message"]
 
 
 def _ai_reply(payload):
@@ -3183,3 +3671,134 @@ def test_runner_reports_deterministic_action_bug_as_internal_error(tmp_path):
 	assert run["error"]["code"] == "INTERNAL_ERROR"
 	assert run["error"]["recoverable"] is False
 	assert run["error"]["message"] == "KeyError: 'jobList'"
+
+
+def test_runner_reports_local_file_error_as_local_io_error(tmp_path):
+	"""导出路径不可写时重试同一 run_id 也不会成功，不能报成可重试的 NETWORK_ERROR。"""
+
+	def broken(context, inputs, prior):
+		raise PermissionError(13, "Permission denied", str(tmp_path / "export.json"))
+
+	with WorkflowStore(tmp_path) as store:
+		run = WorkflowRunner(store, {"broken": broken}).run(_plan("broken"), object(), run_id="io-run")
+	assert run["error"]["code"] == "LOCAL_IO_ERROR"
+	assert run["error"]["recoverable"] is False
+	assert "不要自动重试" in run["error"]["recovery_action"]
+
+
+# ── 本地记录损坏 ──────────────────────────────────────────────────────
+
+
+def _break_workflow_column(
+	tmp_path,
+	table: str,
+	column: str,
+	run_id: str = "corrupt-run",
+	step_name: str = "auth_status",
+	*,
+	value: str = "{not json",
+):
+	db_path = tmp_path / "cache" / "boss_agent.db"
+	with sqlite3.connect(db_path) as conn:
+		if table == "workflow_steps":
+			conn.execute(
+				f"UPDATE workflow_steps SET {column} = ? WHERE run_id = ? AND step_name = ?",
+				(value, run_id, step_name),
+			)
+		else:
+			conn.execute(f"UPDATE {table} SET {column} = ? WHERE run_id = ?", (value, run_id))
+
+
+def _seed_corrupt_workflow_run(tmp_path, run_id: str = "corrupt-run") -> None:
+	with WorkflowStore(tmp_path) as store:
+		store.create(
+			run_id,
+			WorkflowPlan(
+				role="candidate",
+				platform="zhipin",
+				goal="job_search",
+				inputs={"query": "Python"},
+				requested_steps=("auth_status", "candidate_search"),
+				mode="headless",
+			),
+		)
+
+
+@pytest.mark.parametrize("flag", [["--status"], ["--resume"], ["--stop"]])
+@pytest.mark.parametrize("column", ["params", "last_result"])
+def test_corrupt_workflow_run_reports_envelope(tmp_path, flag, column):
+	"""workflow 记录写坏时不能 traceback，也不能被兜底成可重试的 NETWORK_ERROR。"""
+	_seed_corrupt_workflow_run(tmp_path)
+	_break_workflow_column(tmp_path, "workflow_runs", column)
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "--json", "wizard", *flag, "corrupt-run"])
+	assert result.exit_code == 1, result.output
+	payload = json.loads(result.output)
+	assert payload["ok"] is False
+	assert payload["error"]["code"] == "CACHE_RECORD_INVALID"
+	assert payload["error"]["recoverable"] is True
+	assert "workflow" in payload["error"]["message"]
+
+
+def test_corrupt_workflow_step_reports_envelope(tmp_path):
+	_seed_corrupt_workflow_run(tmp_path)
+	_break_workflow_column(tmp_path, "workflow_steps", "result")
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "--json", "wizard", "--status", "corrupt-run"])
+	assert result.exit_code == 1, result.output
+	assert json.loads(result.output)["error"]["code"] == "CACHE_RECORD_INVALID"
+
+
+def test_list_recent_skips_corrupt_runs_and_reports_them(tmp_path):
+	"""一条坏记录不该让整个任务列表不可用：跳过并点名，交给用户重建。"""
+	_seed_corrupt_workflow_run(tmp_path, "good-run")
+	_seed_corrupt_workflow_run(tmp_path, "corrupt-run")
+	_break_workflow_column(tmp_path, "workflow_runs", "params")
+	with WorkflowStore(tmp_path) as store:
+		runs = store.list_recent()
+		corrupt = store.corrupt_run_ids
+	assert [run["run_id"] for run in runs] == ["good-run"]
+	assert corrupt == ["corrupt-run"]
+
+
+def test_list_recent_skips_runs_with_corrupt_steps(tmp_path):
+	_seed_corrupt_workflow_run(tmp_path, "good-run")
+	_seed_corrupt_workflow_run(tmp_path, "corrupt-run")
+	_break_workflow_column(tmp_path, "workflow_steps", "result")
+	with WorkflowStore(tmp_path) as store:
+		runs = store.list_recent()
+		corrupt = store.corrupt_run_ids
+	assert [run["run_id"] for run in runs] == ["good-run"]
+	assert corrupt == ["corrupt-run"]
+
+
+def test_structurally_drifted_workflow_params_reports_envelope(tmp_path):
+	"""params 是合法 JSON 但不是 object 时，_plan_from_run 会抛 AttributeError。"""
+	_seed_corrupt_workflow_run(tmp_path)
+	_break_workflow_column(tmp_path, "workflow_runs", "params", value='"not-an-object"')
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "--json", "wizard", "--resume", "corrupt-run"])
+	assert result.exit_code == 1, result.output
+	payload = json.loads(result.output)
+	assert payload["error"]["code"] == "CACHE_RECORD_INVALID"
+	assert "JSON object" in payload["error"]["message"]
+
+
+@pytest.mark.parametrize(
+	("params", "field"),
+	[
+		({"inputs": [1, 2], "requested_steps": ["auth_status"]}, "inputs"),
+		({"inputs": {"query": "Python"}, "requested_steps": "auth_status"}, "requested_steps"),
+	],
+)
+def test_structurally_drifted_workflow_params_nested_fields_report_envelope(tmp_path, params, field):
+	"""params 顶层是 object、但 inputs / requested_steps 结构漂移时同样不能 traceback。
+
+	`dict(params["inputs"])` 对数组抛 TypeError（没有任何信封），
+	`tuple("auth_status")` 则会把步骤名静默拆成单个字符。
+	"""
+	_seed_corrupt_workflow_run(tmp_path)
+	_break_workflow_column(tmp_path, "workflow_runs", "params", value=json.dumps(params))
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "--json", "wizard", "--resume", "corrupt-run"])
+	assert result.exit_code == 1, result.output
+	payload = json.loads(result.output)
+	assert payload["error"]["code"] == "CACHE_RECORD_INVALID"
+	assert payload["error"]["recoverable"] is True
+	assert field in payload["error"]["message"]

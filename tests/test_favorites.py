@@ -134,6 +134,36 @@ def test_favorites_list_hints_avoid_detail_with_redacted_sid(mock_auth_cls, mock
 	assert not any(re.search(r"detail <security_id>(?! --job-id)", a) for a in next_actions)
 
 
+@patch("boss_agent_cli.commands.favorites.get_platform_instance")
+@patch("boss_agent_cli.commands.favorites.AuthManager")
+def test_favorites_list_hints_omit_next_page_when_no_more(mock_auth_cls, mock_platform_cls):
+	"""hasMore=false 时不能建议 --page N+1：Agent 照着执行只会拿到空页。"""
+	platform = _ctx_mock(mock_platform_cls)
+	platform.job_favorites.return_value = {
+		"code": 0,
+		"zpData": {"cardList": [_make_card()], "hasMore": False},
+	}
+	result = CliRunner().invoke(cli, ["--json", "favorites", "list", "--page", "3"])
+	assert result.exit_code == 0
+	next_actions = json.loads(result.output)["hints"]["next_actions"]
+	assert all("--page" not in action for action in next_actions)
+
+
+@patch("boss_agent_cli.commands.favorites.get_platform_instance")
+@patch("boss_agent_cli.commands.favorites.AuthManager")
+def test_favorites_list_hints_include_next_page_when_has_more(mock_auth_cls, mock_platform_cls):
+	"""hasMore=true 时保留下一页提示，页码基于当前页 +1。"""
+	platform = _ctx_mock(mock_platform_cls)
+	platform.job_favorites.return_value = {
+		"code": 0,
+		"zpData": {"cardList": [_make_card()], "hasMore": True},
+	}
+	result = CliRunner().invoke(cli, ["--json", "favorites", "list", "--page", "2"])
+	assert result.exit_code == 0
+	next_actions = json.loads(result.output)["hints"]["next_actions"]
+	assert any("favorites list --page 3" in action for action in next_actions)
+
+
 # ── sync ──────────────────────────────────────────────────────────
 
 
@@ -382,6 +412,27 @@ def test_favorites_sync_null_identifiers_are_skipped(mock_auth_cls, mock_platfor
 		"unknown_count": 0,
 	}
 	assert _shortlist_items(tmp_path) == []
+
+
+def test_collect_favorites_keeps_second_page_when_cards_lack_encrypt_job_id():
+	"""卡片刻意缺少 encryptJobId 时签名恒为空，不能把第二页当成重复页丢掉。"""
+	from unittest.mock import MagicMock
+
+	from boss_agent_cli.commands.favorites import collect_favorites_items
+
+	platform = MagicMock()
+	platform.is_success.return_value = True
+	platform.unwrap_data.side_effect = lambda response: response["zpData"]
+	platform.job_favorites.side_effect = [
+		{"code": 0, "zpData": {"cardList": [_make_card(jid="job_1", drop=("encryptJobId",))], "hasMore": True}},
+		{"code": 0, "zpData": {"cardList": [_make_card(jid="job_2", drop=("encryptJobId",))], "hasMore": False}},
+	]
+
+	items, error = collect_favorites_items(platform)
+
+	assert error is None
+	assert len(items) == 2
+	assert platform.job_favorites.call_count == 2
 
 
 def test_collect_favorites_rejects_incomplete_page_budget():

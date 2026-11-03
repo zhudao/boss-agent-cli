@@ -98,6 +98,30 @@ def test_watch_seen_items(store):
 	assert result["seen_count"] == 1
 
 
+def test_watch_dedupes_across_security_id_rotation_with_account(store):
+	"""有账号指纹时，securityId 轮换后同一职位仍算已见。"""
+	first = store.record_watch_results("search1", [{"security_id": "s1", "job_id": "j1"}], account="acct_a")
+	assert first["new_count"] == 1
+	result = store.record_watch_results("search1", [{"security_id": "s2", "job_id": "j1"}], account="acct_a")
+	assert result["new_count"] == 0
+	assert result["seen_count"] == 1
+
+
+def test_watch_accounts_are_isolated(store):
+	"""不同账号看到同一职位时不应共享已见记录。"""
+	store.record_watch_results("search1", [{"security_id": "s1", "job_id": "j1"}], account="acct_a")
+	result = store.record_watch_results("search1", [{"security_id": "s8", "job_id": "j1"}], account="acct_b")
+	assert result["new_count"] == 1
+	assert result["seen_count"] == 0
+
+
+def test_watch_without_account_keeps_legacy_key(store):
+	"""没有账号归属时保留旧复合键，不跨 securityId 轮换合并。"""
+	store.record_watch_results("search1", [{"security_id": "s1", "job_id": "j1"}])
+	result = store.record_watch_results("search1", [{"security_id": "s2", "job_id": "j1"}])
+	assert result["new_count"] == 1
+
+
 def test_watch_mixed_items(store):
 	"""混合新旧项目应分别计数。"""
 	store.record_watch_results("search1", [{"security_id": "s1", "job_id": "j1"}])
@@ -171,6 +195,37 @@ def test_shortlist_add_and_list(store):
 	assert result[0]["security_id"] == "s1"
 	assert result[0]["tags"] == ["前端", "远程"]
 	assert result[0]["note"] == "复盘薪资结构"
+
+
+def test_shortlist_repeat_add_preserves_local_annotations(store):
+	"""重复加入同一职位不能抹掉本地标签、备注和首次加入时间。
+
+	`INSERT OR REPLACE` 会整行替换：脚本重跑一次 `shortlist add`、或换设备后再导
+	一次，用户在本地打的标签和备注就没了，界面也不报任何错。
+	"""
+	store.add_shortlist({"security_id": "s1", "job_id": "j1", "title": "后端", "source": "manual"})
+	assert store.set_shortlist_tags("s1", "j1", ["重点"]) is True
+	assert store.set_shortlist_note("s1", "j1", "等待回复") is True
+	created_at = store.list_shortlist()[0]["created_at"]
+
+	store.add_shortlist({"security_id": "s1", "job_id": "j1", "city": "北京"})
+
+	item = store.list_shortlist()[0]
+	assert item["tags"] == ["重点"]
+	assert item["note"] == "等待回复"
+	assert item["created_at"] == created_at
+	assert item["title"] == "后端"
+	assert item["city"] == "北京"
+
+
+def test_shortlist_repeat_add_applies_explicit_values(store):
+	"""本次显式给出的新值仍然覆盖旧值。"""
+	store.add_shortlist({"security_id": "s1", "job_id": "j1", "tags": ["旧"], "note": "旧备注"})
+	store.add_shortlist({"security_id": "s1", "job_id": "j1", "tags": ["新"], "note": "新备注"})
+
+	item = store.list_shortlist()[0]
+	assert item["tags"] == ["新"]
+	assert item["note"] == "新备注"
 
 
 def test_shortlist_set_tags_and_note(store):

@@ -13,8 +13,14 @@ from boss_agent_cli.api.browser_source import BrowserSourceUnavailable, BrowserS
 from boss_agent_cli.api.client import PlatformRiskError
 from boss_agent_cli.api.request_budget import RequestBudgetExceeded, request_control
 from boss_agent_cli.auth.manager import AuthRequired, TokenRefreshFailed
-from boss_agent_cli.display import INTERNAL_ERROR_TYPES, error_contract_for_code, risk_error_contract
-from boss_agent_cli.wizard.models import StepResult, WorkflowPlan, WorkflowStatus
+from boss_agent_cli.display import (
+	INTERNAL_ERROR_TYPES,
+	error_contract_for_code,
+	risk_error_contract,
+	risk_error_message,
+)
+from boss_agent_cli.output import is_local_io_error
+from boss_agent_cli.wizard.models import StepResult, WorkflowInputError, WorkflowPlan, WorkflowStatus
 from boss_agent_cli.wizard.store import WorkflowStore
 
 Action = Callable[[Any, Mapping[str, Any], Mapping[str, Any]], StepResult]
@@ -30,15 +36,18 @@ class WorkflowActionError(Exception):
 		recoverable: bool = False,
 		recovery_action: str | None = None,
 		details: dict[str, Any] | None = None,
+		replay_safe: bool = True,
 	) -> None:
 		super().__init__(message)
 		self.code = code
 		self.recoverable = recoverable
 		self.recovery_action = recovery_action
 		self.details = details
+		# replay_safe=False 表示动作可能已经生效：--resume 不得重跑该步骤。
+		self.replay_safe = replay_safe
 
 	def to_dict(self) -> dict[str, Any]:
-		result = {
+		result: dict[str, Any] = {
 			"code": self.code,
 			"message": str(self),
 			"recoverable": self.recoverable,
@@ -46,6 +55,8 @@ class WorkflowActionError(Exception):
 		}
 		if self.details:
 			result["details"] = self.details
+		if not self.replay_safe:
+			result["replay_safe"] = False
 		return result
 
 
@@ -79,14 +90,14 @@ class WorkflowControl:
 		if signal == "stop":
 			raise WorkflowActionError(
 				"WORKFLOW_STOPPED",
-				"workflow stop requested",
+				"已按 stop 请求停止 workflow",
 				recoverable=True,
 				recovery_action="创建新 workflow，或恢复其内部可恢复任务",
 			)
 		if signal == "timeout":
 			raise WorkflowActionError(
 				"WORKFLOW_TIMEOUT",
-				"workflow exceeded its timeout",
+				"workflow 超过设定时限",
 				recoverable=True,
 				recovery_action=f"boss wizard --resume {self.run_id}",
 			)
@@ -125,13 +136,23 @@ class WorkflowRunner:
 		stored_run = self._store.get(run_id)
 		if stored_run is None:
 			raise RuntimeError(f"workflow run {run_id!r} was not persisted")
+		blocked_steps: dict[str, dict[str, Any]] = {}
 		for step in stored_run["steps"]:
+			error = step.get("error") or {}
+			if step["status"] == WorkflowStatus.FAILED.value and error.get("replay_safe") is False:
+				# 动作可能已经生效：--resume 不得再执行一次。
+				blocked_steps[step["step_name"]] = error
+				continue
 			if not step["result"]:
 				continue
 			if step["status"] == WorkflowStatus.COMPLETED.value:
 				prior_results[step["step_name"]] = step["result"]
 			elif step["status"] == WorkflowStatus.WAITING_INPUT.value:
 				waiting_priors[step["step_name"]] = step["result"]
+		pending_steps = [name for name in plan.requested_steps if name not in prior_results]
+		if pending_steps and pending_steps[0] in blocked_steps:
+			# 保持原失败状态与 recovery_action，让操作者先核对官方页面。
+			return stored_run
 
 		self._store.update_run(
 			run_id,
@@ -141,6 +162,17 @@ class WorkflowRunner:
 		for step_name in plan.requested_steps:
 			if step_name in prior_results:
 				continue
+			if step_name in blocked_steps:
+				# 正常路径已在循环前返回；持久化状态异常时也不重放，恢复原失败状态。
+				persisted = self._store.get(run_id) or {}
+				self._store.update_run(
+					run_id,
+					status=WorkflowStatus.FAILED.value,
+					current_step=step_name,
+					last_result=persisted.get("last_result"),
+					error=blocked_steps[step_name],
+				)
+				return self._store.get(run_id) or {}
 			current = self._store.get(run_id) or {}
 			if current.get("status") == WorkflowStatus.STOPPED.value:
 				return current
@@ -149,7 +181,7 @@ class WorkflowRunner:
 					run_id,
 					step_name,
 					code="WORKFLOW_TIMEOUT",
-					message=f"workflow exceeded {timeout_seconds:g} seconds",
+					message=f"workflow 超过 {timeout_seconds:g} 秒未完成",
 					recovery_action=f"boss wizard --resume {run_id}",
 				)
 			if on_event:
@@ -181,7 +213,7 @@ class WorkflowRunner:
 							result = action(action_context, plan.inputs, action_prior)
 						break
 					except WorkflowActionError as exc:
-						if not exc.recoverable or attempt >= max_retries:
+						if not exc.recoverable or not exc.replay_safe or attempt >= max_retries:
 							raise
 						attempt += 1
 						control.raise_if_requested()
@@ -202,13 +234,23 @@ class WorkflowRunner:
 				)
 			except WorkflowActionError as exc:
 				error = exc
+			except WorkflowInputError as exc:
+				# inputs 写错（类型不对）不是网络问题：落到下面的通用兜底会变成
+				# NETWORK_ERROR +「重试当前 run_id」，而重试同一条输入必然复现。
+				recoverable, recovery = error_contract_for_code("INVALID_PARAM")
+				error = WorkflowActionError(
+					"INVALID_PARAM",
+					str(exc),
+					recoverable=recoverable,
+					recovery_action=recovery,
+				)
 			except RequestBudgetExceeded as exc:
 				recoverable, recovery = error_contract_for_code(exc.code)
 				error = WorkflowActionError(exc.code, str(exc), recoverable=recoverable, recovery_action=recovery, details=exc.details)
 			except KeyboardInterrupt:
 				error = WorkflowActionError(
 					"WORKFLOW_STOPPED",
-					"workflow interrupted; verify any unfinished operation before starting another run",
+					"workflow 被中断；开始新的运行前请先核对未完成的操作",
 					recoverable=True,
 					recovery_action="检查 checkpoint 与平台实际结果，再显式创建或恢复内部任务",
 				)
@@ -218,7 +260,10 @@ class WorkflowRunner:
 				# 处理完账号/安全页后显式发起（Issue #419）。
 				recovery_action, _ = risk_error_contract(exc.code)
 				error = WorkflowActionError(
-					exc.code, str(exc) or exc.code, recoverable=False, recovery_action=recovery_action
+					exc.code,
+					risk_error_message(exc.code),
+					recoverable=False,
+					recovery_action=recovery_action,
 				)
 			except BrowserNavigationError as exc:
 				# 首页导航已经在会话内重试过。这里不再把同一步骤立刻重跑一遍。
@@ -253,6 +298,21 @@ class WorkflowRunner:
 					recoverable=internal_recoverable,
 					recovery_action=internal_recovery,
 				)
+			except OSError as exc:
+				# 本地文件读写失败（导出路径不可写、磁盘满）重试同一 run_id 也不会成功；
+				# 套接字层的 ConnectionError / TimeoutError 仍是网络问题，保持可重试语义。
+				if is_local_io_error(exc):
+					io_recoverable, io_recovery = error_contract_for_code("LOCAL_IO_ERROR")
+					error = WorkflowActionError(
+						"LOCAL_IO_ERROR",
+						f"本地文件读写失败: {exc}",
+						recoverable=io_recoverable,
+						recovery_action=io_recovery,
+					)
+				else:
+					error = WorkflowActionError(
+						"NETWORK_ERROR", str(exc), recoverable=True, recovery_action="重试当前 run_id"
+					)
 			except Exception as exc:
 				error = WorkflowActionError(
 					"NETWORK_ERROR", str(exc), recoverable=True, recovery_action="重试当前 run_id"
@@ -269,7 +329,7 @@ class WorkflowRunner:
 						run_id,
 						step_name,
 						code="WORKFLOW_TIMEOUT",
-						message=f"workflow exceeded {timeout_seconds:g} seconds",
+						message=f"workflow 超过 {timeout_seconds:g} 秒未完成",
 						recovery_action=f"boss wizard --resume {run_id}",
 						preserve_result=True,
 					)

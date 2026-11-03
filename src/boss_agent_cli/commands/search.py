@@ -3,12 +3,9 @@ from typing import Any
 
 import click
 
-from boss_agent_cli.api.endpoints import (
-	CITY_CODES,
-)
 from boss_agent_cli.auth.manager import AuthManager
-from boss_agent_cli.cache.store import CacheStore
-from boss_agent_cli.commands._platform import get_platform_instance
+from boss_agent_cli.cache.store import CacheStore, SavedSearchParamsError
+from boss_agent_cli.commands._platform import account_scope, get_platform_instance
 from boss_agent_cli.crawler.service import CrawlBudget
 from boss_agent_cli.display import (
 	SearchProgress,
@@ -17,6 +14,8 @@ from boss_agent_cli.display import (
 	handle_error_output,
 	handle_output,
 	is_json_mode,
+	platform_error_contract,
+	platform_error_message,
 	render_job_table,
 )
 from boss_agent_cli.index_cache import try_save_index
@@ -28,6 +27,7 @@ from boss_agent_cli.search_filters import (
 	ACTIVE_LEVELS,
 	detail_channel_for,
 	detail_filter_max_pages,
+	ensure_supported_city,
 	parse_boss_search_url,
 	resolve_active_level,
 	resolve_search_code_params,
@@ -38,12 +38,46 @@ from boss_agent_cli.wizard.actions import execute_candidate_search
 
 
 # 3：职位条目新增 boss_active_desc 字段，旧缓存不再复用。
-_SEARCH_CACHE_SCHEMA = 3
+# 4：缓存键带上账号作用域，且命中后按当前账号重算 greeted；旧缓存不再复用。
+_SEARCH_CACHE_SCHEMA = 4
+
+
+def _parse_cached_result(raw: str) -> dict[str, Any] | None:
+	"""解析搜索缓存；内容损坏或结构不对时按未命中处理。
+
+	缓存写坏（手工改库、磁盘异常）或结构漂移时，`json.loads` 会抛
+	`JSONDecodeError`、`result["data"]` 会抛 `KeyError`，两者都会让
+	`boss search` 直接 traceback；重新搜索会覆盖同键的坏条目。
+	"""
+	try:
+		parsed = json.loads(raw)
+	except json.JSONDecodeError:
+		return None
+	if not isinstance(parsed, dict) or not isinstance(parsed.get("data"), list):
+		return None
+	return parsed
 
 
 def _sort_search_items(items: list[dict[str, Any]], sort: str) -> list[dict[str, Any]]:
 	if sort == "score":
 		return sorted(items, key=lambda item: item.get("match_score", 0), reverse=True)
+	return items
+
+
+def _refresh_greeted(items: list[dict[str, Any]], cache: CacheStore, account: str) -> list[dict[str, Any]]:
+	"""缓存命中后按当前账号重算 ``greeted``。
+
+	缓存写入后本地可能又打过招呼，直接复用旧标记会让 ``greeted`` 一直停留在
+	写入时的状态；账号作用域也要求这里用当前账号查询，而不是沿用缓存里的值。
+	"""
+	for item in items:
+		if not isinstance(item, dict):
+			continue
+		item["greeted"] = cache.is_greeted(
+			str(item.get("security_id") or ""),
+			job_id=str(item.get("job_id") or ""),
+			account=account,
+		)
 	return items
 
 
@@ -99,7 +133,7 @@ def _active_filter_hint(level: str, pipeline_result: Any) -> dict[str, Any]:
 	default=None,
 	help="只保留 HR 活跃度不低于该档的职位：" + " / ".join(ACTIVE_LEVELS) + "（也认 3day、3日 等写法）；online 只看列表，其余档位列表看不出时会逐个查职位详情（更慢、风险更高）",
 )
-@click.option("--page", default=1, help="页码")
+@click.option("--page", default=1, type=click.IntRange(min=1), help="页码")
 @click.option("--no-cache", is_flag=True, default=False, help="跳过缓存")
 @click.option("--with-score", is_flag=True, default=False, help="附加匹配分和原因")
 @click.option("--sort", "sort_mode", default="relevance", type=click.Choice(["relevance", "score"]), help="排序方式")
@@ -129,10 +163,24 @@ def search_cmd(
 	data_dir = ctx.obj["data_dir"]
 	logger = ctx.obj["logger"]
 	raw_params: dict[str, str] = {}
+	# 校验失败的筛选项若完全来自 preset，错误消息要点名是哪条本地预设：
+	# 用户这次没传任何筛选参数，只说「未知薪资范围」看不出该改哪里。
+	preset_origin = ""
+	if preset and not any((city, salary, experience, education, industry, scale, stage, job_type)):
+		preset_origin = f"（来自 preset '{preset}'，可用 boss preset remove {preset} 删除后重建）"
 
 	if preset:
 		with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
-			record = cache.get_saved_search(preset)
+			try:
+				record = cache.get_saved_search(preset)
+			except SavedSearchParamsError as exc:
+				# 预设参数写坏时给可执行的删除重建指引，而不是把 JSON 解析错误
+				# 兜成 NETWORK_ERROR 让 Agent 无限重试。
+				handle_error_output(
+					ctx, "search", code="SAVED_SEARCH_INVALID", message=str(exc),
+					hints={"next_actions": [f"boss preset remove {preset}", f"boss preset add {preset} <关键词>"]},
+				)
+				return
 		if record is None:
 			handle_error_output(ctx, "search", code="JOB_NOT_FOUND", message=f"未找到 preset: {preset}")
 			return
@@ -165,12 +213,10 @@ def search_cmd(
 		return
 	query = query or ""
 
-	if city and city not in CITY_CODES:
-		handle_error_output(
-			ctx, "search",
-			code="INVALID_PARAM",
-			message=f"未知城市: {city}，请使用 CITY_CODES 中的城市名",
-		)
+	try:
+		ensure_supported_city(city)
+	except ValueError as exc:
+		handle_error_output(ctx, "search", code="INVALID_PARAM", message=f"{exc}{preset_origin}")
 		return
 
 	try:
@@ -184,14 +230,14 @@ def search_cmd(
 			job_type=job_type,
 		)
 	except ValueError as exc:
-		handle_error_output(ctx, "search", code="INVALID_PARAM", message=str(exc))
+		handle_error_output(ctx, "search", code="INVALID_PARAM", message=f"{exc}{preset_origin}")
 		return
 	raw_params.update({key: value for key, value in code_params.items() if value})
 
 	try:
 		active_level = resolve_active_level(active)
 	except ValueError as exc:
-		handle_error_output(ctx, "search", code="INVALID_PARAM", message=str(exc))
+		handle_error_output(ctx, "search", code="INVALID_PARAM", message=f"{exc}{preset_origin}")
 		return
 	# 福利和活跃度都可能要逐个查详情（活跃度也会变），结果不进搜索缓存
 	detail_filter = bool(welfare or active_level)
@@ -210,6 +256,10 @@ def search_cmd(
 		raw_params=raw_params,
 	)
 
+	# 账号作用域要在读缓存之前确定：缓存按账号隔离，命中后也要按当前账号重算 greeted。
+	auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
+	account = account_scope(auth)
+
 	with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
 		# 有福利 / 活跃度筛选时跳过缓存（需要逐个查详情，活跃度也会变）
 		if not detail_filter and not no_cache and not with_score:
@@ -219,21 +269,24 @@ def search_cmd(
 				"experience": experience, "education": education,
 				"industry": industry, "scale": scale, "stage": stage,
 				"job_type": job_type, "url": search_url, "raw_params": raw_params, "page": page,
+				"account": account,
 			}
 			cached = cache.get_search(search_params)
 			if cached is not None:
-				logger.debug("搜索命中缓存")
-				result = json.loads(cached)
-				items = _sort_search_items(result["data"], sort_mode)
-				try_save_index(data_dir, items, source=f"search:{query}", logger=logger)
-				handle_output(
-					ctx, "search", items,
-					render=lambda data: render_job_table(data, f"search: {query}"),
-					pagination=result.get("pagination"), hints=result.get("hints"),
-				)
-				return
+				result = _parse_cached_result(cached)
+				if result is not None:
+					logger.debug("搜索命中缓存")
+					items = _refresh_greeted(result["data"], cache, account)
+					items = _sort_search_items(items, sort_mode)
+					try_save_index(data_dir, items, source=f"search:{query}", logger=logger)
+					handle_output(
+						ctx, "search", items,
+						render=lambda data: render_job_table(data, f"search: {query}"),
+						pagination=result.get("pagination"), hints=result.get("hints"),
+					)
+					return
+				logger.debug("搜索缓存内容不可用，按未命中处理")
 
-		auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
 		request_budget = CrawlBudget(cache) if ctx.obj.get("platform", "zhipin") == "zhipin" else None
 		# CDP 模式下详情（--active / --welfare 兜底）只走浏览器、串行并按 CrawlBudget 间隔
 		detail_channel = detail_channel_for(ctx.obj)
@@ -275,6 +328,7 @@ def search_cmd(
 							else None
 						) if active_level or detail_channel == "browser" else None,
 						"detail_channel": detail_channel,
+						"account": account,
 						"before_list_request": (
 							(lambda: request_budget.wait("list", on_wait=progress.waiting))
 							if request_budget is not None and progress is not None
@@ -286,12 +340,17 @@ def search_cmd(
 					pipeline=run_search_pipeline,
 				)
 			except SearchPipelinePlatformError as exc:
+				# 风控码必须走风险契约：不可恢复、不提示重试；登录过期等
+				# 可恢复错误按登记表给出 recovery_action，而不是一律 false。
+				recoverable, recovery_action, error_hints = platform_error_contract(exc.code)
 				handle_error_output(
 					ctx, "search",
 					code=exc.code,
-					message=exc.message or "搜索结果获取失败",
-					recoverable=False,
+					message=platform_error_message(exc.code, exc.message, "搜索结果获取失败"),
+					recoverable=recoverable,
+					recovery_action=recovery_action,
 					details=exc.details,
+					hints=error_hints,
 				)
 				return
 			finally:
@@ -328,16 +387,16 @@ def search_cmd(
 			}
 			hints: dict[str, Any] = {
 				"next_actions": [
-					f"使用 {boss_command_for_ctx(ctx, 'detail <security_id>')} 查看职位详情",
-					f"使用 {boss_command_for_ctx(ctx, 'apply <security_id> <job_id>')} 投递，"
-					f"或 {boss_command_for_ctx(ctx, 'greet <security_id> <job_id>')} 沟通",
+					boss_command_for_ctx(ctx, "detail <security_id>"),
+					boss_command_for_ctx(ctx, "apply <security_id> <job_id>"),
+					boss_command_for_ctx(ctx, "greet <security_id> <job_id>"),
 				],
 			}
 			if active_level:
 				hints["active_filter"] = _active_filter_hint(active_level, pipeline_result)
 			if pipeline_result.has_more and not detail_filter:
 				hints["next_actions"].append(
-					f"使用 boss search <query> --page {page + 1} 查看下一页"
+					boss_command_for_ctx(ctx, f"search <query> --page {page + 1}")
 				)
 
 			# 缓存普通搜索结果
@@ -348,6 +407,7 @@ def search_cmd(
 					"experience": experience, "education": education,
 					"industry": industry, "scale": scale, "stage": stage,
 					"job_type": job_type, "url": search_url, "raw_params": raw_params, "page": page,
+					"account": account,
 				}
 				cache_data = {"data": cache_items, "pagination": pagination, "hints": hints}
 				cache.put_search(search_params, json.dumps(cache_data, ensure_ascii=False))

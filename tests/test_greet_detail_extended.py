@@ -5,6 +5,7 @@ from unittest.mock import patch, MagicMock
 
 from click.testing import CliRunner
 
+from boss_agent_cli.display import risk_error_message
 from boss_agent_cli.main import cli
 
 
@@ -58,7 +59,7 @@ def test_greet_success(tmp_path):
 	assert parsed["ok"] is True
 	assert parsed["data"]["security_id"] == "sid1"
 	mock_client.greet.assert_called_once_with("sid1", "jid1", "")
-	mock_cache.record_greet.assert_called_once_with("sid1", "jid1")
+	mock_cache.record_greet.assert_called_once_with("sid1", "jid1", account="")
 
 
 def test_greet_failure_does_not_record_cache(tmp_path):
@@ -71,6 +72,37 @@ def test_greet_failure_does_not_record_cache(tmp_path):
 	)
 	assert code == 1
 	assert parsed["error"]["code"] == "AUTH_EXPIRED"
+	mock_cache.record_greet.assert_not_called()
+
+
+def test_greet_account_risk_uses_stop_contract(tmp_path):
+	"""响应字典形态的风控码不能提示重试，应走统一风险契约。"""
+	code, parsed, mock_cache, mock_client = _invoke_greet(
+		"greet", "sid1", "jid1", tmp_path=tmp_path,
+		greet_result={"code": 36, "message": "您的账户存在异常行为"},
+		is_success=False,
+		parse_error=("ACCOUNT_RISK", "您的账户存在异常行为"),
+	)
+	assert code == 1
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "ACCOUNT_RISK"
+	assert parsed["error"]["recoverable"] is False
+	assert "停止自动化访问" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"]
+	mock_cache.record_greet.assert_not_called()
+
+
+def test_greet_unknown_error_stays_retryable(tmp_path):
+	"""无法识别的业务失败仍按 NETWORK_ERROR 提示重试，不被风险契约吞掉。"""
+	code, parsed, mock_cache, mock_client = _invoke_greet(
+		"greet", "sid1", "jid1", tmp_path=tmp_path,
+		greet_result={"code": -1, "message": "boom"},
+		is_success=False,
+		parse_error=("UNKNOWN", "boom"),
+	)
+	assert code == 1
+	assert parsed["error"]["code"] == "NETWORK_ERROR"
+	assert parsed["error"]["recoverable"] is True
 	mock_cache.record_greet.assert_not_called()
 
 
@@ -113,7 +145,7 @@ def test_greet_hints_present(tmp_path):
 # ── batch-greet 命令 ────────────────────────────────────────────────
 
 
-def _invoke_batch_greet(*args, tmp_path, search_result=None, greeted_ids=None, is_success=True, parse_error=("UNKNOWN", "")):
+def _invoke_batch_greet(*args, tmp_path, search_result=None, greeted_ids=None, is_success=True, parse_error=("UNKNOWN", ""), client_sink=None):
 	runner = CliRunner()
 	greeted = set(greeted_ids or [])
 	with (
@@ -122,7 +154,7 @@ def _invoke_batch_greet(*args, tmp_path, search_result=None, greeted_ids=None, i
 		patch(_PATCHES["cache"]) as mock_cache_cls,
 	):
 		mock_cache = MagicMock()
-		mock_cache.is_greeted.side_effect = lambda sid: sid in greeted
+		mock_cache.is_greeted.side_effect = lambda sid, *, job_id="", account="": sid in greeted
 		mock_cache_cls.return_value.__enter__ = lambda s: mock_cache
 		mock_cache_cls.return_value.__exit__ = MagicMock(return_value=False)
 
@@ -145,6 +177,8 @@ def _invoke_batch_greet(*args, tmp_path, search_result=None, greeted_ids=None, i
 		mock_client.unwrap_data.side_effect = lambda payload: payload.get("zpData") if "zpData" in payload else payload.get("data")
 		mock_client_cls.return_value.__enter__ = lambda s: mock_client
 		mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+		if client_sink is not None:
+			client_sink.append(mock_client)
 
 		cli_args = ["--data-dir", str(tmp_path), *args]
 		result = runner.invoke(cli, cli_args)
@@ -218,6 +252,32 @@ def test_batch_greet_respects_count_limit(tmp_path):
 	assert parsed["data"]["count"] == 1
 
 
+def test_batch_greet_count_zero_sends_nothing(tmp_path):
+	"""`--count 0` 必须一条招呼都不发。
+
+	旧实现把「到上限就停」放在 append 之后，count=0 时仍会收进 1 个候选，
+	非 dry-run 下就是一次真实的招呼写操作。
+	"""
+	clients: list[MagicMock] = []
+	code, parsed = _invoke_batch_greet(
+		"batch-greet", "python", "--count", "0", tmp_path=tmp_path, client_sink=clients,
+	)
+	assert code == 0
+	assert parsed["data"]["total_greeted"] == 0
+	assert parsed["data"]["greeted"] == []
+	clients[0].greet.assert_not_called()
+
+
+def test_batch_greet_rejects_negative_count(tmp_path):
+	"""负数上限会让「到上限就停」永远不成立，应按参数错误拒绝。"""
+	code, parsed = _invoke_batch_greet(
+		"batch-greet", "python", "--count", "-1", tmp_path=tmp_path,
+	)
+	assert code == 1
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+
+
 def test_batch_greet_reports_platform_error(tmp_path):
 	"""搜索接口明确失败时，不应伪装成空候选成功。"""
 	code, parsed = _invoke_batch_greet(
@@ -261,7 +321,7 @@ _DETAIL_RESULT = {
 }
 
 
-def _invoke_detail(*args, tmp_path, detail_result=None, cache_job_id=None):
+def _invoke_detail(*args, tmp_path, detail_result=None, cache_job_id=None, is_success=None, parse_error=("UNKNOWN", "")):
 	runner = CliRunner()
 	with (
 		patch(_DETAIL_PATCHES["auth"]),
@@ -276,6 +336,9 @@ def _invoke_detail(*args, tmp_path, detail_result=None, cache_job_id=None):
 
 		mock_client = MagicMock()
 		mock_client.job_detail.return_value = detail_result or _DETAIL_RESULT
+		if is_success is not None:
+			mock_client.is_success.return_value = is_success
+		mock_client.parse_error.return_value = parse_error
 		mock_client.job_card.return_value = {"zpData": {"jobCard": {
 			"encryptJobId": "j1", "jobName": "前端工程师",
 			"postDescription": "负责前端开发",
@@ -371,3 +434,55 @@ def test_detail_json_envelope(tmp_path):
 	assert "command" in parsed
 	assert "data" in parsed
 	assert parsed["command"] == "detail"
+
+
+def test_batch_greet_search_risk_uses_stop_contract(tmp_path):
+	"""搜索阶段返回风控码时不能输出可重试的普通失败。"""
+	code, parsed = _invoke_batch_greet(
+		"batch-greet", "python", "--dry-run", tmp_path=tmp_path,
+		search_result={"code": 36, "message": "risk"},
+		is_success=False,
+		parse_error=("ACCOUNT_RISK", "risk"),
+	)
+	assert code == 1
+	assert parsed["error"]["code"] == "ACCOUNT_RISK"
+	assert parsed["error"]["recoverable"] is False
+	assert "停止自动化访问" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"]
+
+
+def test_detail_risk_uses_stop_contract(tmp_path):
+	"""detail 的风控错误信封也要带停止指引，而不是只有空白 hints。"""
+	code, parsed = _invoke_detail(
+		"detail", "sid1", "--job-id", "j1", tmp_path=tmp_path,
+		detail_result={"code": 36, "message": "fixture-platform-response-token"},
+		is_success=False,
+		parse_error=("ACCOUNT_RISK", "fixture-platform-response-token"),
+	)
+	assert code == 1
+	assert parsed["error"]["code"] == "ACCOUNT_RISK"
+	assert parsed["error"]["message"] == risk_error_message("ACCOUNT_RISK")
+	assert "fixture-platform-response-token" not in parsed["error"]["message"]
+	assert parsed["error"]["recoverable"] is False
+	assert "停止自动化访问" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"]
+
+
+def test_detail_budget_stop_does_not_fall_back_to_browser(tmp_path):
+	"""httpx 快速通道遇到预算/时限停止时不能再换浏览器通道补一次请求。"""
+	from boss_agent_cli.api.request_budget import RequestBudgetExceeded
+
+	runner = CliRunner()
+	with (
+		patch(_DETAIL_PATCHES["auth"]),
+		patch(_DETAIL_PATCHES["client"]),
+		patch("boss_agent_cli.commands.detail._detail_via_httpx", side_effect=RequestBudgetExceeded("fixture budget stop")),
+		patch("boss_agent_cli.commands.detail._detail_via_browser") as browser,
+	):
+		result = runner.invoke(cli, ["detail", "sid1", "--job-id", "j1"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "REQUEST_BUDGET_EXHAUSTED"
+	assert parsed["error"]["recoverable"] is True
+	assert parsed["error"]["recovery_action"]
+	browser.assert_not_called()

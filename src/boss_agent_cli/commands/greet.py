@@ -1,5 +1,6 @@
 import random
 import time
+from typing import Any
 
 import click
 
@@ -11,19 +12,29 @@ from boss_agent_cli.api.endpoints import (
 	STAGE_CODES,
 )
 from boss_agent_cli.api.models import JobItem, field_list
+from boss_agent_cli.api.request_budget import is_request_stop
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.cache.store import CacheStore
 from boss_agent_cli.compliance import require_compliance_allowed
-from boss_agent_cli.commands._platform import get_platform_instance
+from boss_agent_cli.commands._platform import account_scope, get_platform_instance
 from boss_agent_cli.display import (
+	boss_command_for_ctx,
+	error_contract_for_code,
 	handle_auth_errors,
 	handle_error_output,
 	handle_output,
+	handle_platform_error_output,
 	render_batch_operation_summary,
 	render_message_panel,
 	risk_error_contract,
+	risk_error_message,
 )
-from boss_agent_cli.search_filters import SearchFilterCriteria, prefilter_platform_job_type
+from boss_agent_cli.search_filters import (
+	SearchFilterCriteria,
+	ensure_supported_city,
+	prefilter_platform_job_type,
+	resolve_search_code_params,
+)
 from boss_agent_cli.services.job_identity import deduplicate_job_result
 
 
@@ -41,17 +52,19 @@ def greet_cmd(ctx: click.Context, security_id: str, job_id: str, message: str) -
 	data_dir = ctx.obj["data_dir"]
 	logger = ctx.obj["logger"]
 
+	auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
+	account = account_scope(auth)
+
 	with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
-		if cache.is_greeted(security_id):
+		if cache.is_greeted(security_id, job_id=job_id, account=account):
 			handle_error_output(
 				ctx, "greet",
 				code="ALREADY_GREETED",
 				message="已向该招聘者打过招呼",
-				hints={"next_actions": ["boss search <query> — 搜索其他职位"]},
+				hints={"next_actions": [boss_command_for_ctx(ctx, "search <query>")]},
 			)
 			return
 
-		auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
 		with get_platform_instance(ctx, auth) as platform:
 			# greet_before hook — allows veto
 			hooks = ctx.obj.get("hooks")
@@ -63,26 +76,45 @@ def greet_cmd(ctx: click.Context, security_id: str, job_id: str, message: str) -
 					"source": "greet",
 				})
 				if veto:
+					recoverable, recovery_action = error_contract_for_code("HOOK_BLOCKED")
 					handle_error_output(
 						ctx, "greet", code="HOOK_BLOCKED",
 						message=f"打招呼被钩子阻止: {veto}",
-						recoverable=True,
+						recoverable=recoverable,
+						recovery_action=recovery_action,
 					)
 					return
 
 			resp = platform.greet(security_id, job_id, message)
 			if not platform.is_success(resp):
-				error_code, _ = platform.parse_error(resp)
-				handle_error_output(
-					ctx, "greet",
-					code=error_code if error_code != "UNKNOWN" else "NETWORK_ERROR",
-					message=resp.get("message") or "打招呼失败",
-					recoverable=True,
-					recovery_action="重试",
+				# 风控码必须走 RISK_ERROR_CONTRACTS：不可恢复、不提示重试，
+				# 与 apply / batch-greet 的风险终止语义保持一致。
+				handle_platform_error_output(
+					ctx,
+					"greet",
+					platform,
+					resp,
+					fallback_message="打招呼失败",
+					unknown_error_code="NETWORK_ERROR",
 				)
 				return
 
-			cache.record_greet(security_id, job_id)
+			try:
+				cache.record_greet(security_id, job_id, account=account)
+			except Exception:
+				# 平台已确认招呼发出，本地记账失败不能降级成 NETWORK_ERROR「重试」：
+				# 重跑会绕过 is_greeted 检查，把同一个人再打一次招呼。
+				recoverable, recovery_action = error_contract_for_code("LOCAL_STATE_WRITE_FAILED")
+				handle_error_output(
+					ctx, "greet",
+					code="LOCAL_STATE_WRITE_FAILED",
+					message="已向该招聘者打招呼，但本地状态保存失败；不要自动重发",
+					recoverable=recoverable,
+					recovery_action=recovery_action,
+					details={"security_id": security_id, "job_id": job_id, "greeted": True, "recorded": False},
+					hints={"operator_actions": ["先在 BOSS 直聘官方页面核对是否已打过招呼；不要自动重发本次招呼"]},
+				)
+				return
 
 			# greet_after hook
 			if hooks:
@@ -100,8 +132,8 @@ def greet_cmd(ctx: click.Context, security_id: str, job_id: str, message: str) -
 			}
 			hints = {
 				"next_actions": [
-					"boss search <query> — 继续搜索其他职位",
-					"boss recommend — 获取个性化推荐",
+					boss_command_for_ctx(ctx, "search <query>"),
+					boss_command_for_ctx(ctx, "recommend"),
 				],
 			}
 			handle_output(
@@ -121,7 +153,7 @@ def greet_cmd(ctx: click.Context, security_id: str, job_id: str, message: str) -
 @click.option("--scale", default=None, type=click.Choice(list(SCALE_CODES.keys()), case_sensitive=False), help="公司规模（如 100-499人）")
 @click.option("--stage", default=None, type=click.Choice(list(STAGE_CODES.keys()), case_sensitive=False), help="融资阶段（如 已上市、A轮）")
 @click.option("--job-type", default=None, type=click.Choice(list(JOB_TYPE_CODES.keys()), case_sensitive=False), help="职位类型（全职/兼职/实习）")
-@click.option("--count", default=10, help="打招呼数量上限（最大 10）")
+@click.option("--count", default=10, type=click.IntRange(0), help="打招呼数量上限（最大 10）")
 @click.option("--dry-run", is_flag=True, default=False, help="仅模拟执行，不实际打招呼")
 @click.pass_context
 @handle_auth_errors("batch-greet")
@@ -135,8 +167,29 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 
 	count = min(count, 10)
 
+	# 筛选条件必须在搜索之前校验：非法城市会抛 ValueError 被兜成可重试的
+	# NETWORK_ERROR；未知薪资 / 经验 / 学历会被静默丢弃，等于不筛选就直接打招呼。
+	try:
+		ensure_supported_city(city)
+	except ValueError as exc:
+		handle_error_output(
+			ctx, "batch-greet", code="INVALID_PARAM", message=str(exc),
+			hints={"next_actions": [boss_command_for_ctx(ctx, "cities")]},
+		)
+		return
+	try:
+		resolve_search_code_params(
+			salary=salary, experience=experience, education=education,
+			industry=industry, scale=scale, stage=stage, job_type=job_type,
+		)
+	except ValueError as exc:
+		handle_error_output(ctx, "batch-greet", code="INVALID_PARAM", message=str(exc))
+		return
+
+	auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
+	account = account_scope(auth)
+
 	with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
-		auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
 		with get_platform_instance(ctx, auth) as platform:
 			raw = platform.search_jobs(
 				query, city=city, salary=salary, experience=experience,
@@ -144,12 +197,13 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 				stage=stage, job_type=job_type,
 			)
 			if not platform.is_success(raw):
-				code, message = platform.parse_error(raw)
-				handle_error_output(
-					ctx, "batch-greet",
-					code=code,
-					message=message or "搜索结果获取失败",
-					recoverable=False,
+				# 搜索阶段就命中风控时同样要走风险契约：不可恢复、不提示重试。
+				handle_platform_error_output(
+					ctx,
+					"batch-greet",
+					platform,
+					raw,
+					fallback_message="搜索结果获取失败",
 				)
 				return
 			platform_data = platform.unwrap_data(raw) or {}
@@ -166,16 +220,18 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 				job_type=job_type,
 			)
 
-			candidates = []
+			candidates: list[JobItem] = []
 			for raw_item in deduplicate_job_result(job_list):
+				# 上限必须在下一次收集之前判断：放在 append 之后时 --count 0 仍会
+				# 收进 1 个候选并真实发出招呼（写操作）。
+				if len(candidates) >= count:
+					break
 				matches, _ = prefilter_platform_job_type(raw_item, criteria, platform_name=platform.name)
 				if not matches:
 					continue
 				item = JobItem.from_api(raw_item)
-				if not cache.is_greeted(item.security_id):
+				if not cache.is_greeted(item.security_id, job_id=item.job_id, account=account):
 					candidates.append(item)
-				if len(candidates) >= count:
-					break
 
 			if dry_run:
 				items = [item.to_dict() for item in candidates]
@@ -192,6 +248,8 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 			results = []
 			stopped_reason = None
 			risk_error: PlatformRiskError | None = None
+			stop_error: Exception | None = None
+			cache_write_failed = False
 
 			for idx, item in enumerate(candidates):
 				retry_count = 0
@@ -208,14 +266,22 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 								# 不再靠 message 里的「频率」字样误判成 RATE_LIMITED（Issue #419）。
 								raise risk_cls(error_message or error_code)
 							raise RuntimeError(error_code if error_code != "UNKNOWN" else (resp.get("message") or "greet failed"))
-						cache.record_greet(item.security_id, item.job_id)
-						results.append({
+						entry: dict[str, Any] = {
 							"security_id": item.security_id,
 							"job_id": item.job_id,
 							"title": item.title,
 							"company": item.company,
 							"status": "success",
-						})
+						}
+						try:
+							cache.record_greet(item.security_id, item.job_id, account=account)
+						except Exception:
+							# 记账失败不能落进下面的通用失败分支：那会 sleep 后重发同一个招呼。
+							# 标记后停止批次，由收尾逻辑输出不可重试的本地状态错误。
+							entry["recorded"] = False
+							cache_write_failed = True
+							logger.warning(f"本地记账失败，停止批量打招呼: {item.title} @ {item.company}")
+						results.append(entry)
 						success = True
 						logger.info(f"打招呼成功: {item.title} @ {item.company}")
 						break
@@ -226,6 +292,12 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 						logger.warning(f"平台风控，停止批量打招呼: {item.title} @ {item.company}")
 						break
 					except Exception as e:
+						if is_request_stop(e):
+							# 预算/超时不是普通失败：不 sleep、不重试、不继续下一个候选人。
+							stop_error = e
+							stopped_reason = getattr(e, "code", None) or "REQUEST_BUDGET_EXHAUSTED"
+							logger.warning(f"请求预算耗尽，停止批量打招呼: {item.title} @ {item.company}")
+							break
 						error_msg = str(e)
 						if "RATE_LIMITED" in error_msg or "频率" in error_msg:
 							stopped_reason = "RATE_LIMITED"
@@ -251,6 +323,9 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 				if stopped_reason:
 					break
 
+				if cache_write_failed:
+					break
+
 				if success and idx < len(candidates) - 1:
 					bg_delay = ctx.obj.get("config", {}).get("batch_greet_delay", [2.0, 5.0])
 					time.sleep(random.uniform(bg_delay[0], bg_delay[1]))
@@ -264,6 +339,40 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 			if stopped_reason:
 				data["stopped_reason"] = stopped_reason
 
+			if cache_write_failed:
+				# 已发出的招呼不能因为本地记账失败被重发；先停下来让操作者核对。
+				data["stopped_reason"] = "LOCAL_STATE_WRITE_FAILED"
+				recoverable, recovery_action = error_contract_for_code("LOCAL_STATE_WRITE_FAILED")
+				handle_error_output(
+					ctx, "batch-greet",
+					code="LOCAL_STATE_WRITE_FAILED",
+					message="部分招呼已发送，但本地状态保存失败；已停止剩余候选人，不要自动重发",
+					recoverable=recoverable,
+					recovery_action=recovery_action,
+					details=data,
+					hints={
+						"operator_actions": [
+							"先在 BOSS 直聘官方页面核对已发送的招呼；不要自动重发本次批次",
+							"确认磁盘空间与缓存目录权限后，再用 boss chat 核对会话",
+						]
+					},
+				)
+				return
+
+			if stop_error is not None:
+				# 预算/时限停止必须回 ok:false，不能让 Agent 把 stopped_reason 当成「稍后重试」。
+				stop_code = getattr(stop_error, "code", None) or "REQUEST_BUDGET_EXHAUSTED"
+				recoverable, recovery_action = error_contract_for_code(stop_code)
+				handle_error_output(
+					ctx, "batch-greet",
+					code=stop_code,
+					message=str(stop_error),
+					recoverable=recoverable,
+					recovery_action=recovery_action,
+					details=data,
+				)
+				return
+
 			if risk_error is not None:
 				# 停批原因是风控时信封必须是 ok:false + 对应错误码 + recoverable=false，
 				# 而不是 ok:true + stopped_reason——后者会让 Agent 当成「等一会儿重试」。
@@ -272,7 +381,7 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 				handle_error_output(
 					ctx, "batch-greet",
 					code=risk_error.code,
-					message=str(risk_error) or risk_error.code,
+					message=risk_error_message(risk_error.code),
 					recoverable=False,
 					recovery_action=recovery_action,
 					details=data,

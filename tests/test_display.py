@@ -12,10 +12,13 @@ from boss_agent_cli.api.browser_urls import is_zhipin_url
 from boss_agent_cli.display import (
 	boss_command_for_ctx,
 	is_json_mode,
+	json_forced,
 	handle_output,
 	handle_error_output,
 	handle_auth_errors,
+	handle_platform_error_output,
 	login_action_for_ctx,
+	risk_error_message,
 )
 
 
@@ -68,6 +71,25 @@ class TestIsJsonMode:
 		with patch.object(sys, "stdout") as mock_out:
 			mock_out.isatty.return_value = False
 			assert is_json_mode(None) is True
+
+
+class TestJsonForced:
+	"""`--json` 与「stdout 被管道接走」必须区分：前者是硬契约，后者是人工重定向。"""
+
+	def test_explicit_flag(self):
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True}
+		assert json_forced(ctx) is True
+
+	def test_piped_stdout_alone_does_not_count(self):
+		ctx = MagicMock()
+		ctx.obj = {"json_output": False}
+		with patch.object(sys, "stdout") as mock_out:
+			mock_out.isatty.return_value = False
+			assert json_forced(ctx) is False
+
+	def test_none_ctx(self):
+		assert json_forced(None) is False
 
 
 class TestHandleOutput:
@@ -330,6 +352,21 @@ class TestHandleErrorOutputTTY:
 			with pytest.raises(SystemExit):
 				handle_error_output(ctx, "test", code="ERR", message="bad")
 
+	def test_tty_mode_recovery_falls_back_to_registry(self, monkeypatch):
+		"""只传 code / message 时 TTY 也要展示登记表里的恢复指引。"""
+		import pytest
+		from boss_agent_cli.schema.error_codes import ERROR_CODES
+
+		ctx = MagicMock()
+		ctx.obj = {"json_output": False}
+		stream = _capture_display_console(monkeypatch)
+		with patch.object(sys, "stdout") as mock_out:
+			mock_out.isatty.return_value = True
+			with pytest.raises(SystemExit):
+				handle_error_output(ctx, "test", code="NETWORK_ERROR", message="请求失败")
+
+		assert ERROR_CODES["NETWORK_ERROR"]["recovery_action"] in stream.getvalue()
+
 
 # ── handle_auth_errors AccountRiskError 分支 ─────────────────
 
@@ -366,6 +403,75 @@ class TestHandleAuthErrorsAccountRisk:
 			kwargs = mock_err.call_args[1]
 			assert kwargs["recoverable"] is False
 			assert "客服" in kwargs["recovery_action"]
+
+	def test_account_risk_message_uses_registry_text(self):
+		"""风控信封不透传平台响应文本，只给错误码登记表里的稳定文案。"""
+		from boss_agent_cli.api.client import AccountRiskError
+
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True}
+
+		@handle_auth_errors("search")
+		def impl(ctx):
+			raise AccountRiskError("fixture-platform-response-token", is_cdp=True)
+
+		with patch("boss_agent_cli.display.handle_error_output") as mock_err:
+			impl(ctx)
+			kwargs = mock_err.call_args[1]
+			assert kwargs["message"] == risk_error_message("ACCOUNT_RISK")
+			assert "fixture-platform-response-token" not in kwargs["message"]
+
+
+# ── handle_platform_error_output 风控分支 ─────────────────────
+
+
+class TestHandlePlatformErrorOutput:
+	def test_risk_code_message_uses_registry_text(self):
+		"""响应字典形态的风控码同样不透传平台响应原文。"""
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True}
+		platform = MagicMock()
+		platform.parse_error.return_value = ("ACCOUNT_RISK", "fixture-platform-response-token")
+
+		with patch("boss_agent_cli.display.handle_error_output") as mock_err:
+			handle_platform_error_output(
+				ctx, "search", platform, {"code": 36}, fallback_message="搜索失败"
+			)
+			kwargs = mock_err.call_args[1]
+			assert kwargs["code"] == "ACCOUNT_RISK"
+			assert kwargs["message"] == risk_error_message("ACCOUNT_RISK")
+			assert "fixture-platform-response-token" not in kwargs["message"]
+
+	def test_non_risk_code_keeps_platform_message(self):
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True}
+		platform = MagicMock()
+		platform.parse_error.return_value = ("RATE_LIMITED", "请求过于频繁")
+
+		with patch("boss_agent_cli.display.handle_error_output") as mock_err:
+			handle_platform_error_output(
+				ctx, "search", platform, {"code": 9}, fallback_message="搜索失败"
+			)
+			kwargs = mock_err.call_args[1]
+			assert kwargs["message"] == "请求过于频繁"
+
+	def test_unknown_code_uses_registered_recovery_action(self):
+		"""未识别的平台错误也要给出登记表里的恢复指引，不能是 null。"""
+		from boss_agent_cli.schema.error_codes import ERROR_CODES
+
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True}
+		platform = MagicMock()
+		platform.parse_error.return_value = ("UNKNOWN", "服务开小差了")
+
+		with patch("boss_agent_cli.display.handle_error_output") as mock_err:
+			handle_platform_error_output(
+				ctx, "search", platform, {"code": 999}, fallback_message="搜索失败"
+			)
+			kwargs = mock_err.call_args[1]
+		assert kwargs["code"] == "UNKNOWN"
+		assert kwargs["recoverable"] is False
+		assert kwargs["recovery_action"] == ERROR_CODES["UNKNOWN"]["recovery_action"]
 
 
 # ── 各 renderer 冒烟测试（调用不抛异常即可覆盖） ────────────

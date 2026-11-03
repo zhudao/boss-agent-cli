@@ -4,11 +4,13 @@ from typing import Any
 
 import click
 
+from boss_agent_cli.api.client import RISK_ERROR_BY_CODE
+from boss_agent_cli.api.request_budget import is_request_stop
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._recruiter_platform import get_recruiter_platform_instance
 from boss_agent_cli.services.chat_utils import MSG_STATUS_LABELS
-from boss_agent_cli.display import handle_auth_errors, handle_output, handle_platform_error_output
+from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_output, handle_platform_error_output
 
 
 _RECRUITER_MSG_STATUS_LABELS = {0: "发送中", **MSG_STATUS_LABELS}
@@ -302,7 +304,11 @@ def _page_summaries(platform: Any) -> tuple[dict[int, dict[str, Any]], dict[str,
 		return {}, None
 	try:
 		snapshot = snapshot_fn()
-	except Exception:  # noqa: BLE001 — 页面快照只是增强，失败退回接口/列表字段
+	except Exception as exc:  # noqa: BLE001 — 页面快照只是增强，失败退回接口/列表字段
+		# 风控 / 预算停止不是“快照不可用”：吞掉后调用方还会继续发 userLastMsg 请求，
+		# 违反「命中风控立即停止」的硬边界。页面快照的普通失败仍按增强项降级。
+		if is_request_stop(exc):
+			raise
 		return {}, None
 	if not isinstance(snapshot, dict) or not snapshot.get("ok"):
 		return {}, None
@@ -350,6 +356,10 @@ def _fetch_last_messages(
 			stats["failed_response"] = result
 			if isinstance(result, dict):
 				code, message = platform.parse_error(result)
+				risk_cls = RISK_ERROR_BY_CODE.get(code)
+				if risk_cls is not None:
+					# 响应字典形态的风控同样是停止信号：不能降级成 partial_error 后继续输出 ok:true。
+					raise risk_cls(message or code)
 				stats["error"] = message or f"code={result.get('code')}"
 				if code is not None:
 					stats["error_code"] = code
@@ -407,9 +417,9 @@ def _enrich_chat_summaries(
 
 
 @click.command("chat")
-@click.option("--page", default=1, type=int, help="页码")
+@click.option("--page", default=1, type=click.IntRange(min=1), help="页码")
 @click.option("--job-id", default=None, help="按职位筛选")
-@click.option("--label-id", default=0, type=int, help="按标签筛选（0=全部, 1=新招呼, 2=沟通中）")
+@click.option("--label-id", default=0, type=click.IntRange(min=0), help="按标签筛选（0=全部, 1=新招呼, 2=沟通中）")
 @click.option(
 	"--summary-limit", default=DEFAULT_SUMMARY_LIMIT, show_default=True,
 	type=click.IntRange(0, MAX_SUMMARY_LIMIT),
@@ -435,8 +445,8 @@ def recruiter_chat_cmd(ctx: click.Context, page: int, job_id: str | None, label_
 		friend_items = _friend_items(data)
 		summary_hint = _enrich_chat_summaries(platform, friend_items, summary_limit=summary_limit)
 		hints: dict[str, Any] = {"next_actions": [
-			"boss hr resume <geek_id> --job-id <id> --security-id <id> — 查看候选人简历",
-			"boss hr chatmsg <friend_id> — 查看候选人沟通上下文",
+			boss_command_for_ctx(ctx, "hr resume <geek_id> --job-id <id> --security-id <id>"),
+			boss_command_for_ctx(ctx, "hr chatmsg <friend_id>"),
 		]}
 		# 未读总数只读页面内存（uncountTab$），不额外发请求；放在 hints 顶层，拿不到为 null。
 		hints.update(_unread_totals(summary_hint.get("page_snapshot")))
@@ -446,9 +456,9 @@ def recruiter_chat_cmd(ctx: click.Context, page: int, job_id: str | None, label_
 
 
 @click.command("chatmsg")
-@click.argument("friend_id", type=int)
-@click.option("--count", default=20, type=int, help="消息数量")
-@click.option("--max-msg-id", default=None, type=int, help="向前翻页的最大消息 ID")
+@click.argument("friend_id", type=click.IntRange(min=1))
+@click.option("--count", default=20, type=click.IntRange(min=1), help="消息数量")
+@click.option("--max-msg-id", default=None, type=click.IntRange(min=1), help="向前翻页的最大消息 ID")
 @click.pass_context
 @handle_auth_errors("recruiter-chatmsg")
 def recruiter_chatmsg_cmd(ctx: click.Context, friend_id: int, count: int, max_msg_id: int | None) -> None:
@@ -469,17 +479,17 @@ def recruiter_chatmsg_cmd(ctx: click.Context, friend_id: int, count: int, max_ms
 		handle_output(
 			ctx, "recruiter-chatmsg", data,
 			hints={"next_actions": [
-				f"boss hr reply {friend_id} <message> — 回复候选人消息",
-				"boss hr chat — 返回沟通列表",
+				boss_command_for_ctx(ctx, f"hr reply {friend_id} <message>"),
+				boss_command_for_ctx(ctx, "hr chat"),
 			]},
 		)
 
 
 @click.command("last-messages")
-@click.option("--page", default=1, type=int, help="沟通列表页码")
+@click.option("--page", default=1, type=click.IntRange(min=1), help="沟通列表页码")
 @click.option("--job-id", default=None, help="按职位筛选")
-@click.option("--label-id", default=0, type=int, help="按标签筛选（0=全部, 1=新招呼, 2=沟通中）")
-@click.option("--friend-id", "friend_ids", multiple=True, type=int, help="指定候选人会话 friend_id，可重复")
+@click.option("--label-id", default=0, type=click.IntRange(min=0), help="按标签筛选（0=全部, 1=新招呼, 2=沟通中）")
+@click.option("--friend-id", "friend_ids", multiple=True, type=click.IntRange(min=1), help="指定候选人会话 friend_id，可重复")
 @click.option(
 	"--limit", default=DEFAULT_SUMMARY_LIMIT, show_default=True,
 	type=click.IntRange(1, MAX_SUMMARY_LIMIT),
@@ -536,7 +546,7 @@ def recruiter_last_messages_cmd(
 			ctx, "recruiter-last-messages",
 			output,
 			hints={"next_actions": [
-				"boss hr chatmsg <friend_id> — 查看候选人沟通上下文",
-				"boss hr reply <friend_id> <message> — 回复候选人消息",
+				boss_command_for_ctx(ctx, "hr chatmsg <friend_id>"),
+				boss_command_for_ctx(ctx, "hr reply <friend_id> <message>"),
 			]},
 		)

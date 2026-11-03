@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from click.testing import CliRunner
+from boss_agent_cli.display import risk_error_message
 from boss_agent_cli.main import cli
 from boss_agent_cli.search_filters import SearchPipelinePlatformError
 
@@ -113,6 +114,34 @@ def test_status_reports_user_info_error(mock_auth_cls, mock_client_cls):
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "TOKEN_REFRESH_FAILED"
 	assert parsed["error"]["message"] == "stoken expired"
+	assert parsed["error"]["recoverable"] is True
+	assert parsed["error"]["recovery_action"] == "boss login"
+	assert parsed["hints"]["auth_health"]["primary_name"] == "wt2"
+
+
+@patch("boss_agent_cli.commands.status.get_platform_instance")
+@patch("boss_agent_cli.commands.status.AuthManager")
+def test_status_live_risk_uses_stop_contract_and_keeps_auth_health(mock_auth_cls, mock_client_cls):
+	"""风控码要带回停止指引，同时保留 status 自己的诊断字段。"""
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {"wt2": "x"}, "stoken": "s"}
+	mock_client = mock_client_cls.return_value
+	mock_client.__enter__ = lambda self: self
+	mock_client.__exit__ = lambda self, *a: None
+	mock_client.is_success.return_value = False
+	mock_client.user_info.return_value = {"code": 36, "message": "risk"}
+	mock_client.parse_error.return_value = ("ACCOUNT_RISK", "risk")
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--json", "status", "--live"])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "ACCOUNT_RISK"
+	assert parsed["error"]["recoverable"] is False
+	assert "停止自动化访问" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"]
+	assert parsed["hints"]["auth_health"]["primary_name"] == "wt2"
+	assert "checks" in parsed["hints"]
 
 
 @patch("boss_agent_cli.commands.search.CacheStore")
@@ -588,7 +617,98 @@ def test_search_cache_key_includes_current_result_schema(mock_client_cls, mock_a
 
 	assert result.exit_code == 0
 	cache_params = mock_cache.get_search.call_args.args[0]
-	assert cache_params["cache_schema"] == 3
+	assert cache_params["cache_schema"] == 4
+	assert "account" in cache_params
+	mock_pipeline.assert_not_called()
+
+
+@patch("boss_agent_cli.commands.search.run_search_pipeline")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.AuthManager")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+def test_search_corrupt_cache_entry_falls_back_to_live_search(
+	mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline,
+):
+	"""缓存条目损坏或结构漂移时按未命中处理，而不是 traceback。"""
+	mock_cache = _ctx_mock(mock_cache_cls)
+	_ctx_mock(mock_client_cls)
+	mock_auth_cls.return_value.account_fingerprint.return_value = "acct_a"
+	mock_pipeline.return_value = SimpleNamespace(
+		items=[],
+		has_more=False,
+		total=0,
+		stats=SimpleNamespace(
+			pages_scanned=1,
+			jobs_seen=0,
+			jobs_prefiltered=0,
+			detail_checks=0,
+		),
+	)
+
+	for cached in ("{not json", json.dumps({"items": []}), json.dumps({"data": {}})):
+		mock_cache.get_search.return_value = cached
+		mock_pipeline.reset_mock()
+
+		result = CliRunner().invoke(cli, ["search", "产品"])
+
+		assert result.exit_code == 0, result.output
+		mock_pipeline.assert_called_once()
+		# 重新搜索会用新结果覆盖同键的坏条目。
+		mock_cache.put_search.assert_called()
+
+
+@patch("boss_agent_cli.commands.search.run_search_pipeline")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.AuthManager")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+def test_search_cache_scope_uses_current_account(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline):
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.get_search.return_value = None
+	_ctx_mock(mock_client_cls)
+	mock_auth_cls.return_value.account_fingerprint.return_value = "acct_a"
+	mock_pipeline.return_value = SimpleNamespace(
+		items=[],
+		has_more=False,
+		total=0,
+		stats=SimpleNamespace(
+			pages_scanned=1,
+			jobs_seen=0,
+			jobs_prefiltered=0,
+			detail_checks=0,
+		),
+	)
+
+	result = CliRunner().invoke(cli, ["search", "产品"])
+
+	assert result.exit_code == 0
+	assert mock_cache.get_search.call_args.args[0]["account"] == "acct_a"
+	assert mock_cache.put_search.call_args.args[0]["account"] == "acct_a"
+
+
+@patch("boss_agent_cli.commands.search.run_search_pipeline")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.AuthManager")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+def test_search_cache_hit_recomputes_greeted_for_current_account(
+	mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline,
+):
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.get_search.return_value = json.dumps({
+		"data": [
+			{"security_id": "sec_1", "job_id": "job_1", "greeted": False},
+			{"security_id": "sec_2", "job_id": "job_2", "greeted": True},
+		],
+		"pagination": {"page": 1, "has_more": False, "total": 2},
+		"hints": None,
+	})
+	mock_auth_cls.return_value.account_fingerprint.return_value = "acct_a"
+	mock_cache.is_greeted.side_effect = lambda sid, *, job_id="", account="": job_id == "job_1"
+
+	result = CliRunner().invoke(cli, ["search", "产品"])
+
+	assert result.exit_code == 0
+	assert [item["greeted"] for item in json.loads(result.output)["data"]] == [True, False]
+	assert mock_cache.is_greeted.call_args_list[0].kwargs == {"job_id": "job_1", "account": "acct_a"}
 	mock_pipeline.assert_not_called()
 
 
@@ -720,8 +840,13 @@ def test_search_json_hints_expose_available_candidate_actions(mock_client_cls, m
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
-	assert "使用 boss detail <security_id> 查看职位详情" in actions
-	assert "使用 boss apply <security_id> <job_id> 投递，或 boss greet <security_id> <job_id> 沟通" in actions
+	# next_actions 的每条都必须能直接执行：说明性文字放 operator_actions。
+	assert actions == [
+		"boss detail <security_id>",
+		"boss apply <security_id> <job_id>",
+		"boss greet <security_id> <job_id>",
+	]
+	assert all("使用 " not in action and " — " not in action for action in actions)
 	mock_save_index.assert_called_once()
 
 
@@ -815,7 +940,8 @@ def test_export_reports_search_error(mock_auth_cls, mock_client_cls):
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "ACCOUNT_RISK"
-	assert parsed["error"]["message"] == "account risk"
+	assert parsed["error"]["message"] == risk_error_message("ACCOUNT_RISK")
+	assert "account risk" not in parsed["error"]["message"]
 
 
 def _make_friend_item(name, brand, relation_type, last_ts):
@@ -902,6 +1028,16 @@ def test_chat_days_filter(mock_auth_cls, mock_client_cls):
 	assert parsed["ok"] is True
 	assert len(parsed["data"]) == 1
 	assert parsed["data"][0]["brand_name"] == "阿里"
+
+
+def test_chat_rejects_overflowing_days():
+	"""天数值大到 timedelta / float 转换溢出时，参数错误在 fetch 前就返回信封。"""
+	runner = CliRunner()
+	result = runner.invoke(cli, ["chat", "--days", "9" * 400])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "INVALID_PARAM"
 
 
 @patch("boss_agent_cli.commands.chat.get_platform_instance")
@@ -1054,6 +1190,132 @@ def test_chat_export_csv(mock_auth_cls, mock_client_cls, tmp_path):
 		content = f.read()
 	assert "name,title,brand_name" in content
 	assert "张HR" in content
+
+
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_export_unwritable_export_dir_returns_local_io_error(mock_auth_cls, mock_client_cls, tmp_path):
+	"""export_dir 指向同名文件时是本地 IO 错误，不能报成可重试的 NETWORK_ERROR。"""
+	import time
+	now_ms = int(time.time() * 1000)
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {}}
+	_ctx_mock(mock_client_cls)
+	mock_client_cls.return_value.friend_list.return_value = {
+		"zpData": {
+			"result": [
+				_make_friend_item("张HR", "阿里", 1, now_ms),
+			],
+		},
+	}
+	blocker = tmp_path / "blocked"
+	blocker.write_text("not a directory", encoding="utf-8")
+	(tmp_path / "config.json").write_text(json.dumps({"export_dir": str(blocker)}), encoding="utf-8")
+
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "chat", "--export", "json"])
+	parsed = json.loads(result.output)
+	assert result.exit_code == 1
+	assert parsed["error"]["code"] == "LOCAL_IO_ERROR"
+	assert parsed["error"]["recoverable"] is False
+	assert "本地文件读写失败" in parsed["error"]["message"]
+	assert "不要自动重试" in parsed["error"]["recovery_action"]
+
+
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_export_non_string_export_dir_returns_invalid_param(mock_auth_cls, mock_client_cls, tmp_path):
+	"""config.json 的 export_dir 不是字符串时不能抛 os.path.expanduser 的 TypeError。"""
+	import time
+	now_ms = int(time.time() * 1000)
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {}}
+	_ctx_mock(mock_client_cls)
+	mock_client_cls.return_value.friend_list.return_value = {
+		"zpData": {
+			"result": [
+				_make_friend_item("张HR", "阿里", 1, now_ms),
+			],
+		},
+	}
+	(tmp_path / "config.json").write_text(json.dumps({"export_dir": 9}), encoding="utf-8")
+
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "chat", "--export", "json"])
+	parsed = json.loads(result.output)
+	assert result.exit_code == 1
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "export_dir" in parsed["error"]["message"]
+	assert "9" in parsed["error"]["message"]
+	assert parsed["error"]["recoverable"] is True
+	assert "config reset export_dir" in parsed["error"]["recovery_action"]
+
+
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_export_container_export_dir_returns_invalid_param(mock_auth_cls, mock_client_cls, tmp_path):
+	"""数组 / 对象形态的 export_dir 同样按参数错误处理。"""
+	import time
+	now_ms = int(time.time() * 1000)
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {}}
+	_ctx_mock(mock_client_cls)
+	mock_client_cls.return_value.friend_list.return_value = {
+		"zpData": {"result": [_make_friend_item("张HR", "阿里", 1, now_ms)]},
+	}
+	for value in (["/tmp/exports"], {"path": "/tmp/exports"}):
+		(tmp_path / "config.json").write_text(json.dumps({"export_dir": value}), encoding="utf-8")
+
+		result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "chat", "--export", "json"])
+		parsed = json.loads(result.output)
+		assert result.exit_code == 1
+		assert parsed["error"]["code"] == "INVALID_PARAM"
+		assert repr(value) in parsed["error"]["message"]
+
+
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_export_output_path_outside_data_dir_is_written(mock_auth_cls, mock_client_cls, tmp_path):
+	"""-o 指定的绝对路径不在当前目录或数据目录下时也要照写，不能报「输出路径不安全」。"""
+	import time
+	now_ms = int(time.time() * 1000)
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {}}
+	_ctx_mock(mock_client_cls)
+	mock_client_cls.return_value.friend_list.return_value = {
+		"zpData": {"result": [_make_friend_item("张HR", "阿里", 1, now_ms)]},
+	}
+	data_dir = tmp_path / "data"
+	data_dir.mkdir()
+	output_path = tmp_path / "elsewhere" / "chat.json"
+
+	result = CliRunner().invoke(cli, [
+		"--data-dir", str(data_dir), "chat", "--export", "json", "-o", str(output_path),
+	])
+	parsed = json.loads(result.output)
+	assert result.exit_code == 0
+	assert parsed["ok"] is True
+	assert parsed["data"]["path"] == str(output_path)
+	assert output_path.exists()
+
+
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_export_output_path_expands_home(mock_auth_cls, mock_client_cls, tmp_path, monkeypatch):
+	"""-o ~/chat.json 要展开到用户主目录，而不是在当前目录建一个名叫 ~ 的目录。"""
+	import time
+	now_ms = int(time.time() * 1000)
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {}}
+	_ctx_mock(mock_client_cls)
+	mock_client_cls.return_value.friend_list.return_value = {
+		"zpData": {"result": [_make_friend_item("张HR", "阿里", 1, now_ms)]},
+	}
+	home = tmp_path / "home"
+	home.mkdir()
+	monkeypatch.setenv("HOME", str(home))
+
+	result = CliRunner().invoke(cli, [
+		"--data-dir", str(tmp_path / "data"), "chat", "--export", "json", "-o", "~/chat.json",
+	])
+	parsed = json.loads(result.output)
+	assert result.exit_code == 0
+	assert parsed["data"]["path"] == str(home / "chat.json")
+	assert (home / "chat.json").exists()
+	assert not (tmp_path / "~").exists()
 
 
 @patch("boss_agent_cli.commands.chat.get_platform_instance")
@@ -1615,6 +1877,49 @@ def test_search_reports_pipeline_platform_error(mock_client_cls, mock_auth_cls, 
 	assert parsed["error"]["message"] == "service unavailable"
 
 
+@patch("boss_agent_cli.commands.search.run_search_pipeline")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.AuthManager")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+def test_search_pipeline_risk_uses_stop_contract(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline):
+	"""响应字典形态的风控码被包成 SearchPipelinePlatformError 时也要停止。"""
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.get_search.return_value = None
+	_ctx_mock(mock_client_cls)
+	mock_pipeline.side_effect = SearchPipelinePlatformError("ACCOUNT_RISK", "fixture-platform-response-token")
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["search", "golang"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "ACCOUNT_RISK"
+	assert parsed["error"]["message"] == risk_error_message("ACCOUNT_RISK")
+	assert "fixture-platform-response-token" not in parsed["error"]["message"]
+	assert parsed["error"]["recoverable"] is False
+	assert "停止自动化访问" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"]
+
+
+@patch("boss_agent_cli.commands.search.run_search_pipeline")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.AuthManager")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+def test_search_pipeline_auth_expired_is_recoverable(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline):
+	"""登录过期是可恢复错误，不能硬编码成不可恢复。"""
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.get_search.return_value = None
+	_ctx_mock(mock_client_cls)
+	mock_pipeline.side_effect = SearchPipelinePlatformError("AUTH_EXPIRED", "expired")
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["search", "golang"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "AUTH_EXPIRED"
+	assert parsed["error"]["recoverable"] is True
+	assert parsed["error"]["recovery_action"] == "boss login"
+
+
 @patch("boss_agent_cli.commands.search.CacheStore")
 @patch("boss_agent_cli.commands.search.AuthManager")
 @patch("boss_agent_cli.commands.search.get_platform_instance")
@@ -1688,7 +1993,8 @@ def test_detail_json_hints_expose_available_candidate_actions(mock_client_cls, m
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
-	assert "boss apply <security_id> <job_id> 或 boss greet <security_id> <job_id>" in actions
+	assert "boss apply <security_id> <job_id>" in actions
+	assert "boss greet <security_id> <job_id>" in actions
 
 
 @patch("boss_agent_cli.commands.show.CacheStore")
@@ -1724,7 +2030,8 @@ def test_show_json_hints_expose_available_candidate_actions(mock_get_job, mock_c
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
-	assert "boss apply <security_id> <job_id> 或 boss greet <security_id> <job_id>" in actions
+	assert "boss apply <security_id> <job_id>" in actions
+	assert "boss greet <security_id> <job_id>" in actions
 
 
 @patch("boss_agent_cli.commands.stats._collect_stats")
@@ -1743,4 +2050,21 @@ def test_stats_json_hints_expose_available_application_action(mock_collect_stats
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
-	assert "使用 boss apply <security_id> <job_id> 继续投递" in actions
+	assert "boss apply <security_id> <job_id>" in actions
+
+
+def test_corrupt_cache_database_returns_envelope_not_traceback(tmp_path):
+	"""库文件被写坏时，异常发生在命令自己的 try 之外，启动期兜底也要给信封。"""
+	db = tmp_path / "cache" / "boss_agent.db"
+	db.parent.mkdir(parents=True)
+	db.write_bytes(b"not a sqlite database")
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "--json", "preset", "list"])
+	assert result.exit_code == 1, result.output
+	payload = json.loads(result.output)
+	assert payload["ok"] is False
+	assert payload["command"] == "preset"
+	assert payload["error"]["code"] == "CACHE_DATABASE_INVALID"
+	assert payload["error"]["recoverable"] is True
+	assert str(db) in payload["error"]["message"]
+	assert str(db) in payload["hints"]["operator_actions"][0]
+	assert "备份" in payload["error"]["recovery_action"]

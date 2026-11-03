@@ -4,6 +4,19 @@ from pathlib import Path
 from typing import Any
 
 from boss_agent_cli.resume.models import ResumeData, ResumeFile, dict_to_resume, resume_to_dict
+from boss_agent_cli.services.json_files import write_json_atomic
+
+
+class ResumeImportError(ValueError):
+	"""导入文件不是可用的简历 JSON；消息是给用户看的修复指引。"""
+
+
+class ResumeAlreadyExistsError(ValueError):
+	"""导入时遇到同名简历，且没有显式要求覆盖。"""
+
+	def __init__(self, name: str):
+		super().__init__(name)
+		self.name = name
 
 
 def _safe_filename(name: str) -> str:
@@ -27,12 +40,15 @@ class ResumeStore:
 		for path in sorted(self._dir.glob("*.json")):
 			try:
 				raw = json.loads(path.read_text(encoding="utf-8"))
+				if not isinstance(raw, dict):
+					# 手写坏的简历文件不该让整份列表都打不开。
+					continue
 				results.append({
 					"name": raw.get("name", ""),
 					"title": raw.get("title", ""),
 					"updated_at": raw.get("updated_at", ""),
 				})
-			except (json.JSONDecodeError, OSError):
+			except (json.JSONDecodeError, UnicodeDecodeError, OSError):
 				continue
 		return results
 
@@ -43,16 +59,20 @@ class ResumeStore:
 			return None
 		try:
 			raw = json.loads(path.read_text(encoding="utf-8"))
+			if not isinstance(raw, dict):
+				return None
 			return dict_to_resume(raw)
-		except (json.JSONDecodeError, OSError):
+		except (json.JSONDecodeError, UnicodeDecodeError, OSError, AttributeError, TypeError):
+			# 字段类型写错（如 personal_info 写成数组）时模型解析会抛 AttributeError：
+			# 与语法损坏同样按「读不出来」处理，避免 resume show 甩 traceback。
 			return None
 
 	def save(self, resume: ResumeData) -> None:
 		"""保存/更新简历，自动更新 updated_at"""
 		resume.updated_at = datetime.now().isoformat()
 		d = resume_to_dict(resume)
-		path = self._path_for(resume.name)
-		path.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+		# 原子写：编辑到一半被中断不能把用户唯一一份简历写成半截 JSON。
+		write_json_atomic(self._path_for(resume.name), d)
 
 	def delete(self, name: str) -> bool:
 		"""删除简历，返回是否成功"""
@@ -66,13 +86,33 @@ class ResumeStore:
 		"""检查简历是否存在"""
 		return self._path_for(name).exists()
 
-	def import_file(self, file_path: Path) -> ResumeData:
-		"""导入 JSON 文件（兼容 wzdnzd/zine0 camelCase 格式）"""
-		raw_text = file_path.read_text(encoding="utf-8")
-		raw = json.loads(raw_text)
+	def import_file(self, file_path: Path, *, overwrite: bool = False) -> ResumeData:
+		"""导入 JSON 文件（兼容 wzdnzd/zine0 camelCase 格式）。
 
-		if "version" in raw and "data" in raw and isinstance(raw["data"], dict):
+		文件里的 `name` 与已有简历同名时默认抛 `ResumeAlreadyExistsError`：
+		`save()` 是整份覆盖，导入一份旧备份会静默丢掉本地已有的编辑（`resume init` /
+		`resume clone` 都拒绝同名）。只有调用方显式要求覆盖时才继续。
+		"""
+		try:
+			raw_text = file_path.read_text(encoding="utf-8")
+		except UnicodeDecodeError as exc:
+			# GBK 保存的 JSON、误选的 PDF / 图片都会走到这里：报一句能指导操作的话，
+			# 而不是把 codecs 的 traceback 甩给调用方。
+			raise ResumeImportError("文件不是 UTF-8 编码的文本；请先转存为 UTF-8 的 JSON 再导入") from exc
+		try:
+			raw = json.loads(raw_text)
+		except json.JSONDecodeError as exc:
+			raise ResumeImportError(f"不是合法 JSON（第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}）") from exc
+
+		if isinstance(raw, dict) and "version" in raw and "data" in raw and isinstance(raw["data"], dict):
 			raw = raw["data"]
+		if not isinstance(raw, dict):
+			raise ResumeImportError("顶层必须是 JSON 对象")
+		name = raw.get("name")
+		if not isinstance(name, str) or not name.strip():
+			raise ResumeImportError("缺少非空字符串字段 name")
+		if not overwrite and self.exists(name):
+			raise ResumeAlreadyExistsError(name)
 
 		resume = dict_to_resume(raw)
 		self.save(resume)

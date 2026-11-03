@@ -17,7 +17,9 @@ import click
 from rich.table import Table
 
 from boss_agent_cli import display
-from boss_agent_cli.display import handle_output, render_action_result
+from boss_agent_cli.cache.store import CacheDatabaseInvalid
+from boss_agent_cli.display import boss_command_for_ctx, handle_output, json_forced, render_action_result
+from boss_agent_cli.services.output_path import prepare_output_path
 
 
 def _safe_count(conn: sqlite3.Connection, table: str) -> int:
@@ -57,14 +59,19 @@ def _collect_stats(db_path: Path, days: int) -> dict[str, Any]:
 	since = time.time() - days * 86400
 	conn = sqlite3.connect(str(db_path))
 	try:
-		greeted_total = _safe_count(conn, "greet_records")
-		applied_total = _safe_count(conn, "apply_records")
-		shortlist_total = _safe_count(conn, "shortlist_records")
+		try:
+			greeted_total = _safe_count(conn, "greet_records")
+			applied_total = _safe_count(conn, "apply_records")
+			shortlist_total = _safe_count(conn, "shortlist_records")
 
-		greeted_window = _count_since(conn, "greet_records", "greeted_at", since)
-		applied_window = _count_since(conn, "apply_records", "applied_at", since)
-		shortlist_window = _count_since(conn, "shortlist_records", "created_at", since)
-		watch_window = _count_since(conn, "watch_hits", "first_seen_at", since)
+			greeted_window = _count_since(conn, "greet_records", "greeted_at", since)
+			applied_window = _count_since(conn, "apply_records", "applied_at", since)
+			shortlist_window = _count_since(conn, "shortlist_records", "created_at", since)
+			watch_window = _count_since(conn, "watch_hits", "first_seen_at", since)
+		except sqlite3.DatabaseError as exc:
+			# 只读聚合直接开 SQLite，不经过 CacheStore 的启动校验；库文件损坏时
+			# 交给 main.py 统一出 CACHE_DATABASE_INVALID 信封，而不是 traceback。
+			raise CacheDatabaseInvalid(db_path, str(exc)) from exc
 	finally:
 		conn.close()
 
@@ -95,15 +102,21 @@ def _build_hints(data: dict[str, Any]) -> list[str]:
 	greeted_total = funnel.get("greeted", 0)
 	applied_total = funnel.get("applied", 0)
 	if greeted_total == 0:
-		hints.append("boss search <query> 搜索职位")
+		hints.append("boss search <query>")
 	elif applied_total == 0 and greeted_total > 0:
-		hints.append("使用 boss apply <security_id> <job_id> 继续投递")
-	apply_rate = data.get("conversion", {}).get("apply_rate", 0)
-	if apply_rate < 0.1 and greeted_total >= 20:
-		hints.append("打招呼转投递率偏低，考虑调整目标岗位或优化简历（boss ai optimize）")
-	hints.append("boss pipeline 查看候选进度")
-	hints.append("boss follow-up 查看需要跟进的联系人")
+		hints.append("boss apply <security_id> <job_id>")
+	hints.append("boss pipeline")
+	hints.append("boss follow-up")
 	return hints
+
+
+def _build_operator_actions(data: dict[str, Any]) -> list[str]:
+	"""转化率建议属于操作者判断，放 operator_actions，不能混进可执行命令。"""
+	funnel = data.get("funnel", {})
+	apply_rate = data.get("conversion", {}).get("apply_rate", 0)
+	if apply_rate < 0.1 and funnel.get("greeted", 0) >= 20:
+		return ["打招呼转投递率偏低，考虑调整目标岗位或优化简历（boss ai optimize）"]
+	return []
 
 
 def _render_html(data: dict[str, Any]) -> str:
@@ -336,7 +349,9 @@ def _percent(value: Any) -> str:
 
 
 @click.command("stats")
-@click.option("--days", default=30, type=int, help="统计窗口天数（默认 30 天）")
+# 上限 100 年：`since = time.time() - days * 86400` 要把天数转成 float，
+# 无界的整数（如 10**400）会抛 OverflowError，命令连信封都发不出来。
+@click.option("--days", default=30, type=click.IntRange(min=0, max=36500), help="统计窗口天数（默认 30 天）")
 @click.option(
 	"--format", "output_format",
 	type=click.Choice(["json", "html"]),
@@ -347,7 +362,7 @@ def _percent(value: Any) -> str:
 	"-o", "--output", "output_path",
 	type=click.Path(dir_okay=False, writable=True, path_type=Path),
 	default=None,
-	help="HTML 输出路径（仅 --format html 时有效，未指定时写到 stdout）",
+	help="HTML 输出路径（仅 --format html 时有效，未指定时写到 stdout；--json 时放进信封 data.content）",
 )
 @click.pass_context
 def stats_cmd(ctx: click.Context, days: int, output_format: str, output_path: Path | None) -> None:
@@ -360,12 +375,21 @@ def stats_cmd(ctx: click.Context, days: int, output_format: str, output_path: Pa
 	if output_format == "html":
 		html_text = _render_html(data)
 		if output_path:
-			output_path.write_text(html_text, encoding="utf-8")
+			target = prepare_output_path(output_path)
+			target.write_text(html_text, encoding="utf-8")
 			handle_output(
 				ctx, "stats",
-				{"format": "html", "path": str(output_path), "bytes": len(html_text)},
-				render=lambda d: render_action_result(d, title="stats（HTML 报表）", next_steps=[f"open {output_path}"]),
-				hints={"next_actions": [f"open {output_path}"]},
+				{"format": "html", "path": str(target), "bytes": len(html_text.encode("utf-8"))},
+				render=lambda d: render_action_result(d, title="stats（HTML 报表）", next_steps=[f"open {target}"]),
+				hints={"next_actions": [f"open {target}"]},
+			)
+		elif json_forced(ctx):
+			# 同 digest：`--json` 下 stdout 必须是信封，把 HTML 放进 data.content。
+			handle_output(
+				ctx, "stats",
+				{"format": "html", "content": html_text, "bytes": len(html_text.encode("utf-8"))},
+				hints={"next_actions": [boss_command_for_ctx(ctx, "stats --format html -o <path>")],
+				"operator_actions": ["把 data.content 写成 .html 文件后打开"]},
 			)
 		else:
 			# stdout 直出 HTML（便于管道重定向）
@@ -373,4 +397,8 @@ def stats_cmd(ctx: click.Context, days: int, output_format: str, output_path: Pa
 			sys.stdout.flush()
 		return
 
-	handle_output(ctx, "stats", data, render=_render_stats, hints={"next_actions": _build_hints(data)})
+	stats_hints: dict[str, Any] = {"next_actions": _build_hints(data)}
+	stats_operator_actions = _build_operator_actions(data)
+	if stats_operator_actions:
+		stats_hints["operator_actions"] = stats_operator_actions
+	handle_output(ctx, "stats", data, render=_render_stats, hints=stats_hints)

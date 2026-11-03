@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import click
 
@@ -21,7 +21,7 @@ from boss_agent_cli.automation.models import (
 	RunReport,
 )
 from boss_agent_cli.automation.runner import run_automation_cycle
-from boss_agent_cli.automation.storage import AutomationStore
+from boss_agent_cli.automation.storage import AutomationStateError, AutomationStore
 from boss_agent_cli.ai.service import AIServiceError
 from boss_agent_cli.cache.store import CacheStore
 from boss_agent_cli.commands.ai_cmd import _build_fit_prompt, _create_ai_service
@@ -29,6 +29,7 @@ from boss_agent_cli.commands.crawl import _require_crawl_capabilities, _settings
 from boss_agent_cli.crawler.operations import crawl_status, import_crawl_shortlist
 from boss_agent_cli.crawler.service import CrawlService
 from boss_agent_cli.display import (
+	boss_command_for_ctx,
 	handle_auth_errors,
 	handle_error_output,
 	handle_output,
@@ -52,7 +53,7 @@ def agent_group() -> None:
 	default=False,
 	help="只演练自动化决策，不执行真实平台动作",
 )
-@click.option("--limit", default=None, type=int, help="本轮最多处理多少个会话")
+@click.option("--limit", default=None, type=click.IntRange(min=1), help="本轮最多处理多少个会话")
 @click.option(
 	"--resume",
 	is_flag=True,
@@ -60,9 +61,10 @@ def agent_group() -> None:
 	help="已完成官方验证并核实未确认动作后，显式清除停止标志并从本地 checkpoint 恢复",
 )
 @click.pass_context
+@handle_auth_errors("agent.run")
 def run_cmd(ctx: click.Context, dry_run: bool, limit: int | None, resume: bool) -> None:
 	"""运行一轮招聘自动化。"""
-	report = _run_agent(ctx, dry_run=dry_run, limit=limit, force_mode=None, resume=resume)
+	report = _run_agent(ctx, dry_run=dry_run, limit=limit, force_mode=None, command="agent.run", resume=resume)
 	handle_output(
 		ctx,
 		"agent.run",
@@ -252,8 +254,9 @@ def crawl_cmd(
 	default=True,
 	help="训练模式默认只演练；传 --live 执行满足阈值的动作",
 )
-@click.option("--limit", default=None, type=int, help="本轮最多处理多少个会话")
+@click.option("--limit", default=None, type=click.IntRange(min=1), help="本轮最多处理多少个会话")
 @click.pass_context
+@handle_auth_errors("agent.train")
 def train_cmd(ctx: click.Context, dry_run: bool, limit: int | None) -> None:
 	"""运行训练校准模式：默认演练，--live 直接执行满足阈值的动作。"""
 	report = _run_agent(
@@ -261,6 +264,7 @@ def train_cmd(ctx: click.Context, dry_run: bool, limit: int | None) -> None:
 		dry_run=dry_run,
 		limit=limit,
 		force_mode=AutomationMode.TRAINING,
+		command="agent.train",
 	)
 	handle_output(
 		ctx,
@@ -302,7 +306,8 @@ def review_approve_cmd(ctx: click.Context, review_id: str) -> None:
 	store = AutomationStore(ctx.obj["data_dir"])
 	pending = store.approve_review(review_id, now_iso())
 	if pending is None:
-		raise click.ClickException(f"review item not found or not reviewable: {review_id}")
+		_emit_review_missing(ctx, "agent.review.approve", review_id)
+		return
 	handle_output(
 		ctx,
 		"agent.review.approve",
@@ -321,7 +326,8 @@ def review_reject_cmd(ctx: click.Context, review_id: str, reason: str) -> None:
 	store = AutomationStore(ctx.obj["data_dir"])
 	rejected = store.reject_review(review_id, reason, now_iso())
 	if rejected is None:
-		raise click.ClickException(f"review item not found or not reviewable: {review_id}")
+		_emit_review_missing(ctx, "agent.review.reject", review_id)
+		return
 	event = make_event(
 		rejected.platform,
 		rejected.candidate_key,
@@ -368,10 +374,15 @@ def pending_list_cmd(ctx: click.Context) -> None:
 def agent_stats_cmd(ctx: click.Context) -> None:
 	"""查看招聘自动化统计。"""
 	store = AutomationStore(ctx.obj["data_dir"])
+	try:
+		stats = store.stats()
+	except AutomationStateError as exc:
+		_emit_state_error(ctx, "agent.stats", exc)
+		return
 	handle_output(
 		ctx,
 		"agent.stats",
-		store.stats(),
+		stats,
 		render=lambda d: render_record_result(d, title="agent stats", next_steps=["boss agent pending list"]),
 		hints=_agent_hints(ctx),
 	)
@@ -418,36 +429,93 @@ def stop_cmd(ctx: click.Context, reason: str) -> None:
 	)
 
 
+def _emit_review_missing(ctx: click.Context, command: str, review_id: str) -> NoReturn:
+	"""复核项不存在或已处理时给信封。
+
+	`raise click.ClickException` 会被组层兜底成 `command: "boss"`、`INVALID_PARAM`
+	和英文消息；这里直接按命令名输出，与其它子命令的信封一致。
+	"""
+	handle_error_output(
+		ctx,
+		command,
+		code="INVALID_PARAM",
+		message=f"复核项 '{review_id}' 不存在或已处理",
+		hints={"next_actions": [_agent_review_list_command(ctx)]},
+	)
+	ctx.exit(1)
+
+
+def _emit_state_error(ctx: click.Context, command: str, exc: AutomationStateError) -> NoReturn:
+	"""状态文件损坏时输出信封：自动化不能带着未知状态继续发送。"""
+	handle_error_output(
+		ctx,
+		command,
+		code="AUTOMATION_STATE_INVALID",
+		message=f"{exc.path} 无法解析：{exc.detail}",
+	)
+	ctx.exit(1)
+
+
 def _run_agent(
 	ctx: click.Context,
 	*,
 	dry_run: bool,
 	limit: int | None,
 	force_mode: AutomationMode | None,
+	command: str,
 	resume: bool = False,
 ) -> RunReport:
-	cfg = automation_config_from_dict((ctx.obj.get("config") or {}).get("automation"))
+	raw_config = (ctx.obj.get("config") or {}).get("automation")
+	if raw_config is not None and not isinstance(raw_config, dict):
+		# 手工编辑 config.json 把 automation 写成字符串时，不能带着 traceback 退出：
+		# 按信封契约给出修复入口，用户执行后即可恢复。
+		handle_error_output(
+			ctx,
+			command,
+			code="INVALID_PARAM",
+			message="automation 配置必须是 JSON object",
+			recoverable=True,
+			recovery_action=boss_command_for_ctx(ctx, "config reset automation"),
+		)
+		ctx.exit(1)
+	try:
+		cfg = automation_config_from_dict(raw_config)
+	except (TypeError, ValueError) as exc:
+		# 枚举值或数值字段写错（如 mode=nonsense）同样不能抛 traceback，
+		# 与形状错误走同一个修复入口。
+		handle_error_output(
+			ctx,
+			command,
+			code="INVALID_PARAM",
+			message=f"automation 配置无效: {exc}",
+			recoverable=True,
+			recovery_action=boss_command_for_ctx(ctx, "config reset automation"),
+		)
+		ctx.exit(1)
 	if force_mode is not None:
 		cfg = replace(cfg, mode=force_mode)
 	platform = ctx.obj.get("platform") or "zhipin"
 	store = AutomationStore(ctx.obj["data_dir"])
-	if resume:
-		store.resume()
-	adapter = build_automation_adapter(
-		platform,
-		data_dir=ctx.obj["data_dir"],
-		delay=ctx.obj.get("delay", DEFAULT_REQUEST_DELAY),
-		cdp_url=ctx.obj.get("cdp_url"),
-		live=not dry_run,
-	)
-	return run_automation_cycle(
-		adapter,
-		store,
-		cfg,
-		platform=platform,
-		dry_run=dry_run,
-		limit=limit,
-	)
+	try:
+		if resume:
+			store.resume()
+		adapter = build_automation_adapter(
+			platform,
+			data_dir=ctx.obj["data_dir"],
+			delay=ctx.obj.get("delay", DEFAULT_REQUEST_DELAY),
+			cdp_url=ctx.obj.get("cdp_url"),
+			live=not dry_run,
+		)
+		return run_automation_cycle(
+			adapter,
+			store,
+			cfg,
+			platform=platform,
+			dry_run=dry_run,
+			limit=limit,
+		)
+	except AutomationStateError as exc:
+		_emit_state_error(ctx, command, exc)
 
 
 def _resume_text(data_dir: Path, resume_name: str) -> str | None:
@@ -538,6 +606,12 @@ def _report_payload(report: RunReport) -> dict[str, Any]:
 	payload = asdict(report)
 	payload["mode"] = report.mode.value
 	return payload
+
+
+def _agent_review_list_command(ctx: click.Context) -> str:
+	platform = ctx.obj.get("platform") or "zhipin"
+	prefix = "boss" if platform == "zhipin" else f"boss --platform {platform}"
+	return f"{prefix} --role recruiter agent review list"
 
 
 def _agent_hints(ctx: click.Context) -> dict[str, Any]:

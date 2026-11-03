@@ -30,12 +30,12 @@ def _seed_cache(
 	now = time.time()
 	for i in range(greet):
 		conn.execute(
-			"INSERT OR REPLACE INTO greet_records VALUES (?, ?, ?)",
+			"INSERT OR REPLACE INTO greet_records (security_id, job_id, greeted_at) VALUES (?, ?, ?)",
 			(f"sid-{i}", f"jid-{i}", now),
 		)
 	for i in range(applied):
 		conn.execute(
-			"INSERT OR REPLACE INTO apply_records VALUES (?, ?, ?)",
+			"INSERT OR REPLACE INTO apply_records (security_id, job_id, applied_at) VALUES (?, ?, ?)",
 			(f"sid-{i}", f"jid-{i}", now),
 		)
 	for i in range(shortlist):
@@ -70,9 +70,9 @@ def test_stats_empty_cache(tmp_path):
 	assert parsed["data"]["window_days"] == 30
 	assert "缓存尚未建立" in parsed["data"]["note"]
 	assert parsed["hints"]["next_actions"] == [
-		"boss search <query> 搜索职位",
-		"boss pipeline 查看候选进度",
-		"boss follow-up 查看需要跟进的联系人",
+		"boss search <query>",
+		"boss pipeline",
+		"boss follow-up",
 	]
 
 
@@ -97,8 +97,8 @@ def test_stats_funnel_counts(tmp_path):
 	assert conv["shortlist_rate"] == 0.2
 	assert conv["apply_rate_window"] == 0.3
 	assert parsed["hints"]["next_actions"] == [
-		"boss pipeline 查看候选进度",
-		"boss follow-up 查看需要跟进的联系人",
+		"boss pipeline",
+		"boss follow-up",
 	]
 
 
@@ -115,6 +115,20 @@ def test_stats_window_days_option(tmp_path):
 		"shortlist": 0,
 		"watch_hits": 0,
 	}
+
+
+def test_stats_rejects_overflowing_days(tmp_path):
+	"""无界天数值要变成 INVALID_PARAM 信封，而不是 float 转换的 traceback。
+
+	``since = time.time() - days * 86400`` 会把天数转成 float，10**400 这类整数
+	直接抛 OverflowError，stdout 连信封都没有。
+	"""
+	_seed_cache(tmp_path)
+	result = _invoke(tmp_path, "--days", "9" * 400)
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["data"] is None
 
 
 def test_stats_zero_greet_no_divide_by_zero(tmp_path):
@@ -151,7 +165,7 @@ def test_stats_registered_in_main_and_schema(tmp_path):
 
 
 def test_stats_html_format_to_stdout(tmp_path):
-	"""--format html 无 -o 时 HTML 直出 stdout。"""
+	"""未强制 --json 且无 -o 时 HTML 直出 stdout，供管道重定向。"""
 	_seed_cache(tmp_path, greet=3, applied=1, shortlist=1)
 	runner = CliRunner()
 	result = runner.invoke(cli, [
@@ -163,6 +177,53 @@ def test_stats_html_format_to_stdout(tmp_path):
 	# 数据点应嵌入到 HTML
 	assert ">3<" in result.output  # greeted 显示
 	assert "33.33%" in result.output or "0.3333%" in result.output or "33.33" in result.output  # apply_rate
+
+
+def test_stats_html_format_with_json_flag_returns_envelope(tmp_path):
+	"""--json 下 stdout 必须是信封：MCP 不能靠解析裸 HTML 拿到报表。"""
+	_seed_cache(tmp_path, greet=3, applied=1, shortlist=1)
+	runner = CliRunner()
+	result = runner.invoke(cli, [
+		"--data-dir", str(tmp_path), "--json", "stats", "--format", "html",
+	])
+	assert result.exit_code == 0
+
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["format"] == "html"
+	assert parsed["data"]["content"].startswith("<!doctype html>")
+	# bytes 是落盘后的字节数，中文报表按 UTF-8 计算，不能是字符数。
+	assert parsed["data"]["bytes"] == len(parsed["data"]["content"].encode("utf-8"))
+	assert parsed["data"]["bytes"] > len(parsed["data"]["content"])
+
+
+def test_stats_corrupt_cache_database_returns_envelope(tmp_path):
+	"""缓存库损坏时返回 CACHE_DATABASE_INVALID 信封，而不是 sqlite traceback。"""
+	db_dir = tmp_path / "cache"
+	db_dir.mkdir(parents=True, exist_ok=True)
+	(db_dir / "boss_agent.db").write_bytes(b"not a database")
+
+	result = _invoke(tmp_path)
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "CACHE_DATABASE_INVALID"
+	assert "boss_agent.db" in parsed["error"]["message"]
+
+
+def test_stats_html_output_does_not_write_file_when_database_corrupt(tmp_path):
+	"""损坏库在渲染 HTML 之前就失败：不能留下半份报表文件。"""
+	db_dir = tmp_path / "cache"
+	db_dir.mkdir(parents=True, exist_ok=True)
+	(db_dir / "boss_agent.db").write_bytes(b"not a database")
+	out_path = tmp_path / "report.html"
+
+	result = _invoke(tmp_path, "--format", "html", "-o", str(out_path))
+
+	assert result.exit_code == 1
+	assert json.loads(result.output)["error"]["code"] == "CACHE_DATABASE_INVALID"
+	assert not out_path.exists()
 
 
 def test_stats_html_format_to_file(tmp_path):
@@ -178,10 +239,24 @@ def test_stats_html_format_to_file(tmp_path):
 	assert parsed["data"]["bytes"] > 1000
 	# 文件真的写了
 	assert out_path.exists()
+	assert parsed["data"]["bytes"] == out_path.stat().st_size
 	html_content = out_path.read_text(encoding="utf-8")
 	assert "<!doctype html>" in html_content
 	assert "10" in html_content  # greeted
 	assert "50.0%" in html_content  # apply_rate
+
+
+def test_stats_output_path_expands_tilde_and_creates_parent(tmp_path, monkeypatch):
+	"""MCP 子进程调用不经 shell，`~` 不会被展开；-o 必须自己展开并建父目录。"""
+	_seed_cache(tmp_path, greet=2)
+	monkeypatch.setenv("HOME", str(tmp_path))
+	monkeypatch.setenv("USERPROFILE", str(tmp_path))
+	result = _invoke(tmp_path, "--format", "html", "-o", "~/reports/nested/report.html")
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	expected = tmp_path / "reports" / "nested" / "report.html"
+	assert parsed["data"]["path"] == str(expected)
+	assert "<!doctype html>" in expected.read_text(encoding="utf-8")
 
 
 def test_stats_html_empty_cache(tmp_path):

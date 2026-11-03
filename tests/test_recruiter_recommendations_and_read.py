@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from boss_agent_cli.api import recruiter_endpoints as ep
-from boss_agent_cli.api.client import AccountRiskError
+from boss_agent_cli.api.client import AccountRiskError, EnvironmentRiskError, EnvironmentRiskLockedError
 from boss_agent_cli.api.recruiter_client import BossRecruiterClient, RecruiterAuthError
 from boss_agent_cli.auth.manager import AuthRequired, TokenRefreshFailed
 from boss_agent_cli.display import error_contract_for_code
@@ -242,6 +242,60 @@ def test_recruiter_reservation_is_atomic_and_separate_from_candidate_records(tmp
 		assert second.claim_recruiter_greet("another-geek", "job") is None
 
 
+def test_release_only_clears_pending_reservation(tmp_path: Path) -> None:
+	"""撤销预约只针对 pending：已发送或结果未知的记录不能被放开重发。"""
+	from boss_agent_cli.cache.store import CacheStore
+	with CacheStore(tmp_path / "cache.db") as cache:
+		assert cache.claim_recruiter_greet("geek", "job") is None
+		assert cache.release_recruiter_greet("geek", "job") is True
+		assert cache.claim_recruiter_greet("geek", "job") is None
+		cache.record_recruiter_greet("geek", "job")
+		assert cache.release_recruiter_greet("geek", "job") is False
+		assert cache.claim_recruiter_greet("geek", "job") == "sent"
+
+
+def test_greet_budget_stop_releases_unsent_reservation(greeting_args, greeting_platform):
+	"""预算在调度前停止：请求没有发出，撤销预约后预算恢复即可重试。"""
+	from boss_agent_cli.api.request_budget import RequestBudgetExceeded
+
+	greeting_platform.start_chat.side_effect = RequestBudgetExceeded("fixture budget stop")
+	first = CliRunner().invoke(cli, greeting_args + ["--yes"])
+	body = json.loads(first.output)
+	assert first.exit_code == 1
+	assert body["error"]["code"] == "REQUEST_BUDGET_EXHAUSTED"
+	assert body["error"]["details"] == {"request_sent": False}
+	assert (body["error"]["recoverable"], body["error"]["recovery_action"]) == error_contract_for_code(
+		"REQUEST_BUDGET_EXHAUSTED"
+	)
+
+	greeting_platform.start_chat.side_effect = None
+	greeting_platform.start_chat.return_value = {"code": 0, "zpData": {}}
+	second = CliRunner().invoke(cli, greeting_args + ["--yes"])
+	assert second.exit_code == 0, second.output
+	assert json.loads(second.output)["data"]["sent"] is True
+	assert greeting_platform.start_chat.call_count == 2
+
+
+def test_greet_browser_unavailable_releases_unsent_reservation(greeting_args, greeting_platform):
+	"""通道全部不可用等于请求未发出：修正通道后重试不应被旧的 pending 挡住。"""
+	from boss_agent_cli.api.browser_source import POLICIES, BrowserSourceUnavailable
+
+	policy = POLICIES["stored-cookie"]
+	greeting_platform.start_chat.side_effect = BrowserSourceUnavailable(policy, attempted=("cdp",))
+	first = CliRunner().invoke(cli, greeting_args + ["--yes"])
+	body = json.loads(first.output)
+	assert first.exit_code == 1
+	assert body["error"]["code"] == policy.failure_code
+	assert body["error"]["recoverable"] is True
+	assert policy.recovery_action in body["error"]["recovery_action"]
+
+	greeting_platform.start_chat.side_effect = None
+	greeting_platform.start_chat.return_value = {"code": 0, "zpData": {}}
+	second = CliRunner().invoke(cli, greeting_args + ["--yes"])
+	assert second.exit_code == 0, second.output
+	assert greeting_platform.start_chat.call_count == 2
+
+
 @pytest.mark.parametrize("message", ["访问环境存在异常", "环境异常", ""])
 def test_greet_environment_risk_does_not_suggest_more_requests(
 	greeting_args: list[str], greeting_platform: MagicMock, message: str,
@@ -255,11 +309,27 @@ def test_greet_environment_risk_does_not_suggest_more_requests(
 	assert body["error"]["details"]["sent"] is None
 	assert error_contract_for_code("ENVIRONMENT_RISK")[1] in body["error"]["recovery_action"]
 	assert "不要自动重发" in body["error"]["recovery_action"]
-	assert not body["hints"].get("next_actions")
+	# 机器可读提示只能是「停止 / 不要重试」，不能出现任何继续请求平台的命令。
+	next_actions = body["hints"]["next_actions"]
+	assert next_actions
+	assert all("boss " not in action for action in next_actions)
 	assert "boss hr chat" not in json.dumps(body["hints"])
 	greeting_platform.start_chat.assert_called_once()
 	greeting_platform.friend_list.assert_not_called()
 
+
+
+def test_greet_risk_response_keeps_platform_message_out_of_details(
+	greeting_args: list[str], greeting_platform: MagicMock,
+) -> None:
+	"""响应字典形态的风控：平台原文可能带临时凭据，不能写进 error.details。"""
+	greeting_platform.start_chat.return_value = {"code": 37, "message": "fixture-platform-response-token"}
+	result = CliRunner().invoke(cli, greeting_args + ["--yes"])
+	body = json.loads(result.output)
+	assert result.exit_code == 1
+	assert body["error"]["code"] == "ENVIRONMENT_RISK"
+	assert "platform_message" not in body["error"]["details"]
+	assert "fixture-platform-response-token" not in result.output
 
 
 def test_compliance_precedes_confirmation(greeting_args):
@@ -354,12 +424,19 @@ def test_cache_write_failure_preserves_sent_and_blocks_resend(greeting_args, gre
 	(AuthRequired("private"), "AUTH_REQUIRED"),
 	(TokenRefreshFailed("private"), "TOKEN_REFRESH_FAILED"),
 	(AccountRiskError("private"), "ACCOUNT_RISK"),
+	(EnvironmentRiskError("private"), "ENVIRONMENT_RISK"),
+	(EnvironmentRiskLockedError("private"), "ENVIRONMENT_RISK_LOCKED"),
 ])
 def test_greeting_auth_and_risk_are_not_network_errors(greeting_args, greeting_platform, failure, code):
 	greeting_platform.start_chat.side_effect = failure
 	result = CliRunner().invoke(cli, greeting_args + ["--yes"])
 	body = json.loads(result.output)
 	assert body["error"]["code"] == code
+	if code in {"ACCOUNT_RISK", "ENVIRONMENT_RISK", "ENVIRONMENT_RISK_LOCKED"}:
+		# 风控异常走统一停止契约，且保留「不要重发本次招呼」的写操作约束。
+		assert error_contract_for_code(code)[1] in body["error"]["recovery_action"]
+		assert "不要自动重发" in body["error"]["recovery_action"]
+		assert body["hints"]["next_actions"]
 	assert body["error"]["details"]["sent"] is None
 	assert body["error"]["recoverable"] is False
 	assert "private" not in result.output

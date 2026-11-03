@@ -1,8 +1,10 @@
 """Tests for AI command group (boss ai)."""
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from boss_agent_cli.main import cli
@@ -166,6 +168,25 @@ def test_polish_success(tmp_path, monkeypatch):
 	assert "general_suggestions" in parsed["data"]
 
 
+def test_cover_letter_non_object_ai_json_returns_parse_error(tmp_path, monkeypatch):
+	"""AI 返回合法 JSON 但不是对象时按解析失败返回，而不是 setdefault 的 AttributeError。"""
+	_setup_ai_config(tmp_path, monkeypatch)
+	_setup_resume(tmp_path)
+	runner = CliRunner()
+
+	mock_resp = MagicMock()
+	mock_resp.status_code = 200
+	mock_resp.json.return_value = {"choices": [{"message": {"content": '["建议一", "建议二"]'}}]}
+	mock_resp.raise_for_status = MagicMock()
+	with patch("boss_agent_cli.ai.service.httpx.post", return_value=mock_resp):
+		result = _invoke(runner, tmp_path, ["cover-letter", "test-resume", "--jd", "目标岗位"])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "AI_PARSE_ERROR"
+	assert "JSON 对象" in parsed["error"]["message"]
+
+
 # ── optimize 成功路径 ─────────────────────────────────────
 
 
@@ -327,6 +348,77 @@ def test_analyze_jd_at_file_not_found(tmp_path, monkeypatch):
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "INVALID_PARAM"
+
+
+_AT_FILE_COMMANDS = [
+	["analyze-jd", "FILE", "--resume", "test-resume"],
+	["optimize", "test-resume", "--jd", "FILE"],
+	["suggest", "test-resume", "--jd", "FILE"],
+	["reply", "FILE"],
+	["interview-prep", "FILE"],
+	["chat-coach", "FILE"],
+	["resume-optimize", "test-resume", "--jd", "FILE"],
+	["cover-letter", "test-resume", "--jd", "FILE"],
+]
+
+
+@pytest.mark.parametrize("args", _AT_FILE_COMMANDS)
+def test_at_file_non_utf8_returns_envelope(tmp_path, monkeypatch, args):
+	"""GBK 保存的输入文件在每条 @file 命令上都给信封，而不是 UnicodeDecodeError traceback"""
+	_setup_ai_config(tmp_path, monkeypatch)
+	_setup_resume(tmp_path)
+	runner = CliRunner()
+
+	jd_file = tmp_path / "gbk.txt"
+	jd_file.write_bytes("需要五年经验的后端工程师".encode("gbk"))
+
+	argv = [f"@{jd_file}" if arg == "FILE" else arg for arg in args]
+
+	result = _invoke(runner, tmp_path, argv)
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "UTF-8" in parsed["error"]["message"]
+
+
+def test_at_file_directory_returns_envelope(tmp_path, monkeypatch):
+	"""@路径 指向目录时给信封，而不是 IsADirectoryError traceback"""
+	_setup_ai_config(tmp_path, monkeypatch)
+	_setup_resume(tmp_path)
+	runner = CliRunner()
+
+	result = _invoke(runner, tmp_path, ["analyze-jd", f"@{tmp_path}", "--resume", "test-resume"])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "是目录" in parsed["error"]["message"]
+
+
+def test_at_file_permission_error_returns_envelope(tmp_path, monkeypatch):
+	"""@file 读取失败（权限不足）时按 LOCAL_IO_ERROR 返回"""
+	_setup_ai_config(tmp_path, monkeypatch)
+	_setup_resume(tmp_path)
+	runner = CliRunner()
+
+	jd_file = tmp_path / "locked.txt"
+	jd_file.write_text("后端工程师", encoding="utf-8")
+	original_read_text = Path.read_text
+
+	def _deny_locked(self, *args, **kwargs):
+		if self == jd_file:
+			raise PermissionError(13, "Permission denied")
+		return original_read_text(self, *args, **kwargs)
+
+	monkeypatch.setattr(Path, "read_text", _deny_locked)
+
+	result = _invoke(runner, tmp_path, ["analyze-jd", f"@{jd_file}", "--resume", "test-resume"])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "LOCAL_IO_ERROR"
+	assert "读取" in parsed["error"]["message"]
 
 
 # ── markdown 代码块包裹的 JSON ────────────────────────────
