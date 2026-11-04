@@ -102,6 +102,68 @@ def test_schema_commands_have_descriptions():
 	)
 
 
+def test_schema_options_and_args_have_descriptions():
+	"""schema 声明的每个选项与位置参数都必须有非空 description。
+
+	`crawl results --detail-status` 曾只声明 enum 不写说明：Agent 能从 schema
+	枚举出 completed / pending 两个取值，却不知道它们分别指详情已抓取与待抓取。
+	"""
+	missing: list[str] = []
+
+	def walk(path: str, spec: Any) -> None:
+		if not isinstance(spec, dict):
+			return
+		for key, value in spec.items():
+			if str(key).startswith("-") and isinstance(value, dict):
+				if not str(value.get("description") or "").strip():
+					missing.append(f"{path} {key}")
+				continue
+			if key == "args" and isinstance(value, list):
+				for entry in value:
+					if isinstance(entry, dict) and not str(entry.get("description") or "").strip():
+						missing.append(f"{path} <{entry.get('name')}>")
+				continue
+			if key in ("description", "subcommands"):
+				continue
+			walk(f"{path}.{key}", value)
+
+	for name, spec in SCHEMA_DATA["commands"].items():
+		walk(name, spec)
+
+	assert not missing, "以下选项/参数缺少 description: " + ", ".join(missing)
+
+
+def _iter_schema_subcommands(entries: dict[str, Any], prefix: str):
+	"""遍历 schema options 里的子命令条目，返回 ``(路径, 条目)``。
+
+	两种形态并存：`watch` / `crawl` 的子命令条目带 ``args``/``options`` 包装，
+	`ai.local` 则直接是「子命令名 → 声明」的字典。空对象是「无参数子命令」的
+	占位（见 ``test_schema_options_declare_every_subcommand``），跳过。
+	"""
+	for name, spec in entries.items():
+		if name.startswith("-") or not isinstance(spec, dict) or not spec:
+			continue
+		yield prefix + name, spec
+		if "args" not in spec and "options" not in spec:
+			yield from _iter_schema_subcommands(spec, prefix + name + " ")
+
+
+def test_schema_subcommands_have_descriptions():
+	"""schema 中每个子命令都应有非空的 description 字段。
+
+	`boss schema` 是 Agent 的能力真源：子命令只列参数和选项、不写它做什么，
+	Agent 就只知道 `watch add` 收 name + query，不知道它会保存下来供 `run`
+	增量拉取。原先 43 个子命令缺描述。
+	"""
+	missing: list[str] = []
+	for name, spec in SCHEMA_DATA["commands"].items():
+		for path, entry in _iter_schema_subcommands(spec.get("options") or {}, f"{name} "):
+			if not str(entry.get("description") or "").strip():
+				missing.append(path)
+
+	assert not missing, f"以下子命令缺少 description: {missing}"
+
+
 # ── 子命令声明 == 实际注册子命令 ─────────────────────────────────────
 
 _SUBCOMMAND_LIST_PATTERN = re.compile(r"子命令：([^）)]+)")
@@ -407,7 +469,7 @@ _NON_ERROR_CODE_LITERALS = {
 	"BOSS_AGENT_MACHINE_ID", "BOSS_BROWSER_VERBOSE", "BOSS_DATA_DIR", "BOSS_EGRESS_PROBE_URL",  # 环境变量名
 	"CLI_ERROR",  # MCP 层「CLI 输出不可解析」分类，不进入 CLI 信封
 	"CREATE_NO_WINDOW",  # Windows 子进程常量
-	"DRY_RUN",  # 招聘自动化事件状态，不是错误码
+	"AUTO_EXECUTED", "DRY_RUN",  # 招聘自动化事件的成功状态，不是错误码
 	"HOOK_SCRIPT_NAMES",  # crawler 常量名
 	"PYTEST_CURRENT_TEST",  # pytest 环境变量
 	"SERVER_INSTRUCTIONS",  # MCP server 常量名
@@ -496,6 +558,34 @@ def test_schema_error_codes_have_recovery_action_field():
 	)
 
 
+def test_schema_error_codes_have_recovery_action_text():
+	"""每个错误码都要给出可理解的 recovery_action，null 会让 Agent 停在原地。
+
+	`APPLICATION_NOT_FOUND` / `JOB_POST_LIMIT` 曾以 `recovery_action: null` 登记，
+	但它们从未被任何代码路径产生，schema 里却像是真实可恢复分支。
+	"""
+	missing = [
+		code
+		for code, spec in SCHEMA_DATA["error_codes"].items()
+		if not isinstance(spec.get("recovery_action"), str) or not spec["recovery_action"].strip()
+	]
+
+	assert not missing, f"以下错误码缺少 recovery_action 文案: {missing}"
+
+
+def test_schema_error_codes_exclude_success_event_statuses():
+	"""AUTO_EXECUTED / DRY_RUN 是招聘自动化事件的成功状态，不能登记成错误码。
+
+	`AUTO_EXECUTED` 曾以 `recoverable: false`、`recovery_action: null` 混进
+	error_codes：Agent 枚举「可能收到的错误」时会看到一个表示「动作已执行」的条目。
+	真正的失败状态（如 `CIRCUIT_BREAKER_OPEN`）仍保留在登记表里。
+	"""
+	from boss_agent_cli.automation.models import EventStatus
+
+	for status in (EventStatus.AUTO_EXECUTED, EventStatus.DRY_RUN):
+		assert status.value not in SCHEMA_DATA["error_codes"]
+
+
 def test_search_schema_keeps_welfare_option():
 	"""--welfare 是核心差异化能力，必须保留在 search schema 中。"""
 	welfare = SCHEMA_DATA["commands"]["search"]["options"]["--welfare"]
@@ -549,8 +639,18 @@ def test_cli_error_envelope_metadata_matches_registry():
 	曾经的缺口：命令层大量 `INVALID_PARAM` 调用点不传 `recoverable` /
 	`recovery_action`，信封里两者落成 `false` / `null`，Agent 拿不到
 	`schema.error_codes` 中已经声明好的「修正参数」指引。
+
+	这里用最小探针命令验证兜底路径本身；不绑定某个尚未补专属指引的真实
+	命令，避免专用文案一补齐，这个契约测试就跟着红。
 	"""
-	result = CliRunner().invoke(cli, ["--json", "export", "--url", "https://example.com/not-boss"])
+	from boss_agent_cli.display import handle_error_output
+
+	@click.command("probe")
+	@click.pass_context
+	def probe(ctx: click.Context) -> None:
+		handle_error_output(ctx, "probe", code="INVALID_PARAM", message="probe")
+
+	result = CliRunner().invoke(probe, [])
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "INVALID_PARAM"
 	assert parsed["error"]["recoverable"] is ERROR_CODES["INVALID_PARAM"]["recoverable"]

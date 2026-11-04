@@ -10,6 +10,7 @@ import threading
 from collections.abc import Sequence
 from typing import Any, Callable
 
+import click
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -20,6 +21,26 @@ from boss_agent_cli.schema.error_codes import ERROR_CODES
 
 # Rich output goes to stderr so stdout stays clean for Agent JSON
 console = Console(stderr=True)
+
+
+_SHELL_METACHARACTERS = frozenset("'\"`$\\!*?[]{}()<>|&;#")
+
+
+def shell_argument(value: str) -> str:
+	"""Quote *value* so it survives being copied into a runnable hint verbatim.
+
+	只在需要时加引号：shlex.quote 用 ASCII 安全字符集，会把中文名也包上引号。
+	除空白外还要挡 shell 元字符——简历名、watch 名、预设名都是自由文本：
+
+	- 空白会把一个名字拆成多个参数；
+	- ``its'fine`` 这种落单的单引号会让整条提示变成非法 shell（引号没闭合）；
+	- ``*`` / ``$HOME`` / 开头的 ``~`` 会在终端里被展开成别的东西。
+
+	以上情况统一加 POSIX 单引号（内部的单引号按 ``'\\''`` 转义）。
+	"""
+	if not any(ch.isspace() or ch in _SHELL_METACHARACTERS for ch in value) and not value.startswith("~"):
+		return value
+	return "'" + value.replace("'", "'\\''") + "'"
 
 
 def boss_command_for_ctx(ctx: Any, command: str) -> str:
@@ -34,6 +55,15 @@ def boss_command_for_ctx(ctx: Any, command: str) -> str:
 def login_action_for_ctx(ctx: Any) -> str:
 	"""Return the platform-aware login recovery command."""
 	return boss_command_for_ctx(ctx, "login")
+
+
+def auth_required_hints(ctx: Any) -> dict[str, list[str]]:
+	"""登录类错误附带的下一步：命令给 Agent 执行，说明给真人扫码。"""
+	login_action = login_action_for_ctx(ctx)
+	return {
+		"next_actions": [login_action],
+		"operator_actions": [f"在终端执行 {login_action}，按提示用 BOSS 直聘 App 扫码完成登录后重试"],
+	}
 
 
 def error_contract_for_code(
@@ -773,6 +803,7 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					message=f"未登录，请先执行 {login_action}",
 					recoverable=True,
 					recovery_action=login_action,
+					hints=auth_required_hints(ctx),
 				)
 			except TokenRefreshFailed:
 				login_action = login_action_for_ctx(ctx)
@@ -783,6 +814,7 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					message="Token 刷新失败，请重新登录",
 					recoverable=True,
 					recovery_action=login_action,
+					hints=auth_required_hints(ctx),
 				)
 			except PlatformRiskError as e:
 				recovery_action, hints = risk_error_contract(e.code)
@@ -860,6 +892,11 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 						recovery_action="重试",
 						hints=_with_httpx_only_hint(ctx, None),
 					)
+			except click.ClickException:
+				# 命令体里抛出的参数校验（如 mark 的 --label）仍是用法错误：交给
+				# BossCliGroup 出 INVALID_PARAM 信封，不能兜成「可重试的 NETWORK_ERROR」，
+				# 否则 Agent 会拿同一个非法值反复重试。
+				raise
 			except Exception as e:
 				handle_error_output(
 					ctx,

@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from typing import Any
 
 import pytest
@@ -40,6 +41,22 @@ def _invoke(*args, tmp_path=None):
 	cli_args.extend(args)
 	result = runner.invoke(cli, cli_args)
 	return result.exit_code, json.loads(result.output) if result.output.strip() else None
+
+
+def _invoke_tty(tmp_path, monkeypatch, *args):
+	"""按 TTY 口径执行命令，返回 (exit_code, 渲染到终端的文本)。"""
+	import io
+
+	from rich.console import Console
+
+	stream = io.StringIO()
+	monkeypatch.setattr(
+		"boss_agent_cli.display.console",
+		Console(file=stream, force_terminal=False, width=120),
+	)
+	monkeypatch.setattr("boss_agent_cli.display.is_json_mode", lambda ctx: False)
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), *args])
+	return result.exit_code, stream.getvalue()
 
 
 # ── config list ─────────────────────────────────────────────────────
@@ -89,6 +106,16 @@ def test_config_get_valid_key(tmp_path):
 	assert parsed["data"]["key"] == "log_level"
 	assert parsed["data"]["value"] == "error"
 	assert parsed["data"]["default"] == "error"
+	assert parsed["hints"]["next_actions"] == ["boss config set log_level <值>", "boss config list"]
+
+
+def test_config_get_renders_value_in_tty(tmp_path, monkeypatch):
+	"""TTY 下 `config get` 必须显示值：之前的 render 是空 lambda，终端一个字都不打。"""
+	code, text = _invoke_tty(tmp_path, monkeypatch, "config", "get", "role")
+	assert code == 0
+	assert "role" in text
+	assert "candidate" in text
+	assert "boss config set role <值>" in text
 
 
 def test_config_get_unknown_key(tmp_path):
@@ -97,7 +124,8 @@ def test_config_get_unknown_key(tmp_path):
 	result = runner.invoke(cli, ["--data-dir", str(tmp_path), "config", "get", "nonexistent"])
 	parsed = _assert_single_stdout_json_error(result, command="config", code="INVALID_PARAM")
 	assert "可用项" in parsed["error"]["message"]
-	assert parsed["hints"] is None
+	# 消息里已经列了可用项，hints 再给出能看到当前值的 config list。
+	assert parsed["hints"]["next_actions"] == ["boss config list"]
 
 
 # ── config set ──────────────────────────────────────────────────────
@@ -112,6 +140,17 @@ def test_config_set_string_value(tmp_path):
 	# 验证持久化
 	config_file = tmp_path / "config.json"
 	saved = json.loads(config_file.read_text())
+	assert saved["log_level"] == "debug"
+	assert parsed["hints"]["next_actions"] == ["boss config get log_level", "boss config list"]
+
+
+def test_config_set_renders_confirmation_in_tty(tmp_path, monkeypatch):
+	"""TTY 下 `config set` 静默成功时，真人只能怀疑自己没按回车。"""
+	code, text = _invoke_tty(tmp_path, monkeypatch, "config", "set", "log_level", "debug")
+	assert code == 0
+	assert "log_level" in text
+	assert "debug" in text
+	saved = json.loads((tmp_path / "config.json").read_text())
 	assert saved["log_level"] == "debug"
 
 
@@ -174,6 +213,35 @@ def test_config_set_browser_source_validates_choice(tmp_path):
 	assert parsed["data"]["value"] == "auto"
 
 
+@pytest.mark.parametrize("value", [":::", "http://", "localhost:9222", "http://127.0.0.1:99999", "ftp://127.0.0.1:1"])
+def test_config_set_rejects_invalid_cdp_url(tmp_path, value):
+	"""坏 cdp_url 会让之后每条命令在启动期失败，写入时就必须拒绝。
+
+	`--cdp-url` 已在启动期按同一规则校验；`config set cdp_url` 若照常落盘，
+	用户会得到 ok=true，然后所有命令都换回 INVALID_PARAM。
+	"""
+	code, parsed = _invoke("config", "set", "cdp_url", value, tmp_path=tmp_path)
+
+	assert code == 1
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "http(s) 调试地址" in parsed["error"]["message"]
+	assert parsed["hints"]["next_actions"] == ["boss config get cdp_url", "boss config list"]
+	written = tmp_path / "config.json"
+	assert not written.exists() or "cdp_url" not in json.loads(written.read_text(encoding="utf-8"))
+
+
+def test_config_set_accepts_valid_cdp_url(tmp_path):
+	"""合法 CDP 地址写入后，普通命令能通过启动期校验。"""
+	code, parsed = _invoke("config", "set", "cdp_url", "http://127.0.0.1:9222", tmp_path=tmp_path)
+	assert code == 0
+	assert parsed["data"]["value"] == "http://127.0.0.1:9222"
+
+	code, parsed = _invoke("config", "list", tmp_path=tmp_path)
+	assert code == 0
+	item = next(i for i in parsed["data"]["items"] if i["key"] == "cdp_url")
+	assert item["value"] == "http://127.0.0.1:9222"
+
+
 def test_config_set_role_validates_choice(tmp_path):
 	"""role 进 _CONFIG_CHOICES：写进非法值时命令本身就该失败。
 
@@ -215,6 +283,41 @@ def test_config_choices_cover_enum_valued_defaults():
 	from boss_agent_cli.commands.config_cmd import _CONFIG_CHOICES
 
 	assert {"operating_mode", "browser_source", "role", "log_level"} <= set(_CONFIG_CHOICES)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 的 Path.expanduser 不解析 ~user")
+def test_unknown_home_in_request_budget_dir_returns_envelope(tmp_path):
+	"""config.json 里 `~未知用户` 的预算目录不能让整条命令冲出 traceback。"""
+	(tmp_path / "config.json").write_text(json.dumps({"request_budget_dir": "~boss_cli_no_such_user_zzz/x"}), encoding="utf-8")
+
+	code, parsed = _invoke("status", tmp_path=tmp_path)
+
+	assert code == 1
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "家目录写法无法展开" in parsed["error"]["message"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 的 Path.expanduser 不解析 ~user")
+def test_config_set_unknown_home_budget_dir_is_rejected(tmp_path):
+	"""`config set request_budget_dir "~未知用户/x"` 要按参数错误拒绝且不写盘。"""
+	code, parsed = _invoke("config", "set", "request_budget_dir", "~boss_cli_no_such_user_zzz/x", tmp_path=tmp_path)
+
+	assert code == 1
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "家目录写法无法展开" in parsed["error"]["message"]
+	written = tmp_path / "config.json"
+	assert not written.exists() or "request_budget_dir" not in json.loads(written.read_text(encoding="utf-8"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 的 Path.expanduser 不解析 ~user")
+def test_budget_directory_unknown_home_is_value_error(tmp_path):
+	"""运行期解析预算目录同样把 ~未知用户 归一成 ValueError，而不是 RuntimeError。"""
+	from boss_agent_cli.api.request_budget import budget_directory
+
+	(tmp_path / "config.json").write_text(json.dumps({"request_budget_dir": "~boss_cli_no_such_user_zzz/x"}), encoding="utf-8")
+
+	with pytest.raises(ValueError, match="家目录写法无法展开"):
+		budget_directory(tmp_path)
 
 
 @pytest.mark.parametrize("value", [5, True, ["auto"], {"name": "auto"}])
@@ -369,6 +472,19 @@ def test_config_set_numeric_parse_error_returns_chinese_envelope(tmp_path, key, 
 	assert value in message
 	assert "could not convert" not in message
 	assert "invalid literal" not in message
+	assert parsed["hints"]["next_actions"] == [f"boss config get {key}", "boss config list"]
+	assert "boss config list" in parsed["error"]["recovery_action"]
+
+
+def test_config_set_invalid_choice_points_at_config_commands(tmp_path):
+	"""枚举值写错时同样要给出查看当前配置的下一步，而不只是「修正参数」。"""
+	code, parsed = _invoke("config", "set", "log_level", "bogus", tmp_path=tmp_path)
+
+	assert code == 1
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["error"]["message"] == "log_level 必须是以下值之一: error, warning, info, debug"
+	assert parsed["hints"]["next_actions"] == ["boss config get log_level", "boss config list"]
+	assert "boss config list" in parsed["error"]["recovery_action"]
 
 
 def test_config_set_list_value(tmp_path):
@@ -493,6 +609,7 @@ def test_config_set_unknown_key(tmp_path):
 	result = runner.invoke(cli, ["--data-dir", str(tmp_path), "config", "set", "bad_key", "val"])
 	parsed = _assert_single_stdout_json_error(result, command="config", code="INVALID_PARAM")
 	assert "可用项" in parsed["error"]["message"]
+	assert parsed["hints"]["next_actions"] == ["boss config list"]
 
 
 def test_config_commands_do_not_expose_internal_low_risk_policy(tmp_path):
@@ -520,10 +637,20 @@ def test_config_reset_restores_default(tmp_path):
 	assert code == 0
 	assert parsed["data"]["value"] == "error"
 	assert parsed["data"]["restored"] is True
+	assert parsed["hints"]["next_actions"] == ["boss config get log_level", "boss config list"]
 	# 验证文件中已移除
 	config_file = tmp_path / "config.json"
 	saved = json.loads(config_file.read_text())
 	assert "log_level" not in saved
+
+
+def test_config_reset_renders_confirmation_in_tty(tmp_path, monkeypatch):
+	"""TTY 下 `config reset` 同样要确认恢复成了哪个值。"""
+	_invoke("config", "set", "log_level", "debug", tmp_path=tmp_path)
+	code, text = _invoke_tty(tmp_path, monkeypatch, "config", "reset", "log_level")
+	assert code == 0
+	assert "log_level" in text
+	assert "restored" in text
 
 
 def test_config_reset_unknown_key(tmp_path):
@@ -532,6 +659,7 @@ def test_config_reset_unknown_key(tmp_path):
 	result = runner.invoke(cli, ["--data-dir", str(tmp_path), "config", "reset", "bad_key"])
 	parsed = _assert_single_stdout_json_error(result, command="config", code="INVALID_PARAM")
 	assert "可用项" in parsed["error"]["message"]
+	assert parsed["hints"]["next_actions"] == ["boss config list"]
 
 
 def test_unreadable_config_file_returns_envelope_instead_of_traceback(tmp_path):

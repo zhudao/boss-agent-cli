@@ -201,6 +201,41 @@ def test_dry_run_has_no_auth_network_or_cache(greeting_args: list[str], tmp_path
 
 
 
+def test_greet_rejects_blank_message_with_executable_next_step(greeting_args: list[str]) -> None:
+	"""空招呼内容不会发出去；恢复指引要指回可执行的推荐列表。"""
+	args = [*greeting_args]
+	args[args.index("--message") + 1] = "   "
+	with patch("boss_agent_cli.commands.recruiter.recommendations.AuthManager") as auth, patch(
+		"boss_agent_cli.commands.recruiter.recommendations.get_recruiter_platform_instance"
+	) as factory:
+		result = CliRunner().invoke(cli, args)
+	assert result.exit_code == 1, result.output
+	payload = json.loads(result.output)
+	assert payload["error"]["code"] == "INVALID_PARAM"
+	assert payload["hints"]["next_actions"] == ["boss hr recommendations --job-id job"]
+	assert "boss hr recommendations --job-id job" in payload["error"]["recovery_action"]
+	auth.assert_not_called()
+	factory.assert_not_called()
+
+
+def test_greet_blank_message_quotes_job_id_with_shell_metacharacters(greeting_args: list[str]) -> None:
+	"""job_id 是自由文本，拼进可执行的推荐命令前必须按 shell 参数转义。"""
+	args = [*greeting_args]
+	args[args.index("--job-id") + 1] = "job; echo pwn"
+	args[args.index("--message") + 1] = "   "
+	with patch("boss_agent_cli.commands.recruiter.recommendations.AuthManager") as auth, patch(
+		"boss_agent_cli.commands.recruiter.recommendations.get_recruiter_platform_instance"
+	) as factory:
+		result = CliRunner().invoke(cli, args)
+	assert result.exit_code == 1, result.output
+	payload = json.loads(result.output)
+	assert payload["error"]["code"] == "INVALID_PARAM"
+	assert payload["hints"]["next_actions"] == ["boss hr recommendations --job-id 'job; echo pwn'"]
+	assert "boss hr recommendations --job-id 'job; echo pwn'" in payload["error"]["recovery_action"]
+	auth.assert_not_called()
+	factory.assert_not_called()
+
+
 def test_greet_deduplicates_when_security_id_rotates(greeting_args: list[str], greeting_platform: MagicMock) -> None:
 	first = CliRunner().invoke(cli, greeting_args + ["--yes"])
 	assert first.exit_code == 0, first.output
@@ -350,6 +385,16 @@ def greeting_platform():
 		yield platform
 
 
+def test_greet_success_points_back_to_the_conversation(greeting_args, greeting_platform):
+	"""招呼发出后要能回到会话跟进：成功信封原先 hints 为 null。"""
+	result = CliRunner().invoke(cli, greeting_args + ["--yes"])
+
+	assert result.exit_code == 0, result.output
+	parsed = json.loads(result.output)
+	assert parsed["data"]["sent"] is True
+	assert parsed["hints"]["next_actions"] == ["boss hr chat", "boss hr last-messages"]
+
+
 def test_rejected_greeting_preserves_safe_platform_diagnostics(greeting_args, greeting_platform):
 	greeting_platform.start_chat.return_value = {"code": 9, "message": "额度不足 cookie=private", "zpData": {"token": "secret"}}
 	result = CliRunner().invoke(cli, greeting_args + ["--yes"])
@@ -417,6 +462,16 @@ def test_cache_write_failure_preserves_sent_and_blocks_resend(greeting_args, gre
 	second = CliRunner().invoke(cli, greeting_args + ["--yes"])
 	assert json.loads(second.output)["error"]["code"] == "GREET_RESULT_UNKNOWN"
 	greeting_platform.start_chat.assert_called_once()
+
+
+def test_greet_unknown_send_failure_quotes_job_id_in_check_command(greeting_args, greeting_platform):
+	"""发送结果未知时给出的核对命令同样要转义 job_id。"""
+	greeting_args[greeting_args.index("--job-id") + 1] = "job; echo pwn"
+	greeting_platform.start_chat.side_effect = RuntimeError("boom")
+	result = CliRunner().invoke(cli, greeting_args + ["--yes"])
+	payload = json.loads(result.output)
+	assert payload["error"]["code"] == "GREET_RESULT_UNKNOWN"
+	assert payload["hints"]["next_actions"] == ["boss hr chat --job-id 'job; echo pwn'"]
 
 
 @pytest.mark.parametrize("failure,code", [

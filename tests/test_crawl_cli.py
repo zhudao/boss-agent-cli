@@ -121,7 +121,11 @@ def test_save_crawl_config_survives_corrupted_config_file(tmp_path):
 def test_configure_without_any_option_is_invalid_param(tmp_path):
 	result = _invoke(CliRunner(), tmp_path, "crawl", "configure")
 	assert result.exit_code == 1
-	assert _envelope(result)["error"]["code"] == "INVALID_PARAM"
+	parsed = _envelope(result)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	# 没给配置项时也要有可执行的下一步：列出可配置项。
+	assert parsed["hints"]["next_actions"] == ["boss crawl configure --help"]
+	assert "boss crawl configure --help" in parsed["error"]["recovery_action"]
 
 
 def test_configure_persists_budget_overrides(tmp_path):
@@ -159,6 +163,38 @@ def test_run_rejects_unknown_city_before_touching_the_browser(tmp_path, monkeypa
 	error = _envelope(result)["error"]
 	assert error["code"] == "INVALID_PARAM"
 	assert "城市" in error["message"]
+	assert "boss crawl configure --help" in error["recovery_action"]
+	assert _envelope(result)["hints"]["next_actions"] == ["boss crawl configure --help"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 的 Path.expanduser 不解析 ~user")
+def test_run_rejects_unknown_home_hook_dir_before_touching_the_browser(tmp_path, monkeypatch):
+	"""`--hook-dir "~未知用户/…"` 是参数问题，不能兜成可重试的网络错误。"""
+
+	def _explode(settings):  # pragma: no cover - 不应被调用
+		raise AssertionError("非法 --hook-dir 不应进入 transport 构造")
+
+	monkeypatch.setattr("boss_agent_cli.commands.crawl._transport_factory", _explode)
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+	result = _invoke(
+		runner,
+		tmp_path,
+		"crawl",
+		"run",
+		"AI",
+		"--city",
+		"杭州",
+		"--hook-profile",
+		"screenshot-full",
+		"--hook-dir",
+		"~boss_cli_no_such_user_zzz/hooks",
+	)
+	assert result.exit_code == 1
+	error = _envelope(result)["error"]
+	assert error["code"] == "INVALID_PARAM"
+	assert "无法展开 --hook-dir 的家目录写法" in error["message"]
+	assert error["recoverable"] is False
 
 
 def test_run_honors_configured_zero_max_retries(tmp_path, monkeypatch):
@@ -263,10 +299,28 @@ def test_run_hints_point_at_output_files_when_completed(tmp_path, monkeypatch):
 	_enable_research(runner, tmp_path)
 	result = _invoke(runner, tmp_path, "crawl", "run", "AI", "--city", "杭州")
 	assert result.exit_code == 0, result.output
-	assert "output_paths" in _envelope(result)["hints"]["operator_actions"][0]
+	payload = _envelope(result)
+	assert "output_paths" in payload["hints"]["operator_actions"][0]
+	# 跑完后唯一能把结果落地的下一步就是按 run_id 读；空列表会让 Agent 自己猜命令。
+	assert payload["hints"]["next_actions"] == ["boss crawl results run-done"]
 
 
 # ── start ─────────────────────────────────────────────────────────────
+
+
+def test_start_hints_cover_status_results_and_stop(tmp_path, monkeypatch):
+	"""启动后 Agent 要能查看进度、取结果、必要时中止；终端 next_steps 与信封同口径。"""
+	monkeypatch.setattr("boss_agent_cli.commands.crawl._launch_background_resume", lambda data_dir, run_id, **kwargs: None)
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+	result = _invoke(runner, tmp_path, "crawl", "start", "AI", "--city", "杭州")
+	assert result.exit_code == 0, result.output
+	run_id = _envelope(result)["data"]["run_id"]
+	assert _envelope(result)["hints"]["next_actions"] == [
+		f"boss crawl status {run_id}",
+		f"boss crawl results {run_id}",
+		f"boss crawl stop {run_id}",
+	]
 
 
 def test_start_marks_run_stopped_when_background_launch_fails(tmp_path, monkeypatch):
@@ -298,15 +352,90 @@ def _all_run_ids(tmp_path: Path) -> list[str]:
 		return [str(row[0]) for row in conn.execute("SELECT run_id FROM crawl_runs")]
 
 
+@pytest.mark.parametrize("query", ["", "   "])
+def test_start_rejects_blank_query_without_creating_a_run(tmp_path, query):
+	"""空关键词等于不筛选：会抓城市默认列表，消耗预算并放大风控面。"""
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+	result = _invoke(runner, tmp_path, "crawl", "start", query, "--city", "杭州")
+	assert result.exit_code == 1
+	error = _envelope(result)["error"]
+	assert error["code"] == "INVALID_PARAM"
+	assert "关键词" in error["message"]
+	assert "boss crawl configure --help" in error["recovery_action"]
+	db = tmp_path / "cache" / "boss_agent.db"
+	if db.exists():
+		assert _all_run_ids(tmp_path) == [], "空关键词不该留下 run 或拉起后台进程"
+
+
+def test_run_rejects_blank_query(tmp_path):
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+	result = _invoke(runner, tmp_path, "crawl", "run", "", "--city", "杭州")
+	assert result.exit_code == 1
+	assert _envelope(result)["error"]["code"] == "INVALID_PARAM"
+	assert "关键词" in _envelope(result)["error"]["message"]
+	assert _envelope(result)["hints"]["next_actions"] == ["boss crawl configure --help"]
+
+
 # ── resume ────────────────────────────────────────────────────────────
 
 
-def test_resume_background_reports_job_not_found(tmp_path):
+def test_resume_background_reports_run_not_found(tmp_path):
 	runner = CliRunner()
 	_enable_research(runner, tmp_path)
 	result = _invoke(runner, tmp_path, "crawl", "resume", "missing", "--background")
 	assert result.exit_code == 1
-	assert _envelope(result)["error"]["code"] == "JOB_NOT_FOUND"
+	assert _envelope(result)["error"]["code"] == "CRAWL_RUN_NOT_FOUND"
+
+
+def test_resume_missing_run_reports_not_found_before_requiring_login(tmp_path):
+	"""run 记录在本地：ID 不存在时不该先把人送去登录。
+
+	`_run_service` 会先注入登录 Cookie；登录态缺失时，一个写错的 run_id 会报
+	``AUTH_REQUIRED``，登录回来才发现任务不存在。
+	"""
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+
+	result = runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "crawl", "resume", "missing"])
+
+	assert result.exit_code == 1
+	payload = _envelope(result)
+	assert payload["error"]["code"] == "CRAWL_RUN_NOT_FOUND"
+	assert "missing" in payload["error"]["message"]
+	assert payload["hints"]["next_actions"] == ["boss crawl start <query>", "boss crawl status <run_id>"]
+
+
+def test_resume_existing_run_without_login_still_requires_auth(tmp_path):
+	"""存在性检查不能把「已登录才可恢复」这条前置条件吞掉。"""
+	_seed_run(tmp_path)
+	runner = CliRunner()
+	_enable_research(runner, tmp_path)
+
+	result = runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "crawl", "resume", "run-1"])
+
+	assert result.exit_code == 1
+	assert _envelope(result)["error"]["code"] == "AUTH_REQUIRED"
+
+
+def test_empty_run_id_is_invalid_param_not_run_not_found(tmp_path):
+	"""空 run_id 是 argv 少传了值，不是「任务不存在」。
+
+	原样查缓存会报 ``CRAWL_RUN_NOT_FOUND``「未找到 crawl run: 」（冒号后面空着），
+	Agent 会以为 run 丢了而重建；``crawl resume ""`` 更会因为先做登录校验而报
+	``AUTH_REQUIRED``，把参数写错的人送去重新登录。
+	"""
+	runner = CliRunner()
+	for command in ("status", "stop", "results", "resume"):
+		result = _invoke(runner, tmp_path, "crawl", command, "")
+		assert result.exit_code == 1, command
+		payload = _envelope(result)
+		assert payload["error"]["code"] == "INVALID_PARAM", command
+		assert "run_id 不能为空" in payload["error"]["message"], command
+		assert payload["hints"]["next_actions"] == ["boss crawl start <query>", "boss crawl status <run_id>"]
+		# 恢复动作要说明「补上已存在的 run_id」或新建任务，而不是「修正参数」。
+		assert "run_id" in payload["error"]["recovery_action"], command
 
 
 def test_resume_background_relaunches_stopped_run(tmp_path, monkeypatch):
@@ -395,16 +524,36 @@ def test_status_returns_checkpoint_and_detail_progress(tmp_path):
 	runner = CliRunner()
 	result = _invoke(runner, tmp_path, "crawl", "status", "run-1")
 	assert result.exit_code == 0, result.output
-	data = _envelope(result)["data"]
+	payload = _envelope(result)
+	data = payload["data"]
 	assert data["run_id"] == "run-1"
 	assert data["query"] == "AI"
 	assert data["status"] == "completed"
+	# 已结束的 run 上 stop 什么都不会停：只提示读取结果。
+	assert payload["hints"]["next_actions"] == ["boss crawl results run-1"]
 
 
-def test_status_reports_job_not_found(tmp_path):
+def test_status_running_points_to_results_and_stop(tmp_path):
+	_seed_run(tmp_path, "run-1", status="running")
+	payload = _envelope(_invoke(CliRunner(), tmp_path, "crawl", "status", "run-1"))
+	assert payload["hints"]["next_actions"] == [
+		"boss crawl results run-1",
+		"boss crawl stop run-1",
+	]
+
+
+def test_status_quotes_run_id_in_checkpoint_resume_command(tmp_path):
+	"""checkpoint.resume_command 也是可执行提示，run_id 必须按 shell 参数转义。"""
+	_seed_run(tmp_path, "run; echo pwn", status="running")
+	payload = _envelope(_invoke(CliRunner(), tmp_path, "crawl", "status", "run; echo pwn"))
+	assert payload["ok"] is True
+	assert payload["data"]["checkpoint"]["resume_command"] == "boss crawl resume 'run; echo pwn'"
+
+
+def test_status_reports_run_not_found(tmp_path):
 	result = _invoke(CliRunner(), tmp_path, "crawl", "status", "missing")
 	assert result.exit_code == 1
-	assert _envelope(result)["error"]["code"] == "JOB_NOT_FOUND"
+	assert _envelope(result)["error"]["code"] == "CRAWL_RUN_NOT_FOUND"
 
 
 def test_status_risk_stopped_reports_operator_unlock(tmp_path):
@@ -429,10 +578,10 @@ def test_status_completed_has_no_unlock_flag(tmp_path):
 	assert "hints" not in payload or "operator_actions" not in (payload.get("hints") or {})
 
 
-def test_stop_reports_job_not_found(tmp_path):
+def test_stop_reports_run_not_found(tmp_path):
 	result = _invoke(CliRunner(), tmp_path, "crawl", "stop", "missing")
 	assert result.exit_code == 1
-	assert _envelope(result)["error"]["code"] == "JOB_NOT_FOUND"
+	assert _envelope(result)["error"]["code"] == "CRAWL_RUN_NOT_FOUND"
 
 
 def test_stop_records_the_kill_switch(tmp_path):
@@ -471,10 +620,10 @@ def test_results_never_leaks_platform_identifiers(tmp_path):
 	assert "job-0" not in raw, "平台职位 ID 不得出现在 crawl results 输出里"
 
 
-def test_results_reports_job_not_found(tmp_path):
+def test_results_reports_run_not_found(tmp_path):
 	result = _invoke(CliRunner(), tmp_path, "crawl", "results", "missing")
 	assert result.exit_code == 1
-	assert _envelope(result)["error"]["code"] == "JOB_NOT_FOUND"
+	assert _envelope(result)["error"]["code"] == "CRAWL_RUN_NOT_FOUND"
 
 
 # ── shortlist ─────────────────────────────────────────────────────────
@@ -486,11 +635,29 @@ def test_shortlist_requires_exactly_one_selection_mode(tmp_path):
 
 	neither = _invoke(runner, tmp_path, "crawl", "shortlist", "run-1")
 	assert neither.exit_code == 1
-	assert _envelope(neither)["error"]["code"] == "INVALID_PARAM"
+	neither_error = _envelope(neither)["error"]
+	assert neither_error["code"] == "INVALID_PARAM"
+	assert "--all" in neither_error["recovery_action"]
+	assert "--selector" in neither_error["recovery_action"]
+	assert _envelope(neither)["hints"]["next_actions"] == ["boss crawl results run-1"]
 
 	both = _invoke(runner, tmp_path, "crawl", "shortlist", "run-1", "--all", "--selector", selectors[0])
 	assert both.exit_code == 1
 	assert _envelope(both)["error"]["code"] == "INVALID_PARAM"
+
+
+def test_shortlist_hint_quotes_run_id_with_shell_metacharacters(tmp_path):
+	"""run_id 是自由文本，拼进 next_actions 前必须按 shell 参数转义。
+
+	``boss crawl shortlist 'run; echo pwn'`` 原先把这段原样拼成
+	``boss crawl results run; echo pwn``，Agent 照抄会把后半段当成独立命令执行。
+	"""
+	result = _invoke(CliRunner(), tmp_path, "crawl", "shortlist", "run; echo pwn")
+	assert result.exit_code == 1
+	payload = _envelope(result)
+	assert payload["error"]["code"] == "INVALID_PARAM"
+	assert payload["hints"]["next_actions"] == ["boss crawl results 'run; echo pwn'"]
+	assert "boss crawl results 'run; echo pwn'" in payload["error"]["recovery_action"]
 
 
 def test_shortlist_imports_selected_rows_with_tags_and_note(tmp_path):
@@ -509,13 +676,16 @@ def test_shortlist_rejects_unknown_selector(tmp_path):
 	_seed_run(tmp_path, "run-1", jobs=1)
 	result = _invoke(CliRunner(), tmp_path, "crawl", "shortlist", "run-1", "--selector", "csel_不存在")
 	assert result.exit_code == 1
-	assert _envelope(result)["error"]["code"] == "INVALID_PARAM"
+	error = _envelope(result)["error"]
+	assert error["code"] == "INVALID_PARAM"
+	assert "boss crawl results run-1" in error["recovery_action"]
+	assert _envelope(result)["hints"]["next_actions"] == ["boss crawl results run-1"]
 
 
-def test_shortlist_reports_job_not_found(tmp_path):
+def test_shortlist_reports_run_not_found(tmp_path):
 	result = _invoke(CliRunner(), tmp_path, "crawl", "shortlist", "missing", "--all")
 	assert result.exit_code == 1
-	assert _envelope(result)["error"]["code"] == "JOB_NOT_FOUND"
+	assert _envelope(result)["error"]["code"] == "CRAWL_RUN_NOT_FOUND"
 
 
 # ── 后台拉起的命令拼装 ────────────────────────────────────────────────
@@ -562,7 +732,7 @@ def test_background_resume_omits_optional_flags_when_not_requested(tmp_path, mon
 # ── _run_service 的错误映射 ───────────────────────────────────────────
 
 
-def test_resume_maps_missing_run_to_job_not_found(tmp_path, monkeypatch):
+def test_resume_maps_missing_run_to_run_not_found(tmp_path, monkeypatch):
 	from boss_agent_cli.commands import crawl as crawl_module
 
 	def _missing(self, run_id, **kwargs):
@@ -574,7 +744,7 @@ def test_resume_maps_missing_run_to_job_not_found(tmp_path, monkeypatch):
 	result = _invoke(runner, tmp_path, "crawl", "resume", "run-missing")
 	assert result.exit_code == 1
 	error = _envelope(result)["error"]
-	assert error["code"] == "JOB_NOT_FOUND"
+	assert error["code"] == "CRAWL_RUN_NOT_FOUND"
 	assert "run-missing" in error["message"]
 
 
@@ -585,6 +755,7 @@ def test_resume_maps_value_error_to_invalid_param(tmp_path, monkeypatch):
 		raise ValueError("run 已完成，无需恢复")
 
 	monkeypatch.setattr(crawl_module.CrawlService, "resume", _invalid)
+	_seed_run(tmp_path)
 	runner = CliRunner()
 	_enable_research(runner, tmp_path)
 	result = _invoke(runner, tmp_path, "crawl", "resume", "run-1")
@@ -612,6 +783,7 @@ def test_resume_foreground_clears_the_stop_request_but_queue_resume_does_not(tmp
 		return _Outcome()
 
 	monkeypatch.setattr(crawl_module.CrawlService, "resume", _resume)
+	_seed_run(tmp_path)
 	runner = CliRunner()
 	_enable_research(runner, tmp_path)
 
@@ -722,3 +894,14 @@ def test_structurally_drifted_hook_results_reports_envelope(tmp_path):
 	result = _invoke(CliRunner(), tmp_path, "crawl", "status", "run-1")
 	assert result.exit_code == 1, result.output
 	assert "JSON array" in _envelope(result)["error"]["message"]
+
+
+def test_run_not_found_carries_recovery_and_hints(tmp_path):
+	"""run_id 写错时给出新建与核对两条可执行下一步，而不是「职位不存在」。"""
+	result = _invoke(CliRunner(), tmp_path, "crawl", "status", "missing")
+
+	assert result.exit_code == 1
+	payload = _envelope(result)
+	assert payload["error"]["code"] == "CRAWL_RUN_NOT_FOUND"
+	assert payload["error"]["recovery_action"]
+	assert payload["hints"]["next_actions"] == ["boss crawl start <query>", "boss crawl status <run_id>"]

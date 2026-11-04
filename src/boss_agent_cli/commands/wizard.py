@@ -10,7 +10,7 @@ import click
 
 from boss_agent_cli.cache.store import CacheRecordInvalid
 from boss_agent_cli.config import DEFAULT_REQUEST_DELAY
-from boss_agent_cli.display import console, handle_error_output, handle_output
+from boss_agent_cli.display import boss_command_for_ctx, console, handle_error_output, handle_output, shell_argument
 from boss_agent_cli.wizard.actions import ActionContext, DEFAULT_ACTIONS
 from boss_agent_cli.wizard.catalog import build_plan, require_supported_platform
 from boss_agent_cli.wizard.models import WorkflowInputError, WorkflowPlan, WizardInput
@@ -80,6 +80,27 @@ def _wizard_error(
 		details=details,
 		hints=hints,
 	)
+
+
+def _workflow_next_actions(ctx: click.Context, run: Mapping[str, Any]) -> list[str]:
+	"""按 run 状态给出可直接执行的后继命令。
+
+	``--status`` / ``--stop`` 成功后此前不带 hints：Agent 查完状态或停掉任务
+	就断了，看不出该恢复、继续等待还是新建（主执行路径跑完反而给了
+	``--status <run_id>``）。这里按状态补齐，取值来自 ``WorkflowStatus``。
+	"""
+	prefix = boss_command_for_ctx(ctx, "wizard")
+	run_id = str(run.get("run_id") or "").strip()
+	if not run_id:
+		return [prefix]
+	status_cmd = f"{prefix} --status {shell_argument(run_id)}"
+	status = str(run.get("status") or "")
+	if status in {"stopped", "failed", "waiting_input"}:
+		# 断点仍在本地：恢复是唯一能接着往下跑的动作，status 方便先核对。
+		return [f"{prefix} --resume {shell_argument(run_id)}", status_cmd]
+	if status in {"running", "pending"}:
+		return [status_cmd, f"{prefix} --stop {shell_argument(run_id)}"]
+	return [prefix, status_cmd]
 
 
 def _plan_from_run(run: Mapping[str, Any]) -> WorkflowPlan:
@@ -295,7 +316,7 @@ def _emit_run(ctx: click.Context, run: Mapping[str, Any], *, interactive: bool) 
 		"wizard",
 		run,
 		render=render_run,
-		hints={"next_actions": [f"boss wizard --status {run['run_id']}"]},
+		hints={"next_actions": [f"boss wizard --status {shell_argument(str(run['run_id']))}"]},
 	)
 
 
@@ -350,7 +371,7 @@ def _run_interactive_session(
 				if selection.action == "status":
 					run = store.get(str(selection.run_id))
 					if run is None:
-						render_error(code="JOB_NOT_FOUND")
+						render_error(code="WORKFLOW_NOT_FOUND")
 						if not ask_continue_session(clear_before=False):
 							return
 						continue
@@ -388,7 +409,7 @@ def _run_interactive_session(
 						continue
 				elif selection.action == "stop":
 					if not store.request_stop(str(selection.run_id)):
-						render_error(code="JOB_NOT_FOUND")
+						render_error(code="WORKFLOW_NOT_FOUND")
 					else:
 						clear_wizard_screen()
 						render_run(store.get(str(selection.run_id)) or {})
@@ -401,7 +422,7 @@ def _run_interactive_session(
 						turn_retries = max(1, max_retries)
 					existing = store.get(str(resume_run_id))
 					if existing is None:
-						render_error(code="JOB_NOT_FOUND")
+						render_error(code="WORKFLOW_NOT_FOUND")
 						if not ask_continue_session():
 							return
 						continue
@@ -410,7 +431,7 @@ def _run_interactive_session(
 				source_id = str(selection.inputs.get("source_run_id") or "")
 				browse_run = store.get(source_id) if source_id else None
 				if browse_run is None:
-					render_error(code="JOB_NOT_FOUND", message="找不到可浏览的采集结果")
+					render_error(code="WORKFLOW_NOT_FOUND", message="找不到可浏览的采集结果")
 					if not ask_continue_session():
 						return
 					continue
@@ -587,7 +608,16 @@ def _run_wizard_command(
 	if not interactive:
 		# stdin 非 TTY 时必须使用 Agent JSON 路由，即使 stdout 仍连接终端。
 		ctx.obj["json_output"] = True
-	selectors = [value for value in (input_json, resume_run_id, status_run_id, stop_run_id) if value is not None]
+	selectors = [
+		(name, value)
+		for name, value in (
+			("--input-json", input_json),
+			("--resume", resume_run_id),
+			("--status", status_run_id),
+			("--stop", stop_run_id),
+		)
+		if value is not None
+	]
 	if len(selectors) > 1:
 		_wizard_error(
 			ctx,
@@ -595,6 +625,19 @@ def _run_wizard_command(
 			code="INVALID_PARAM",
 			message="--input-json/--resume/--status/--stop 只能指定一个",
 			recovery_action="选择一个 workflow 操作后重试",
+		)
+		return
+	if len(selectors) == 1 and not selectors[0][1].strip():
+		# 传了 flag 但值为空时，旧逻辑把它当成「没有选择器」，回一句
+		# 「非交互模式需要 --input-json、--resume、--status 或 --stop」——
+		# 用户明明传了，看到的却是「你没传」，只能再猜一次。
+		_wizard_error(
+			ctx,
+			interactive,
+			code="INVALID_PARAM",
+			message=f"{selectors[0][0]} 的值不能为空",
+			recovery_action="补上 run_id 后重试；用 boss wizard --status <run_id> 核对已有任务",
+			hints={"next_actions": ["boss wizard"]},
 		)
 		return
 
@@ -606,23 +649,25 @@ def _run_wizard_command(
 				_wizard_error(
 					ctx,
 					interactive,
-					code="JOB_NOT_FOUND",
+					code="WORKFLOW_NOT_FOUND",
 					message=f"未找到任务: {status_run_id}",
+					hints={"next_actions": ["boss wizard"]},
 				)
 				return
-			handle_output(ctx, "wizard", run, render=render_run)
+			handle_output(ctx, "wizard", run, render=render_run, hints={"next_actions": _workflow_next_actions(ctx, run)})
 			return
 		if stop_run_id:
 			if not store.request_stop(stop_run_id):
 				_wizard_error(
 					ctx,
 					interactive,
-					code="JOB_NOT_FOUND",
+					code="WORKFLOW_NOT_FOUND",
 					message=f"未找到可停止的任务: {stop_run_id}",
+					hints={"next_actions": ["boss wizard"]},
 				)
 				return
 			run = store.get(stop_run_id) or {}
-			handle_output(ctx, "wizard", run, render=render_run)
+			handle_output(ctx, "wizard", run, render=render_run, hints={"next_actions": _workflow_next_actions(ctx, run)})
 			return
 
 		# 纯 TTY 无 flag：多轮主菜单循环；flag / headless 仍是单次执行。
@@ -646,8 +691,9 @@ def _run_wizard_command(
 					_wizard_error(
 						ctx,
 						interactive,
-						code="JOB_NOT_FOUND",
+						code="WORKFLOW_NOT_FOUND",
 						message=f"未找到任务: {resume_run_id}",
+						hints={"next_actions": ["boss wizard"]},
 					)
 					return
 				plan = _plan_from_run(existing)
@@ -716,7 +762,7 @@ def _run_wizard_command(
 		"wizard",
 		run,
 		render=render_run,
-		hints={"next_actions": [f"boss wizard --status {run['run_id']}"]},
+		hints={"next_actions": [f"boss wizard --status {shell_argument(str(run['run_id']))}"]},
 	)
 
 

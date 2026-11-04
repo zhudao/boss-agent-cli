@@ -28,6 +28,7 @@ from boss_agent_cli.display import (
 	render_message_panel,
 	risk_error_contract,
 	risk_error_message,
+	shell_argument,
 )
 from boss_agent_cli.search_filters import (
 	SearchFilterCriteria,
@@ -35,6 +36,7 @@ from boss_agent_cli.search_filters import (
 	prefilter_platform_job_type,
 	resolve_search_code_params,
 )
+from boss_agent_cli.commands._filter_errors import emit_filter_error
 from boss_agent_cli.services.job_identity import deduplicate_job_result
 
 
@@ -47,6 +49,20 @@ from boss_agent_cli.services.job_identity import deduplicate_job_result
 def greet_cmd(ctx: click.Context, security_id: str, job_id: str, message: str) -> None:
 	"""向指定招聘者打招呼"""
 	if not require_compliance_allowed(ctx, "greet"):
+		return
+
+	# 空 ID 无法定位任何职位或招聘者：继续下去只会先查一次本地缓存、再带着空参数
+	# 发平台请求，错误看起来像网络或登录问题，真正的原因（argv 拼错）被掩盖。
+	if not security_id.strip() or not job_id.strip():
+		search_cmd = boss_command_for_ctx(ctx, "search <关键词>")
+		handle_error_output(
+			ctx,
+			"greet",
+			code="INVALID_PARAM",
+			message="security_id 与 job_id 不能为空；先用 boss search 取到完整职位参数再打招呼",
+			recovery_action=f"补上两个编号后重试；完整职位参数可从 {search_cmd} 的结果中取到",
+			hints={"next_actions": [search_cmd]},
+		)
 		return
 
 	data_dir = ctx.obj["data_dir"]
@@ -143,6 +159,29 @@ def greet_cmd(ctx: click.Context, security_id: str, job_id: str, message: str) -
 			)
 
 
+def _batch_greet_dry_run_rerun(ctx: click.Context, query: str) -> str:
+	"""dry-run 之后真正要执行的那条命令：与本次调用同参数，只去掉 --dry-run。"""
+	params = ctx.params or {}
+	argv = boss_command_for_ctx(ctx, "batch-greet").split(" ") + [query]
+	for flag, key in (
+		("--city", "city"),
+		("--salary", "salary"),
+		("--experience", "experience"),
+		("--education", "education"),
+		("--industry", "industry"),
+		("--scale", "scale"),
+		("--stage", "stage"),
+		("--job-type", "job_type"),
+	):
+		value = params.get(key)
+		if value:
+			argv.extend([flag, str(value)])
+	count = params.get("count")
+	if count is not None:
+		argv.extend(["--count", str(count)])
+	return " ".join(shell_argument(part) for part in argv)
+
+
 @click.command("batch-greet")
 @click.argument("query")
 @click.option("--city", default=None, help="城市名称")
@@ -172,10 +211,7 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 	try:
 		ensure_supported_city(city)
 	except ValueError as exc:
-		handle_error_output(
-			ctx, "batch-greet", code="INVALID_PARAM", message=str(exc),
-			hints={"next_actions": [boss_command_for_ctx(ctx, "cities")]},
-		)
+		emit_filter_error(ctx, "batch-greet", exc)
 		return
 	try:
 		resolve_search_code_params(
@@ -183,7 +219,7 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 			industry=industry, scale=scale, stage=stage, job_type=job_type,
 		)
 	except ValueError as exc:
-		handle_error_output(ctx, "batch-greet", code="INVALID_PARAM", message=str(exc))
+		emit_filter_error(ctx, "batch-greet", exc)
 		return
 
 	auth = AuthManager(data_dir, logger=logger, platform=ctx.obj.get("platform", "zhipin"))
@@ -235,6 +271,8 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 
 			if dry_run:
 				items = [item.to_dict() for item in candidates]
+				# dry-run 的意义是「先看候选、再决定发不发」；不给如何去重的命令，
+				# Agent 预览完 30 个候选人就断了，不知道去掉 --dry-run 就能真发。
 				handle_output(
 					ctx, "batch-greet", {
 						"dry_run": True,
@@ -242,6 +280,10 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 						"count": len(items),
 					},
 					render=lambda d: render_batch_operation_summary(d, title="batch-greet"),
+					hints={
+						"next_actions": [_batch_greet_dry_run_rerun(ctx, query)],
+						"operator_actions": ["确认候选名单后去掉 --dry-run 重新执行，才会真实发出招呼"],
+					},
 				)
 				return
 
@@ -392,4 +434,9 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 			handle_output(
 				ctx, "batch-greet", data,
 				render=lambda d: render_batch_operation_summary(d, title="batch-greet"),
+				# 招呼已经发出，下一步是跟进会话；`me` 没有 greet 分区，不能提示去那里看。
+				hints={
+					"next_actions": [boss_command_for_ctx(ctx, "chat")],
+					"operator_actions": ["到 BOSS 直聘会话列表跟进已打招呼的招聘者"],
+				},
 			)

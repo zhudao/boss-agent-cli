@@ -100,6 +100,29 @@ def test_status_live_logged_in_unknown_user(mock_auth_cls, mock_client_cls):
 
 @patch("boss_agent_cli.commands.status.get_platform_instance")
 @patch("boss_agent_cli.commands.status.AuthManager")
+def test_status_live_success_points_at_business_commands(mock_auth_cls, mock_client_cls):
+	"""在线验证通过不是终点：非 live 的下一步就是 --live，live 成功后
+	信封必须给出可直接执行的业务命令，终端也要说明可以开始了。"""
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {"wt2": "x"}, "stoken": "s"}
+	mock_client = mock_client_cls.return_value
+	mock_client.__enter__ = lambda self: self
+	mock_client.__exit__ = lambda self, *a: None
+	mock_client.is_success.return_value = True
+	mock_client.user_info.return_value = {"zpData": {"name": "tester"}}
+	mock_client.unwrap_data.return_value = {"name": "tester"}
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--json", "status", "--live"])
+
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["data"]["user_name"] == "tester"
+	assert parsed["hints"]["next_actions"] == ["boss recommend", "boss search <关键词>"]
+	assert parsed["hints"]["operator_actions"]
+
+
+@patch("boss_agent_cli.commands.status.get_platform_instance")
+@patch("boss_agent_cli.commands.status.AuthManager")
 def test_status_reports_user_info_error(mock_auth_cls, mock_client_cls):
 	mock_auth_cls.return_value.check_status.return_value = {"cookies": {"wt2": "x"}, "stoken": "s"}
 	mock_client = mock_client_cls.return_value
@@ -166,6 +189,59 @@ def test_greet_already_greeted(mock_cache_cls, mock_auth_cls, mock_client_cls):
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "ALREADY_GREETED"
+	# 已打招呼不是死胡同：恢复指引要给出跟进会话的路径。
+	assert "boss chat" in parsed["error"]["recovery_action"]
+
+
+@patch("boss_agent_cli.commands.greet.get_platform_instance")
+@patch("boss_agent_cli.commands.greet.AuthManager")
+@patch("boss_agent_cli.commands.greet.CacheStore")
+def test_greet_limit_reports_recovery_action(mock_cache_cls, mock_auth_cls, mock_client_cls):
+	"""额度用完不是死胡同：信封要说明停止自动招呼、等待权益恢复。"""
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.is_greeted.return_value = False
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.greet.return_value = {"code": 99}
+	mock_client.is_success.return_value = False
+	mock_client.parse_error.return_value = ("GREET_LIMIT", "今日主动沟通人数已达上限")
+	runner = CliRunner()
+	result = runner.invoke(cli, ["greet", "sec_001", "job_001"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "GREET_LIMIT"
+	assert "不要自动重发" in parsed["error"]["recovery_action"]
+
+
+def test_greet_rejects_blank_identifiers():
+	"""空 security_id / job_id 是 argv 构造错误，不该发平台请求。"""
+	runner = CliRunner()
+	result = runner.invoke(cli, ["greet", "", "job_001"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["hints"]["next_actions"] == ["boss search <关键词>"]
+	assert "boss search <关键词>" in parsed["error"]["recovery_action"]
+
+
+def test_detail_rejects_blank_security_id():
+	"""空 security_id 不该换来一次无意义的平台往返。"""
+	runner = CliRunner()
+	result = runner.invoke(cli, ["detail", ""])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["hints"]["next_actions"] == ["boss search <关键词>", "boss show <编号>"]
+	assert "boss search <关键词>" in parsed["error"]["recovery_action"]
+
+
+def test_apply_rejects_blank_identifiers():
+	"""空标识的投递是 argv 构造错误，必须在碰本地缓存和平台之前拒绝。"""
+	runner = CliRunner()
+	result = runner.invoke(cli, ["apply", "", "job_001"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["hints"]["next_actions"] == ["boss search <关键词>"]
 
 
 @patch("boss_agent_cli.commands.greet.time")
@@ -721,6 +797,15 @@ def test_search_rejects_non_boss_url():
 	assert parsed["error"]["code"] == "INVALID_PARAM"
 
 
+def test_search_rejects_blank_query():
+	"""纯空白的 query 等于没给关键词，不能变成一次无关键词搜索。"""
+	for query in ("", " ", "\t"):
+		result = CliRunner().invoke(cli, ["search", query])
+		assert result.exit_code == 1, repr(query)
+		parsed = json.loads(result.output)
+		assert parsed["error"]["code"] == "INVALID_PARAM", repr(query)
+
+
 @patch("boss_agent_cli.index_cache.save_index", side_effect=PermissionError("readonly"))
 @patch("boss_agent_cli.commands.recommend.CacheStore")
 @patch("boss_agent_cli.commands.recommend.get_platform_instance")
@@ -942,6 +1027,15 @@ def test_export_reports_search_error(mock_auth_cls, mock_client_cls):
 	assert parsed["error"]["code"] == "ACCOUNT_RISK"
 	assert parsed["error"]["message"] == risk_error_message("ACCOUNT_RISK")
 	assert "account risk" not in parsed["error"]["message"]
+
+
+def test_export_rejects_blank_query():
+	"""纯空白的 query 不能变成一次无关键词的全量导出。"""
+	for query in ("", " "):
+		result = CliRunner().invoke(cli, ["export", query])
+		assert result.exit_code == 1, repr(query)
+		parsed = json.loads(result.output)
+		assert parsed["error"]["code"] == "INVALID_PARAM", repr(query)
 
 
 def _make_friend_item(name, brand, relation_type, last_ts):
@@ -1663,19 +1757,19 @@ def test_chat_summary_finds_contact_on_second_page(mock_auth_cls, mock_client_cl
 
 @patch("boss_agent_cli.commands.chat_summary.get_platform_instance")
 @patch("boss_agent_cli.commands.chat_summary.AuthManager")
-def test_chat_summary_not_found_keeps_job_not_found(mock_auth_cls, mock_client_cls):
+def test_chat_summary_not_found_keeps_contact_not_found(mock_auth_cls, mock_client_cls):
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.friend_list.return_value = {"code": 200, "data": {"result": []}}
 	runner = CliRunner()
 	result = runner.invoke(cli, ["--json", "chat-summary", "sec_missing"])
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
-	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
+	assert parsed["error"]["code"] == "CONTACT_NOT_FOUND"
 
 
 @patch("boss_agent_cli.commands.chat_summary.get_platform_instance")
 @patch("boss_agent_cli.commands.chat_summary.AuthManager")
-def test_chat_summary_not_found_after_second_page_keeps_job_not_found(mock_auth_cls, mock_client_cls):
+def test_chat_summary_not_found_after_second_page_keeps_contact_not_found(mock_auth_cls, mock_client_cls):
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.friend_list.side_effect = [
 		{"code": 200, "data": {"result": [_make_friend_item("其他HR", "别家公司", 1, 1700000000000) | {"securityId": "sec_other", "uid": 99999}]}},
@@ -1685,7 +1779,7 @@ def test_chat_summary_not_found_after_second_page_keeps_job_not_found(mock_auth_
 	result = runner.invoke(cli, ["--json", "chat-summary", "sec_missing"])
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
-	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
+	assert parsed["error"]["code"] == "CONTACT_NOT_FOUND"
 
 
 @patch("boss_agent_cli.commands.pipeline.get_platform_instance")
@@ -2068,3 +2162,18 @@ def test_corrupt_cache_database_returns_envelope_not_traceback(tmp_path):
 	assert str(db) in payload["error"]["message"]
 	assert str(db) in payload["hints"]["operator_actions"][0]
 	assert "备份" in payload["error"]["recovery_action"]
+
+
+@patch("boss_agent_cli.commands.mark.get_platform_instance")
+@patch("boss_agent_cli.commands.mark.AuthManager")
+def test_mark_rejects_blank_identifier(mock_auth_cls, mock_client_cls):
+	"""mark 与其他联系人命令共用解析：空标识在拉取沟通列表之前就被拒绝。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	runner = CliRunner()
+	result = runner.invoke(cli, ["mark", "", "--label", "沟通中"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["hints"]["next_actions"] == ["boss chat"]
+	assert "boss chat" in parsed["error"]["recovery_action"]
+	mock_client.friend_list.assert_not_called()

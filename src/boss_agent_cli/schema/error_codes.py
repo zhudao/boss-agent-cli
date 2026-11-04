@@ -142,17 +142,46 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 	"JOB_NOT_FOUND": {
 		"message": "职位不存在或已下架",
 		"recoverable": False,
-		"recovery_action": None,
+		# 平台职位不存在是确定性结果，但 Agent 仍需一条换线索的路径；
+		# 留 null 会让错误信封变成「下架」的死胡同。
+		"recovery_action": "该职位已不可用：用 boss search <关键词> 重新搜索，或 boss recommend 查看推荐职位",
+	},
+	"CONTACT_NOT_FOUND": {
+		"message": "沟通列表中未找到该联系人",
+		"recoverable": False,
+		"recovery_action": "boss chat",
+	},
+	"CRAWL_RUN_NOT_FOUND": {
+		"message": "本地采集任务不存在或 run_id 有误",
+		"recoverable": False,
+		"recovery_action": "boss crawl start <query>（新建任务），或 boss crawl status <run_id> 核对 ID",
+	},
+	"SAVED_SEARCH_NOT_FOUND": {
+		"message": "本地预设或 watch 不存在",
+		"recoverable": False,
+		"recovery_action": "boss preset list（预设）或 boss watch list（watch）",
+	},
+	"SHORTLIST_ENTRY_NOT_FOUND": {
+		"message": "候选池中没有该职位，无法标注",
+		"recoverable": False,
+		"recovery_action": "boss shortlist add <security_id> <job_id>（先加入候选池），或 boss shortlist list 核对已有条目",
+	},
+	"WORKFLOW_NOT_FOUND": {
+		"message": "本地 workflow 任务不存在或 run_id 有误",
+		"recoverable": False,
+		"recovery_action": "boss wizard（新建 workflow），或 boss wizard --status <run_id> 核对 ID",
 	},
 	"ALREADY_GREETED": {
 		"message": "已向该招聘者打过招呼",
 		"recoverable": False,
-		"recovery_action": None,
+		# 重复打招呼被本地去重拦下：会话其实已建立，下一步是跟进而不是停住。
+		"recovery_action": "该招聘者已打过招呼：用 boss chat 查看会话，或用 boss search <关键词> 换一批职位",
 	},
 	"ALREADY_APPLIED": {
 		"message": "已发起过投递/立即沟通",
 		"recoverable": False,
-		"recovery_action": None,
+		# 与 greet 同理：投递记录已经存在，给出查看与跟进的路径。
+		"recovery_action": "该职位已投递过：用 boss me --section deliver 查看投递记录，或用 boss chat 跟进",
 	},
 	"ACCOUNT_RISK": {
 		"message": "风控拦截",
@@ -167,7 +196,8 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 	"GREET_LIMIT": {
 		"message": "今日打招呼次数已用完",
 		"recoverable": False,
-		"recovery_action": None,
+		# 平台按职位/账号限制主动沟通人数：等待权益恢复，不能自动重发。
+		"recovery_action": "今日主动沟通额度已用完：停止自动打招呼，等平台权益恢复后再试；不要自动重发本次招呼",
 	},
 	"INTERNAL_ERROR": {
 		"message": "CLI 内部错误，或平台返回了未预期的数据结构",
@@ -242,7 +272,12 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 	"RESUME_NOT_FOUND": {
 		"message": "简历不存在",
 		"recoverable": False,
-		"recovery_action": None,
+		"recovery_action": "boss resume list",
+	},
+	"RESUME_FILE_INVALID": {
+		"message": "本地简历文件损坏或字段类型不正确，无法读取",
+		"recoverable": True,
+		"recovery_action": "修正 resumes/<name>.json 的 JSON 内容后重试，或执行 boss resume delete <name> 后重新创建；该文件只存在本机",
 	},
 	"RESUME_ALREADY_EXISTS": {
 		"message": "简历名称已存在",
@@ -314,30 +349,15 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"recoverable": True,
 		"recovery_action": "切换招聘者账号或使用 --role candidate",
 	},
-	"APPLICATION_NOT_FOUND": {
-		"message": "投递申请不存在",
-		"recoverable": False,
-		"recovery_action": None,
-	},
 	"RESUME_NOT_SHARED": {
 		"message": "候选人未分享简历",
 		"recoverable": True,
 		"recovery_action": "使用 boss hr request-resume <friend_id> 请求附件简历",
 	},
-	"JOB_POST_LIMIT": {
-		"message": "职位发布数量已达上限",
-		"recoverable": False,
-		"recovery_action": None,
-	},
 	"PLATFORM_NOT_SUPPORTED": {
 		"message": "当前平台不支持该角色或子命令",
 		"recoverable": True,
 		"recovery_action": "切换到支持的平台（如 boss --platform zhipin hr ...）",
-	},
-	"AUTO_EXECUTED": {
-		"message": "招聘自动化动作已执行",
-		"recoverable": False,
-		"recovery_action": None,
 	},
 	"QUEUED_FOR_REVIEW": {
 		"message": "旧版本招聘自动化动作进入人工复核（当前决策路径不主动产生）",

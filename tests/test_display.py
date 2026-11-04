@@ -2,6 +2,7 @@
 
 import io
 import re
+import shlex
 import sys
 from unittest.mock import patch, MagicMock
 from urllib.parse import urlparse
@@ -19,6 +20,7 @@ from boss_agent_cli.display import (
 	handle_platform_error_output,
 	login_action_for_ctx,
 	risk_error_message,
+	shell_argument,
 )
 
 
@@ -1110,3 +1112,26 @@ def test_search_pipeline_progress_markers_contract():
 	assert "✅ {company} - {title}（详情匹配）" in content
 	assert "❌ {company} - {title}" in content
 	assert "预筛排除:" in content
+
+
+def test_shell_argument_quotes_only_when_needed():
+	"""提示里的用户输入只在会被 shell 解释时加引号，正常中文名不加。"""
+	assert shell_argument("我的简历") == "我的简历"
+	assert shell_argument("qwen3:14b") == "qwen3:14b"
+	assert shell_argument("我的 简历") == "'我的 简历'"
+	assert shell_argument("it's mind") == "'it'\\''s mind'"
+
+
+def test_shell_argument_quotes_shell_metacharacters():
+	"""落单的单引号会让提示变成非法 shell，通配符 / 变量 / 开头的 ~ 会被展开。
+
+	`boss resume show its'fine` 在终端里直接报「引号未闭合」——提示本身就是坏的；
+	`boss preset remove *` 则会被 glob 展开成当前目录下的文件名。
+	"""
+	assert shell_argument("its'fine") == "'its'\\''fine'"
+	assert shell_argument("全天*") == "'全天*'"
+	assert shell_argument("$HOME") == "'$HOME'"
+	assert shell_argument("~") == "'~'"
+	assert shell_argument("a~b") == "a~b"
+	for value in ("its'fine", "全天*", "$HOME", "~", "a;b", "x|y"):
+		assert shlex.split(shell_argument(value)) == [value]

@@ -1,7 +1,7 @@
 import re
 import sys
-from pathlib import Path
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import click
@@ -10,7 +10,14 @@ from boss_agent_cli import __version__
 from boss_agent_cli.api.browser_source import POLICIES as BROWSER_SOURCES
 from boss_agent_cli.cache.store import CacheDatabaseInvalid
 from boss_agent_cli.commands.register import register_candidate_commands, register_recruiter_commands
-from boss_agent_cli.config import DEFAULT_REQUEST_DELAY, ROLES, load_config, validate_request_config
+from boss_agent_cli.config import (
+	CDP_URL_REQUIREMENT,
+	DEFAULT_REQUEST_DELAY,
+	ROLES,
+	is_valid_cdp_url,
+	load_config,
+	validate_request_config,
+)
 from boss_agent_cli.api.request_budget import validate_delay
 from boss_agent_cli.display import INTERNAL_ERROR_TYPES, error_contract_for_code
 from boss_agent_cli.hooks import create_hook_bus
@@ -26,6 +33,50 @@ def _command_path(ctx: click.Context | None) -> str:
 			names.append(current.info_name)
 		current = current.parent
 	return " ".join(reversed(names))
+
+
+def _resolve_data_dir(data_dir: str) -> Path:
+	"""解析并创建 ``--data-dir``，拒绝启动期无法正确处理的值。
+
+	``Path("")`` 等于当前目录：`--data-dir ""`（例如脚本里变量为空）会把登录态、
+	缓存和配置静默写进 cwd，看起来像「未登录」而不是参数写错；``~某用户`` 在
+	系统里查不到用户时 ``expanduser`` 直接抛 ``RuntimeError``，traceback 冲出
+	stdout，连信封都没有。两者都在建目录之前按参数错误拒绝。目录位置被一个
+	已存在的文件占住时，``mkdir`` 的 ``FileExistsError`` 原来会报成
+	``LOCAL_IO_ERROR``「status 本地文件读写失败: [Errno 17] File exists」——把
+	``--data-dir`` 的参数错误说成命令的本地 IO 失败，也没有可执行的下一步。
+	"""
+	raw = data_dir.strip()
+	if not raw:
+		raise click.BadParameter(
+			"必须是目录路径，不能为空（省略该选项时使用 ~/.boss-agent）",
+			param_hint="--data-dir",
+		)
+	if raw != data_dir:
+		raise click.BadParameter(
+			f"路径首尾不能有空白，收到 {data_dir!r}",
+			param_hint="--data-dir",
+		)
+	try:
+		resolved = Path(raw).expanduser()
+	except RuntimeError as exc:
+		raise click.BadParameter(
+			f"无法展开家目录写法，收到 {data_dir!r}（{exc}）；请改用绝对路径或 ~/ 开头的当前用户路径",
+			param_hint="--data-dir",
+		) from exc
+	try:
+		resolved.mkdir(parents=True, exist_ok=True)
+	except FileExistsError as exc:
+		raise click.BadParameter(
+			f"必须是目录路径，{str(resolved)!r} 已存在且不是目录",
+			param_hint="--data-dir",
+		) from exc
+	except NotADirectoryError as exc:
+		raise click.BadParameter(
+			f"必须是目录路径，{str(resolved)!r} 的上级路径不是目录",
+			param_hint="--data-dir",
+		) from exc
+	return resolved
 
 
 def _missing_subcommand_error(ctx: click.Context | None) -> tuple[str, str, dict[str, Any]] | None:
@@ -50,6 +101,346 @@ def _missing_subcommand_error(ctx: click.Context | None) -> tuple[str, str, dict
 		f"{path} 缺少子命令（可选：{', '.join(names)}）",
 		f"从子命令中选一个后重试，例如 {path} {names[0]} --help",
 		{"next_actions": [f"{path} {name}" for name in names]},
+	)
+
+
+def _unknown_subcommand_error(exc: click.ClickException) -> tuple[str, str, dict[str, Any]] | None:
+	"""把 ``No such command 'bogus'.`` 换成点名可选子命令的中文消息。
+
+	与 ``_missing_subcommand_error`` 同一主题的另一半：``boss resume bogus`` /
+	``boss crawl bogus`` 这类写错子命令的调用只拿到 Click 的英文原文，Agent 看
+	不出是哪个命令组、有哪些可选值，``hints`` 也是 null，只能再猜一次。
+	"""
+	name = getattr(exc, "command_name", None)
+	if name is None:
+		# NoSuchCommand 在 Click 8.4 才出现，依赖声明是 click>=8.0：旧版本用普通
+		# UsageError 抛同一条英文消息，只能从消息里取名字。
+		matched = re.match(r"No such command '(.+)'\.$", str(getattr(exc, "message", "")))
+		if matched is None:
+			return None
+		name = matched.group(1)
+	ctx = getattr(exc, "ctx", None)
+	if ctx is None or not isinstance(ctx.command, click.Group):
+		return None
+	names = sorted(ctx.command.list_commands(ctx))
+	if not names:
+		return None
+	root = ctx.find_root().info_name or "boss"
+	path = f"{root} {_command_path(ctx)}".strip()
+	return (
+		f"{path} 没有子命令 '{name}'（可选：{', '.join(names)}）",
+		f"从子命令中选一个后重试，例如 {path} {names[0]} --help",
+		{"next_actions": [f"{path} {name}" for name in names]},
+	)
+
+
+def _unknown_option_error(exc: click.ClickException) -> tuple[str, str, dict[str, Any]] | None:
+	"""把 ``No such option '--limit'. Did you mean '--city'?`` 换成中文说明。
+
+	与 ``_unknown_subcommand_error`` 同口径：Agent 最常踩的 ``boss search golang
+	--limit 10`` 只拿到 Click 的英文原文，拼写建议还按编辑距离把 ``--limit`` 猜成
+	``--city``，与「限制结果数」的意图毫无关系。这里只指向命令自己的帮助。
+	"""
+	if not isinstance(exc, click.NoSuchOption):
+		return None
+	ctx = getattr(exc, "ctx", None)
+	if ctx is None:
+		return None
+	raw = exc.option_name or ""
+	token = raw if raw.startswith("-") else f"--{raw}"
+	root = ctx.find_root().info_name or "boss"
+	path = f"{root} {_command_path(ctx)}".strip()
+	return (
+		f"{path} 没有选项 '{token}'",
+		f"用 {path} --help 查看可用选项",
+		{"next_actions": [f"{path} --help"]},
+	)
+
+
+_EXTRA_ARGUMENT_RE = re.compile(r"^Got unexpected extra arguments? \((.*)\)$")
+_OPTION_VALUE_MISSING_RE = re.compile(r"^Option '(.+)' requires an argument\.$")
+
+
+def _usage_path(exc: click.ClickException) -> str | None:
+	"""用法错误所在命令的完整路径（``boss resume diff``）。"""
+	ctx = getattr(exc, "ctx", None)
+	if ctx is None:
+		return None
+	root = ctx.find_root().info_name or "boss"
+	return f"{root} {_command_path(ctx)}".strip()
+
+
+def _parameter_display_name(exc: click.BadParameter) -> str:
+	"""参数 / 选项在消息里的展示名，与 Click 自己的英文消息同源。
+
+	位置参数是 metavar（``NAME2``），选项是 ``'--label'``；直接用 ``param.name``
+	会退化成小写的内部名（``name2`` / ``label``）。
+	"""
+	hint = exc.param_hint
+	if hint is None and exc.param is not None:
+		hint = exc.param.get_error_hint(exc.ctx) if exc.ctx is not None else exc.param.human_readable_name
+	if isinstance(hint, (list, tuple)):
+		hint = " / ".join(hint)
+	# 多别名选项的 hint 是 ``'-o' / '--output'``：逐个去引号，只剥首尾会留下
+	# ``-o' / '--output`` 这种半截引号。
+	return str(hint or "").replace("'", "").replace('"', "").strip()
+
+
+def _missing_parameter_error(exc: click.ClickException) -> tuple[str, str, dict[str, Any]] | None:
+	"""把 ``Missing option '--label'.`` 换成点明命令与参数的中文消息。
+
+	``boss mark <uid>`` 漏掉 ``--label``、``boss resume diff <旧名>`` 漏掉第二个
+	名字时，信封里只有 Click 的英文原文和笼统的「修正参数」，Agent 既看不出
+	是哪个命令、缺的是选项还是位置参数，也没有可执行的下一步。这里按类型
+	分成「缺少必填选项」与「缺少必填参数」，并指向该命令的 ``--help``。
+	"""
+	if not isinstance(exc, click.MissingParameter):
+		return None
+	path = _usage_path(exc)
+	if path is None:
+		return None
+	hint = _parameter_display_name(exc)
+	kind = "选项" if isinstance(exc.param, click.Option) else "参数"
+	shown = f" '{hint}'" if hint else ""
+	return (
+		f"{path} 缺少必填{kind}{shown}",
+		f"用 {path} --help 查看用法",
+		{"next_actions": [f"{path} --help"]},
+	)
+
+
+def _unexpected_extra_argument_error(exc: click.ClickException) -> tuple[str, str, dict[str, Any]] | None:
+	"""把 ``Got unexpected extra argument (x)`` 换成中文说明。
+
+	``boss search golang extra`` / ``boss resume init extra`` 这类多给参数的调用
+	只拿到英文原文，Agent 读到的原因（多余的参数）与真正该做的动作（去掉它）
+	都对不上。Click 8.x 没有专门的异常类，按消息格式识别，未知格式保持原样。
+	括号里为空是 ``boss chat ""``：空字符串也是 argv 里的一个额外参数。
+	"""
+	matched = _EXTRA_ARGUMENT_RE.match(str(getattr(exc, "message", "") or ""))
+	if matched is None:
+		return None
+	path = _usage_path(exc)
+	if path is None:
+		return None
+	extra = matched.group(1).strip()
+	if extra:
+		message = f"{path} 收到了多余的参数 '{extra}'"
+	else:
+		message = f"{path} 不接受额外的空参数"
+	return (
+		message,
+		f"去掉多余的参数后重试；用 {path} --help 查看用法",
+		{"next_actions": [f"{path} --help"]},
+	)
+
+
+def _missing_option_value_error(
+	exc: click.ClickException, fallback_path: str = ""
+) -> tuple[str, str, dict[str, Any]] | None:
+	"""把 ``Option '--city' requires an argument.`` 换成中文说明。
+
+	``boss search --city``（选项后面没跟取值）原来把 Click 的英文原文直接交给
+	用户和 Agent，``recovery_action`` 也停在「修正参数」；真正的原因是选项后面
+	少了值。这类错误在 parser 层抛出、异常上不挂 ``ctx``，命令路径只能由调用方
+	从 argv 推断后作为 ``fallback_path`` 传入。
+	"""
+	matched = _OPTION_VALUE_MISSING_RE.match(str(getattr(exc, "message", "") or ""))
+	if matched is None:
+		return None
+	path = _usage_path(exc) or (fallback_path or None)
+	if path is None:
+		return None
+	option = matched.group(1)
+	return (
+		f"{path} 的选项 {option} 缺少取值",
+		f"在 {option} 后面补上取值后重试；用 {path} --help 查看用法",
+		{"next_actions": [f"{path} --help"]},
+	)
+
+
+_RANGE_INVALID_RE = re.compile(r"^(.+) is not in the range (.+)\.$")
+_CHOICE_INVALID_RE = re.compile(r"^(.+) is not one of (.+)\.$")
+_TYPE_INVALID_RE = re.compile(r"^(.+) is not a valid (.+)\.$")
+_PATH_MISSING_RE = re.compile(r"^(?:Path|File|Directory) '(.*)' does not exist\.$")
+_PATH_INVALID_RE = re.compile(
+	r"^(?:Path|File|Directory) '(.*)' is (a file|a directory|not readable|not writable|not executable)\.$"
+)
+_PATH_PROBLEMS = {
+	"a file": "是文件，但这里需要目录",
+	"a directory": "是目录，但这里需要文件",
+	"not readable": "不可读",
+	"not writable": "不可写",
+	"not executable": "不可执行",
+}
+# click.File 打不开文件时抛出的正文形如 ``'/tmp/x': No such file or directory``，
+# 后半段是 OSError.strerror（英文）。
+_FILE_ERROR_RE = re.compile(r"^'(.*)': ([^:]+)$")
+_FILE_ERROR_PROBLEMS = {
+	"No such file or directory": "不存在",
+	"Is a directory": "是目录，但这里需要文件",
+	"Permission denied": "没有读取权限",
+	"File name too long": "路径过长",
+	"Too many open files": "打开的文件过多",
+	"Too many open files in system": "系统打开的文件过多",
+	"Too many levels of symbolic links": "符号链接层级过深",
+}
+
+
+def _invalid_value_error(exc: click.ClickException) -> tuple[str, str, dict[str, Any]] | None:
+	"""把 Click 自带校验（范围 / 枚举 / 数值转换）的英文正文换成中文。
+
+	``boss search golang --page 0`` 回 ``Invalid value for '--page': 0 is not in
+	the range x>=1.``，``boss export golang --format ""`` 回 ``'' is not one of
+	'html', 'csv', 'json'.``，``boss hr reply u1 hi`` 回 ``'u1' is not a valid
+	integer.``：错误码是对的，但正文是英文、``recovery_action`` 只有「修正参数」、
+	``hints`` 为 null。这里按消息里的取值与范围 / 可选值重排成中文，正文格式不
+	认识（例如已本地化）时保持原样。
+
+	不能按「消息里有没有中文」判断是不是 Click 自己的英文骨架：``--industry`` /
+	``--stage`` 这类选项的候选值本身就是中文，``__nope__ is not one of '不限',
+	'电子商务', …`` 含中文却仍是 Click 生成的英文正文。只按格式匹配，匹配不上
+	才原样透出。
+	"""
+	if not isinstance(exc, click.BadParameter):
+		return None
+	path = _usage_path(exc)
+	if path is None:
+		return None
+	hint = _parameter_display_name(exc)
+	label = f"{hint}" if hint else "参数"
+	raw = str(exc.message)
+	matched = _RANGE_INVALID_RE.match(raw)
+	if matched is not None:
+		message = f"{path} 的 {label} 取值无效：{matched.group(1)} 不在范围 {matched.group(2)} 内"
+	elif (matched := _CHOICE_INVALID_RE.match(raw)) is not None:
+		message = f"{path} 的 {label} 取值无效：{matched.group(1)} 不在可选值 {matched.group(2)} 中"
+	else:
+		matched = _TYPE_INVALID_RE.match(raw)
+		if matched is None:
+			return None
+		kind = "整数" if "integer" in matched.group(2) else "数字"
+		message = f"{path} 的 {label} 取值无效：{matched.group(1)} 不是{kind}"
+	return (
+		message,
+		f"用 {path} --help 查看参数说明",
+		{"next_actions": [f"{path} --help"]},
+	)
+
+
+def _invalid_path_error(exc: click.ClickException) -> tuple[str, str, dict[str, Any]] | None:
+	"""把 ``Path '' does not exist.`` 这类 Click 路径校验换成中文。
+
+	``boss ai local import --path ""`` 原来回 ``Invalid value for '--path':
+	Path '' does not exist.``：正文英文、``hints`` 为 null，Agent 读不出是路径
+	不存在还是类型不对。
+
+	Click 按 ``dir_okay`` / ``file_okay`` 决定前缀：只收文件时是 ``File '/tmp' is
+	a directory.``（``boss stats --output <目录>``），只收目录时是 ``Directory …``，
+	两种都收才是 ``Path …``——三种前缀都要认。
+
+	同样不能因为消息含中文就跳过：路径本身可以是中文，``Path '/tmp/不存在的模型
+	目录' does not exist.`` 的英文骨架仍要说清楚。
+	"""
+	if not isinstance(exc, click.BadParameter):
+		return None
+	raw = str(exc.message)
+	matched = _PATH_MISSING_RE.match(raw)
+	if matched is not None:
+		problem = "不存在"
+	else:
+		matched = _PATH_INVALID_RE.match(raw)
+		if matched is None:
+			return None
+		problem = _PATH_PROBLEMS[matched.group(2)]
+	path = _usage_path(exc)
+	if path is None:
+		return None
+	hint = _parameter_display_name(exc)
+	label = hint or "参数"
+	return (
+		f"{path} 的 {label} 无效：路径 '{matched.group(1)}' {problem}",
+		f"用 {path} --help 查看参数说明",
+		{"next_actions": [f"{path} --help"]},
+	)
+
+
+def _invalid_file_error(exc: click.ClickException) -> tuple[str, str, dict[str, Any]] | None:
+	"""``click.File`` 打不开文件时的英文正文同样要换成中文。
+
+	``boss login --curl-file ''`` 回 ``Invalid value for '--curl-file': '':
+	No such file or directory``，``--curl-file /tmp`` 回 ``'/tmp': Is a directory``：
+	错误码对，但正文是 OSError 的英文 strerror，``recovery_action`` 只有「修正参数」、
+	``hints`` 为 null。只翻译认识的 strerror，其余（含已本地化的消息）保持原样。
+	路径名带中文时消息同样含中文，不能据此跳过。
+	"""
+	if not isinstance(exc, click.BadParameter):
+		return None
+	raw = str(exc.message)
+	matched = _FILE_ERROR_RE.match(raw)
+	if matched is None:
+		return None
+	problem = _FILE_ERROR_PROBLEMS.get(matched.group(2))
+	if problem is None:
+		return None
+	path = _usage_path(exc)
+	if path is None:
+		return None
+	hint = _parameter_display_name(exc)
+	label = hint or "参数"
+	if not matched.group(1).strip():
+		message = f"{path} 的 {label} 的值不能为空"
+	else:
+		message = f"{path} 的 {label} 无效：路径 '{matched.group(1)}' {problem}"
+	return (
+		message,
+		f"用 {path} --help 查看参数说明",
+		{"next_actions": [f"{path} --help"]},
+	)
+
+
+def _usage_error_detail(exc: click.ClickException, ctx: click.Context | None) -> tuple[str, str, dict[str, Any]] | None:
+	"""按异常类型给用法错误配中文说明；不认识时返回 ``None``，保留 Click 原文。"""
+	if type(exc).__name__ == "NoArgsIsHelpError":
+		# NoArgsIsHelpError 在 Click 8.2 才出现，依赖声明是 click>=8.0：
+		# 按类名判断，避免为它把最低版本抬上去。
+		missing = _missing_subcommand_error(ctx)
+		if missing is not None:
+			return missing
+	for converter in (
+		_unknown_subcommand_error,
+		_missing_parameter_error,
+		_unexpected_extra_argument_error,
+		_invalid_value_error,
+		_invalid_path_error,
+		_invalid_file_error,
+		_localized_bad_parameter_error,
+	):
+		detail = converter(exc)
+		if detail is not None:
+			return detail
+	return None
+
+
+def _localized_bad_parameter_error(exc: click.ClickException) -> tuple[str, str, dict[str, Any]] | None:
+	"""自定义回调已经写好中文正文的 ``BadParameter``：至少补齐可执行的下一步。
+
+	``--platform`` / ``--delay`` / ``--role`` / ``mark --label`` 这类校验由回调自己
+	raise，正文是中文，四类 Click 自带格式（范围 / 枚举 / 类型 / 路径）都匹配不上，
+	原来的兜底只有 ``recovery_action="修正参数"``、``hints=null``——Agent 拿不到
+	任何能执行的命令。正文保留，恢复指引与 ``next_actions`` 指向出错命令的 ``--help``。
+	"""
+	if not isinstance(exc, click.BadParameter) or not _has_cjk(str(exc.message)):
+		return None
+	path = _usage_path(exc)
+	if path is None:
+		return None
+	hint = _parameter_display_name(exc)
+	subject = f"的 {hint} 取值无效" if hint else "的参数取值无效"
+	return (
+		f"{path} {subject}：{exc.message}",
+		f"用 {path} --help 查看参数说明",
+		{"next_actions": [f"{path} --help"]},
 	)
 
 
@@ -151,6 +542,33 @@ def _invoked_command_name(args: Sequence[str] | None, fallback: str) -> str:
 	return fallback
 
 
+def _argv_command_path(group: click.Group, args: Sequence[str] | None, root: str) -> str:
+	"""从 argv 推断出错命令的完整路径（``boss crawl start``）。
+
+	解析器层抛出的异常不挂 ``ctx``，``_usage_path`` 拿不到命令层级；信封的
+	``command`` 仍按顶层命令口径，这里只给 message 里的示例命令用完整路径。
+	"""
+	tokens = list(args) if args is not None else sys.argv[1:]
+	path = [root]
+	current: click.Command = group
+	index = 0
+	while index < len(tokens):
+		token = tokens[index]
+		if token in _GLOBAL_OPTIONS_WITH_VALUE:
+			index += 2
+			continue
+		if token.startswith("-"):
+			index += 1
+			continue
+		if isinstance(current, click.Group) and token in current.commands:
+			path.append(token)
+			current = current.commands[token]
+			index += 1
+			continue
+		break
+	return " ".join(path)
+
+
 def _top_level_command_name(ctx: click.Context | None, fallback: str) -> str:
 	"""用法错误落到最外层子命令上，与成功信封的 command 口径一致。
 
@@ -239,13 +657,22 @@ class BossCliGroup(click.Group):
 			if not standalone_mode:
 				raise
 			ctx = getattr(exc, "ctx", None)
-			command = _top_level_command_name(ctx, self.name or "boss")
+			if ctx is not None:
+				command = _top_level_command_name(ctx, self.name or "boss")
+			else:
+				# 选项缺取值时 Click 在 parser 层直接抛 UsageError，异常上不挂
+				# ctx（缺位置参数 / 未知选项都会挂）：一律退回 argv，否则
+				# `boss search --city` 会被报成 command: "boss"。
+				command = _invoked_command_name(args, self.name or "boss")
 			message = _click_error_message(exc)
 			recovery_action = "修正参数"
 			hints = None
-			missing = _missing_subcommand_error(ctx) if type(exc).__name__ == "NoArgsIsHelpError" else None
-			if missing is not None:
-				message, recovery_action, hints = missing
+			detail = _usage_error_detail(exc, ctx)
+			if detail is None:
+				# 选项缺取值的异常不挂 ctx，命令路径从 argv 推断。
+				detail = _missing_option_value_error(exc, _argv_command_path(self, args, self.name or "boss"))
+			if detail is not None:
+				message, recovery_action, hints = detail
 			misplaced = _misplaced_global_option(self, exc)
 			if misplaced is not None:
 				message, recovery_action = misplaced
@@ -255,6 +682,10 @@ class BossCliGroup(click.Group):
 						"全局选项（--json、--data-dir、--platform、--cdp-url 等）写在子命令前面",
 					],
 				}
+			else:
+				unknown_option = _unknown_option_error(exc)
+				if unknown_option is not None:
+					message, recovery_action, hints = unknown_option
 			emit_error(
 				command,
 				code="INVALID_PARAM",
@@ -341,7 +772,7 @@ class BossCliGroup(click.Group):
 	type=click.Choice(ROLES),
 	help="角色模式：candidate（求职者，默认）/ recruiter（招聘者）",
 )
-@click.option("--log-level", default=None, type=click.Choice(LOG_LEVELS))
+@click.option("--log-level", default=None, type=click.Choice(LOG_LEVELS), help="运行日志级别（全局选项，日志只写 stderr）；省略时用默认级别")
 @click.option(
 	"--json/--no-json",
 	"json_output",
@@ -368,8 +799,7 @@ def cli(
 	exit_codes: str,
 ) -> None:
 	ctx.ensure_object(dict)
-	resolved_dir = Path(data_dir).expanduser()
-	resolved_dir.mkdir(parents=True, exist_ok=True)
+	resolved_dir = _resolve_data_dir(data_dir)
 	ctx.obj["data_dir"] = resolved_dir
 	ctx.obj["json_output"] = json_output
 	ctx.obj["exit_codes"] = exit_codes
@@ -418,6 +848,14 @@ def cli(
 			f"必须是调试地址字符串或 null，收到 {resolved_cdp_url!r}",
 			param_hint="--cdp-url",
 		)
+	if resolved_cdp_url is not None and (cdp_url is not None or ctx.invoked_subcommand != "config"):
+		# 显式 --cdp-url 任何时候都要校验；config.json 里的坏值则放行 config
+		# 子命令，否则 `boss config reset cdp_url` 会在启动期被同一个坏值挡住。
+		if not is_valid_cdp_url(resolved_cdp_url):
+			raise click.BadParameter(
+				f"{CDP_URL_REQUIREMENT}，收到 {resolved_cdp_url!r}",
+				param_hint="--cdp-url",
+			)
 	ctx.obj["cdp_url"] = resolved_cdp_url
 
 	# 归一化（大小写/首尾空白）后再校验，与下游 resolve_policy 的 .strip().lower() 一致，

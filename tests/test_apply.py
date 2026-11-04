@@ -34,6 +34,17 @@ def test_apply_success(mock_cache_cls, mock_auth_cls, mock_get_platform):
 	mock_cache.record_apply.assert_called_once_with("sec_001", "job_001", account="")
 
 
+def test_apply_rejects_blank_identifiers_with_search_hint():
+	"""空编号不会发出投递请求；恢复指引指回搜索结果取得完整参数。"""
+	result = CliRunner().invoke(cli, ["--json", "apply", "", "job_001"])
+
+	assert result.exit_code == 1, result.output
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["hints"]["next_actions"] == ["boss search <关键词>"]
+	assert "boss search <关键词>" in parsed["error"]["recovery_action"]
+
+
 @patch("boss_agent_cli.commands.apply.get_platform_instance")
 @patch("boss_agent_cli.commands.apply.AuthManager")
 @patch("boss_agent_cli.commands.apply.CacheStore")
@@ -46,6 +57,8 @@ def test_apply_duplicate_is_blocked(mock_cache_cls, mock_auth_cls, mock_get_plat
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "ALREADY_APPLIED"
+	# 已投递不是死胡同：恢复指引要给出查看投递记录 / 跟进会话的路径。
+	assert "boss me --section deliver" in parsed["error"]["recovery_action"]
 
 
 @patch("boss_agent_cli.commands.apply.get_platform_instance")

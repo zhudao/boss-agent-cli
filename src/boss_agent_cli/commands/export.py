@@ -33,6 +33,7 @@ from boss_agent_cli.search_filters import (
 	prefilter_platform_job_type,
 	resolve_search_code_params,
 )
+from boss_agent_cli.commands._filter_errors import emit_filter_error
 
 
 _EXPORT_FILTER_PAGE_ALLOWANCE = 5
@@ -77,6 +78,22 @@ def export_cmd(
 	include_private: bool,
 ) -> None:
 	"""导出搜索结果为 HTML / CSV / JSON 文件"""
+	# 与 search 同一口径：传了 --url 但值是空串时，「未提供 query」会读成
+	# 「你没传 --url」，真正的原因（flag 后面少了值）被掩盖。
+	if search_url is not None and not search_url.strip():
+		handle_error_output(
+			ctx,
+			"export",
+			code="INVALID_PARAM",
+			message="--url 的值不能为空",
+			recovery_action="boss export <关键词> 或 boss export --url <搜索页URL>",
+			hints={"next_actions": ["boss export <关键词>"]},
+		)
+		return
+	# 与 search 同一口径：纯空白的 query 仍是「没给关键词」，不能当成一次
+	# 合法的全量导出——那会翻页抓取大量无关职位，并写出一份内容可疑的文件。
+	if query is not None and not query.strip():
+		query = None
 	data_dir = ctx.obj["data_dir"]
 	logger = ctx.obj["logger"]
 	raw_params: dict[str, str] = {}
@@ -85,7 +102,15 @@ def export_cmd(
 		try:
 			parsed_url = parse_boss_search_url(search_url)
 		except SearchUrlParseError as exc:
-			handle_error_output(ctx, "export", code="INVALID_PARAM", message=str(exc))
+			export_cmd = boss_command_for_ctx(ctx, "export <关键词>")
+			handle_error_output(
+				ctx,
+				"export",
+				code="INVALID_PARAM",
+				message=str(exc),
+				recovery_action=f"换成完整的 BOSS 直聘搜索页链接，或改用关键词重试，例如 {export_cmd}",
+				hints={"next_actions": [export_cmd]},
+			)
 			return
 		query = query or parsed_url.query
 		raw_params.update(parsed_url.params)
@@ -105,13 +130,7 @@ def export_cmd(
 	try:
 		ensure_supported_city(city)
 	except ValueError as exc:
-		handle_error_output(
-			ctx,
-			"export",
-			code="INVALID_PARAM",
-			message=str(exc),
-			hints={"next_actions": [boss_command_for_ctx(ctx, "cities")]},
-		)
+		emit_filter_error(ctx, "export", exc)
 		return
 
 	try:
@@ -127,7 +146,7 @@ def export_cmd(
 			)
 		)
 	except ValueError as exc:
-		handle_error_output(ctx, "export", code="INVALID_PARAM", message=str(exc))
+		emit_filter_error(ctx, "export", exc)
 		return
 	criteria = SearchFilterCriteria(
 		query=query,

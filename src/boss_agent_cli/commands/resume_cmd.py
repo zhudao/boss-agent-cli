@@ -13,6 +13,7 @@ from boss_agent_cli.display import (
 	render_action_result,
 	render_list_result,
 	render_record_result,
+	shell_argument,
 )
 from boss_agent_cli.resume.models import ResumeData, PersonalInfoSection, resume_to_dict
 from boss_agent_cli.resume.store import ResumeAlreadyExistsError, ResumeImportError, ResumeStore
@@ -22,6 +23,67 @@ from boss_agent_cli.services.output_path import prepare_output_path
 def _get_store(ctx: click.Context) -> ResumeStore:
 	resumes_dir: Path = ctx.obj["data_dir"] / "resumes"
 	return ResumeStore(resumes_dir)
+
+
+def _require_resume_name(ctx: click.Context, name: str) -> bool:
+	"""空简历名按参数错误拒绝。
+
+	空字符串是合法 argv，但拿它查 store 只会得到「简历 '' 不存在」：错误码是
+	RESUME_NOT_FOUND（不可恢复、看不出是漏填了名字），而同一类输入在
+	`resume init --name ""` / `resume clone <源> ""` 里都是 INVALID_PARAM。
+	"""
+	if name.strip():
+		return True
+	list_cmd = boss_command_for_ctx(ctx, "resume list")
+	handle_error_output(
+		ctx,
+		"resume",
+		code="INVALID_PARAM",
+		message="简历名称不能为空",
+		recovery_action=f"补上简历名称后重试；用 {list_cmd} 查看已有简历",
+		hints={"next_actions": [list_cmd]},
+	)
+	return False
+
+
+def _emit_resume_not_found(ctx: click.Context, name: str) -> None:
+	"""简历不存在：给出列出可选简历的命令，别让 Agent 再猜一次名字。"""
+	handle_error_output(
+		ctx, "resume",
+		code="RESUME_NOT_FOUND",
+		message=f"简历 '{name}' 不存在",
+		hints={"next_actions": [boss_command_for_ctx(ctx, "resume list")]},
+	)
+	ctx.exit(1)
+
+
+def _load_resume(ctx: click.Context, store: ResumeStore, name: str) -> ResumeData | None:
+	"""读取简历；文件存在但读不出来时按「文件损坏」上报，而不是「不存在」。
+
+	以前两者共用 RESUME_NOT_FOUND +「boss resume list」：列表会隐藏坏文件，
+	Agent 照提示只能看到一份空列表，再 `resume init` 又被同名文件挡住
+	（RESUME_ALREADY_EXISTS），恢复链在这里断掉。
+	"""
+	resume = store.get(name)
+	if resume is not None:
+		return resume
+	if store.is_corrupt(name):
+		handle_error_output(
+			ctx,
+			"resume",
+			code="RESUME_FILE_INVALID",
+			message=f"简历文件 '{name}.json' 损坏，无法读取",
+			hints={
+				"next_actions": [
+					boss_command_for_ctx(ctx, f"resume delete {name}"),
+					boss_command_for_ctx(ctx, "resume list"),
+				]
+			},
+		)
+		ctx.exit(1)
+		return None
+	_emit_resume_not_found(ctx, name)
+	return None
 
 
 def _build_default_template(name: str) -> ResumeData:
@@ -51,6 +113,17 @@ def _set_nested(data: dict[str, Any], path: str, value: str) -> bool:
 		current[last] = value
 		return True
 	return False
+
+
+def _lookup_nested(data: dict[str, Any], path: str) -> tuple[bool, Any]:
+	"""按 . 分隔路径取字段，返回 (是否存在, 当前值)。"""
+	current: Any = data
+	for key in path.split("."):
+		if isinstance(current, dict) and key in current:
+			current = current[key]
+		else:
+			return False, None
+	return True, current
 
 
 def _flat_diff(left: dict[str, Any], right: dict[str, Any], prefix: str = "") -> list[dict[str, Any]]:
@@ -89,8 +162,7 @@ def resume_init_cmd(ctx: click.Context, name: str | None, template: str | None) 
 		name = "default"
 	# 空名称的简历能被写出来，却没法点名：`resume show ` / `resume edit ` 都缺参数，
 	# `resume list` 里也只显示一行没有名字的记录。
-	if not name.strip():
-		handle_error_output(ctx, "resume", code="INVALID_PARAM", message="简历名称不能为空")
+	if not _require_resume_name(ctx, name):
 		return
 	if store.exists(name):
 		handle_error_output(
@@ -107,11 +179,11 @@ def resume_init_cmd(ctx: click.Context, name: str | None, template: str | None) 
 		ctx, "resume",
 		{"action": "init", "name": name, "template": template},
 		render=lambda d: render_action_result(
-			d, title="resume init", next_steps=[f"boss resume show {name}", f"boss resume edit {name} --field title --value <新标题>"]
+			d, title="resume init", next_steps=[f"boss resume show {shell_argument(name)}", f"boss resume edit {shell_argument(name)} --field title --value <新标题>"]
 		),
 		hints={"next_actions": [
-			f"boss resume show {name}",
-			f"boss resume edit {name} --field title --value <新标题>",
+			f"boss resume show {shell_argument(name)}",
+			f"boss resume edit {shell_argument(name)} --field title --value <新标题>",
 			boss_command_for_ctx(ctx, "me"),
 			boss_command_for_ctx(ctx, "resume import <path>"),
 		]},
@@ -123,7 +195,19 @@ def resume_init_cmd(ctx: click.Context, name: str | None, template: str | None) 
 def resume_list_cmd(ctx: click.Context) -> None:
 	"""列出所有本地简历"""
 	store = _get_store(ctx)
-	items = store.list_all()
+	items, corrupt = store.list_all_with_corrupt()
+	hints: dict[str, Any] = {
+		# 空列表里没有简历名可 show：照抄只会换回 RESUME_NOT_FOUND。
+		"next_actions": ["boss resume init --template default"]
+		if not items
+		else ["boss resume show <name>", "boss resume init --template default"]
+	}
+	if corrupt:
+		# 读不出来的文件不能假装不存在：列表隐藏了它，init 又会被同名文件挡住。
+		hints["corrupt"] = corrupt
+		hints["operator_actions"] = [
+			f"以下简历文件已损坏，先执行 boss resume delete <名称> 后重新创建，或直接修正 resumes/ 下对应的 .json：{', '.join(corrupt)}"
+		]
 	handle_output(
 		ctx, "resume", items,
 		render=lambda d: render_list_result(
@@ -134,7 +218,7 @@ def resume_list_cmd(ctx: click.Context) -> None:
 			if not d
 			else ["boss resume show <name>", "boss resume init --template default"],
 		),
-		hints={"next_actions": ["boss resume show <name>", "boss resume init --template default"]},
+		hints=hints,
 	)
 
 
@@ -144,21 +228,21 @@ def resume_list_cmd(ctx: click.Context) -> None:
 def resume_show_cmd(ctx: click.Context, name: str) -> None:
 	"""查看简历详情"""
 	store = _get_store(ctx)
-	resume = store.get(name)
+	if not _require_resume_name(ctx, name):
+		return
+	resume = _load_resume(ctx, store, name)
 	if resume is None:
-		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
-		ctx.exit(1)
 		return
 	handle_output(
 		ctx, "resume", resume_to_dict(resume),
 		render=lambda d: render_record_result(
 			d,
 			title="resume",
-			next_steps=[f"boss resume edit {name} --field title --value <新标题>", f"boss resume export {name} --format json"],
+			next_steps=[f"boss resume edit {shell_argument(name)} --field title --value <新标题>", f"boss resume export {shell_argument(name)} --format json"],
 		),
 		hints={"next_actions": [
-			f"boss resume edit {name} --field title --value <新标题>",
-			f"boss resume export {name} --format json",
+			f"boss resume edit {shell_argument(name)} --field title --value <新标题>",
+			f"boss resume export {shell_argument(name)} --format json",
 		]},
 	)
 
@@ -171,21 +255,43 @@ def resume_show_cmd(ctx: click.Context, name: str) -> None:
 def resume_edit_cmd(ctx: click.Context, name: str, field: str, value: str) -> None:
 	"""编辑简历字段"""
 	store = _get_store(ctx)
-	resume = store.get(name)
+	if not _require_resume_name(ctx, name):
+		return
+	resume = _load_resume(ctx, store, name)
 	if resume is None:
-		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
-		ctx.exit(1)
 		return
 	data = resume_to_dict(resume)
-	ok = _set_nested(data, field, value)
-	if not ok:
+	# --field 只接受文本叶子字段。用路径点到容器（personal_info / modules）或 null
+	# （job_intention）时，_set_nested 会把整个子对象换成字符串，dict_to_resume 随后
+	# 抛 AttributeError，被兜成不可重试的 INTERNAL_ERROR——参数错误看起来像程序缺陷。
+	# name 则会被后面的 updated.name = name 覆盖回去，成功信封与实际内容不符。
+	if field == "name":
 		handle_error_output(
 			ctx, "resume",
 			code="INVALID_PARAM",
-			message=f"字段 '{field}' 不存在",
+			message="简历名称不能用 --field 修改；先 boss resume clone <旧名> <新名> 再删除旧简历",
+			recovery_action="先用 boss resume clone 复制出改名后的简历，再删除旧简历",
+			hints={"next_actions": [f"boss resume clone {shell_argument(name)} <新名>"]},
 		)
 		ctx.exit(1)
 		return
+	found, current = _lookup_nested(data, field)
+	if not found or not isinstance(current, str):
+		detail = (
+			f"字段 '{field}' 不是文本字段，请点到具体子字段（如 personal_info.layout）"
+			if found
+			else f"字段 '{field}' 不存在"
+		)
+		handle_error_output(
+			ctx, "resume",
+			code="INVALID_PARAM",
+			message=f"{detail}；可用 --field title 之类的文本字段，完整结构见 boss resume export {shell_argument(name)} --format json",
+			recovery_action="用 --field 指向存在的文本子字段后重试；先 export 导出 JSON 查看完整结构",
+			hints={"next_actions": [f"boss resume export {shell_argument(name)} --format json", f"boss resume show {shell_argument(name)}"]},
+		)
+		ctx.exit(1)
+		return
+	_set_nested(data, field, value)
 	from boss_agent_cli.resume.models import dict_to_resume
 	updated = dict_to_resume(data)
 	updated.name = name
@@ -193,8 +299,8 @@ def resume_edit_cmd(ctx: click.Context, name: str, field: str, value: str) -> No
 	handle_output(
 		ctx, "resume",
 		{"action": "edit", "name": name, "field": field, "value": value},
-		render=lambda d: render_action_result(d, title="resume edit", next_steps=[f"boss resume show {name}"]),
-		hints={"next_actions": [f"boss resume show {name}"]},
+		render=lambda d: render_action_result(d, title="resume edit", next_steps=[f"boss resume show {shell_argument(name)}"]),
+		hints={"next_actions": [f"boss resume show {shell_argument(name)}"]},
 	)
 
 
@@ -204,9 +310,10 @@ def resume_edit_cmd(ctx: click.Context, name: str, field: str, value: str) -> No
 def resume_delete_cmd(ctx: click.Context, name: str) -> None:
 	"""删除简历"""
 	store = _get_store(ctx)
+	if not _require_resume_name(ctx, name):
+		return
 	if not store.exists(name):
-		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
-		ctx.exit(1)
+		_emit_resume_not_found(ctx, name)
 		return
 	store.delete(name)
 	# 关联表以简历名为外键，但没有任何外键约束：不同步清理的话，之后用同一个名字
@@ -231,14 +338,14 @@ def resume_delete_cmd(ctx: click.Context, name: str) -> None:
 def resume_export_cmd(ctx: click.Context, name: str, fmt: str, output_path: str | None) -> None:
 	"""导出简历"""
 	store = _get_store(ctx)
+	if not _require_resume_name(ctx, name):
+		return
 	# 文件存在但读不出来（手写坏、字段类型写错）与「不存在」走同一个契约：
 	# 其它子命令都是这样。json 导出若交给 export_json 内部的 FileNotFoundError，
 	# 会被顶层 OSError 网兜报成 LOCAL_IO_ERROR「本地文件读写失败」，指引用户去查
 	# 磁盘与权限，而真正该做的是重建这份简历。
-	resume = store.get(name)
+	resume = _load_resume(ctx, store, name)
 	if resume is None:
-		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
-		ctx.exit(1)
 		return
 	if fmt in ("pdf", "html"):
 		if output_path is None:
@@ -264,8 +371,8 @@ def resume_export_cmd(ctx: click.Context, name: str, fmt: str, output_path: str 
 		handle_output(
 			ctx, "resume",
 			{"action": "export", "name": name, "format": fmt, "path": str(out.resolve())},
-			render=lambda d: render_action_result(d, title="resume export", next_steps=[f"open {out.resolve()}"]),
-			hints={"next_actions": [f"boss resume show {name}"]},
+			render=lambda d: render_action_result(d, title="resume export", next_steps=[f"open {shell_argument(str(out.resolve()))}"]),
+			hints={"next_actions": [f"boss resume show {shell_argument(name)}"]},
 		)
 		return
 	json_str = store.export_json(name)
@@ -275,9 +382,9 @@ def resume_export_cmd(ctx: click.Context, name: str, fmt: str, output_path: str 
 	handle_output(
 		ctx, "resume", export_data,
 		render=lambda d: render_record_result(
-			d, title="resume export", next_steps=[f"boss resume show {name}"]
+			d, title="resume export", next_steps=[f"boss resume show {shell_argument(name)}"]
 		),
-		hints={"next_actions": [f"boss resume show {name}"]},
+		hints={"next_actions": [f"boss resume show {shell_argument(name)}"]},
 	)
 
 
@@ -287,12 +394,37 @@ def resume_export_cmd(ctx: click.Context, name: str, fmt: str, output_path: str 
 @click.pass_context
 def resume_import_cmd(ctx: click.Context, file_path: Path, force: bool) -> None:
 	"""导入 JSON 简历"""
+	# 空路径会被 click.Path() 解析成当前目录（Path("") == "."），既存在又是目录，
+	# 于是绕过「文件不存在」检查，在打开文件时抛 IsADirectoryError，被顶层兜成
+	# LOCAL_IO_ERROR「本地文件读写失败」——参数少写一个值看起来像磁盘或权限问题。
+	if not str(file_path).strip():
+		handle_error_output(
+			ctx, "resume",
+			code="INVALID_PARAM",
+			message="文件路径不能为空",
+			recovery_action="boss resume import <简历JSON路径>",
+			hints={"next_actions": ["boss resume import <file>", "boss resume list"]},
+		)
+		ctx.exit(1)
+		return
 	path = Path(file_path)
+	if path.is_dir():
+		handle_error_output(
+			ctx, "resume",
+			code="INVALID_PARAM",
+			message=f"文件 '{file_path}' 是目录，不是简历 JSON 文件",
+			recovery_action="boss resume import <简历JSON路径>",
+			hints={"next_actions": ["boss resume import <file>", "boss resume list"]},
+		)
+		ctx.exit(1)
+		return
 	if not path.exists():
 		handle_error_output(
 			ctx, "resume",
 			code="INVALID_PARAM",
 			message=f"文件 '{file_path}' 不存在",
+			recovery_action="boss resume import <简历JSON路径>",
+			hints={"next_actions": ["boss resume import <file>", "boss resume list"]},
 		)
 		ctx.exit(1)
 		return
@@ -309,10 +441,13 @@ def resume_import_cmd(ctx: click.Context, file_path: Path, force: bool) -> None:
 		ctx.exit(1)
 		return
 	except ResumeImportError as exc:
+		export_cmd = boss_command_for_ctx(ctx, "resume export <简历> --format json")
 		handle_error_output(
 			ctx, "resume",
 			code="INVALID_PARAM",
 			message=f"文件 '{file_path}' 导入失败: {exc}",
+			recovery_action=f"按提示修正 JSON 文件（UTF-8 编码、合法 JSON、顶层对象、非空 name 字段）后重试；可用 {export_cmd} 对照结构",
+			hints={"next_actions": [export_cmd, boss_command_for_ctx(ctx, "resume list")]},
 		)
 		ctx.exit(1)
 		return
@@ -323,14 +458,16 @@ def resume_import_cmd(ctx: click.Context, file_path: Path, force: bool) -> None:
 			ctx, "resume",
 			code="INVALID_PARAM",
 			message=f"文件 '{file_path}' 解析失败: {exc}",
+			recovery_action=f"按提示修正 JSON 字段后重试；可用 {boss_command_for_ctx(ctx, 'resume export <简历> --format json')} 对照结构",
+			hints={"next_actions": [boss_command_for_ctx(ctx, "resume export <简历> --format json"), boss_command_for_ctx(ctx, "resume list")]},
 		)
 		ctx.exit(1)
 		return
 	handle_output(
 		ctx, "resume",
 		{"action": "import", "name": resume.name, "title": resume.title},
-		render=lambda d: render_action_result(d, title="resume import", next_steps=[f"boss resume show {resume.name}"]),
-		hints={"next_actions": [f"boss resume show {resume.name}"]},
+		render=lambda d: render_action_result(d, title="resume import", next_steps=[f"boss resume show {shell_argument(resume.name)}"]),
+		hints={"next_actions": [f"boss resume show {shell_argument(resume.name)}"]},
 	)
 
 
@@ -341,13 +478,20 @@ def resume_import_cmd(ctx: click.Context, file_path: Path, force: bool) -> None:
 def resume_clone_cmd(ctx: click.Context, name: str, new_name: str) -> None:
 	"""复制简历为新版本"""
 	store = _get_store(ctx)
+	if not _require_resume_name(ctx, name):
+		return
 	# 空新名称会复制出一份无法点名的简历，`resume show ` 缺参数。
 	if not new_name.strip():
-		handle_error_output(ctx, "resume", code="INVALID_PARAM", message="新简历名称不能为空")
+		handle_error_output(
+			ctx,
+			"resume",
+			code="INVALID_PARAM",
+			message="新简历名称不能为空",
+			recovery_action=f"补上新简历名称后重试，例如 {boss_command_for_ctx(ctx, 'resume clone <源简历> <新名称>')}",
+			hints={"next_actions": [boss_command_for_ctx(ctx, "resume list")]},
+		)
 		return
-	if not store.exists(name):
-		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
-		ctx.exit(1)
+	if _load_resume(ctx, store, name) is None:
 		return
 	if store.exists(new_name):
 		handle_error_output(
@@ -363,9 +507,9 @@ def resume_clone_cmd(ctx: click.Context, name: str, new_name: str) -> None:
 		ctx, "resume",
 		{"action": "clone", "name": resume.name, "source": name},
 		render=lambda d: render_action_result(
-			d, title="resume clone", next_steps=[f"boss resume show {new_name}", f"boss resume diff {name} {new_name}"]
+			d, title="resume clone", next_steps=[f"boss resume show {shell_argument(new_name)}", f"boss resume diff {shell_argument(name)} {shell_argument(new_name)}"]
 		),
-		hints={"next_actions": [f"boss resume show {new_name}", f"boss resume diff {name} {new_name}"]},
+		hints={"next_actions": [f"boss resume show {shell_argument(new_name)}", f"boss resume diff {shell_argument(name)} {shell_argument(new_name)}"]},
 	)
 
 
@@ -376,15 +520,15 @@ def resume_clone_cmd(ctx: click.Context, name: str, new_name: str) -> None:
 def resume_diff_cmd(ctx: click.Context, name1: str, name2: str) -> None:
 	"""对比两份简历差异"""
 	store = _get_store(ctx)
-	r1 = store.get(name1)
-	if r1 is None:
-		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name1}' 不存在")
-		ctx.exit(1)
+	if not _require_resume_name(ctx, name1):
 		return
-	r2 = store.get(name2)
+	if not _require_resume_name(ctx, name2):
+		return
+	r1 = _load_resume(ctx, store, name1)
+	if r1 is None:
+		return
+	r2 = _load_resume(ctx, store, name2)
 	if r2 is None:
-		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name2}' 不存在")
-		ctx.exit(1)
 		return
 	d1 = resume_to_dict(r1)
 	d2 = resume_to_dict(r2)
@@ -396,9 +540,9 @@ def resume_diff_cmd(ctx: click.Context, name1: str, name2: str) -> None:
 			d.get("diffs", []),
 			f"diff: {name1} ↔ {name2}",
 			[("字段", "field", "bold cyan"), (name1, "left", "green"), (name2, "right", "yellow")],
-			next_steps=[f"boss resume show {name1}", f"boss resume show {name2}"],
+			next_steps=[f"boss resume show {shell_argument(name1)}", f"boss resume show {shell_argument(name2)}"],
 		),
-		hints={"next_actions": [f"boss resume show {name1}", f"boss resume show {name2}"]},
+		hints={"next_actions": [f"boss resume show {shell_argument(name1)}", f"boss resume show {shell_argument(name2)}"]},
 	)
 
 
@@ -412,14 +556,23 @@ def resume_diff_cmd(ctx: click.Context, name1: str, name2: str) -> None:
 def resume_link_cmd(ctx: click.Context, name: str, security_id: str, job_id: str, title: str, company: str) -> None:
 	"""关联简历与职位"""
 	store = _get_store(ctx)
+	if not _require_resume_name(ctx, name):
+		return
 	if not store.exists(name):
-		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
-		ctx.exit(1)
+		_emit_resume_not_found(ctx, name)
 		return
 	# 空字符串仍是合法 argv，但不构成一条职位关联：存进去之后 `resume applications`
 	# 会多出一行空 ID，提示里的 `boss apply  ` 也没有可执行参数。
 	if not security_id.strip() or not job_id.strip():
-		handle_error_output(ctx, "resume", code="INVALID_PARAM", message="security_id 与 job_id 不能为空")
+		search_cmd = boss_command_for_ctx(ctx, "search <关键词>")
+		handle_error_output(
+			ctx,
+			"resume",
+			code="INVALID_PARAM",
+			message="security_id 与 job_id 不能为空",
+			recovery_action=f"先用 {search_cmd} 取到完整的职位参数，再关联到简历",
+			hints={"next_actions": [search_cmd]},
+		)
 		return
 	cache = CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db")
 	cache.link_resume_to_job(name, security_id, job_id, title, company)
@@ -428,9 +581,9 @@ def resume_link_cmd(ctx: click.Context, name: str, security_id: str, job_id: str
 		ctx, "resume",
 		{"action": "link", "name": name, "security_id": security_id, "job_id": job_id},
 		render=lambda d: render_action_result(
-			d, title="resume link", next_steps=[f"boss resume applications {name}", f"boss apply {security_id} {job_id}"]
+			d, title="resume link", next_steps=[f"boss resume applications {shell_argument(name)}", f"boss apply {shell_argument(security_id)} {shell_argument(job_id)}"]
 		),
-		hints={"next_actions": [f"boss resume applications {name}", f"boss apply {security_id} {job_id}"]},
+		hints={"next_actions": [f"boss resume applications {shell_argument(name)}", f"boss apply {shell_argument(security_id)} {shell_argument(job_id)}"]},
 	)
 
 
@@ -440,9 +593,10 @@ def resume_link_cmd(ctx: click.Context, name: str, security_id: str, job_id: str
 def resume_applications_cmd(ctx: click.Context, name: str) -> None:
 	"""查看简历关联的所有职位"""
 	store = _get_store(ctx)
+	if not _require_resume_name(ctx, name):
+		return
 	if not store.exists(name):
-		handle_error_output(ctx, "resume", code="RESUME_NOT_FOUND", message=f"简历 '{name}' 不存在")
-		ctx.exit(1)
+		_emit_resume_not_found(ctx, name)
 		return
 	cache = CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db")
 	items = cache.get_resume_applications(name)
@@ -454,7 +608,10 @@ def resume_applications_cmd(ctx: click.Context, name: str) -> None:
 			d,
 			f"{name} 关联职位",
 			[("职位", "job_title", "bold cyan"), ("公司", "company", "green"), ("状态", "status", "yellow"), ("更新", "updated_at", "dim")],
-			next_steps=[f"boss resume link {name} <security_id> <job_id>"] if not d else [f"boss resume show {name}"],
+			next_steps=[f"boss resume link {shell_argument(name)} <security_id> <job_id>"] if not d else [f"boss resume show {shell_argument(name)}"],
 		),
-		hints={"next_actions": [f"boss resume show {name}"]},
+		# 与 TTY 同一口径：没有关联职位时 show 只能看到简历本身，下一步是关联一个职位。
+		hints={"next_actions": [f"boss resume link {shell_argument(name)} <security_id> <job_id>"]
+		if not items
+		else [f"boss resume show {shell_argument(name)}"]},
 	)

@@ -10,9 +10,9 @@ import click
 
 from boss_agent_cli.api.browser_source import POLICIES as BROWSER_SOURCES
 from boss_agent_cli.automation.config import automation_config_from_dict
-from boss_agent_cli.config import DEFAULTS, ROLES, validate_request_config
+from boss_agent_cli.config import CDP_URL_REQUIREMENT, DEFAULTS, ROLES, is_valid_cdp_url, validate_request_config
 from boss_agent_cli.crawler.service import crawl_cdp_port, crawl_chrome_path, crawl_int_setting
-from boss_agent_cli.display import boss_command_for_ctx, handle_output, render_simple_list
+from boss_agent_cli.display import boss_command_for_ctx, handle_output, render_action_result, render_simple_list
 from boss_agent_cli.output import LOG_LEVELS
 from boss_agent_cli.platforms import list_platforms
 from boss_agent_cli.services.json_files import write_json_atomic
@@ -27,6 +27,41 @@ _CONFIG_CHOICES = {
 }
 _PUBLIC_CONFIG_KEYS = tuple(key for key in DEFAULTS if key != "low_risk_mode")
 _AVAILABLE_CONFIG_MESSAGE = f"可用项: {', '.join(sorted(_PUBLIC_CONFIG_KEYS))}"
+
+
+def _emit_unknown_key(ctx: click.Context) -> None:
+	"""未知配置项：消息里列出可用项，hints 给出能看到当前值的 config list。"""
+	from boss_agent_cli.output import emit_error
+
+	emit_error(
+		"config",
+		code="INVALID_PARAM",
+		message=f"未知配置项。{_AVAILABLE_CONFIG_MESSAGE}",
+		hints={"next_actions": [boss_command_for_ctx(ctx, "config list")]},
+	)
+
+
+def _emit_invalid_value(ctx: click.Context, key: str, message: str) -> None:
+	"""取值不合法：消息已说明原因，再给出查看当前值与可用项的下一步。
+
+	``config set log_level bogus`` / ``config set request_delay abc`` 原来只有中文
+	message，``recovery_action`` 是笼统的「修正参数」、``hints`` 为 null；Agent 拿不到
+	结构化的 ``config get <键>`` / ``config list``。
+	"""
+	from boss_agent_cli.output import emit_error
+
+	emit_error(
+		"config",
+		code="INVALID_PARAM",
+		message=message,
+		recovery_action=f"按提示修正 {key} 的取值；用 {boss_command_for_ctx(ctx, 'config list')} 查看当前值与可用项",
+		hints={
+			"next_actions": [
+				boss_command_for_ctx(ctx, f"config get {key}"),
+				boss_command_for_ctx(ctx, "config list"),
+			]
+		},
+	)
 
 
 @click.group("config", invoke_without_command=True)
@@ -90,13 +125,7 @@ def config_get_cmd(ctx: click.Context, key: str) -> None:
 	"""查看单个配置项的值。"""
 	cfg = ctx.obj["config"]
 	if key not in _PUBLIC_CONFIG_KEYS:
-		from boss_agent_cli.output import emit_error
-
-		emit_error(
-			"config",
-			code="INVALID_PARAM",
-			message=f"未知配置项。{_AVAILABLE_CONFIG_MESSAGE}",
-		)
+		_emit_unknown_key(ctx)
 		ctx.exit(1)
 		return
 
@@ -105,7 +134,19 @@ def config_get_cmd(ctx: click.Context, key: str) -> None:
 		"value": cfg.get(key, DEFAULTS[key]),
 		"default": DEFAULTS[key],
 	}
-	handle_output(ctx, "config", data, render=lambda d: None)
+	# `render=lambda d: None` 让 TTY 下的 get / set / reset 什么都不打印：真人在终端
+	# 改完配置看不到任何确认，只能再跑一次 config list 才能确认是否生效。
+	next_actions = [
+		boss_command_for_ctx(ctx, f"config set {key} <值>"),
+		boss_command_for_ctx(ctx, "config list"),
+	]
+	handle_output(
+		ctx,
+		"config",
+		data,
+		render=lambda d: render_action_result(d, title="config get", next_steps=next_actions),
+		hints={"next_actions": next_actions},
+	)
 
 
 @config_group.command("set")
@@ -115,13 +156,7 @@ def config_get_cmd(ctx: click.Context, key: str) -> None:
 def config_set_cmd(ctx: click.Context, key: str, value: str) -> None:
 	"""修改配置项。"""
 	if key not in _PUBLIC_CONFIG_KEYS:
-		from boss_agent_cli.output import emit_error
-
-		emit_error(
-			"config",
-			code="INVALID_PARAM",
-			message=f"未知配置项。{_AVAILABLE_CONFIG_MESSAGE}",
-		)
+		_emit_unknown_key(ctx)
 		ctx.exit(1)
 		return
 
@@ -154,21 +189,17 @@ def config_set_cmd(ctx: click.Context, key: str, value: str) -> None:
 		if key.startswith("request_") or key == "batch_greet_delay":
 			# Validate the edited field without preventing repairs of other bad fields.
 			validate_request_config({**DEFAULTS, key: parsed_value})
+		if key == "cdp_url" and parsed_value is not None and not is_valid_cdp_url(parsed_value):
+			# 启动期按同一规则拒绝坏地址：写进去会让之后每条命令都启动失败，
+			# 连 `config get` 也只能靠 config 子命令的豁免勉强可用。
+			raise ValueError(f"{CDP_URL_REQUIREMENT}，收到 {parsed_value!r}")
 	except (TypeError, ValueError) as exc:
-		from boss_agent_cli.output import emit_error
-
-		emit_error("config", code="INVALID_PARAM", message=str(exc))
+		_emit_invalid_value(ctx, key, str(exc))
 		ctx.exit(1)
 		return
 	choices = list_platforms() if key == "platform" else _CONFIG_CHOICES.get(key)
 	if choices is not None and parsed_value not in choices:
-		from boss_agent_cli.output import emit_error
-
-		emit_error(
-			"config",
-			code="INVALID_PARAM",
-			message=f"{key} 必须是以下值之一: {', '.join(choices)}",
-		)
+		_emit_invalid_value(ctx, key, f"{key} 必须是以下值之一: {', '.join(choices)}")
 		ctx.exit(1)
 		return
 	user_cfg[key] = parsed_value
@@ -181,7 +212,17 @@ def config_set_cmd(ctx: click.Context, key: str, value: str) -> None:
 		return
 
 	data = {"key": key, "value": parsed_value, "previous": ctx.obj["config"].get(key)}
-	handle_output(ctx, "config", data, render=lambda d: None)
+	next_actions = [
+		boss_command_for_ctx(ctx, f"config get {key}"),
+		boss_command_for_ctx(ctx, "config list"),
+	]
+	handle_output(
+		ctx,
+		"config",
+		data,
+		render=lambda d: render_action_result(d, title="config set", next_steps=next_actions),
+		hints={"next_actions": next_actions},
+	)
 
 
 @config_group.command("reset")
@@ -190,13 +231,7 @@ def config_set_cmd(ctx: click.Context, key: str, value: str) -> None:
 def config_reset_cmd(ctx: click.Context, key: str) -> None:
 	"""将配置项恢复为默认值。"""
 	if key not in _PUBLIC_CONFIG_KEYS:
-		from boss_agent_cli.output import emit_error
-
-		emit_error(
-			"config",
-			code="INVALID_PARAM",
-			message=f"未知配置项。{_AVAILABLE_CONFIG_MESSAGE}",
-		)
+		_emit_unknown_key(ctx)
 		ctx.exit(1)
 		return
 
@@ -210,7 +245,17 @@ def config_reset_cmd(ctx: click.Context, key: str) -> None:
 		return
 
 	data = {"key": key, "value": DEFAULTS[key], "restored": True}
-	handle_output(ctx, "config", data, render=lambda d: None)
+	next_actions = [
+		boss_command_for_ctx(ctx, f"config get {key}"),
+		boss_command_for_ctx(ctx, "config list"),
+	]
+	handle_output(
+		ctx,
+		"config",
+		data,
+		render=lambda d: render_action_result(d, title="config reset", next_steps=next_actions),
+		hints={"next_actions": next_actions},
+	)
 
 
 def _load_user_overrides(config_path: Path) -> dict[str, Any]:

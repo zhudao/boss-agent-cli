@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -63,6 +64,22 @@ def test_ai_local_pull_requires_confirm_download(tmp_path: Path) -> None:
 	assert payload["error"]["code"] == "CONFIRM_DOWNLOAD_REQUIRED"
 
 
+def test_ai_local_pull_hint_quotes_model_with_spaces(tmp_path: Path) -> None:
+	"""模型名是自由文本：recovery_action 里的名字带空格时必须整体加引号。
+
+	Agent 照抄 `--model my model --confirm-download` 会把 `model` 当位置参数，
+	真正下载的还是错误的名字。
+	"""
+	result = _invoke(CliRunner(), tmp_path, ["pull", "--model", "my model"])
+
+	assert result.exit_code == 1
+	recovery = json.loads(result.output)["error"]["recovery_action"]
+	assert recovery == "boss ai local pull --model 'my model' --confirm-download"
+	assert shlex.split(recovery) == [
+		"boss", "ai", "local", "pull", "--model", "my model", "--confirm-download",
+	]
+
+
 def test_ai_local_pull_runs_ollama_pull_when_confirmed(tmp_path: Path) -> None:
 	runner = CliRunner()
 
@@ -104,6 +121,61 @@ def test_ai_local_import_registers_external_model(tmp_path: Path, monkeypatch) -
 	assert payload["command"] == "ai.local.import"
 	assert payload["data"]["model"] == "local-test"
 	assert (tmp_path / "models" / "local-test" / "source.gguf").exists()
+
+
+def test_ai_local_import_hint_quotes_model_with_spaces(tmp_path: Path, monkeypatch) -> None:
+	"""导入名带空格时，下一步 configure 的 hint 必须保持是同一个模型名。"""
+	monkeypatch.setenv("BOSS_AGENT_MACHINE_ID", "test-machine")
+	source = tmp_path / "source.gguf"
+	source.write_text("tiny fixture", encoding="utf-8")
+
+	result = _invoke(
+		CliRunner(), tmp_path, ["import", "--path", str(source), "--model", "my model"]
+	)
+
+	assert result.exit_code == 0, result.output
+	hint = json.loads(result.output)["hints"]["next_actions"][0]
+	assert hint == "boss ai local configure --runtime vllm --model 'my model'"
+	assert shlex.split(hint)[-1] == "my model"
+
+
+def test_ai_local_import_does_not_reset_configured_endpoint(tmp_path: Path, monkeypatch) -> None:
+	"""导入模型只登记文件，不能改 AI 配置。
+
+	以前会写 ai_provider=custom / ai_base_url=None / ai_model=<导入名> 并覆盖
+	api_key：用户刚配好的 ollama 端点被清空，下一条 AI 命令直接报「AI 服务未配置」。
+	"""
+	monkeypatch.setenv("BOSS_AGENT_MACHINE_ID", "test-machine")
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["configure", "--runtime", "ollama", "--model", "qwen3:14b"])
+	source = tmp_path / "source.gguf"
+	source.write_text("tiny fixture", encoding="utf-8")
+
+	result = _invoke(runner, tmp_path, ["import", "--path", str(source), "--model", "local-test"])
+
+	assert result.exit_code == 0
+	store = AIConfigStore(tmp_path)
+	assert store.load_config()["ai_provider"] == "ollama"
+	assert store.load_config()["ai_model"] == "qwen3:14b"
+	assert store.get_base_url() == "http://localhost:11434/v1"
+	assert store.get_api_key() == "local"
+	payload = json.loads(result.output)
+	assert payload["hints"]["next_actions"][0] == "boss ai local configure --runtime vllm --model local-test"
+
+
+def test_ai_local_smoke_names_provider_without_endpoint(tmp_path: Path, monkeypatch) -> None:
+	"""遗留坏配置下要点名是端点缺失，而不是笼统的「本地 AI 服务未配置」。"""
+	monkeypatch.setenv("BOSS_AGENT_MACHINE_ID", "test-machine")
+	store = AIConfigStore(tmp_path)
+	store.save_config(ai_provider="custom", ai_model="m", ai_base_url=None)
+	store.save_api_key("sk-test")
+
+	result = _invoke(CliRunner(), tmp_path, ["smoke"])
+
+	assert result.exit_code == 1
+	payload = json.loads(result.output)
+	assert payload["error"]["code"] == "AI_NOT_CONFIGURED"
+	assert "'custom'" in payload["error"]["message"]
 
 
 def test_ai_local_smoke_calls_openai_compatible_endpoint(tmp_path: Path, monkeypatch) -> None:

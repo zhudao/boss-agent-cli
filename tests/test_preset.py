@@ -1,4 +1,5 @@
 import json
+import shlex
 import sqlite3
 from unittest.mock import patch
 
@@ -69,6 +70,28 @@ def test_preset_add_list_remove(tmp_path):
 	assert remove_result.exit_code == 0
 	remove_parsed = json.loads(remove_result.output)
 	assert remove_parsed["data"]["removed"] is True
+	# TTY 渲染给了「boss preset list」的下一步，信封必须同样给出。
+	assert remove_parsed["hints"]["next_actions"] == ["boss preset list"]
+
+	missing_result = runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "preset", "remove", "nope"])
+	assert missing_result.exit_code == 0
+	missing_parsed = json.loads(missing_result.output)
+	assert missing_parsed["data"]["removed"] is False
+	assert missing_parsed["hints"]["next_actions"] == ["boss preset list"]
+
+
+def test_preset_remove_rejects_blank_name(tmp_path):
+	"""空名字不可能命中任何预设：不能以 removed=false 的 ok:true 报成功。"""
+	runner = CliRunner()
+	for name in ("", "  "):
+		result = runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "preset", "remove", name])
+		assert result.exit_code == 1, result.output
+		parsed = json.loads(result.output)
+		assert parsed["error"]["code"] == "INVALID_PARAM"
+		assert "名称不能为空" in parsed["error"]["message"]
+		# 空名字的恢复指引要能直接执行：空串既没有名字也查不到记录。
+		assert parsed["hints"]["next_actions"] == ["boss preset list"]
+		assert "boss preset list" in parsed["error"]["recovery_action"]
 
 
 def test_preset_list_empty_next_step_is_executable(tmp_path, monkeypatch):
@@ -136,6 +159,28 @@ def test_search_with_invalid_preset_names_the_preset(tmp_path):
 	assert parsed["error"]["code"] == "INVALID_PARAM"
 	assert "来自 preset 'legacy'" in parsed["error"]["message"]
 	assert "boss preset remove legacy" in parsed["error"]["message"]
+
+
+def test_search_with_invalid_preset_quotes_name_in_message(tmp_path):
+	"""消息里的删除命令同样要保住带空格的预设名。
+
+	`boss preset remove 我的 列表` 拆成两个参数后命中错误的名字，另外两条
+	hints.next_actions 已走 shell_argument()，这条正文是同一类残留。
+	"""
+	runner = CliRunner()
+	runner.invoke(
+		cli, ["--data-dir", str(tmp_path), "--json", "preset", "add", "我的 列表", "golang"]
+	)
+	_break_params(tmp_path, "我的 列表", json.dumps({"query": "golang", "salary": "天价"}))
+
+	result = runner.invoke(
+		cli, ["--data-dir", str(tmp_path), "--json", "search", "--preset", "我的 列表"]
+	)
+
+	assert result.exit_code == 1, result.output
+	message = json.loads(result.output)["error"]["message"]
+	assert "boss preset remove '我的 列表'" in message
+	assert "boss preset remove 我的 列表" not in message
 
 
 @patch("boss_agent_cli.commands.search.get_platform_instance")
@@ -231,3 +276,89 @@ def test_search_with_corrupt_preset_reports_envelope(tmp_path):
 	assert parsed["error"]["recovery_action"]
 	assert "broken" in parsed["error"]["message"]
 	assert parsed["hints"]["next_actions"][0] == "boss preset remove broken"
+
+
+def test_search_with_missing_preset_reports_saved_search_not_found(tmp_path):
+	"""预设在本地缓存里不存在，不是平台职位下架。
+
+	以前报 JOB_NOT_FOUND（登记表文案「职位不存在或已下架」、recovery_action 为
+	null）：Agent 会以为职位被撤下而跳过，既看不出是预设名写错，也没有下一步。
+	"""
+	result = CliRunner().invoke(
+		cli, ["--data-dir", str(tmp_path), "--json", "search", "--preset", "ghost"]
+	)
+
+	assert result.exit_code == 1, result.output
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "SAVED_SEARCH_NOT_FOUND"
+	assert parsed["error"]["recovery_action"] == "boss preset list（预设）或 boss watch list（watch）"
+	assert parsed["hints"]["next_actions"] == ["boss preset list", "boss preset add ghost <关键词>"]
+
+
+def test_search_with_missing_preset_quotes_name_with_spaces(tmp_path):
+	"""预设名带空格时，重建它的 hint 必须整体加引号，否则 `add 我的 列表 <关键词>`
+	会被拆成「我的」和「列表」两个位置参数。"""
+	result = CliRunner().invoke(
+		cli, ["--data-dir", str(tmp_path), "--json", "search", "--preset", "我的 列表"]
+	)
+
+	assert result.exit_code == 1, result.output
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "SAVED_SEARCH_NOT_FOUND"
+	add_hint = parsed["hints"]["next_actions"][1]
+	assert add_hint == "boss preset add '我的 列表' <关键词>"
+	assert shlex.split(add_hint)[3] == "我的 列表"
+
+
+def test_search_with_corrupt_preset_quotes_name_with_spaces(tmp_path):
+	"""删除重建指引同样要保住带空格的预设名。"""
+	runner = CliRunner()
+	runner.invoke(
+		cli, ["--data-dir", str(tmp_path), "--json", "preset", "add", "我的 列表", "python"]
+	)
+	_break_params(tmp_path, "我的 列表")
+
+	result = runner.invoke(
+		cli, ["--data-dir", str(tmp_path), "--json", "search", "--preset", "我的 列表"]
+	)
+
+	assert result.exit_code == 1, result.output
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "SAVED_SEARCH_INVALID"
+	assert parsed["hints"]["next_actions"] == [
+		"boss preset remove '我的 列表'",
+		"boss preset add '我的 列表' <关键词>",
+	]
+
+
+def test_preset_list_json_hints_follow_the_actual_list(tmp_path):
+	"""JSON 的 next_actions 也要按列表状态切换：空列表没有可搜索 / 可删除的名字。
+
+	TTY 提示早已按空列表给出 `preset add`，但 `hints.next_actions` 仍是
+	`boss search --preset <name>` / `boss preset remove <name>`——Agent 照抄
+	只会把一份从没存在过的预设名传给命令，再换回 SAVED_SEARCH_NOT_FOUND。
+	"""
+	runner = CliRunner()
+
+	empty = json.loads(runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "preset", "list"]).output)
+	assert empty["data"] == []
+	assert empty["hints"]["next_actions"] == ["boss preset add <name> <关键词>"]
+
+	runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "preset", "add", "golang", "golang"])
+	filled = json.loads(runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "preset", "list"]).output)
+	assert [item["name"] for item in filled["data"]] == ["golang"]
+	assert filled["hints"]["next_actions"] == ["boss search --preset <name>", "boss preset remove <name>"]
+
+
+def test_preset_hint_quotes_name_with_spaces(tmp_path):
+	"""预设名是自由文本：带空格时 hint 必须整体加引号，Agent 照抄才不会拆成两个参数。"""
+	runner = CliRunner()
+	added = runner.invoke(
+		cli, ["--data-dir", str(tmp_path), "--json", "preset", "add", "我的 列表", "golang"]
+	)
+	assert added.exit_code == 0, added.output
+	parsed = json.loads(added.output)
+	assert "boss search --preset '我的 列表'" in parsed["hints"]["next_actions"]
+
+	hint = next(a for a in parsed["hints"]["next_actions"] if a.startswith("boss search"))
+	assert shlex.split(hint)[1:] == ["search", "--preset", "我的 列表"]

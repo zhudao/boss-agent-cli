@@ -13,10 +13,13 @@ from boss_agent_cli.commands._recruiter_platform import get_recruiter_platform_i
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.services.output_path import prepare_output_path
 from boss_agent_cli.display import (
+	auth_required_hints,
+	boss_command_for_ctx,
 	error_contract_for_code,
 	handle_auth_errors,
 	handle_error_output,
 	handle_output,
+	login_action_for_ctx,
 	platform_error_contract,
 	risk_error_message,
 )
@@ -52,37 +55,59 @@ def download_resume_cmd(ctx: click.Context, friend_id: int, message_id: int, out
 		try:
 			result = platform.download_resume_by_friend(friend_id, message_id, output)
 		except ResumeValidationError as exc:
-			handle_error_output(ctx, command, code="INVALID_PARAM", message=str(exc))
+			chat_cmd = boss_command_for_ctx(ctx, "hr chat")
+			handle_error_output(
+				ctx,
+				command,
+				code="INVALID_PARAM",
+				message=str(exc),
+				recovery_action=f"按提示核对 friend_id、message_id 与附件状态后重试；不确定时用 {chat_cmd} 核对会话",
+				hints={"next_actions": [chat_cmd]},
+			)
 			return
 		except FileExistsError:
-			handle_error_output(ctx, command, code="INVALID_PARAM", message="输出文件已存在，请指定新文件名；不会覆盖")
+			handle_error_output(
+				ctx,
+				command,
+				code="INVALID_PARAM",
+				message="输出文件已存在，请指定新文件名；不会覆盖",
+				recovery_action="换一个 --output 文件名后重试；已有文件不会被覆盖",
+			)
 			return
 		except NotImplementedError:
 			handle_error_output(ctx, command, code="PLATFORM_NOT_SUPPORTED", message="当前平台不支持下载附件简历")
 			return
 		except OSError:
-			handle_error_output(ctx, command, code="INVALID_PARAM", message="无法保存文件，请检查目标目录与写入权限")
+			handle_error_output(
+				ctx,
+				command,
+				code="INVALID_PARAM",
+				message="无法保存文件，请检查目标目录与写入权限",
+				recovery_action="确认 --output 的父目录存在且可写后重试",
+			)
 			return
 		except (AuthRequired, RecruiterAuthError):
-			recoverable, recovery_action = error_contract_for_code("AUTH_REQUIRED")
+			recoverable, _ = error_contract_for_code("AUTH_REQUIRED")
 			handle_error_output(
 				ctx,
 				command,
 				code="AUTH_REQUIRED",
 				message="登录态不可用，请重新登录后下载",
 				recoverable=recoverable,
-				recovery_action=recovery_action,
+				recovery_action=login_action_for_ctx(ctx),
+				hints=auth_required_hints(ctx),
 			)
 			return
 		except TokenRefreshFailed:
-			recoverable, recovery_action = error_contract_for_code("TOKEN_REFRESH_FAILED")
+			recoverable, _ = error_contract_for_code("TOKEN_REFRESH_FAILED")
 			handle_error_output(
 				ctx,
 				command,
 				code="TOKEN_REFRESH_FAILED",
 				message="登录态刷新失败，请重新登录后下载",
 				recoverable=recoverable,
-				recovery_action=recovery_action,
+				recovery_action=login_action_for_ctx(ctx),
+				hints=auth_required_hints(ctx),
 			)
 			return
 		except PlatformRiskError as exc:
@@ -134,4 +159,9 @@ def download_resume_cmd(ctx: click.Context, friend_id: int, message_id: int, out
 			ctx,
 			command,
 			{"friend_id": friend_id, "message_id": message_id, "downloaded": True, **platform.unwrap_data(result)},
+			# 附件落盘后没有下一步：Agent 只能自己猜文件在哪、也不会回到会话继续沟通。
+			hints={
+				"next_actions": [boss_command_for_ctx(ctx, f"hr chatmsg {friend_id}")],
+				"operator_actions": [f"附件已保存到 {output.resolve()}"],
+			},
 		)

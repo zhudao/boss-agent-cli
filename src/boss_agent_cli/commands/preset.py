@@ -8,7 +8,7 @@ from boss_agent_cli.api.endpoints import (
 	STAGE_CODES,
 )
 from boss_agent_cli.cache.store import CacheStore
-from boss_agent_cli.display import handle_error_output, handle_output, render_action_result, render_list_result
+from boss_agent_cli.display import boss_command_for_ctx, handle_error_output, handle_output, render_action_result, render_list_result, shell_argument
 from boss_agent_cli.search_filters import (
 	ACTIVE_LEVELS,
 	build_search_params,
@@ -16,6 +16,7 @@ from boss_agent_cli.search_filters import (
 	resolve_active_level,
 	resolve_search_code_params,
 )
+from boss_agent_cli.commands._filter_errors import emit_filter_error
 
 
 def _build_params(
@@ -67,10 +68,19 @@ def preset_add_cmd(
 	welfare: str | None,
 	active: str | None,
 ) -> None:
+	"""保存一组可复用的搜索参数，之后用 `boss search --preset <名称>` 调用。"""
 	# 空字符串是合法 argv，但存下来的预设既没法点名（`boss search --preset ""`），
 	# 也没法搜到目标（空关键词等于不筛选）。必须在写盘前拒绝。
 	if not name.strip() or not query.strip():
-		handle_error_output(ctx, "preset", code="INVALID_PARAM", message="preset 名称与搜索关键词不能为空")
+		list_cmd = boss_command_for_ctx(ctx, "preset list")
+		handle_error_output(
+			ctx,
+			"preset",
+			code="INVALID_PARAM",
+			message="preset 名称与搜索关键词不能为空",
+			recovery_action=f"补上预设名称和搜索关键词后重试；用 {list_cmd} 查看已有预设",
+			hints={"next_actions": [list_cmd]},
+		)
 		return
 	# 与 `watch add` 一致：保存时就把筛选条件校验掉。未知薪资 / 经验 / 学历
 	# 写进预设后，`search --preset` 每次都要先在参数解析处失败，而预设本身
@@ -82,12 +92,12 @@ def preset_add_cmd(
 			industry=industry, scale=scale, stage=stage, job_type=job_type,
 		)
 	except ValueError as exc:
-		handle_error_output(ctx, "preset", code="INVALID_PARAM", message=str(exc))
+		emit_filter_error(ctx, "preset", exc)
 		return
 	try:
 		active_level = resolve_active_level(active)
 	except ValueError as exc:
-		handle_error_output(ctx, "preset", code="INVALID_PARAM", message=str(exc))
+		emit_filter_error(ctx, "preset", exc)
 		return
 
 	params = _build_params(query, city, salary, experience, education, industry, scale, stage, job_type, welfare)
@@ -101,18 +111,24 @@ def preset_add_cmd(
 		"preset",
 		{"action": "add", "name": name, "params": params},
 		render=lambda d: render_action_result(
-			d, title="preset", next_steps=[f"boss search --preset {name}", "boss preset list"]
+			d, title="preset", next_steps=[f"boss search --preset {shell_argument(name)}", "boss preset list"]
 		),
-		hints={"next_actions": [f"boss search --preset {name}", "boss preset list"]},
+		hints={"next_actions": [f"boss search --preset {shell_argument(name)}", "boss preset list"]},
 	)
 
 
 @preset_group.command("list")
 @click.pass_context
 def preset_list_cmd(ctx: click.Context) -> None:
+	"""列出本地已保存的搜索预设。"""
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		items, corrupt = cache.list_saved_searches_with_corrupt()
-	hints: dict[str, Any] = {"next_actions": ["boss search --preset <name>", "boss preset remove <name>"]}
+	hints: dict[str, Any] = {
+		# 空列表里没有 name 可搜索 / 删除：照抄只会换回一个不存在的预设。
+		"next_actions": ["boss preset add <name> <关键词>"]
+		if not items
+		else ["boss search --preset <name>", "boss preset remove <name>"]
+	}
 	if corrupt:
 		# 坏条目不能假装不存在：列表照常返回可用项，同时指明该删哪个。
 		hints["corrupt"] = corrupt
@@ -140,6 +156,20 @@ def preset_list_cmd(ctx: click.Context) -> None:
 @click.argument("name")
 @click.pass_context
 def preset_remove_cmd(ctx: click.Context, name: str) -> None:
+	"""删除一条本地搜索预设；名字不存在时保持幂等（不报错）。"""
+	# 与 add 同口径：空名字不可能命中任何本地记录，却会以
+	# `{"removed": false}` 的 `ok: true` 报成功，Agent 会以为已经删掉了。
+	if not name.strip():
+		list_cmd = boss_command_for_ctx(ctx, "preset list")
+		handle_error_output(
+			ctx,
+			"preset",
+			code="INVALID_PARAM",
+			message="预设名称不能为空",
+			recovery_action=f"补上预设名称后重试；用 {list_cmd} 查看已有预设",
+			hints={"next_actions": [list_cmd]},
+		)
+		return
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		removed = cache.delete_saved_search(name)
 	handle_output(
@@ -147,4 +177,5 @@ def preset_remove_cmd(ctx: click.Context, name: str) -> None:
 		"preset",
 		{"action": "remove", "name": name, "removed": removed},
 		render=lambda d: render_action_result(d, title="preset", next_steps=["boss preset list"]),
+		hints={"next_actions": ["boss preset list"]},
 	)

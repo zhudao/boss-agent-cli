@@ -29,7 +29,7 @@ from boss_agent_cli.crawler.service import (
 )
 from boss_agent_cli.crawler.transport import DrissionCrawlerSession
 from boss_agent_cli.digest import build_digest
-from boss_agent_cli.display import RISK_ERROR_CONTRACTS, risk_error_contract, risk_error_message
+from boss_agent_cli.display import RISK_ERROR_CONTRACTS, risk_error_contract, risk_error_message, shell_argument
 from boss_agent_cli.output import Logger
 from boss_agent_cli.pipeline_state import build_pipeline_items, select_follow_up_candidates
 from boss_agent_cli.resume.models import resume_to_text
@@ -432,7 +432,7 @@ def _auth_status(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 		# 刻意不阻塞轮询等待扫码——Agent 与真人都不该被卡在这里。
 		login_command = f"boss --platform {context.platform} login"
 		control = context.workflow_control
-		resume_command = f"boss wizard --resume {control.run_id}" if control else "boss wizard"
+		resume_command = f"boss wizard --resume {shell_argument(control.run_id)}" if control else "boss wizard"
 		return StepResult(
 			{"authenticated": False, "platform": context.platform, "role": context.role},
 			status=WorkflowStatus.WAITING_INPUT,
@@ -558,7 +558,7 @@ def _candidate_friend(platform: Any, identifier: str) -> dict[str, Any]:
 		_unwrap(platform, error_response, "沟通列表获取失败")
 	if friend is not None:
 		return friend
-	raise WorkflowActionError("JOB_NOT_FOUND", f"沟通列表中未找到联系人: {identifier}")
+	raise WorkflowActionError("CONTACT_NOT_FOUND", f"沟通列表中未找到联系人: {identifier}")
 
 
 def _candidate_current_security_id(friend: Mapping[str, Any]) -> str:
@@ -807,10 +807,12 @@ def _candidate_watch(context: ActionContext, inputs: Mapping[str, Any], prior: M
 				"SAVED_SEARCH_INVALID",
 				str(exc),
 				recoverable=True,
-				recovery_action=f"boss watch remove {name} 后重新 watch add {name} <关键词>",
+				# watch 名来自 wizard 的 name 输入、是自由文本：带空格时不加引号，
+				# 照抄 `watch remove 我的 监控` 会把一个名字拆成两个参数。
+				recovery_action=f"boss watch remove {shell_argument(name)}；再用 boss watch add {shell_argument(name)} <关键词> 重建",
 			) from exc
 		if record is None:
-			raise WorkflowActionError("JOB_NOT_FOUND", f"未找到 watch: {name}")
+			raise WorkflowActionError("SAVED_SEARCH_NOT_FOUND", f"未找到 watch: {name}")
 		account = account_scope(context.auth())
 		with context.candidate_platform() as platform:
 			result = execute_candidate_search(platform, cache, context.logger, {**record["params"], "account": account})
@@ -897,14 +899,14 @@ def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> Step
 			"WORKFLOW_TIMEOUT",
 			outcome.error or "workflow 超过设定时限",
 			recoverable=True,
-			recovery_action=f"boss crawl resume {outcome.run_id}",
+			recovery_action=f"boss crawl resume {shell_argument(outcome.run_id)}",
 		)
 	if outcome.status in {"workflow_stopped", "stopped"} and "stop requested" in str(outcome.error or ""):
 		raise WorkflowActionError(
 			"WORKFLOW_STOPPED",
 			outcome.error or "crawl 已停止",
 			recoverable=True,
-			recovery_action=f"boss crawl resume {outcome.run_id}",
+			recovery_action=f"boss crawl resume {shell_argument(outcome.run_id)}",
 		)
 	if outcome.status in {"risk_stopped", "budget_stopped"}:
 		# 风控停止时 service 会 keep Chrome；把标记写入结果供向导文案使用。
@@ -917,7 +919,7 @@ def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> Step
 				"browser_kept_open": browser_kept_open,
 				"cdp_port": browser.get("cdp_port") or data.get("cdp_port"),
 			}
-		resume_command = f"boss crawl resume {outcome.run_id}"
+		resume_command = f"boss crawl resume {shell_argument(outcome.run_id)}"
 		operator_actions: tuple[str, ...]
 		if browser_kept_open:
 			operator_actions = (
@@ -943,7 +945,7 @@ def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> Step
 			"NETWORK_ERROR",
 			outcome.error or f"crawl 以状态 {outcome.status} 停止",
 			recoverable=True,
-			recovery_action=f"boss crawl resume {outcome.run_id}",
+			recovery_action=f"boss crawl resume {shell_argument(outcome.run_id)}",
 		)
 	return StepResult(data, artifacts=tuple(outcome.output_paths.values()))
 
@@ -1031,7 +1033,7 @@ def _crawl_status(context: ActionContext, inputs: Mapping[str, Any], prior: Mapp
 			data = crawl_status(cache, run_id)
 			data = _attach_wizard_jobs(data, cache, run_id)
 		except KeyError as exc:
-			raise WorkflowActionError("JOB_NOT_FOUND", str(exc)) from exc
+			raise WorkflowActionError("CRAWL_RUN_NOT_FOUND", str(exc)) from exc
 	return StepResult(data)
 
 
@@ -1048,7 +1050,7 @@ def _crawl_resume(context: ActionContext, inputs: Mapping[str, Any], prior: Mapp
 				clear_stop=True,
 			)
 		except KeyError as exc:
-			raise WorkflowActionError("JOB_NOT_FOUND", f"未找到 crawl run: {run_id}") from exc
+			raise WorkflowActionError("CRAWL_RUN_NOT_FOUND", f"未找到 crawl run: {run_id}") from exc
 		return _crawl_outcome_result(outcome, cache)
 
 
@@ -1056,7 +1058,7 @@ def _crawl_stop(context: ActionContext, inputs: Mapping[str, Any], prior: Mappin
 	run_id = str(_required(inputs, "run_id"))
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		if not cache.request_crawl_stop(run_id):
-			raise WorkflowActionError("JOB_NOT_FOUND", f"未找到 crawl run: {run_id}")
+			raise WorkflowActionError("CRAWL_RUN_NOT_FOUND", f"未找到 crawl run: {run_id}")
 	return StepResult({"run_id": run_id, "status": "stop_requested"})
 
 

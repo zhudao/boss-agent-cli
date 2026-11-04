@@ -1,4 +1,5 @@
 import json
+import shlex
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -94,7 +95,8 @@ def test_list_empty(tmp_path):
 	parsed = json.loads(result.output)
 	_assert_success_envelope(parsed)
 	assert parsed["data"] == []
-	assert parsed["hints"]["next_actions"] == ["boss resume show <name>", "boss resume init --template default"]
+	# 空列表里没有简历名可 show：照抄只会换回 RESUME_NOT_FOUND。
+	assert parsed["hints"]["next_actions"] == ["boss resume init --template default"]
 
 
 def test_list_with_items(tmp_path):
@@ -137,6 +139,31 @@ def test_show_not_found(tmp_path):
 	_assert_error_envelope(parsed, "RESUME_NOT_FOUND")
 
 
+@pytest.mark.parametrize(
+	"args",
+	[
+		["show", "ghost"],
+		["edit", "ghost", "--field", "title", "--value", "X"],
+		["delete", "ghost"],
+		["diff", "ghost", "other"],
+		["applications", "ghost"],
+		["clone", "ghost", "new"],
+		["link", "ghost", "sid1", "job1"],
+	],
+)
+def test_not_found_points_at_resume_list(tmp_path, args):
+	"""简历不存在时 ``recovery_action`` 已指向 resume list，``hints`` 却是 null。
+
+	Agent 只从自然语言的 recovery_action 里抽命令，拿不到结构化的
+	``next_actions``；列出可选简历是唯一能把错误名字换成正确名字的入口。
+	"""
+	result = _invoke(CliRunner(), tmp_path, args)
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "RESUME_NOT_FOUND")
+	assert parsed["hints"]["next_actions"] == ["boss resume list"]
+
+
 # ── edit ──────────────────────────────────────────────────────
 
 
@@ -163,6 +190,78 @@ def test_edit_nested_field(tmp_path):
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
+
+
+def test_edit_container_field_is_rejected(tmp_path):
+	"""--field 点到容器时不能整体替换成字符串再炸成 INTERNAL_ERROR。"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "container", "--template", "default"])
+	for field in ("personal_info", "modules", "job_intention"):
+		result = _invoke(runner, tmp_path, ["edit", "container", "--field", field, "--value", "x"])
+		assert result.exit_code == 1, field
+		parsed = json.loads(result.output)
+		_assert_error_envelope(parsed, "INVALID_PARAM")
+		assert "不是文本字段" in parsed["error"]["message"]
+		assert parsed["hints"]["next_actions"] == [
+			"boss resume export container --format json",
+			"boss resume show container",
+		]
+		assert "export" in parsed["error"]["recovery_action"]
+
+	# 简历本身没有被写坏：仍然可以正常展示与导出。
+	shown = _invoke(runner, tmp_path, ["show", "container"])
+	assert shown.exit_code == 0, shown.output
+
+
+def test_edit_unknown_field_lists_next_steps(tmp_path):
+	"""字段名拼错时给出「怎么看到完整结构」的下一步，而不是一句「不存在」。"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "typo", "--template", "default"])
+	result = _invoke(runner, tmp_path, ["edit", "typo", "--field", "titl", "--value", "x"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "INVALID_PARAM")
+	assert "不存在" in parsed["error"]["message"]
+	assert parsed["hints"]["next_actions"][0] == "boss resume export typo --format json"
+	assert "文本子字段" in parsed["error"]["recovery_action"]
+
+
+def test_edit_error_message_quotes_resume_name_with_spaces(tmp_path):
+	"""message 里让人「照抄」的 export 命令同样要转义。
+
+	hints 早已走 shell_argument，消息正文却直接拼名字：简历名带空格时
+	``boss resume export 我的 简历 --format json`` 会被拆成两个参数。
+	"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "我的 简历", "--template", "default"])
+	result = _invoke(runner, tmp_path, ["edit", "我的 简历", "--field", "titl", "--value", "x"])
+
+	assert result.exit_code == 1
+	message = json.loads(result.output)["error"]["message"]
+	assert "boss resume export '我的 简历' --format json" in message
+	assert shlex.split(message.split("完整结构见 ", 1)[1]) == [
+		"boss",
+		"resume",
+		"export",
+		"我的 简历",
+		"--format",
+		"json",
+	]
+
+
+def test_edit_name_field_points_to_clone(tmp_path):
+	"""--field name 会被后面的 updated.name 覆盖，成功信封与实际内容不符，必须拒绝。"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "oldname", "--template", "default"])
+	result = _invoke(runner, tmp_path, ["edit", "oldname", "--field", "name", "--value", "newname"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "INVALID_PARAM")
+	assert parsed["hints"]["next_actions"] == ["boss resume clone oldname <新名>"]
+	assert "clone" in parsed["error"]["recovery_action"]
+
+	shown = json.loads(_invoke(runner, tmp_path, ["show", "oldname"]).output)
+	assert shown["data"]["name"] == "oldname"
 
 
 def test_edit_not_found(tmp_path):
@@ -355,12 +454,80 @@ def test_import_invalid_file(tmp_path):
 	assert parsed["ok"] is False
 
 
+def test_import_parse_failure_points_at_export_template(tmp_path):
+	"""无法解析的 JSON 也要给出可执行的修复入口，而不只是「导入失败」。"""
+	bad_file = tmp_path / "bad.json"
+	bad_file.write_text("not json at all", encoding="utf-8")
+	result = _invoke(CliRunner(), tmp_path, ["import", str(bad_file)])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "INVALID_PARAM")
+	assert "UTF-8" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"] == [
+		"boss resume export <简历> --format json",
+		"boss resume list",
+	]
+
+
+def test_import_malformed_structure_points_at_export_template(tmp_path):
+	"""结构对不上模型的 JSON 要给出对照模板，而不是只报一句「解析失败」。"""
+	bad_file = tmp_path / "bad_structure.json"
+	bad_file.write_text(json.dumps({"name": "broken", "personal_info": "not-an-object"}), encoding="utf-8")
+	result = _invoke(CliRunner(), tmp_path, ["import", str(bad_file)])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "INVALID_PARAM")
+	assert "解析失败" in parsed["error"]["message"]
+	assert parsed["hints"]["next_actions"] == [
+		"boss resume export <简历> --format json",
+		"boss resume list",
+	]
+	assert "export" in parsed["error"]["recovery_action"]
+
+
 def test_import_file_not_found(tmp_path):
 	runner = CliRunner()
 	result = _invoke(runner, tmp_path, ["import", str(tmp_path / "no_such_file.json")])
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is False
+
+
+def test_import_rejects_blank_path(tmp_path):
+	"""空路径会被 Path("") 解析成当前目录，原来报成 LOCAL_IO_ERROR「本地文件读写失败」。
+
+	真正的原因是 argv 少传了一个值，却让人去查磁盘和权限。
+	"""
+	result = _invoke(CliRunner(), tmp_path, ["import", ""])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "INVALID_PARAM")
+	assert parsed["error"]["message"] == "文件路径不能为空"
+	assert parsed["hints"]["next_actions"]
+
+
+def test_import_rejects_directory_path(tmp_path):
+	"""目录同样能通过 exists() 检查，随后在打开文件时抛 IsADirectoryError。"""
+	result = _invoke(CliRunner(), tmp_path, ["import", str(tmp_path)])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "INVALID_PARAM")
+	assert "是目录" in parsed["error"]["message"]
+
+
+def test_import_missing_file_points_at_import_flow(tmp_path):
+	"""不存在的文件要和空路径、目录两条分支一样给出可执行的下一步。
+
+	原来这条分支只回「文件 '…' 不存在」，``recovery_action`` 是笼统的「修正参数」、
+	``hints`` 为 null，Agent 不知道是该重新导出还是换个路径。
+	"""
+	result = _invoke(CliRunner(), tmp_path, ["import", str(tmp_path / "missing.json")])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "INVALID_PARAM")
+	assert "不存在" in parsed["error"]["message"]
+	assert parsed["error"]["recovery_action"] == "boss resume import <简历JSON路径>"
+	assert parsed["hints"]["next_actions"] == ["boss resume import <file>", "boss resume list"]
 
 
 def test_import_non_utf8_file_returns_invalid_param(tmp_path):
@@ -430,6 +597,7 @@ def test_clone_rejects_blank_new_name(tmp_path):
 		parsed = json.loads(result.output)
 		assert parsed["error"]["code"] == "INVALID_PARAM"
 		assert "名称" in parsed["error"]["message"]
+		assert parsed["hints"]["next_actions"] == ["boss resume list"]
 
 	listed = json.loads(_invoke(runner, tmp_path, ["list"]).output)
 	assert [item["name"] for item in listed["data"]] == ["original"]
@@ -493,6 +661,19 @@ def test_link_resume_to_job(tmp_path):
 	assert parsed["hints"]["next_actions"] == ["boss resume applications linktest", "boss apply sid-001 jid-001"]
 
 
+def test_link_hints_quote_identifiers_with_shell_metacharacters(tmp_path):
+	"""security_id / job_id 是自由文本，拼进 ``boss apply`` 提示前必须转义。"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "quotetest", "--template", "default"])
+	result = _invoke(runner, tmp_path, ["link", "quotetest", "sid; echo pwn", "jid $(id)"])
+	assert result.exit_code == 0, result.output
+	parsed = json.loads(result.output)
+	assert parsed["hints"]["next_actions"] == [
+		"boss resume applications quotetest",
+		"boss apply 'sid; echo pwn' 'jid $(id)'",
+	]
+
+
 def test_link_resume_not_found(tmp_path):
 	runner = CliRunner()
 	result = _invoke(runner, tmp_path, ["link", "ghost", "sid", "jid"])
@@ -531,6 +712,17 @@ def test_applications_list(tmp_path):
 	assert all(item["resume_name"] == "apptest" for item in parsed["data"])
 	assert all(item["status"] == "prepared" for item in parsed["data"])
 	assert parsed["hints"]["next_actions"] == ["boss resume show apptest"]
+
+
+def test_applications_empty_hints_point_to_link(tmp_path):
+	"""没有关联职位时下一步是关联一个职位，而不是再 show 一次简历。"""
+	runner = CliRunner()
+	_invoke(runner, tmp_path, ["init", "--name", "apptest", "--template", "default"])
+	result = _invoke(runner, tmp_path, ["applications", "apptest"])
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["data"] == []
+	assert parsed["hints"]["next_actions"] == ["boss resume link apptest <security_id> <job_id>"]
 
 
 def test_relink_resume_keeps_title_company_and_tracking(tmp_path):
@@ -592,3 +784,107 @@ def test_schema_contains_resume_error_codes():
 	assert "RESUME_NOT_FOUND" in codes
 	assert "RESUME_ALREADY_EXISTS" in codes
 	assert "EXPORT_FAILED" in codes
+
+
+# ── 空简历名 / 错误恢复动作 ─────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+	"args",
+	[
+		["show", ""],
+		["edit", "", "--field", "title", "--value", "x"],
+		["delete", ""],
+		["export", ""],
+		["clone", "", "dst"],
+		["diff", "", "other"],
+		["diff", "other", ""],
+		["link", "", "sid", "jid"],
+		["applications", ""],
+	],
+)
+def test_name_commands_reject_blank_resume_name(tmp_path, args):
+	"""空简历名是漏填参数，不是「简历不存在」。
+
+	以前这些命令都报 RESUME_NOT_FOUND「简历 '' 不存在」：错误码不可恢复，
+	也看不出要补 NAME；同一类输入在 `resume init --name ""` 里是 INVALID_PARAM。
+	"""
+	result = _invoke(CliRunner(), tmp_path, args)
+
+	assert result.exit_code == 1, result.output
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "名称不能为空" in parsed["error"]["message"]
+	# 空名字的下一步是列出已有简历，而不是笼统的「修正参数」。
+	assert parsed["hints"]["next_actions"] == ["boss resume list"]
+
+
+def test_blank_name_rejected_for_whitespace_only(tmp_path):
+	"""纯空格同样没有可点名的简历。"""
+	result = _invoke(CliRunner(), tmp_path, ["show", "   "])
+
+	assert result.exit_code == 1
+	assert json.loads(result.output)["error"]["code"] == "INVALID_PARAM"
+
+
+def test_resume_not_found_gives_executable_recovery(tmp_path):
+	"""RESUME_NOT_FOUND 的 recovery_action 以前是 null，Agent 读到错误却无动作可执行。"""
+	result = _invoke(CliRunner(), tmp_path, ["show", "missing"])
+
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "RESUME_NOT_FOUND"
+	assert parsed["error"]["recovery_action"] == "boss resume list"
+
+
+# ── 损坏的简历文件 ────────────────────────────────────────────
+
+
+def _write_corrupt_resume(tmp_path, name: str = "broken") -> None:
+	resumes = tmp_path / "resumes"
+	resumes.mkdir(parents=True, exist_ok=True)
+	(resumes / f"{name}.json").write_text("{bad json", encoding="utf-8")
+
+
+def test_list_reports_corrupt_resume_files(tmp_path):
+	"""读不出来的简历文件不能被列表隐藏：init 会被同名文件挡住。"""
+	_write_corrupt_resume(tmp_path)
+	result = _invoke(CliRunner(), tmp_path, ["list"])
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["data"] == []
+	assert parsed["hints"]["corrupt"] == ["broken"]
+	assert any("boss resume delete" in text for text in parsed["hints"]["operator_actions"])
+
+
+def test_show_corrupt_resume_reports_file_invalid(tmp_path):
+	"""文件存在但读不出来不是「简历不存在」：LIST 里也没有它，照提示会空转。"""
+	_write_corrupt_resume(tmp_path)
+	result = _invoke(CliRunner(), tmp_path, ["show", "broken"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "RESUME_FILE_INVALID")
+	assert parsed["error"]["recoverable"] is True
+	assert "boss resume delete" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"] == ["boss resume delete broken", "boss resume list"]
+
+
+def test_clone_corrupt_resume_not_local_io_error(tmp_path):
+	"""clone 以前把 FileNotFoundError 漏到顶层，报成「本地文件读写失败」+ 查磁盘。"""
+	_write_corrupt_resume(tmp_path)
+	result = _invoke(CliRunner(), tmp_path, ["clone", "broken", "newone"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	_assert_error_envelope(parsed, "RESUME_FILE_INVALID")
+	assert not (tmp_path / "resumes" / "newone.json").exists()
+
+
+def test_delete_corrupt_resume_still_removes_file(tmp_path):
+	"""损坏文件必须能被删除，否则它会一直挡着同名 init。"""
+	_write_corrupt_resume(tmp_path)
+	runner = CliRunner()
+	deleted = _invoke(runner, tmp_path, ["delete", "broken"])
+	assert deleted.exit_code == 0
+	assert json.loads(deleted.output)["data"]["deleted"] is True
+	assert not (tmp_path / "resumes" / "broken.json").exists()
+	listed = json.loads(_invoke(runner, tmp_path, ["list"]).output)
+	assert "corrupt" not in listed["hints"]

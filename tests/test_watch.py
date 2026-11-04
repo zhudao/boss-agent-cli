@@ -65,6 +65,38 @@ def test_watch_add_list_remove(tmp_path):
 	assert remove_result.exit_code == 0
 	remove_parsed = json.loads(remove_result.output)
 	assert remove_parsed["data"]["removed"] is True
+	# TTY 渲染给了「boss watch list」的下一步，信封必须同样给出。
+	assert remove_parsed["hints"]["next_actions"] == ["boss watch list"]
+
+	missing_result = runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "watch", "remove", "nope"])
+	assert missing_result.exit_code == 0
+	missing_parsed = json.loads(missing_result.output)
+	assert missing_parsed["data"]["removed"] is False
+	assert missing_parsed["hints"]["next_actions"] == ["boss watch list"]
+
+
+def test_watch_remove_rejects_blank_name(tmp_path):
+	"""空名字不可能命中任何 watch：不能以 removed=false 的 ok:true 报成功。"""
+	runner = CliRunner()
+	for name in ("", "  "):
+		result = runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "watch", "remove", name])
+		assert result.exit_code == 1, result.output
+		parsed = json.loads(result.output)
+		assert parsed["error"]["code"] == "INVALID_PARAM"
+		assert "名称不能为空" in parsed["error"]["message"]
+		# 空名字的恢复指引要能直接执行：空串既没有名字也查不到记录。
+		assert parsed["hints"]["next_actions"] == ["boss watch list"]
+		assert "boss watch list" in parsed["error"]["recovery_action"]
+
+
+def test_watch_run_blank_name_points_at_list_and_all(tmp_path):
+	"""``boss watch run ""`` 也要给出可选的两条路径：点名运行或 --all。"""
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "--json", "watch", "run", ""])
+
+	assert result.exit_code == 1, result.output
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["hints"]["next_actions"] == ["boss watch list", "boss watch run --all"]
 
 
 def test_watch_list_empty_next_step_is_executable(tmp_path, monkeypatch):
@@ -431,3 +463,28 @@ def test_watch_run_params_type_drift_reports_saved_search_invalid(tmp_path):
 	assert "query" in parsed["error"]["message"]
 	assert "list" in parsed["error"]["message"]
 	assert parsed["hints"]["next_actions"][0] == "boss watch remove drifted"
+
+
+def test_watch_run_missing_reports_saved_search_not_found(tmp_path):
+	"""watch 名不存在是本地记录缺失：给出已有条目与重建命令。"""
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "--json", "watch", "run", "ghost"])
+
+	assert result.exit_code == 1, result.output
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "SAVED_SEARCH_NOT_FOUND"
+	assert parsed["error"]["recovery_action"] == "boss preset list（预设）或 boss watch list（watch）"
+	assert parsed["hints"]["next_actions"] == ["boss watch list", "boss watch add ghost <关键词>"]
+
+
+def test_watch_list_json_hints_follow_the_actual_list(tmp_path):
+	"""JSON 的 next_actions 也要按列表状态切换：空列表没有可运行 / 可删除的名字。"""
+	runner = CliRunner()
+
+	empty = json.loads(runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "watch", "list"]).output)
+	assert empty["data"] == []
+	assert empty["hints"]["next_actions"] == ["boss watch add <name> <关键词>"]
+
+	runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "watch", "add", "golang", "golang"])
+	filled = json.loads(runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "watch", "list"]).output)
+	assert [item["name"] for item in filled["data"]] == ["golang"]
+	assert filled["hints"]["next_actions"] == ["boss watch run <name>", "boss watch remove <name>"]

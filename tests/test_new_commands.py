@@ -95,12 +95,12 @@ def test_chatmsg_not_found(mock_auth_cls, mock_client_cls):
 	result = runner.invoke(cli, ["chatmsg", "sec_nonexistent"])
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
-	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
+	assert parsed["error"]["code"] == "CONTACT_NOT_FOUND"
 
 
 @patch("boss_agent_cli.commands.chatmsg.get_platform_instance")
 @patch("boss_agent_cli.commands.chatmsg.AuthManager")
-def test_chatmsg_not_found_after_second_page_keeps_job_not_found(mock_auth_cls, mock_client_cls):
+def test_chatmsg_not_found_after_second_page_keeps_contact_not_found(mock_auth_cls, mock_client_cls):
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.friend_list.side_effect = [
 		_friend_list_response([_make_friend(sid="sec_other", uid=999)]),
@@ -110,7 +110,7 @@ def test_chatmsg_not_found_after_second_page_keeps_job_not_found(mock_auth_cls, 
 	result = runner.invoke(cli, ["chatmsg", "sec_nonexistent"])
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
-	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
+	assert parsed["error"]["code"] == "CONTACT_NOT_FOUND"
 
 
 @patch("boss_agent_cli.commands.chatmsg.get_platform_instance")
@@ -297,12 +297,12 @@ def test_mark_not_found(mock_auth_cls, mock_client_cls):
 	result = runner.invoke(cli, ["mark", "sec_none", "--label", "收藏"])
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
-	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
+	assert parsed["error"]["code"] == "CONTACT_NOT_FOUND"
 
 
 @patch("boss_agent_cli.commands.mark.get_platform_instance")
 @patch("boss_agent_cli.commands.mark.AuthManager")
-def test_mark_not_found_after_second_page_keeps_job_not_found(mock_auth_cls, mock_client_cls):
+def test_mark_not_found_after_second_page_keeps_contact_not_found(mock_auth_cls, mock_client_cls):
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.friend_list.side_effect = [
 		_friend_list_response([_make_friend(sid="sec_other", uid=999)]),
@@ -312,7 +312,7 @@ def test_mark_not_found_after_second_page_keeps_job_not_found(mock_auth_cls, moc
 	result = runner.invoke(cli, ["mark", "sec_none", "--label", "收藏"])
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
-	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
+	assert parsed["error"]["code"] == "CONTACT_NOT_FOUND"
 
 
 @patch("boss_agent_cli.commands.mark.get_platform_instance")
@@ -384,7 +384,7 @@ def test_exchange_finds_contact_on_second_page(mock_auth_cls, mock_client_cls):
 
 @patch("boss_agent_cli.commands.exchange.get_platform_instance")
 @patch("boss_agent_cli.commands.exchange.AuthManager")
-def test_exchange_not_found_after_second_page_keeps_job_not_found(mock_auth_cls, mock_client_cls):
+def test_exchange_not_found_after_second_page_keeps_contact_not_found(mock_auth_cls, mock_client_cls):
 	mock_client = _ctx_mock(mock_client_cls)
 	mock_client.friend_list.side_effect = [
 		_friend_list_response([_make_friend(sid="sec_other", uid=999)]),
@@ -394,7 +394,7 @@ def test_exchange_not_found_after_second_page_keeps_job_not_found(mock_auth_cls,
 	result = runner.invoke(cli, ["exchange", "sec_none"])
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
-	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
+	assert parsed["error"]["code"] == "CONTACT_NOT_FOUND"
 
 
 @patch("boss_agent_cli.commands.exchange.get_platform_instance")
@@ -561,6 +561,26 @@ def test_detail_reports_not_supported_when_browser_fallback_missing(mock_auth_cl
 	assert parsed["error"]["message"] == "job_card is not supported"
 	assert parsed["error"]["recoverable"] is True
 	assert parsed["error"]["recovery_action"] == "切换平台或调整命令参数后重试"
+
+
+@patch("boss_agent_cli.commands.detail.CacheStore")
+@patch("boss_agent_cli.commands.detail.get_platform_instance")
+@patch("boss_agent_cli.commands.detail.AuthManager")
+def test_detail_empty_job_card_reports_not_found_with_next_steps(mock_auth_cls, mock_client_cls, mock_cache_cls):
+	"""「下架」不是死胡同：恢复指引与下一步必须能直接换线索。"""
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.is_greeted.return_value = False
+	mock_cache.get_job_id.return_value = ""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.job_card.return_value = {"zpData": {"jobCard": {}}}
+	mock_client.unwrap_data.return_value = {"jobCard": {}}
+	runner = CliRunner()
+	result = runner.invoke(cli, ["detail", "sec_001"])
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
+	assert parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"] == ["boss search <关键词>", "boss recommend"]
 
 
 @patch("boss_agent_cli.commands.detail.CacheStore")
@@ -1179,3 +1199,19 @@ def test_schema_includes_new_commands_v2():
 	assert "chatmsg" in commands
 	assert "mark" in commands
 	assert "exchange" in commands
+
+
+@patch("boss_agent_cli.commands.chatmsg.get_platform_instance")
+@patch("boss_agent_cli.commands.chatmsg.AuthManager")
+def test_chatmsg_missing_contact_recovery_points_to_chat(mock_auth_cls, mock_client_cls):
+	"""联系人不在沟通列表里不是「职位下架」：错误码与恢复动作都要指向会话列表。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.friend_list.return_value = _friend_list_response([])
+
+	result = CliRunner().invoke(cli, ["chatmsg", "sec_nonexistent"])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "CONTACT_NOT_FOUND"
+	assert parsed["error"]["recovery_action"] == "boss chat"
+	assert parsed["hints"]["next_actions"] == ["boss chat"]

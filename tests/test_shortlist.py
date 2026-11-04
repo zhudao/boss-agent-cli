@@ -184,9 +184,28 @@ def test_shortlist_add_rejects_blank_identifiers(tmp_path):
 		assert result.exit_code == 1, result.output
 		parsed = json.loads(result.output)
 		assert parsed["error"]["code"] == "INVALID_PARAM"
+		# 空编号的恢复指引要能直接执行：编号从搜索结果里取，而不是让 Agent 猜。
+		assert parsed["hints"]["next_actions"] == ["boss search <关键词>"]
+		assert "boss search <关键词>" in parsed["error"]["recovery_action"]
 
 	listed = json.loads(runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "shortlist", "list"]).output)
 	assert listed["data"] == []
+
+
+def test_shortlist_remove_and_annotate_reject_blank_identifiers(tmp_path):
+	"""空标识既不会命中条目，也不该被当成「删掉了」或「条目不存在」。"""
+	runner = CliRunner()
+	for action in ("remove", "annotate"):
+		result = runner.invoke(
+			cli,
+			["--data-dir", str(tmp_path), "--json", "shortlist", action, "", "  "],
+		)
+		assert result.exit_code == 1, result.output
+		parsed = json.loads(result.output)
+		assert parsed["error"]["code"] == "INVALID_PARAM", action
+		# 候选池条目的编号来自本地列表：空编号时要指回 shortlist list。
+		assert parsed["hints"]["next_actions"] == ["boss shortlist list"]
+		assert "boss shortlist list" in parsed["error"]["recovery_action"]
 
 
 def test_shortlist_schema_is_exposed():
@@ -202,3 +221,70 @@ def test_shortlist_schema_is_exposed():
 	assert "--note" in shortlist["options"]["add"]
 	assert shortlist["options"]["add"]["--lid"]["default"] == ""
 	assert "--tag" in shortlist["options"]["compare"]
+
+
+def test_shortlist_annotate_missing_entry_reports_not_found(tmp_path):
+	"""对不在候选池里的职位 annotate 不能返回 ok:true。
+
+	以前是 `ok: true` + `updated: false` + `item: null`：Agent 会以为标签和备注
+	已经写进去了，实际什么都没发生，提示还指向与本次操作无关的 `shortlist compare`。
+	"""
+	result = CliRunner().invoke(
+		cli,
+		[
+			"--data-dir", str(tmp_path),
+			"--json",
+			"shortlist", "annotate", "sec_missing", "job_missing",
+			"--add-tag", "重点",
+			"--note", "等回复",
+		],
+	)
+
+	assert result.exit_code == 1, result.output
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "SHORTLIST_ENTRY_NOT_FOUND"
+	assert parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"] == [
+		"boss shortlist add sec_missing job_missing",
+		"boss shortlist list",
+	]
+
+	listed = json.loads(
+		CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "--json", "shortlist", "list"]).output
+	)
+	assert listed["data"] == []
+
+
+def test_shortlist_list_and_compare_empty_hints_point_to_add(tmp_path):
+	"""空候选池没有职位可查看 / 可标注：下一步必须是加入候选池。"""
+	runner = CliRunner()
+
+	listed = json.loads(runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "shortlist", "list"]).output)
+	assert listed["data"] == []
+	assert listed["hints"]["next_actions"] == ["boss shortlist add <security_id> <job_id>"]
+
+	compared = json.loads(runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "shortlist", "compare"]).output)
+	assert compared["data"]["items"] == []
+	assert compared["hints"]["next_actions"] == ["boss shortlist add <security_id> <job_id>"]
+
+	runner.invoke(
+		cli,
+		["--data-dir", str(tmp_path), "--json", "shortlist", "add", "sec_001", "job_001", "--title", "Go 开发"],
+	)
+	filled = json.loads(runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "shortlist", "list"]).output)
+	assert filled["hints"]["next_actions"] == ["boss detail <security_id> --job-id <job_id>"]
+
+
+def test_shortlist_compare_tag_without_match_does_not_point_to_add(tmp_path):
+	"""带 --tag 没有命中时池子里明明有条目：下一步是不带过滤的比较，不是再加一条。"""
+	runner = CliRunner()
+	runner.invoke(
+		cli,
+		["--data-dir", str(tmp_path), "--json", "shortlist", "add", "sec_001", "job_001", "--tags", "后端"],
+	)
+
+	compared = json.loads(
+		runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "shortlist", "compare", "--tag", "前端"]).output
+	)
+	assert compared["data"]["items"] == []
+	assert compared["hints"]["next_actions"] == ["boss shortlist compare", "boss shortlist list"]

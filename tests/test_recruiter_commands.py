@@ -224,6 +224,22 @@ def test_recruiter_chatmsg_returns_history_envelope(mock_auth_cls, mock_platform
 
 @patch("boss_agent_cli.commands.recruiter.chat.get_recruiter_platform_instance")
 @patch("boss_agent_cli.commands.recruiter.chat.AuthManager")
+def test_recruiter_last_messages_empty_result_points_to_chat(mock_auth_cls, mock_platform_cls):
+	"""没有会话时不能只回空列表：Agent 需要一条可执行的后继命令。"""
+	mock_platform = _ctx_mock(mock_platform_cls)
+	mock_platform.friend_list.return_value = {"code": 200, "data": {"friendList": []}}
+
+	result = _invoke("hr", "last-messages")
+
+	assert result.exit_code == 0, result.output
+	parsed = json.loads(result.output)
+	assert parsed["data"] == {"friend_ids": [], "messages": []}
+	assert parsed["hints"]["next_actions"] == ["boss hr chat"]
+	assert parsed["hints"]["operator_actions"]
+
+
+@patch("boss_agent_cli.commands.recruiter.chat.get_recruiter_platform_instance")
+@patch("boss_agent_cli.commands.recruiter.chat.AuthManager")
 def test_recruiter_last_messages_returns_batch_summary(mock_auth_cls, mock_platform_cls):
 	mock_platform = _ctx_mock(mock_platform_cls)
 	mock_platform.friend_list.return_value = {
@@ -374,6 +390,35 @@ def test_recruiter_jobs_online_reports_error_when_platform_rejects(mock_auth_cls
 		recoverable=True,
 		recovery_action="等待后重试",
 	)
+
+
+@patch("boss_agent_cli.commands.recruiter.jobs.get_recruiter_platform_instance")
+@patch("boss_agent_cli.commands.recruiter.jobs.AuthManager")
+def test_recruiter_jobs_success_paths_point_to_the_next_step(mock_auth_cls, mock_platform_cls):
+	"""hr jobs 的成功信封原先没有 hints：Agent 改完职位状态后看不出下一步。
+
+	上线 / 下线是成对动作，列表之后要点进详情，详情之后才是上下线。
+	"""
+	mock_platform = _ctx_mock(mock_platform_cls)
+	mock_platform.list_jobs.return_value = {"code": 0, "zpData": {"data": []}}
+	mock_platform.job_offline.return_value = {"code": 0}
+	mock_platform.job_online.return_value = {"code": 0}
+	mock_platform.job_detail.return_value = {"code": 0, "zpData": {"jobName": "后端工程师"}}
+
+	cases = [
+		(("hr", "jobs", "list"), ["boss hr jobs detail <enc_job_id>"]),
+		(("hr", "jobs", "offline", "enc-job-1"), ["boss hr jobs list", "boss hr jobs online enc-job-1"]),
+		(("hr", "jobs", "online", "enc-job-1"), ["boss hr jobs list", "boss hr jobs offline enc-job-1"]),
+		(
+			("hr", "jobs", "detail", "enc-job-1"),
+			["boss hr jobs offline enc-job-1", "boss hr jobs online enc-job-1", "boss hr jobs list"],
+		),
+	]
+	for args, expected in cases:
+		result = _invoke(*args)
+		assert result.exit_code == 0, result.output
+		parsed = json.loads(result.output)
+		assert parsed["hints"]["next_actions"] == expected, args
 
 
 @patch("boss_agent_cli.commands.recruiter.jobs.get_recruiter_platform_instance")
@@ -640,3 +685,87 @@ def test_hr_group_rejects_removed_zhilian_platform():
 	assert parsed["ok"] is False
 	assert parsed["error"]["code"] == "INVALID_PARAM"
 	assert "不支持的平台" in parsed["error"]["message"]
+
+
+@patch("boss_agent_cli.commands.recruiter.reply.get_recruiter_platform_instance")
+@patch("boss_agent_cli.commands.recruiter.reply.AuthManager")
+def test_recruiter_reply_rejects_blank_message(mock_auth_cls, mock_platform_cls):
+	"""空白回复会真的作为一条空消息发到候选人会话，必须在本地拦下。"""
+	mock_platform = _ctx_mock(mock_platform_cls)
+	result = _invoke("hr", "reply", "123", "   ")
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["hints"]["next_actions"] == ["boss hr chat"]
+	assert "boss hr chat" in parsed["error"]["recovery_action"]
+	mock_platform.send_message_by_friend.assert_not_called()
+
+
+@patch("boss_agent_cli.commands.recruiter.jobs.get_recruiter_platform_instance")
+@patch("boss_agent_cli.commands.recruiter.jobs.AuthManager")
+def test_recruiter_jobs_offline_rejects_blank_job_id(mock_auth_cls, mock_platform_cls):
+	"""空 job_id 的「下线」请求不该真的发给平台。"""
+	mock_platform = _ctx_mock(mock_platform_cls)
+	result = _invoke("hr", "jobs", "offline", " ")
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["hints"]["next_actions"] == ["boss hr jobs list"]
+	assert "boss hr jobs list" in parsed["error"]["recovery_action"]
+	mock_platform.job_offline.assert_not_called()
+
+
+@patch("boss_agent_cli.commands.recruiter.jobs.get_recruiter_platform_instance")
+@patch("boss_agent_cli.commands.recruiter.jobs.AuthManager")
+def test_recruiter_jobs_online_rejects_blank_job_id(mock_auth_cls, mock_platform_cls):
+	mock_platform = _ctx_mock(mock_platform_cls)
+	result = _invoke("hr", "jobs", "online", " ")
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["hints"]["next_actions"] == ["boss hr jobs list"]
+	assert "boss hr jobs list" in parsed["error"]["recovery_action"]
+	mock_platform.job_online.assert_not_called()
+
+
+@patch("boss_agent_cli.commands.recruiter.jobs.get_recruiter_platform_instance")
+@patch("boss_agent_cli.commands.recruiter.jobs.AuthManager")
+def test_recruiter_jobs_detail_rejects_blank_enc_job_id(mock_auth_cls, mock_platform_cls):
+	mock_platform = _ctx_mock(mock_platform_cls)
+	result = _invoke("hr", "jobs", "detail", " ")
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["hints"]["next_actions"] == ["boss hr jobs list"]
+	assert "boss hr jobs list" in parsed["error"]["recovery_action"]
+	mock_platform.job_detail.assert_not_called()
+
+
+@patch("boss_agent_cli.commands.recruiter.resume.get_recruiter_platform_instance")
+@patch("boss_agent_cli.commands.recruiter.resume.AuthManager")
+def test_recruiter_resume_exchange_without_friend_id_points_at_chat(mock_auth_cls, mock_platform_cls):
+	"""缺 --friend-id 时给出可执行来源命令，而不是笼统的「修正参数」。"""
+	mock_platform = _ctx_mock(mock_platform_cls)
+	result = _invoke("hr", "resume", "--exchange")
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["error"]["recoverable"] is False
+	assert parsed["hints"]["next_actions"] == ["boss hr chat"]
+	assert "boss hr chat" in parsed["error"]["recovery_action"]
+	mock_platform.exchange_request_by_friend.assert_not_called()
+
+
+@patch("boss_agent_cli.commands.recruiter.resume.get_recruiter_platform_instance")
+@patch("boss_agent_cli.commands.recruiter.resume.AuthManager")
+def test_recruiter_resume_without_ids_points_at_applications(mock_auth_cls, mock_platform_cls):
+	"""缺 --job-id / --security-id 时给出可执行来源命令。"""
+	mock_platform = _ctx_mock(mock_platform_cls)
+	result = _invoke("hr", "resume")
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert parsed["error"]["recoverable"] is False
+	assert parsed["hints"]["next_actions"] == ["boss hr applications"]
+	assert "boss hr applications" in parsed["error"]["recovery_action"]
+	mock_platform.view_geek.assert_not_called()

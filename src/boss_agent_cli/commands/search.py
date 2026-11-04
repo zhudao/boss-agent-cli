@@ -17,6 +17,7 @@ from boss_agent_cli.display import (
 	platform_error_contract,
 	platform_error_message,
 	render_job_table,
+	shell_argument,
 )
 from boss_agent_cli.index_cache import try_save_index
 from boss_agent_cli.match_score import score_job_dict
@@ -34,6 +35,7 @@ from boss_agent_cli.search_filters import (
 	resolve_welfare_keywords,
 	run_search_pipeline,
 )
+from boss_agent_cli.commands._filter_errors import emit_filter_error
 from boss_agent_cli.wizard.actions import execute_candidate_search
 
 
@@ -79,6 +81,16 @@ def _refresh_greeted(items: list[dict[str, Any]], cache: CacheStore, account: st
 			account=account,
 		)
 	return items
+
+
+def _more_hint(query: str, page: int) -> str:
+	"""TTY 表尾的翻页提示。
+
+	query 是用户输入，原来手写双引号：``a"b`` 会把提示截成
+	``boss search "a"b" --page 2``，``$HOME`` 在双引号里照样展开。统一走
+	``shell_argument`` 后，带元字符的关键词才能被原样复制执行。
+	"""
+	return f"more: boss search {shell_argument(query)} --page {page + 1}"
 
 
 def _progress_title(criteria: SearchFilterCriteria, welfare_conditions: Any, active: str | None = None) -> str:
@@ -160,6 +172,33 @@ def search_cmd(
 	sort_mode: str,
 ) -> None:
 	"""按关键词和筛选条件搜索职位列表"""
+	# 传了 flag 但值是空串 / 纯空白时，下面的「未提供 query」会回
+	# 「请传入搜索关键词、--preset 或 --url」——用户明明传了 --preset，读到的
+	# 却是「你没传」。先点明是哪个选项的值空了。
+	if preset is not None and not preset.strip():
+		handle_error_output(
+			ctx,
+			"search",
+			code="INVALID_PARAM",
+			message="--preset 的值不能为空",
+			recovery_action="用 boss preset list 查看已保存的预设，或改用搜索关键词",
+			hints={"next_actions": ["boss preset list"]},
+		)
+		return
+	if search_url is not None and not search_url.strip():
+		handle_error_output(
+			ctx,
+			"search",
+			code="INVALID_PARAM",
+			message="--url 的值不能为空",
+			recovery_action="boss search <关键词> 或 boss search --url <搜索页URL>",
+			hints={"next_actions": ["boss search <关键词>"]},
+		)
+		return
+	# 纯空白的 query 与空串等价：`boss search " "` 能绕过下面的「未提供 query」
+	# 检查，进入一次没有关键词的搜索——既消耗请求预算，也把账号放在更宽的风控面里。
+	if query is not None and not query.strip():
+		query = None
 	data_dir = ctx.obj["data_dir"]
 	logger = ctx.obj["logger"]
 	raw_params: dict[str, str] = {}
@@ -167,7 +206,7 @@ def search_cmd(
 	# 用户这次没传任何筛选参数，只说「未知薪资范围」看不出该改哪里。
 	preset_origin = ""
 	if preset and not any((city, salary, experience, education, industry, scale, stage, job_type)):
-		preset_origin = f"（来自 preset '{preset}'，可用 boss preset remove {preset} 删除后重建）"
+		preset_origin = f"（来自 preset '{preset}'，可用 boss preset remove {shell_argument(preset)} 删除后重建）"
 
 	if preset:
 		with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
@@ -178,11 +217,14 @@ def search_cmd(
 				# 兜成 NETWORK_ERROR 让 Agent 无限重试。
 				handle_error_output(
 					ctx, "search", code="SAVED_SEARCH_INVALID", message=str(exc),
-					hints={"next_actions": [f"boss preset remove {preset}", f"boss preset add {preset} <关键词>"]},
+					hints={"next_actions": [f"boss preset remove {shell_argument(preset)}", f"boss preset add {shell_argument(preset)} <关键词>"]},
 				)
 				return
 		if record is None:
-			handle_error_output(ctx, "search", code="JOB_NOT_FOUND", message=f"未找到 preset: {preset}")
+			handle_error_output(
+				ctx, "search", code="SAVED_SEARCH_NOT_FOUND", message=f"未找到 preset: {preset}",
+				hints={"next_actions": ["boss preset list", f"boss preset add {shell_argument(preset)} <关键词>"]},
+			)
 			return
 		params = record["params"]
 		query = params.get("query") or query
@@ -201,7 +243,15 @@ def search_cmd(
 		try:
 			parsed_url = parse_boss_search_url(search_url)
 		except SearchUrlParseError as exc:
-			handle_error_output(ctx, "search", code="INVALID_PARAM", message=str(exc))
+			search_cmd = boss_command_for_ctx(ctx, "search <关键词>")
+			handle_error_output(
+				ctx,
+				"search",
+				code="INVALID_PARAM",
+				message=str(exc),
+				recovery_action=f"换成完整的 BOSS 直聘搜索页链接，或改用关键词重试，例如 {search_cmd}",
+				hints={"next_actions": [search_cmd]},
+			)
 			return
 		query = query or parsed_url.query
 		raw_params.update(parsed_url.params)
@@ -209,14 +259,22 @@ def search_cmd(
 			page = parsed_url.page
 
 	if not query and not search_url:
-		handle_error_output(ctx, "search", code="INVALID_PARAM", message="未提供 query，请传入搜索关键词、--preset 或 --url")
+		search_cmd = boss_command_for_ctx(ctx, "search <关键词>")
+		handle_error_output(
+			ctx,
+			"search",
+			code="INVALID_PARAM",
+			message="未提供 query，请传入搜索关键词、--preset 或 --url",
+			recovery_action=f"补上搜索关键词、--preset 或 --url 后重试，例如 {search_cmd}",
+			hints={"next_actions": [search_cmd, boss_command_for_ctx(ctx, "preset list")]},
+		)
 		return
 	query = query or ""
 
 	try:
 		ensure_supported_city(city)
 	except ValueError as exc:
-		handle_error_output(ctx, "search", code="INVALID_PARAM", message=f"{exc}{preset_origin}")
+		emit_filter_error(ctx, "search", exc, preset_origin)
 		return
 
 	try:
@@ -230,14 +288,14 @@ def search_cmd(
 			job_type=job_type,
 		)
 	except ValueError as exc:
-		handle_error_output(ctx, "search", code="INVALID_PARAM", message=f"{exc}{preset_origin}")
+		emit_filter_error(ctx, "search", exc, preset_origin)
 		return
 	raw_params.update({key: value for key, value in code_params.items() if value})
 
 	try:
 		active_level = resolve_active_level(active)
 	except ValueError as exc:
-		handle_error_output(ctx, "search", code="INVALID_PARAM", message=f"{exc}{preset_origin}")
+		emit_filter_error(ctx, "search", exc, preset_origin)
 		return
 	# 福利和活跃度都可能要逐个查详情（活跃度也会变），结果不进搜索缓存
 	detail_filter = bool(welfare or active_level)
@@ -420,7 +478,7 @@ def search_cmd(
 				render=lambda data: render_job_table(
 					data, f"search: {query}{title_suffix}",
 					page=page,
-					hint_next=f"more: boss search \"{query}\" --page {page + 1}" if pipeline_result.has_more and not detail_filter else "",
+					hint_next=_more_hint(query, page) if pipeline_result.has_more and not detail_filter else "",
 				),
 				pagination=pagination, hints=hints,
 			)

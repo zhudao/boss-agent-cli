@@ -45,6 +45,25 @@ def test_show_index_out_of_range(mock_get_job, mock_get_info):
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "INVALID_PARAM"
 	assert "超出范围" in parsed["error"]["message"]
+	assert "结果数以内的编号" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"] == ["boss search <关键词>", "boss recommend"]
+
+
+@patch("boss_agent_cli.commands.show.get_index_info")
+@patch("boss_agent_cli.commands.show.get_job_by_index")
+def test_show_non_positive_index_rejected_before_cache(mock_get_job, mock_get_info):
+	"""编号从 1 开始：0 / 负数不该被引去先 search 一次，等回来还是同一个错误。"""
+	runner = CliRunner()
+	for argv in (["0"], ["--", "-3"]):
+		result = runner.invoke(cli, ["--json", "show", *argv])
+		parsed = json.loads(result.output)
+		assert result.exit_code == 1
+		assert parsed["ok"] is False
+		assert parsed["error"]["code"] == "INVALID_PARAM"
+		assert "编号必须从 1 开始" in parsed["error"]["message"]
+		assert parsed["hints"]["next_actions"] == ["boss search <关键词>", "boss recommend"]
+	mock_get_job.assert_not_called()
+	mock_get_info.assert_not_called()
 
 
 @patch("boss_agent_cli.commands.show.get_index_info")
@@ -57,6 +76,8 @@ def test_show_no_cached_results(mock_get_job, mock_get_info):
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "INVALID_PARAM"
 	assert "没有缓存的搜索结果" in parsed["error"]["message"]
+	assert "建立结果缓存" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"] == ["boss search <关键词>", "boss recommend"]
 
 
 @patch("boss_agent_cli.commands.show.get_job_by_index")
@@ -67,6 +88,8 @@ def test_show_missing_security_id(mock_get_job):
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "INVALID_PARAM"
 	assert "security_id" in parsed["error"]["message"]
+	assert "重新搜索后再查看" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"] == ["boss search <关键词>", "boss recommend"]
 
 
 @patch("boss_agent_cli.commands.show.get_platform_instance")
@@ -81,6 +104,9 @@ def test_show_job_card_empty_returns_not_found(mock_get_job, mock_auth_cls, mock
 	result = runner.invoke(cli, ["--json", "show", "1"])
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
+	# 「下架」不是死胡同：恢复指引与下一步必须能直接换线索。
+	assert parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"] == ["boss search <关键词>", "boss recommend"]
 
 
 # ── mark 错误分支和 _resolve_label ───────────────────────
@@ -116,7 +142,7 @@ def test_mark_security_id_not_found_in_friend_list(mock_auth_cls, mock_client_cl
 	runner = CliRunner()
 	result = runner.invoke(cli, ["--json", "mark", "ghost", "--label", "收藏"])
 	parsed = json.loads(result.output)
-	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
+	assert parsed["error"]["code"] == "CONTACT_NOT_FOUND"
 
 
 # ── me 异常分支 ──────────────────────────────────────────

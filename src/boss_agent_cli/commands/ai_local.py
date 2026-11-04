@@ -21,7 +21,7 @@ from boss_agent_cli.ai.service import AIService, AIServiceError, recovery_action
 from rich.table import Table
 
 from boss_agent_cli import display
-from boss_agent_cli.display import error_contract_for_code, handle_error_output, handle_output, render_action_result, render_next_steps
+from boss_agent_cli.display import error_contract_for_code, handle_error_output, handle_output, render_action_result, render_next_steps, shell_argument
 
 
 def _render_local_status(data: dict[str, Any]) -> None:
@@ -89,9 +89,9 @@ def local_status_cmd(ctx: click.Context) -> None:
 
 
 @ai_local_group.command("configure")
-@click.option("--runtime", required=True, type=click.Choice(["ollama", "vllm"]))
-@click.option("--model", required=True)
-@click.option("--base-url", default=None)
+@click.option("--runtime", required=True, type=click.Choice(["ollama", "vllm"]), help="本地运行时")
+@click.option("--model", required=True, help="本地模型名称")
+@click.option("--base-url", default=None, help="本地服务基础地址；省略时按 runtime 取默认值")
 @click.pass_context
 def local_configure_cmd(ctx: click.Context, runtime: str, model: str, base_url: str | None) -> None:
 	"""配置本地 OpenAI-compatible 模型服务。"""
@@ -116,8 +116,8 @@ def local_configure_cmd(ctx: click.Context, runtime: str, model: str, base_url: 
 
 
 @ai_local_group.command("pull")
-@click.option("--model", required=True)
-@click.option("--confirm-download", is_flag=True, default=False)
+@click.option("--model", required=True, help="要下载的模型名称")
+@click.option("--confirm-download", is_flag=True, default=False, help="确认下载并接受模型体积与来源")
 @click.pass_context
 def local_pull_cmd(ctx: click.Context, model: str, confirm_download: bool) -> None:
 	"""通过 Ollama 下载模型权重。"""
@@ -128,7 +128,7 @@ def local_pull_cmd(ctx: click.Context, model: str, confirm_download: bool) -> No
 			code="CONFIRM_DOWNLOAD_REQUIRED",
 			message="下载模型权重需要显式传 --confirm-download",
 			recoverable=True,
-			recovery_action=f"boss ai local pull --model {model} --confirm-download",
+			recovery_action=f"boss ai local pull --model {shell_argument(model)} --confirm-download",
 		)
 	try:
 		result = subprocess.run(
@@ -164,12 +164,13 @@ def local_pull_cmd(ctx: click.Context, model: str, confirm_download: bool) -> No
 		"ai.local.pull",
 		{"status": "installed", "model": model},
 		render=lambda d: render_action_result(d, title="ai local pull", next_steps=["boss ai local smoke"]),
+		hints={"next_actions": ["boss ai local smoke"]},
 	)
 
 
 @ai_local_group.command("import")
-@click.option("--path", "source_path", required=True, type=click.Path(exists=True, path_type=Path))
-@click.option("--model", required=True)
+@click.option("--path", "source_path", required=True, type=click.Path(exists=True, path_type=Path), help="本地模型文件或目录路径")
+@click.option("--model", required=True, help="导入后登记的模型名称")
 @click.pass_context
 def local_import_cmd(ctx: click.Context, source_path: Path, model: str) -> None:
 	"""导入离线模型文件或目录到本地数据目录。"""
@@ -185,14 +186,26 @@ def local_import_cmd(ctx: click.Context, source_path: Path, model: str) -> None:
 			recoverable=recoverable,
 			recovery_action=recovery_action,
 		)
-	store = AIConfigStore(ctx.obj["data_dir"])
-	store.save_config(ai_provider="custom", ai_model=model, ai_base_url=None)
-	store.save_api_key("local")
+	# 只登记模型文件，不改 AI 配置：这里原先会写 ai_provider=custom / ai_base_url=None /
+	# ai_model=<导入名> 并覆盖 api_key，把已经配好的 ollama / vLLM 端点清空，下一条
+	# AI 命令就直接报「AI 服务未配置」。导入也不该切换当前模型——把一个正在服务的
+	# 模型名换成只有权重文件、没有服务在跑的导入名，请求同样必然失败。
 	handle_output(
 		ctx,
 		"ai.local.import",
 		asdict(imported),
-		render=lambda d: render_action_result(d, title="ai local import", next_steps=["boss ai local status"]),
+		render=lambda d: render_action_result(
+			d, title="ai local import", next_steps=[f"boss ai local configure --runtime vllm --model {shell_argument(model)}"]
+		),
+		hints={
+			"next_actions": [
+				f"boss ai local configure --runtime vllm --model {shell_argument(model)}",
+				"boss ai local status",
+			],
+			"operator_actions": [
+				"用 vLLM / llama.cpp 等 OpenAI 兼容服务加载该模型后，执行上面的 configure 命令把端点写入配置",
+			],
+		},
 	)
 
 
@@ -206,13 +219,19 @@ def local_smoke_cmd(ctx: click.Context) -> None:
 	base_url = store.get_base_url()
 	model = config.get("ai_model")
 	if not api_key or not base_url or not model:
+		provider = store.unresolved_provider()
+		message = (
+			"本地 AI 服务未配置"
+			if provider is None
+			else f"本地 AI 服务没有可用端点：provider {provider!r} 未登记或未设置 --base-url"
+		)
 		handle_error_output(
 			ctx,
 			"ai.local.smoke",
 			code="AI_NOT_CONFIGURED",
-			message="本地 AI 服务未配置",
+			message=message,
 			recoverable=True,
-			recovery_action="boss ai local configure --runtime ollama --model qwen3:14b",
+			recovery_action="boss ai local configure --runtime ollama --model qwen3:14b，或 boss ai config --provider <provider> --base-url <url>",
 		)
 		return
 	# 输出上限用配置值而不是写死的小数：思考模型在几十个 token 内写不完思考，
@@ -244,4 +263,5 @@ def local_smoke_cmd(ctx: click.Context) -> None:
 		"ai.local.smoke",
 		{"status": "ok", "model": str(model), "reply": reply[:200]},
 		render=lambda d: render_action_result(d, title="ai local smoke", next_steps=["boss ai analyze-jd <security_id>"]),
+		hints={"next_actions": ["boss ai analyze-jd <security_id>"]},
 	)

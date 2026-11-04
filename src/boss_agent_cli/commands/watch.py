@@ -13,6 +13,7 @@ from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._platform import account_scope, get_platform_instance
 from boss_agent_cli.display import (
 	RISK_ERROR_CONTRACTS,
+	boss_command_for_ctx,
 	handle_auth_errors,
 	handle_error_output,
 	handle_output,
@@ -21,6 +22,7 @@ from boss_agent_cli.display import (
 	render_action_result,
 	render_list_result,
 	render_message_panel,
+	shell_argument,
 )
 from boss_agent_cli.crawler.service import CrawlBudget
 from boss_agent_cli.search_filters import (
@@ -34,6 +36,7 @@ from boss_agent_cli.search_filters import (
 	resolve_welfare_keywords,
 	run_search_pipeline,
 )
+from boss_agent_cli.commands._filter_errors import emit_filter_error
 
 
 def _parse_watch_filters(
@@ -88,10 +91,19 @@ def watch_add_cmd(
 	job_type: str | None,
 	welfare: str | None,
 ) -> None:
+	"""保存一条可复用的搜索条件（名称 + 关键词 + 筛选），之后用 run 增量拉取。"""
 	# 空字符串是合法 argv，但存下来的记录既没法点名（`boss watch run ` 缺参数），
 	# 也没法搜到目标（空关键词等于不筛选）。必须在写盘前拒绝。
 	if not name.strip() or not query.strip():
-		handle_error_output(ctx, "watch", code="INVALID_PARAM", message="watch 名称与搜索关键词不能为空")
+		list_cmd = boss_command_for_ctx(ctx, "watch list")
+		handle_error_output(
+			ctx,
+			"watch",
+			code="INVALID_PARAM",
+			message="watch 名称与搜索关键词不能为空",
+			recovery_action=f"补上 watch 名称和搜索关键词后重试；用 {list_cmd} 查看已有 watch",
+			hints={"next_actions": [list_cmd]},
+		)
 		return
 	# 保存时就把筛选条件校验掉：watch run 直接把存下来的参数交给平台客户端，
 	# 未知薪资 / 经验 / 学历在 `*_CODES.get(...)` 处返回 None，参数被静默丢弃，
@@ -103,7 +115,7 @@ def watch_add_cmd(
 			industry=industry, scale=scale, stage=stage, job_type=job_type,
 		)
 	except ValueError as exc:
-		handle_error_output(ctx, "watch", code="INVALID_PARAM", message=str(exc))
+		emit_filter_error(ctx, "watch", exc)
 		return
 
 	params, _ = _parse_watch_filters(query, city, salary, experience, education, industry, scale, stage, job_type, welfare)
@@ -113,18 +125,24 @@ def watch_add_cmd(
 		ctx, "watch",
 		{"action": "add", "name": name, "params": params},
 		render=lambda d: render_action_result(
-			d, title="watch", next_steps=[f"boss watch run {name}", "boss watch list"]
+			d, title="watch", next_steps=[f"boss watch run {shell_argument(name)}", "boss watch list"]
 		),
-		hints={"next_actions": [f"boss watch run {name}", "boss watch list"]},
+		hints={"next_actions": [f"boss watch run {shell_argument(name)}", "boss watch list"]},
 	)
 
 
 @watch_group.command("list")
 @click.pass_context
 def watch_list_cmd(ctx: click.Context) -> None:
+	"""列出本地已保存的 watch，并提示下一步可执行命令。"""
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		items, corrupt = cache.list_saved_searches_with_corrupt()
-	hints: dict[str, Any] = {"next_actions": ["boss watch run <name>", "boss watch remove <name>"]}
+	hints: dict[str, Any] = {
+		# 空列表没有任何 name 可 run / remove：照抄只会换回一个不存在的 watch。
+		"next_actions": ["boss watch add <name> <关键词>"]
+		if not items
+		else ["boss watch run <name>", "boss watch remove <name>"]
+	}
 	if corrupt:
 		hints["corrupt"] = corrupt
 		hints["operator_actions"] = [
@@ -150,6 +168,20 @@ def watch_list_cmd(ctx: click.Context) -> None:
 @click.argument("name")
 @click.pass_context
 def watch_remove_cmd(ctx: click.Context, name: str) -> None:
+	"""删除一条本地 watch；名字不存在时保持幂等（不报错）。"""
+	# 与 add / run 同口径：空名字不可能命中任何本地记录，却会以
+	# `{"removed": false}` 的 `ok: true` 报成功，Agent 会以为已经删掉了。
+	if not name.strip():
+		list_cmd = boss_command_for_ctx(ctx, "watch list")
+		handle_error_output(
+			ctx,
+			"watch",
+			code="INVALID_PARAM",
+			message="watch 名称不能为空",
+			recovery_action=f"补上 watch 名称后重试；用 {list_cmd} 查看已有 watch",
+			hints={"next_actions": [list_cmd]},
+		)
+		return
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		removed = cache.delete_saved_search(name)
 	handle_output(
@@ -157,6 +189,7 @@ def watch_remove_cmd(ctx: click.Context, name: str) -> None:
 		"watch",
 		{"action": "remove", "name": name, "removed": removed},
 		render=lambda d: render_action_result(d, title="watch", next_steps=["boss watch list"]),
+		hints={"next_actions": ["boss watch list"]},
 	)
 
 
@@ -233,6 +266,7 @@ def _execute_single_watch(ctx: click.Context, cache: Any, name: str) -> dict[str
 @click.pass_context
 @handle_auth_errors("watch")
 def watch_run_cmd(ctx: click.Context, name: str | None, run_all: bool) -> None:
+	"""执行一条或全部 watch，把新增职位写入本地缓存。"""
 	if not require_compliance_allowed(ctx, "watch-run"):
 		ctx.exit(1)
 
@@ -271,7 +305,13 @@ def watch_run_cmd(ctx: click.Context, name: str | None, run_all: bool) -> None:
 					hints=risk_hints,
 				)
 				return
-			all_hints: dict[str, Any] = {"next_actions": ["boss watch list", "boss detail <security_id>"]}
+			all_hints: dict[str, Any] = {
+				# 一个 watch 都没跑成时没有任何 security_id 可 detail：照抄只会换回一个
+				# 必然失败的编号，下一步应该是先建一个 watch。
+				"next_actions": ["boss watch add <name> <关键词>"]
+				if not watches
+				else ["boss watch list", "boss detail <security_id>"]
+			}
 			if corrupt:
 				all_hints["corrupt"] = corrupt
 				all_hints["operator_actions"] = [
@@ -288,11 +328,14 @@ def watch_run_cmd(ctx: click.Context, name: str | None, run_all: bool) -> None:
 			return
 
 		if not name:
+			list_cmd = boss_command_for_ctx(ctx, "watch list")
 			handle_error_output(
 				ctx, "watch",
 				code="INVALID_PARAM",
 				message="必须传入 watch 名或使用 --all",
 				recoverable=False,
+				recovery_action=f"用 {list_cmd} 查看已保存的 watch 后点名运行，或加 --all 运行全部",
+				hints={"next_actions": [list_cmd, boss_command_for_ctx(ctx, "watch run --all")]},
 			)
 			return
 
@@ -305,7 +348,7 @@ def watch_run_cmd(ctx: click.Context, name: str | None, run_all: bool) -> None:
 				"watch",
 				code="SAVED_SEARCH_INVALID",
 				message=str(exc),
-				hints={"next_actions": [f"boss watch remove {name}", f"boss watch add {name} <关键词>"]},
+				hints={"next_actions": [f"boss watch remove {shell_argument(name)}", f"boss watch add {shell_argument(name)} <关键词>"]},
 			)
 			return
 		except SearchPipelinePlatformError as exc:
@@ -324,7 +367,10 @@ def watch_run_cmd(ctx: click.Context, name: str | None, run_all: bool) -> None:
 			return
 
 		if summary is None:
-			handle_error_output(ctx, "watch", code="JOB_NOT_FOUND", message=f"未找到 watch: {name}")
+			handle_error_output(
+				ctx, "watch", code="SAVED_SEARCH_NOT_FOUND", message=f"未找到 watch: {name}",
+				hints={"next_actions": ["boss watch list", f"boss watch add {shell_argument(name)} <关键词>"]},
+			)
 			return
 
 		handle_output(

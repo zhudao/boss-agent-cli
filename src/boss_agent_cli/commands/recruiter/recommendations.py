@@ -22,6 +22,7 @@ from boss_agent_cli.display import (
 	handle_output,
 	handle_platform_error_output,
 	risk_error_contract,
+	shell_argument,
 )
 
 
@@ -54,7 +55,7 @@ def recommendations_cmd(ctx: click.Context, job_id: str, page: int) -> None:
 
 def _send_error(ctx: click.Context, *, code: str, job_id: str, details: dict[str, Any]) -> None:
 	"""保留发送状态并停止工作流，禁止把写失败解释为自动重发。"""
-	check = f"boss hr chat --job-id {job_id}"
+	check = f"boss hr chat --job-id {shell_argument(job_id)}"
 	message = "招呼已发送，但本地状态保存失败；停止后续建联" if details.get("sent") else "首次招呼未确认成功；停止发送并核对会话"
 	if code == "ALREADY_GREETED":
 		message = "该候选人在此职位下已发送过招呼，禁止重复发送"
@@ -117,7 +118,15 @@ def greet_cmd(
 		return
 	data: dict[str, Any] = {"geek_id": geek_id, "job_id": job_id, "sent": False}
 	if not message.strip():
-		handle_error_output(ctx, "recruiter-greet", code="INVALID_PARAM", message="首次招呼内容不能为空")
+		rec_cmd = boss_command_for_ctx(ctx, f"hr recommendations --job-id {shell_argument(job_id)}")
+		handle_error_output(
+			ctx,
+			"recruiter-greet",
+			code="INVALID_PARAM",
+			message="首次招呼内容不能为空",
+			recovery_action=f"补上首次招呼内容后重试；候选人与职位可用 {rec_cmd} 核对",
+			hints={"next_actions": [rec_cmd]},
+		)
 		return
 	if dry_run:
 		operator_actions = ["核对候选人和话术；明确批准后才可加 --yes 发送"]
@@ -196,4 +205,12 @@ def greet_cmd(
 		except Exception:
 			_send_error(ctx, code="GREET_RESULT_UNKNOWN", job_id=job_id, details=data)
 			return
-		handle_output(ctx, "recruiter-greet", data)
+		# 招呼发出后 Agent 需要回到沟通列表跟进候选人：成功信封原先没有 hints，
+		# 终端也不渲染任何内容，整条链在「已发送」处断掉。
+		handle_output(
+			ctx, "recruiter-greet", data,
+			hints={"next_actions": [
+				boss_command_for_ctx(ctx, "hr chat"),
+				boss_command_for_ctx(ctx, "hr last-messages"),
+			]},
+		)

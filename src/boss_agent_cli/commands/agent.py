@@ -36,6 +36,7 @@ from boss_agent_cli.display import (
 	render_action_result,
 	render_list_result,
 	render_record_result,
+	shell_argument,
 )
 from boss_agent_cli.resume.models import resume_to_text
 from boss_agent_cli.resume.store import ResumeStore
@@ -97,19 +98,30 @@ def crawl_cmd(
 	limit: int,
 ) -> None:
 	"""新建或读取 crawl 结果，导入候选池并执行 ai fit。"""
+	crawl_by_run = boss_command_for_ctx(ctx, "agent crawl --run-id <run_id> --resume <简历>")
+	crawl_by_query = boss_command_for_ctx(ctx, "agent crawl --query <关键词> --city <城市> --resume <简历>")
 	if bool(run_id) == bool(query):
 		handle_error_output(
 			ctx,
 			"agent.crawl",
 			code="INVALID_PARAM",
 			message="必须且只能使用 --run-id 或 --query",
+			recovery_action="只传 --run-id，或只传 --query 后重试",
+			hints={"next_actions": [crawl_by_run, crawl_by_query]},
 		)
 		return
 	if query and not _require_crawl_capabilities(ctx):
 		ctx.exit(1)
 		return
 	if query and not city:
-		handle_error_output(ctx, "agent.crawl", code="INVALID_PARAM", message="使用 --query 时必须提供 --city")
+		handle_error_output(
+			ctx,
+			"agent.crawl",
+			code="INVALID_PARAM",
+			message="使用 --query 时必须提供 --city",
+			recovery_action=f"补上 --city <城市> 后重试，例如 {crawl_by_query}",
+			hints={"next_actions": [crawl_by_query]},
+		)
 		return
 
 	data_dir = ctx.obj["data_dir"]
@@ -162,10 +174,24 @@ def crawl_cmd(
 			crawl_jobs = cache.list_crawl_jobs(run_id or "")
 			jobs, missing = _crawl_fit_jobs(cache, crawl_jobs)
 	except KeyError:
-		handle_error_output(ctx, "agent.crawl", code="JOB_NOT_FOUND", message=f"未找到 crawl run: {run_id}")
+		handle_error_output(
+			ctx,
+			"agent.crawl",
+			code="CRAWL_RUN_NOT_FOUND",
+			message=f"未找到 crawl run: {run_id}",
+			hints={"next_actions": ["boss crawl start <query>", "boss crawl status <run_id>"]},
+		)
 		return
 	except ValueError as exc:
-		handle_error_output(ctx, "agent.crawl", code="INVALID_PARAM", message=str(exc))
+		configure_cmd = boss_command_for_ctx(ctx, "crawl configure --help")
+		handle_error_output(
+			ctx,
+			"agent.crawl",
+			code="INVALID_PARAM",
+			message=str(exc),
+			recovery_action=f"按提示修正关键词、城市或 crawl 配置后重试；可用 {configure_cmd} 查看可配置项",
+			hints={"next_actions": [configure_cmd]},
+		)
 		return
 	except RuntimeError as exc:
 		handle_error_output(
@@ -195,7 +221,7 @@ def crawl_cmd(
 				"summary": {"analyzed": 0, "missing_details": len(missing)},
 			},
 			render=lambda d: render_record_result(d, title="agent crawl", next_steps=["boss shortlist list"]),
-			hints={"next_actions": [f"boss crawl resume {run_id} --with-detail"]},
+			hints={"next_actions": [f"boss crawl resume {shell_argument(run_id or '')} --with-detail"]},
 		)
 		return
 
@@ -240,7 +266,7 @@ def crawl_cmd(
 		render=lambda d: render_record_result(d, title="agent crawl", next_steps=["boss shortlist list"]),
 		hints={
 			"next_actions": [
-				f"boss crawl results {run_id}",
+				f"boss crawl results {shell_argument(run_id or '')}",
 				"boss shortlist list",
 			],
 		},
@@ -283,6 +309,7 @@ def review_group() -> None:
 @review_group.command("list")
 @click.pass_context
 def review_list_cmd(ctx: click.Context) -> None:
+	"""列出旧版本遗留的待人工复核动作。"""
 	store = AutomationStore(ctx.obj["data_dir"])
 	handle_output(
 		ctx,
@@ -354,6 +381,7 @@ def pending_group() -> None:
 @pending_group.command("list")
 @click.pass_context
 def pending_list_cmd(ctx: click.Context) -> None:
+	"""列出旧版本遗留的待执行动作队列。"""
 	store = AutomationStore(ctx.obj["data_dir"])
 	handle_output(
 		ctx,
@@ -435,12 +463,14 @@ def _emit_review_missing(ctx: click.Context, command: str, review_id: str) -> No
 	`raise click.ClickException` 会被组层兜底成 `command: "boss"`、`INVALID_PARAM`
 	和英文消息；这里直接按命令名输出，与其它子命令的信封一致。
 	"""
+	list_command = _agent_review_list_command(ctx)
 	handle_error_output(
 		ctx,
 		command,
 		code="INVALID_PARAM",
 		message=f"复核项 '{review_id}' 不存在或已处理",
-		hints={"next_actions": [_agent_review_list_command(ctx)]},
+		recovery_action=f"用 {list_command} 核对当前待复核项后重试",
+		hints={"next_actions": [list_command]},
 	)
 	ctx.exit(1)
 

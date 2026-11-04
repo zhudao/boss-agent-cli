@@ -559,6 +559,24 @@ def test_candidate_watch_corrupt_params_reports_recovery(tmp_path):
 	assert "boss watch remove daily" in exc_info.value.recovery_action
 
 
+def test_candidate_watch_corrupt_params_quotes_name_with_spaces(tmp_path):
+	"""watch 名是 wizard 的自由文本输入：恢复指引里的名字带空格时必须整体加引号。"""
+	context = _action_context(tmp_path)
+	DEFAULT_ACTIONS["candidate_watch"](
+		context, {"action": "add", "name": "我的 监控", "query": "Python"}, {}
+	)
+	conn = sqlite3.connect(tmp_path / "cache" / "boss_agent.db")
+	conn.execute("UPDATE saved_searches SET params = ? WHERE name = ?", ("{not json", "我的 监控"))
+	conn.commit()
+	conn.close()
+
+	with pytest.raises(WorkflowActionError) as exc_info:
+		DEFAULT_ACTIONS["candidate_watch"](context, {"action": "run", "name": "我的 监控"}, {})
+	assert exc_info.value.code == "SAVED_SEARCH_INVALID"
+	assert "boss watch remove '我的 监控'" in exc_info.value.recovery_action
+	assert "boss watch add '我的 监控' <关键词>" in exc_info.value.recovery_action
+
+
 def _crawl_outcome(run_id, status="completed"):
 	return CrawlOutcome(
 		run_id=run_id,
@@ -949,6 +967,26 @@ def test_runner_normalizes_auth_and_network_failures(tmp_path):
 	assert last["next_action"] == "boss wizard --resume auth-required-run"
 	assert any("boss --platform zhipin login" in action for action in last["operator_actions"])
 
+
+def test_runner_auth_wait_quotes_run_id_in_resume_next_action(tmp_path):
+	"""等待登录时给出的 --resume next_action 同样要转义 run_id。"""
+	auth_plan = WorkflowPlan(
+		role="candidate",
+		platform="zhipin",
+		goal="recommendations",
+		inputs={},
+		requested_steps=("auth_status",),
+		mode="headless",
+	)
+	with WorkflowStore(tmp_path) as store:
+		run = WorkflowRunner(store, DEFAULT_ACTIONS).run(
+			auth_plan,
+			_action_context(tmp_path),
+			run_id="auth; echo pwn",
+		)
+	assert run["status"] == "waiting_input"
+	assert run["last_result"]["next_action"] == "boss wizard --resume 'auth; echo pwn'"
+
 	def broken(context, inputs, prior):
 		raise OSError("offline")
 
@@ -1270,6 +1308,21 @@ def test_runner_records_timeout_at_action_boundary(tmp_path):
 	assert run["status"] == "failed"
 	assert run["error"]["code"] == "WORKFLOW_TIMEOUT"
 	assert run["error"]["recoverable"] is True
+
+
+def test_runner_timeout_quotes_run_id_in_recovery_action(tmp_path):
+	"""run_id 是本地自由文本，拼进可执行的 --resume 提示前必须按 shell 参数转义。"""
+	def slow(context, inputs, prior):
+		time.sleep(0.01)
+		return StepResult({"done": True})
+
+	with WorkflowStore(tmp_path) as store:
+		run = WorkflowRunner(store, {"slow": slow}).run(
+			_plan("slow"), object(), run_id="run; echo pwn", timeout_seconds=0.001
+		)
+
+	assert run["error"]["code"] == "WORKFLOW_TIMEOUT"
+	assert run["error"]["recovery_action"] == "boss wizard --resume 'run; echo pwn'"
 
 
 def _shortlist_input() -> str:
@@ -2639,6 +2692,21 @@ def test_mixed_tty_headless_forces_json_envelope(tmp_path, monkeypatch):
 	assert result.stderr == ""
 
 
+def test_empty_selector_value_is_invalid_param(tmp_path):
+	"""传了 ``--resume ""`` 不能回「非交互模式需要 --json」。
+
+	旧逻辑只看值是否为 None，空串被当成「没有选择器」，于是一边拒绝一边让
+	Agent 重复刚做过的动作；真实原因是 flag 后面少了值。
+	"""
+	for flag in ("--input-json", "--resume", "--status", "--stop"):
+		result = CliRunner().invoke(cli, ["--json", "--data-dir", str(tmp_path), "wizard", flag, ""])
+		payload = json.loads(result.stdout)
+		assert result.exit_code == 1, flag
+		assert payload["error"]["code"] == "INVALID_PARAM", flag
+		assert flag in payload["error"]["message"], flag
+		assert "不能为空" in payload["error"]["message"], flag
+
+
 def _once_then_cancel(value):
 	"""Return value once then exit the interactive main loop."""
 	state = {"used": False}
@@ -2745,7 +2813,83 @@ def test_wizard_status_and_stop_use_explicit_run_id(tmp_path):
 		],
 	)
 	assert stop.exit_code == 1
-	assert json.loads(stop.stdout)["error"]["code"] == "JOB_NOT_FOUND"
+	envelope = json.loads(stop.stdout)
+	assert envelope["error"]["code"] == "WORKFLOW_NOT_FOUND"
+	# 任务记录缺失是本地状态问题：Agent 需要一条能直接执行的重建入口。
+	assert envelope["error"]["recovery_action"]
+	assert envelope["hints"]["next_actions"] == ["boss wizard"]
+
+
+def test_wizard_status_reports_resume_next_action(tmp_path):
+	"""`--status` 成功后不能到此为止：挂起/停止的 run 要给出恢复入口，
+	否则 Agent 查完状态就断了（主执行路径跑完反而提示 `--status`）。"""
+	created = CliRunner().invoke(
+		cli,
+		["--json", "--data-dir", str(tmp_path), "wizard", "--input-json", _shortlist_input()],
+	)
+	run_id = json.loads(created.stdout)["data"]["run_id"]
+	status = CliRunner().invoke(
+		cli,
+		["--json", "--data-dir", str(tmp_path), "wizard", "--status", run_id],
+	)
+
+	assert status.exit_code == 0
+	envelope = json.loads(status.stdout)
+	assert envelope["data"]["run_id"] == run_id
+	assert envelope["data"]["status"] == "completed"
+	assert envelope["hints"]["next_actions"] == ["boss wizard", f"boss wizard --status {run_id}"]
+
+
+def test_wizard_status_and_stop_after_stop_report_resume(tmp_path):
+	"""被停掉的 run 断点还在本地：`--stop` 与随后的 `--status` 都要给出 `--resume`。"""
+	plan = WorkflowPlan(
+		role="candidate",
+		platform="zhipin",
+		goal="shortlist",
+		inputs={},
+		requested_steps=(),
+		mode="headless",
+	)
+	with WorkflowStore(tmp_path) as store:
+		store.create("wrn_stopped", plan)
+
+	stop = CliRunner().invoke(cli, ["--json", "--data-dir", str(tmp_path), "wizard", "--stop", "wrn_stopped"])
+	assert stop.exit_code == 0
+	stopped = json.loads(stop.stdout)
+	assert stopped["data"]["status"] == "stopped"
+	assert stopped["hints"]["next_actions"] == [
+		"boss wizard --resume wrn_stopped",
+		"boss wizard --status wrn_stopped",
+	]
+
+	status = CliRunner().invoke(cli, ["--json", "--data-dir", str(tmp_path), "wizard", "--status", "wrn_stopped"])
+	envelope = json.loads(status.stdout)
+	assert envelope["hints"]["next_actions"] == [
+		"boss wizard --resume wrn_stopped",
+		"boss wizard --status wrn_stopped",
+	]
+
+
+def test_wizard_stop_hints_quote_run_id_with_shell_metacharacters(tmp_path):
+	"""run_id 是本地自由文本，拼进可执行提示前必须按 shell 参数转义。"""
+	plan = WorkflowPlan(
+		role="candidate",
+		platform="zhipin",
+		goal="shortlist",
+		inputs={},
+		requested_steps=(),
+		mode="headless",
+	)
+	run_id = "wrn; echo pwn"
+	with WorkflowStore(tmp_path) as store:
+		store.create(run_id, plan)
+
+	stop = CliRunner().invoke(cli, ["--json", "--data-dir", str(tmp_path), "wizard", "--stop", run_id])
+	assert stop.exit_code == 0, stop.stdout
+	assert json.loads(stop.stdout)["hints"]["next_actions"] == [
+		"boss wizard --resume 'wrn; echo pwn'",
+		"boss wizard --status 'wrn; echo pwn'",
+	]
 
 
 # ── 未登录 = waiting_input（不是 failed，也不阻塞）─────────────
