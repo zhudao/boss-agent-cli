@@ -8,6 +8,9 @@ Use this checklist before publishing a release tag.
 - Breaking changes are called out in `CHANGELOG.md`.
 - CLI JSON envelope changes are documented.
 - `boss schema --format native` still describes the released capability surface.
+- `llms.txt` 的 `Current version` 与能力计数（顶层命令 / 一级招聘者子命令 / MCP 工具）已随本次发版更新；`tests/test_agent_docs.py` 会对照代码校验，漏改会直接失败。
+- `SECURITY.md` 的支持版本表已更新到当前 minor（< 当前 minor 标为不再支持）；`tests/test_open_source_docs.py` 会校验。
+- GitHub Pages 站点（`demo/index.html` 的版本链接与指标、`demo/llms.txt` 的版本与计数）已同步；`tests/test_agent_docs.py` 会校验（`demo/keynote-animation` 等发布素材是历史版本，不随发版修改）。
 
 ## 2. Local verification
 
@@ -51,6 +54,11 @@ publishing, use `--require-clean`; when the local tag already exists, also pass
 Git tags and does not replace the local quality baseline or fixture eval. Run
 `uv run python evals/run_eval.py --mode fixture` in an independent terminal, not
 inside an active agent session.
+
+The tag-triggered `release.yml` runs the same artifact check
+(`--artifacts dist --tag "$GITHUB_REF_NAME" --require-clean`) between `uv build`
+and `uv publish`, so a tag that does not match `pyproject.toml` fails before
+anything reaches PyPI.
 
 ## 5. Publish
 

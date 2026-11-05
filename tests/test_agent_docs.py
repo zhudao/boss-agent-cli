@@ -188,6 +188,118 @@ def test_readme_en_mentions_current_mcp_tool_count():
 	assert "[Roadmap](ROADMAP.en.md)" in content
 
 
+def test_llms_txt_reports_current_version_and_counts():
+	"""`llms.txt` 是 Agent 的入口索引：版本与计数必须与代码一致。
+
+	它曾把版本停在 3.0.0，连着两个 minor 版本没人发现——README 与
+	capability-matrix 的计数都有守卫，而这份机器入口没有任何测试。
+	"""
+	from boss_agent_cli import __version__
+	from boss_agent_cli.main import cli
+	from boss_agent_cli.schema.data import SCHEMA_DATA
+
+	content = _read("llms.txt")
+	recruiter_subcommands = len(cli.commands["hr"].commands)
+
+	assert f"Current version: {__version__}" in content
+	assert f"{len(SCHEMA_DATA['commands'])} top-level commands" in content
+	assert f"{recruiter_subcommands} first-level recruiter subcommands" in content
+	assert f"{len(_load_mcp_tools())} implemented MCP tools" in content
+
+
+def test_llms_txt_doc_links_resolve():
+	"""`llms.txt` 里的文档链接必须都指向仓库内真实存在的文件。"""
+	content = _read("llms.txt")
+	links = re.findall(r"\]\((docs/[^)#]+)\)", content)
+
+	assert links, "llms.txt 应至少链接 Agent quickstart / commands / capability matrix"
+	missing = [path for path in links if not (ROOT / path).exists()]
+	assert not missing, f"以下 llms.txt 链接指向不存在的文件: {missing}"
+
+
+def test_readme_documents_full_envelope_keys():
+	"""README 的能力条目必须描述完整的七键信封。
+
+	中英 README 曾写成 `{ok, data, pagination, error, hints}`——漏掉
+	`schema_version` 与 `command`，Agent 照此构造解析器会对不上真实 stdout。
+	"""
+	keys = "{ok, schema_version, command, data, pagination, error, hints}"
+	old_subset = "{ok, data, pagination, error, hints}"
+
+	for path in ("README.md", "README.en.md"):
+		content = _read(path)
+		assert keys in content, f"{path} 未描述完整七键信封"
+		assert old_subset not in content, f"{path} 仍在描述五键子集"
+
+
+def test_site_copy_matches_current_version_and_counts():
+	"""GitHub Pages 站点是公开门面：首页与站点 llms.txt 的事实必须跟代码一致。
+
+	首页曾停在 v3.0.0、MCP 工具数写成 77（实际 78）；它和仓库内 `llms.txt` 一样
+	没有守卫，发版时不会有人记得同步。
+	"""
+	from boss_agent_cli import __version__
+	from boss_agent_cli.main import cli
+	from boss_agent_cli.schema.data import SCHEMA_DATA
+
+	index = _read("demo/index.html")
+	site_llms = _read("demo/llms.txt")
+	command_count = len(SCHEMA_DATA["commands"])
+	recruiter_count = len(cli.commands["hr"].commands)
+	tool_count = len(_load_mcp_tools())
+
+	version_match = re.search(r'class="version-link"[^>]*>v([0-9.]+)</a>', index)
+	assert version_match, "demo/index.html 缺少版本链接"
+	assert version_match.group(1) == __version__
+
+	def _metric(label: str) -> int:
+		match = re.search(
+			rf'<span class="metric-value">(\d+)</span><span class="metric-label" data-zh="{label}"',
+			index,
+		)
+		assert match, f"demo/index.html 缺少「{label}」指标"
+		return int(match.group(1))
+
+	assert _metric("顶层命令") == command_count
+	assert _metric("MCP 工具") == tool_count
+
+	assert f"Current version: {__version__}" in site_llms
+	assert f"{command_count} top-level commands" in site_llms
+	assert f"{recruiter_count} recruiter subcommands" in site_llms
+	assert f"{tool_count} implemented MCP tools" in site_llms
+
+
+def test_contributing_documents_offline_mcp_evals():
+	"""离线评测必须能被贡献者发现：双语 CONTRIBUTING 说明场景、命令与独立终端要求。"""
+	zh = _read("CONTRIBUTING.md")
+	en = _read("CONTRIBUTING.en.md")
+
+	for content in (zh, en):
+		assert "uv run python evals/run_eval.py --mode fixture" in content
+		assert "evals/README.md" in content
+		assert "4/4 passed" in content
+
+	assert "## 离线 MCP 评测" in zh
+	assert "不要嵌套" in zh
+	assert "## Offline MCP evals" in en
+	assert "do not nest" in en.lower()
+
+
+def test_readme_links_offline_evals():
+	"""README 的贡献入口要指向评测说明，而不是只藏在 evals/ 目录里。"""
+	for path in ("README.md", "README.en.md"):
+		assert "evals/README.md" in _read(path), path
+
+
+def test_evals_readme_documents_scenario_criteria():
+	"""评测说明要有「场景 → 通过信号 → 失败信号」表，失败时能直接定位原因。"""
+	content = _read("evals/README.md")
+	assert "## Scenario Criteria" in content
+	for scenario in ("福利筛选", "详情+候选池", "合规边界", "错误恢复"):
+		assert scenario in content
+	assert "| Scenario | Pass signal (with-MCP) | Failure signals |" in content
+
+
 def test_english_agent_docs_exist_and_are_linked_from_english_entrypoints():
 	quickstart = _read("docs/agent-quickstart.en.md")
 	assert "# Agent Quickstart" in quickstart

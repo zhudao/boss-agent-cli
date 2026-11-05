@@ -107,6 +107,60 @@ def test_removed_bridge_is_not_shipped_or_advertised_as_an_extra():
 	assert "bridge" not in metadata("boss-agent-cli").get_all("Provides-Extra", [])
 
 
+def test_release_workflow_verifies_artifacts_before_publishing():
+	"""发版工作流必须先跑 `scripts/verify_release.py`，再发布到 PyPI。
+
+	`uv build` 不校验 tag 与 pyproject 版本是否一致，也不检查产物里是否混入本地
+	文件；tag 打错时 `uv publish` 会照常把错误产物推上 PyPI。校验脚本早已实现这
+	些检查，但工作流此前没有调用它。
+	"""
+	content = read(".github/workflows/release.yml")
+
+	assert "scripts/verify_release.py" in content
+	assert '--tag "${{ github.ref_name }}"' in content
+	assert "--require-clean" in content
+	assert content.index("scripts/verify_release.py") < content.index("uv publish")
+
+
+def test_codeowners_paths_exist():
+	"""CODEOWNERS 里的路径必须真实存在。
+
+	`/SKILL.md` 在 Agent Skill 迁出后仍留在规则里，指向一个已不存在的文件；
+	评审者按 CODEOWNERS 找负责人时会被引到空处。
+	"""
+	content = read(".github/CODEOWNERS")
+	missing: list[str] = []
+	checked: list[str] = []
+	for line in content.splitlines():
+		stripped = line.strip()
+		if not stripped or stripped.startswith("#"):
+			continue
+		path = stripped.split()[0]
+		if any(char in path for char in "*?[]"):
+			continue
+		checked.append(path)
+		if not (ROOT / path.lstrip("/")).exists():
+			missing.append(path)
+
+	assert checked, "CODEOWNERS 应至少声明一个具体路径"
+	assert not missing, f"以下 CODEOWNERS 路径不存在: {missing}"
+
+
+def test_security_policy_supported_versions_match_current_minor():
+	"""SECURITY.md 的支持版本表必须指向当前 minor。
+
+	它曾停在 1.17.x，而项目已到 3.2.0：用户会以为当前版本不再接收安全修复，
+	报告漏洞前也可能先降级到旧版本。
+	"""
+	from boss_agent_cli import __version__
+
+	minor = ".".join(__version__.split(".")[:2])
+	content = read("SECURITY.md")
+
+	assert f"| {minor}.x" in content, f"SECURITY.md 支持版本表未更新到 {minor}.x"
+	assert f"< {minor}" in content, f"SECURITY.md 的「不再支持」区间未更新到 < {minor}"
+
+
 def test_platform_research_template_covers_adapter_admission_gate():
 	index = read("docs/research/platforms/README.md")
 	abstraction_zh = read("docs/platform-abstraction.md")
