@@ -41,7 +41,8 @@ const squashText = (text) => String(text || '').replace(/\\s+/g, ' ').trim();
 const escapeHtml = (text) => String(text)
 	.replace(/&/g, '&amp;')
 	.replace(/</g, '&lt;')
-	.replace(/>/g, '&gt;');
+	.replace(/>/g, '&gt;')
+	.replace(/\\n/g, '<br>');
 const getGeekList = () => {
 	const chatUser = document.querySelector('.chat-user');
 	if (!chatUser) return [null, '.chat-user not found (chat tab not open?)'];
@@ -399,11 +400,26 @@ def _readable_geek_detail(info: Any) -> bool:
 
 _SEND_MESSAGE_ACTION_JS = """
 const escaped = escapeHtml(args.content);
-if (editor.disabled || editor.conversationLoading$) {
+if (editor.conversationLoading$) {
 	return {ok: false, error: 'editor is disabled or conversation is loading', log};
 }
 editor.draft[editor.uniqueId] = args.content;
 input.innerHTML = escaped;
+try { editor.handleKeyup({ key: '', keyCode: 0, preventDefault: () => {}, stopPropagation: () => {} }); } catch (e) { log.push('handleKeyup threw: ' + e.message); }
+// 页面在自己的 input 回调里异步清 disabled：固定等 150ms 在慢页面/慢机器上会
+// 误判为「编辑器不可用」并放弃发送。改为有上限的轮询，仍不强制清除 disabled。
+const readyStartedAt = Date.now();
+const readyDeadline = readyStartedAt + 3000;
+while (editor.disabled && Date.now() < readyDeadline) {
+	await sleep(50);
+}
+log.push('editor ready after ' + (Date.now() - readyStartedAt) + 'ms');
+if (editor.disabled) {
+	return {ok: false, error: 'editor is disabled or conversation is loading', log};
+}
+if (editor.conversationLoading$ || (editor.conversation$ && editor.conversation$.friendId !== args.targetFriendId)) {
+	return {ok: false, error: 'conversation switched away from target before send', log};
+}
 log.push('editbox html set, calling sendText');
 try {
 	const ret = editor.sendText();
@@ -673,7 +689,7 @@ class BossRecruiterClient(_BaseHttpClient):
 				"ok": False,
 				"error": "browser action interrupted; outcome unknown",
 				"action_interrupted": True,
-				"log": [],
+				"log": [f"EXCEPTION {type(exc).__name__}: {exc}"],
 			}, []
 		result = capture.get("value") if isinstance(capture, dict) else capture
 		events = cast("list[dict[str, Any]]", capture.get("events", []) if isinstance(capture, dict) else [])
@@ -1184,6 +1200,8 @@ class BossRecruiterClient(_BaseHttpClient):
 				events=events,
 				expected_bits=[content],
 			)
+		history: dict[str, Any] | None = None
+		history_attempts = 0
 		if isinstance(result, dict) and result.get("ok"):
 			matched_ws = self._matching_chat_send_events(events, [content])
 			history = self._exchange_history_evidence(
@@ -1225,6 +1243,16 @@ class BossRecruiterClient(_BaseHttpClient):
 				result["confirmation_stop"] = history["control_stop"]
 		# Surface the page-side error in CLI envelope shape
 		err_msg = self._page_error_message(result)
+		# 把「回读核对是否执行、命中多少」也放进失败 details：只有 ws_evidence 时
+		# 看不出历史回读到底跑没跑，社区反馈的 matched_ws_count=0 无法进一步定位。
+		history_extra: dict[str, Any] | None = None
+		if history is not None:
+			history_extra = {
+				"history_checked": history.get("checked"),
+				"history_matched_count": history.get("matched_count"),
+				"history_attempts": history_attempts,
+				"history_error": history.get("error"),
+			}
 		return self._chat_action_failure_response(
 			message=f"发送消息未确认: {err_msg}；{_ACTION_UNCONFIRMED_HINT.format(friend_id=friend_id)}",
 			payload=self._chat_action_failure_data(
@@ -1234,6 +1262,7 @@ class BossRecruiterClient(_BaseHttpClient):
 				expected_bits=[content],
 				result=result,
 				events=events,
+				extra=history_extra,
 			),
 			error_code="ACTION_UNCONFIRMED",
 		)

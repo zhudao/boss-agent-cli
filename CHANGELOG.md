@@ -5,10 +5,12 @@
 ## [Unreleased]
 
 ### Added
+- `boss hr reply` 返回 `ACTION_UNCONFIRMED` 时，`error.details` 现在同时带上 `history_checked` / `history_matched_count` / `history_attempts` / `history_error`：此前只有 `ws_evidence`，无法区分「历史回读没跑」与「回读了但没命中」，社区反馈的 `matched_ws_count: 0` 只能靠猜。现在失败信封能直接看出历史回读执行了几次、是否命中；排障表与命令参考（中英）同步说明这四个字段。`tests/test_recruiter_client.py` 的未命中用例补上对应断言，`tests/test_agent_docs.py` 守卫排障文档包含这些字段。
 - 发版工作流在 `uv build` 之后、发布到 PyPI 之前新增 `scripts/verify_release.py --artifacts dist --tag "$GITHUB_REF_NAME" --require-clean --json`：`uv build` 本身不校验 tag 与 `pyproject.toml` 版本是否一致，也不检查产物里是否混入本地文件，tag 打错时 `uv publish` 会照常把错误版本推上 PyPI。校验脚本早已实现这些检查（含 `--tag` / `--require-clean`），此前只有维护者本地手动运行。新增 `tests/test_open_source_docs.py::test_release_workflow_verifies_artifacts_before_publishing` 守卫（校验步骤必须在 `uv publish` 之前），发版清单同步说明。
 - 把已有的离线 MCP 评测提升为可发现的公开能力面（Issue #717）：`CONTRIBUTING.md` / `CONTRIBUTING.en.md` 新增「离线 MCP 评测」一节，说明四个场景、`uv run python evals/run_eval.py --mode fixture` 的预期输出（`4/4 passed`）与「必须在该独立终端运行、不要嵌套在 Agent 会话里」；`README.md` / `README.en.md` 的贡献入口加上指向 `evals/README.md` 的链接；`evals/README.md` 新增「场景 → 通过信号 → 失败信号」判据表。新增 `tests/test_agent_docs.py::test_contributing_documents_offline_mcp_evals` / `test_readme_links_offline_evals` / `test_evals_readme_documents_scenario_criteria` 守卫，文档再次漂移会直接失败。
 
 ### Fixed
+- `boss hr reply` 的发送前就绪判定改为有上限轮询：Issue #724 指出页面在自己的 input 回调里异步清 `editor.disabled`，固定等待 150ms 在慢页面 / 慢机器上会误判「编辑器不可用」并放弃发送（消息其实可以发）。现在最多等 3 秒（每 50ms 检查一次）直到编辑器就绪，仍不强制清除 `disabled`；并在调用 `sendText` 前复查会话加载状态与 `conversation$.friendId`，会话被切走时放弃而不是发到错误的候选人。新增 `tests/test_recruiter_send_js.py`（Node 可用时运行）覆盖慢编辑器、持续 disabled、切走会话、加载中与多行 `<br>` 渲染五种情形。
 - `boss schema` 里 `crawl run` 与 `crawl start` 的 `--hook-profile` 默认值不一致：run 写 `"none"`，start 写 `null`（且 null 不在该选项的 enum 取值域内），而两个命令省略时都按 `hook_profile or "none"` 执行——Agent 会以为 start 的「未指定」另有含义。现在两者统一为 `"none"`，新增 `tests/test_schema_contract.py::test_crawl_run_and_start_share_hook_profile_default` 守卫。
 - README 中英双语的「命令」分组自称列出全部 39 个顶层命令，实际漏了 `mark`（联系人标签）、`interviews`（面试邀请）、`chat-summary`（聊天摘要）、`follow-up`（跟进提醒），中文版还漏了 `recommend`；`chat*` 这种通配写法也让人无法确认覆盖范围。现在逐个列出并补齐，新增 `tests/test_agent_docs.py::test_readme_command_groups_cover_every_top_level_command`（双语 README 必须出现每个顶层命令名），新增命令后漏写会直接失败。
 - 中英 README 的「Schema 驱动 + JSON 信封」条目把信封写成五键 `{ok, data, pagination, error, hints}`，漏掉 `schema_version` 与 `command`——README 是最常被 Agent / 用户引用的契约描述，照此构造解析器会与真实 stdout 对不上；`docs/commands.md` 与实现一直是七键。现在改为完整七键，并新增 `tests/test_agent_docs.py::test_readme_documents_full_envelope_keys`（同时禁止五键子集再次出现）。
