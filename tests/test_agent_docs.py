@@ -153,7 +153,7 @@ def test_mcp_readme_links_to_quickstart_and_matrix():
 
 
 def test_readme_badge_policy_exists_and_has_core_rules():
-	content = _read("docs/readme-badge-policy.md")
+	content = _read("docs/maintainer/readme-badge-policy.md")
 	assert "# README 第三方 Badge 准入标准" in content
 	assert "`README.md` / `README.en.md`" in content
 	assert "### 一类：默认允许" in content
@@ -238,12 +238,26 @@ def test_readme_command_groups_cover_every_top_level_command():
 		assert not missing, f"{path} 缺少顶层命令: {sorted(missing)}"
 
 
+def test_roadmap_lists_the_current_release():
+	"""路线图的「已发布」列表必须包含当前版本。
+
+	它曾停在 v2.0.0，跨过 2.0.1 与整个 3.x 都没人发现；导航文档落后两个大版本
+	比没有路线图更误导。
+	"""
+	from boss_agent_cli import __version__
+
+	for path, heading in (("ROADMAP.md", "## 已发布"), ("ROADMAP.en.md", "## Released")):
+		content = _read(path)
+		section = content.split(heading, 1)[1].split("\n## ", 1)[0]
+		assert f"v{__version__}" in section, f"{path} 的已发布列表缺少 v{__version__}"
+
+
 def test_troubleshooting_documents_action_unconfirmed_evidence():
 	"""ACTION_UNCONFIRMED 的 details 字段要写进排障表，用户才看得懂失败信封。"""
 	for path in ("docs/troubleshooting.md", "docs/troubleshooting.en.md"):
 		content = _read(path)
 		assert "ACTION_UNCONFIRMED" in content, path
-		for field in ("history_checked", "history_matched_count", "history_attempts"):
+		for field in ("ws_send_without_text", "history_checked", "history_matched_count", "history_attempts"):
 			assert field in content, f"{path} 缺少 {field}"
 
 
@@ -381,8 +395,8 @@ def test_english_agent_docs_exist_and_are_linked_from_english_entrypoints():
 def test_english_roadmap_exists_and_readme_en_links_to_it():
 	roadmap_en = _read("ROADMAP.en.md")
 	assert "# Roadmap" in roadmap_en
-	assert "## Near term (current mainline)" in roadmap_en
-	assert "## Mid term (v2.0)" in roadmap_en
+	assert "## ✅ Near term (completed)" in roadmap_en
+	assert "## 🔮 Mid term (v2.x–v3.x)" in roadmap_en
 	assert "## Long-term vision" in roadmap_en
 	assert "[awesome-agents](https://github.com/kyrolabs/awesome-agents)" in roadmap_en
 

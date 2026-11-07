@@ -5,6 +5,22 @@
 ## [Unreleased]
 
 ### Added
+- 命令参考 `docs/commands.md` / `docs/commands.en.md` 新增章节目录（11 个锚点），300+ 行的速查表可以直接跳转；新增 `tests/test_open_source_docs.py::test_commands_doc_toc_matches_headings` 守卫，目录锚点与真实标题不一致时失败。
+- 新增 ADR 索引 `docs/adr/README.md` 与三份架构决策记录：0003（浏览器来源冻结策略表）、0004（七键信封与错误码登记契约）、0005（MCP server 通过子进程适配 CLI）；0001/0002 标注为历史上下文。架构文档与中英 CONTRIBUTING 加入 ADR 入口，新增 `tests/test_open_source_docs.py::test_adr_index_covers_every_record` 守卫（索引覆盖每份记录、必需章节、入口可达）。
+- 新增公开架构文档 `docs/architecture.md` / `docs/architecture.en.md`：四条入口、七键信封、`boss schema` 真源、模块分层与调用链、登录链路、平台抽象、预算与风控边界、本地数据目录；README 顶部导航与 CONTRIBUTING 加入架构入口，新增 `tests/test_open_source_docs.py::test_architecture_docs_exist_and_are_linked` 守卫（中英存在、链接可达、相对链接有效）。
+- `boss hr reply` 的 `ws_evidence` 新增 `ws_send_without_text`：统计有发送帧但提取不到文本（二进制 / 压缩 / 新编码）的条数，把「没有发送帧」与「有帧但读不出文本」区分开，供 Issue #735 定位。排障表与守卫同步。
+
+### Changed
+- ROADMAP 结构整理：全部完成的「近期（当前主线）」改为「近期（已完成）」，「中期（v2.0）」改为「中期（v2.x–v3.x）」，Web UI 明确标注「未排期」（中英同步）。
+- 维护者文档归位：`docs/smoke-testing.md` 与 `docs/readme-badge-policy.md` 实际是单语的维护者文档（未被 README 链接，也没有 `.en.md` 对照），已移到 `docs/maintainer/` 并在中英 CONTRIBUTING 的「维护者文档」清单登记；两处测试引用同步，链接守卫扩展为覆盖全部五份维护者文档。
+
+### Fixed
+- 营销文档 `docs/marketing/awesome-submissions.md` 顶部声明只覆盖「计数与低风险定位」，但正文的投稿模板与 Checklist 仍写着 `38/9/50`、`latest release v2.0.0`；未来投稿者可能直接照抄。现在声明明确覆盖发布版本与投稿文案，Checklist 标题标注为 2026-08-27 快照并要求提交前按 README / PyPI / `boss schema` 复核；历史投稿记录保持原样。
+- ROADMAP 的「已发布」列表停在 v2.0.0，补上 2.0.1 / 3.0.0 / 3.0.1 / 3.1.0 / 3.2.0 / 3.2.1 的摘要（中英同步）。
+
+## [3.2.1] - 2026-11-06
+
+### Added
 - `boss hr reply` 返回 `ACTION_UNCONFIRMED` 时，`error.details` 现在同时带上 `history_checked` / `history_matched_count` / `history_attempts` / `history_error`：此前只有 `ws_evidence`，无法区分「历史回读没跑」与「回读了但没命中」，社区反馈的 `matched_ws_count: 0` 只能靠猜。现在失败信封能直接看出历史回读执行了几次、是否命中；排障表与命令参考（中英）同步说明这四个字段。`tests/test_recruiter_client.py` 的未命中用例补上对应断言，`tests/test_agent_docs.py` 守卫排障文档包含这些字段。
 - 发版工作流在 `uv build` 之后、发布到 PyPI 之前新增 `scripts/verify_release.py --artifacts dist --tag "$GITHUB_REF_NAME" --require-clean --json`：`uv build` 本身不校验 tag 与 `pyproject.toml` 版本是否一致，也不检查产物里是否混入本地文件，tag 打错时 `uv publish` 会照常把错误版本推上 PyPI。校验脚本早已实现这些检查（含 `--tag` / `--require-clean`），此前只有维护者本地手动运行。新增 `tests/test_open_source_docs.py::test_release_workflow_verifies_artifacts_before_publishing` 守卫（校验步骤必须在 `uv publish` 之前），发版清单同步说明。
 - 把已有的离线 MCP 评测提升为可发现的公开能力面（Issue #717）：`CONTRIBUTING.md` / `CONTRIBUTING.en.md` 新增「离线 MCP 评测」一节，说明四个场景、`uv run python evals/run_eval.py --mode fixture` 的预期输出（`4/4 passed`）与「必须在该独立终端运行、不要嵌套在 Agent 会话里」；`README.md` / `README.en.md` 的贡献入口加上指向 `evals/README.md` 的链接；`evals/README.md` 新增「场景 → 通过信号 → 失败信号」判据表。新增 `tests/test_agent_docs.py::test_contributing_documents_offline_mcp_evals` / `test_readme_links_offline_evals` / `test_evals_readme_documents_scenario_criteria` 守卫，文档再次漂移会直接失败。

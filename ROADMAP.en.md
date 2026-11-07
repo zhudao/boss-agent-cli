@@ -4,6 +4,12 @@ This document tracks the medium-term and long-term direction of `boss-agent-cli`
 
 ## Released
 
+- ✅ v3.2.1 (2026-11-06): recruiter replies now fill the editor before checking its state and preserve newlines in multi-line messages (community PR #728); send readiness polls with a bound and re-checks the target conversation; `ACTION_UNCONFIRMED` details now carry history read-back evidence; the release workflow verifies artifacts and the tag before publishing
+- ✅ v3.2.0 (2026-11-01): `--industry` switched to platform industry codes and the `--experience` / `--salary` codes were aligned with the web filters; added the nationwide plus three city codes; fallback errors now report the non-recoverable `INTERNAL_ERROR`; `login --cookie-source` failures explain what to do next (breaking change: industry codes)
+- ✅ v3.1.0 (2026-10-30): added `--browser-source httpx-only` (opens no browser by construction), a shared httpx / Chromium egress proxy, page token identity capture and egress-region probing, the `boss doctor` request-delay check, search `job_url`, and recruiter `hr whoami`
+- ✅ v3.0.1 (2026-10-23): the recruiter online-resume endpoint going away now returns `ENDPOINT_DEPRECATED` with a tracking issue in `details.tracking_issue`; CDP read-back also scans Vue instances inside the popup and the `hr resume` request parameters follow the current endpoint
+- ✅ v3.0.0 (2026-10-02): removed the Browser Bridge and the Zhilian platform, making BOSS Zhipin the only registered platform (the Platform abstraction stays); the browser channel order is now CDP → headless (breaking change)
+- ✅ v2.0.1 (2026-09-29): `boss chat` exposes a cross-request stable `uid`; `chatmsg` / `chat-summary` / `mark` / `exchange` plus snapshots and exports key on `uid`, so rotating `securityId` values no longer break contact lookups
 - ✅ v2.0.0 (2026-09-15): exposed the bounded `--browser-source` policy across CLI / config / schema / MCP / wizard; added `login --force`, read-only validation of reused CDP login state, and cURL credential import; added recruiter recommendations plus resume attachment acceptance/download; unified immediate-stop semantics for account and environment risk; removed the unfinished 51job (`qiancheng`) placeholder platform and Atlas promotion/provider integration (breaking change)
 - ✅ v1.20.0 (2026-09-03): adapted to the mcp 2.x Server API (dependency now `mcp>=2.1.0,<3.0.0`; the MCP wire format is unchanged), fixed every httpx command failing when a SOCKS system proxy is set, collapsed browser-channel selection into a single policy-table-driven dispatch point (prerequisite for the #387 seam), made `boss ai config` echo the resolved endpoint, and wrote down the AI provider admission and removal rules
 - ✅ v1.19.1 (2026-08-27): fixed fresh installs resolving to mcp 2.x, which made `boss-mcp` crash on import (dependency now capped at `<2.0.0`), and added a `fresh_install` CI gate that deliberately bypasses `uv.lock`
@@ -23,7 +29,7 @@ This document tracks the medium-term and long-term direction of `boss-agent-cli`
 
 Full release history lives in [CHANGELOG.md](CHANGELOG.md).
 
-## Near term (current mainline)
+## ✅ Near term (completed)
 
 ### Data visualization
 
@@ -43,7 +49,7 @@ Full release history lives in [CHANGELOG.md](CHANGELOG.md).
 - [x] `boss ai interview-prep` - mock interview generation based on the JD (v1.8.0)
 - [x] support for current Claude 4.7 / GPT-5 generation models (v1.8.2, providers extended to openrouter, qwen, zhipu, and siliconflow)
 
-## Mid term (v2.0)
+## 🔮 Mid term (v2.x–v3.x)
 
 ### Governance and compliance
 
@@ -60,7 +66,7 @@ Full release history lives in [CHANGELOG.md](CHANGELOG.md).
 
 ### Ecosystem expansion
 
-- [ ] Web UI (React + Tailwind) for non-agent users
+- [ ] Web UI (React + Tailwind) for non-agent users (not scheduled)
 - [ ] Multi-platform support: the Platform abstraction shipped (Week 1a-1c); Lagou / Liepin API research is complete (Issue #90 closed, [docs/research/platforms/](docs/research/platforms/)) and neither is pursued; the Zhilian adapter (candidate side + recruiter agent automation) was removed in v3.0.0, so BOSS Zhipin is the only registered platform.
   - [x] Week 1a: Platform ABC skeleton + `BossPlatform` adapter (#129, zero behavior change)
   - [x] Week 1b: global `--platform` CLI option + `get_platform_instance` helper + schema exposure of `current_platform`
