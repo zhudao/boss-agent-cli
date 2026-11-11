@@ -150,6 +150,27 @@ def test_all_tool_schemas_are_well_formed_objects():
 	assert not problems, "工具 schema 结构问题：\n" + "\n".join(problems)
 
 
+def test_every_tool_schema_rejects_unknown_top_level_arguments():
+	"""inputSchema 必须与 call_tool 的未知参数拒绝保持一致。
+
+	服务端在 #776 之后会拒绝 inputSchema 之外的顶层参数；schema 不声明
+	additionalProperties: false 时，客户端按 schema 校验不会拦下拼错的参数，
+	Agent 只能通过一次失败的调用才知道契约。
+	"""
+	missing = [
+		tool.name
+		for tool in TOOLS
+		if (tool.input_schema or {}).get("additionalProperties") is not False
+	]
+	assert not missing, "工具 schema 未声明 additionalProperties: false：\n" + "\n".join(missing)
+
+
+def test_nested_tool_objects_are_not_marked_strict():
+	"""只约束顶层：wizard 的 inputs 由各 goal 自行解释，不能误标为封闭对象。"""
+	wizard = next(t for t in TOOLS if t.name == "boss_wizard")
+	assert "additionalProperties" not in wizard.input_schema["properties"]["inputs"]
+
+
 def test_candidate_tool_description_includes_availability():
 	search = next(t for t in TOOLS if t.name == "boss_search")
 	assert "可用性:" in search.description
@@ -423,6 +444,128 @@ def test_call_tool_rejects_unknown_arguments(monkeypatch):
 	assert result.is_error is True
 	assert payload["error"]["code"] == "INVALID_PARAM"
 	assert "dry_run" in payload["error"]["message"]
+
+
+def test_call_tool_rejects_non_boolean_flags(monkeypatch):
+	"""布尔参数传成字符串时必须拒绝，不能被 truthiness 静默改写。
+
+	`_build_args` 对 `dry_run` 用 truthiness、对 `yes` 用 `is True`：传 `"true"`
+	会同时丢掉预览与确认标志，写操作可能直接执行。
+	"""
+	from types import SimpleNamespace
+
+	from boss_agent_cli import mcp_server
+	from mcp.types import CallToolRequestParams
+
+	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
+	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
+
+	async def fake_run(*args):
+		raise AssertionError("类型错误不应触达 CLI")
+
+	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
+
+	base = {
+		"geek_id": "g",
+		"job_id": "j",
+		"expect_id": "e",
+		"lid": "l",
+		"security_id": "s",
+		"message": "m",
+	}
+	for field in ("dry_run", "yes"):
+		result = asyncio.run(
+			mcp_server.call_tool(
+				None,
+				CallToolRequestParams(name="boss_hr_greet", arguments={**base, field: "true"}),
+			)
+		)
+		payload = json.loads(result.content[0].text)
+		assert result.is_error is True
+		assert payload["error"]["code"] == "INVALID_PARAM"
+		assert field in payload["error"]["message"]
+		assert "boolean" in payload["error"]["message"]
+
+
+def test_call_tool_accepts_boolean_flags(monkeypatch):
+	"""布尔标志仍按原样翻译成 CLI 选项。"""
+	from types import SimpleNamespace
+
+	from boss_agent_cli import mcp_server
+	from mcp.types import CallToolRequestParams
+
+	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
+	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
+
+	seen: list[tuple[str, ...]] = []
+
+	async def fake_run(*args):
+		seen.append(args)
+		return {"ok": True, "error": None}
+
+	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
+
+	arguments = {
+		"geek_id": "g",
+		"job_id": "j",
+		"expect_id": "e",
+		"lid": "l",
+		"security_id": "s",
+		"message": "m",
+		"dry_run": True,
+		"yes": True,
+	}
+	result = asyncio.run(
+		mcp_server.call_tool(None, CallToolRequestParams(name="boss_hr_greet", arguments=arguments))
+	)
+
+	assert result.is_error is False
+	assert seen == [
+		(
+			"hr",
+			"greet",
+			"--geek-id",
+			"g",
+			"--job-id",
+			"j",
+			"--expect-id",
+			"e",
+			"--lid",
+			"l",
+			"--security-id",
+			"s",
+			"--message",
+			"m",
+			"--yes",
+			"--dry-run",
+		)
+	]
+
+
+def test_call_tool_rejects_unknown_tool_name(monkeypatch):
+	"""未知工具名直接返回 INVALID_PARAM，而不是执行 `boss <name>`。"""
+	from types import SimpleNamespace
+
+	from boss_agent_cli import mcp_server
+	from mcp.types import CallToolRequestParams
+
+	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
+	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
+
+	async def fake_run(*args):
+		raise AssertionError("未知工具不应触达 CLI")
+
+	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
+
+	result = asyncio.run(
+		mcp_server.call_tool(None, CallToolRequestParams(name="boss_no_such_tool", arguments={}))
+	)
+
+	payload = json.loads(result.content[0].text)
+	assert result.is_error is True
+	assert payload["error"]["code"] == "INVALID_PARAM"
+	assert "未知工具" in payload["error"]["message"]
+	assert "tools/list" in payload["error"]["message"]
 
 
 def test_search_tool_requires_query():
@@ -1027,6 +1170,15 @@ def test_build_args_shortlist_list():
 
 def test_build_args_favorites_list_is_fixed_to_job_favorites():
 	assert _build_args("boss_favorites_list", {"page": 2, "tag": 99}) == ["favorites", "list", "--page", "2"]
+
+
+def test_build_args_favorites_list_forwards_explicit_zero_page():
+	"""page=0 要原样下发交给 Click 拒绝，不能被真值判断换成默认第 1 页。"""
+	assert _build_args("boss_favorites_list", {"page": 0}) == ["favorites", "list", "--page", "0"]
+
+
+def test_build_args_favorites_list_omits_page_when_absent():
+	assert _build_args("boss_favorites_list", {}) == ["favorites", "list"]
 
 
 def test_tool_count_after_pr41():

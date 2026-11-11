@@ -4,6 +4,8 @@
 
 首次贡献前请先完成 [快速上手](docs/getting-started.md) 中的本地自检与开发者验证；改代码前建议先读 [架构](docs/architecture.md)，了解信封契约、平台抽象与风控边界。
 
+参与本项目（Issue、PR、Discussions）即表示同意遵守 [行为准则](CODE_OF_CONDUCT.md)。
+
 ## 开发环境
 
 ```bash
@@ -33,14 +35,27 @@ Python **≥ 3.11** 是最低要求。项目使用 [`uv`](https://github.com/ast
 
 ## 本地验证
 
-代码改动提交前尽量运行完整矩阵：
+代码改动提交前先跑一键门禁（ruff + 全量离线测试 + mypy）：
+
+```bash
+uv run python scripts/quality_baseline.py
+```
+
+需要定位单步时再单独运行：
 
 ```bash
 uv run pytest tests/ -q
-uv run ruff check src/ tests/
+uv run ruff check src/ tests/ scripts/ mcp-server/
 uv run mypy src/boss_agent_cli
 uv run boss --help
 uv run boss schema --format native
+```
+
+打开 PR 前再跑离线冒烟契约与 MCP eval（eval 只能在独立终端运行，不要嵌套在 Agent 会话里）：
+
+```bash
+BOSS_SMOKE_DRY_RUN=1 uv run python scripts/smoke_p0.py
+uv run python evals/run_eval.py --mode fixture
 ```
 
 文档改动至少运行：
@@ -70,7 +85,7 @@ git diff --check
    ```
 5. **原子提交**：每个 commit 只做一件事。
 6. **Push** 并向 `master` 发起 Pull Request。
-7. **CI 全绿**才能合并：`CI` 工作流在 PR 上跑 ruff / mypy / pre-commit 和 Python 3.11、3.12、3.14 的测试（fork 的 PR 同样会跑，不需要任何 secret），另有 CodeQL 和 GitGuardian 安全扫描。测试全部离线，不要写需要网络、真实浏览器或真实账号的测试。
+7. **CI 全绿**才能合并：`CI` 工作流在 PR 上跑 ruff / mypy / pre-commit 和 Python 3.11、3.12、3.13、3.14 的测试（fork 的 PR 同样会跑，不需要任何 secret），另有 CodeQL 和 GitGuardian 安全扫描。测试全部离线，不要写需要网络、真实浏览器或真实账号的测试。
 
 维护者会使用 squash merge，所以最终 squash 标题也要遵守上面的 commit 格式。
 
@@ -198,4 +213,4 @@ uv run python evals/run_eval.py --mode fixture
 
 ## 有问题？
 
-欢迎在 [Discussions](https://github.com/can4hou6joeng4/boss-agent-cli/discussions) 发帖，或在相关 [Issue](https://github.com/can4hou6joeng4/boss-agent-cli/issues) 下留言。
+欢迎在 [Discussions](https://github.com/can4hou6joeng4/boss-agent-cli/discussions) 发帖，或在相关 [Issue](https://github.com/can4hou6joeng4/boss-agent-cli/issues) 下留言；完整的求助渠道与提问清单见 [获取支持](SUPPORT.md)。

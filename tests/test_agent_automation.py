@@ -141,6 +141,76 @@ def test_automation_config_accepts_zero_limits() -> None:
 	assert config.max_consecutive_errors == 0
 
 
+def test_automation_config_ignores_removed_keys() -> None:
+	"""已移除的死配置键不能让旧 config.json 加载失败。
+
+	`platforms` 与 `stop_on_page_text` 从未有消费点：平台由全局 --platform 决定，
+	页面风控由 api/zhipin_errors 的 URL / 页面内容检测负责。字段删除后，用户的
+	旧 config.json 里可能仍存有它们，解析必须继续接受。
+	"""
+	config = automation_config_from_dict({"platforms": ["zhipin"], "stop_on_page_text": ["验证码"]})
+	assert config == AutomationConfig()
+	# 死字段不得被重新加回：配置项存在却不生效，与「已实现」的承诺相悖。
+	assert not {"platforms", "stop_on_page_text"} & set(AutomationConfig.__dataclass_fields__)
+
+
+def test_automation_config_rejects_unknown_allowed_actions() -> None:
+	"""拼错的动作名必须报错，不能被静默丢弃。
+
+	旧实现对非法值 `if item in allowed_action_values` 过滤后 `or DEFAULT_ALLOWED_ACTIONS`，
+	写错一个枚举值反而回退到完整的默认写动作集——用户以为收紧了权限，实际全部放开。
+	"""
+	with pytest.raises(ValueError, match="allowed_actions"):
+		automation_config_from_dict({"allowed_actions": ["send_follow_up", "send_folow_up"]})
+
+
+def test_automation_config_rejects_non_list_allowed_actions() -> None:
+	"""字符串会被逐字符迭代，必须按形状错误拒绝并给出字段名。"""
+	with pytest.raises(ValueError, match="allowed_actions"):
+		automation_config_from_dict({"allowed_actions": "send_follow_up"})
+
+
+def test_automation_config_empty_allowed_actions_skips_every_action() -> None:
+	"""空列表的语义是「什么都不允许」，执行层全部 SKIPPED。
+
+	配置解析不得把它替换成默认动作集；需要禁用写操作时也应保持这一 fail-closed 行为。
+	"""
+	config = automation_config_from_dict({"allowed_actions": []})
+	assert config.allowed_actions == ()
+
+	conversation = _conversation("你好，我在上海做过3年销售，擅长客户沟通，大专，想看机会")
+	decision = decide_action(conversation, config, {})
+	assert status_for_decision(config, decision, dry_run=False) is EventStatus.SKIPPED
+
+
+@pytest.mark.parametrize(
+	"raw",
+	[
+		{"tabs": "新招呼"},
+		{"tabs": None},
+		{"tabs": 3},
+		{"tabs": ["新招呼", 1]},
+	],
+)
+def test_automation_config_rejects_malformed_tabs(raw) -> None:
+	"""tabs 必须是字符串数组。
+
+	旧实现对值直接迭代：字符串 ``"新招呼"`` 被拆成 ``("新", "招", "呼")``，
+	执行层匹配不到任何 tab，自动化空转却报成功；``null`` / 数字则抛未包装的
+	TypeError，命令以内部错误退出。
+	"""
+	with pytest.raises(ValueError, match="tabs"):
+		automation_config_from_dict(raw)
+
+
+@pytest.mark.parametrize("key", ["questionnaire_message", "follow_up_message"])
+@pytest.mark.parametrize("value", [None, 123, "", "   "])
+def test_automation_config_rejects_malformed_messages(key, value) -> None:
+	"""话术会原样发给候选人：null 经 str() 变成 "None"，空串等于发送空消息。"""
+	with pytest.raises(ValueError, match=key):
+		automation_config_from_dict({key: value})
+
+
 def test_decision_sends_questionnaire_for_high_confidence_new_candidate() -> None:
 	config = AutomationConfig()
 	conversation = _conversation(

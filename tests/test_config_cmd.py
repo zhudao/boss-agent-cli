@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 from click.testing import CliRunner, Result
 
+from boss_agent_cli.automation.config import AutomationConfig, automation_config_from_dict
+from boss_agent_cli.config import DEFAULTS
 from boss_agent_cli.main import cli
 
 
@@ -96,6 +98,21 @@ def test_config_without_subcommand_shows_list(tmp_path):
 	assert "items" in parsed["data"]
 
 
+def test_config_list_renders_structured_values_in_full(tmp_path, monkeypatch):
+	"""结构化配置不能在 25 宽单元格里挤成多行截断文本。
+
+	``automation`` 的字典 repr 有二十多行，两条话术会被截成省略号——用户看不到
+	自己配的内容。现在表格里给出占位，完整 JSON 放在表格下方。
+	"""
+	code, text = _invoke_tty(tmp_path, monkeypatch, "config", "list")
+	assert code == 0
+	assert "（JSON，见下方）" in text
+	assert "您好，想确认下近期是否看机会？" in text
+	assert "谢谢回复，我这边同步岗位信息，方便的话可以继续沟通面试时间。" in text
+	# 表格里不再出现被 rich 折行的 dict repr。
+	assert "'allowed_actions':" not in text
+
+
 # ── config get ──────────────────────────────────────────────────────
 
 
@@ -116,6 +133,30 @@ def test_config_get_renders_value_in_tty(tmp_path, monkeypatch):
 	assert "role" in text
 	assert "candidate" in text
 	assert "boss config set role <值>" in text
+
+
+def test_config_get_renders_structured_value_as_json(tmp_path, monkeypatch):
+	"""结构化值在终端里用格式化 JSON，不再输出会被折行的 Python repr。
+
+	当前值与默认值相同时只展开一次，避免重复四十行相同内容。
+	"""
+	code, text = _invoke_tty(tmp_path, monkeypatch, "config", "get", "automation")
+	assert code == 0
+	assert "（JSON，见下方）" in text
+	assert "您好，想确认下近期是否看机会？" in text
+	assert '"reply_strategy": "hybrid"' in text
+	assert "'allowed_actions':" not in text
+	assert text.count('"allowed_actions"') == 1
+
+
+def test_config_get_renders_override_and_default_when_different(tmp_path, monkeypatch):
+	"""用户覆盖与默认值不同时，两组 JSON 都要出现，便于对比。"""
+	(tmp_path / "config.json").write_text('{"automation": {"mode": "training"}}', encoding="utf-8")
+	code, text = _invoke_tty(tmp_path, monkeypatch, "config", "get", "automation")
+	assert code == 0
+	assert '"mode": "training"' in text
+	assert '"default"' in text
+	assert '"reply_strategy": "hybrid"' in text
 
 
 def test_config_get_unknown_key(tmp_path):
@@ -152,6 +193,16 @@ def test_config_set_renders_confirmation_in_tty(tmp_path, monkeypatch):
 	assert "debug" in text
 	saved = json.loads((tmp_path / "config.json").read_text())
 	assert saved["log_level"] == "debug"
+
+
+def test_config_set_renders_structured_values_as_json(tmp_path, monkeypatch):
+	"""设置结构化配置时，新值与上一次的值都以格式化 JSON 呈现。"""
+	code, text = _invoke_tty(tmp_path, monkeypatch, "config", "set", "automation", '{"mode": "training"}')
+	assert code == 0
+	assert "（JSON，见下方）" in text
+	assert '"mode": "training"' in text
+	assert '"previous"' in text
+	assert '"reply_strategy": "hybrid"' in text
 
 
 def test_config_set_operating_mode_validates_choice(tmp_path):
@@ -548,6 +599,36 @@ def test_config_set_automation_accepts_partial_object(tmp_path):
 	assert parsed["data"]["value"] == {"max_per_tab": 5}
 
 
+def test_defaults_automation_matches_runtime_parser():
+	"""``config list`` 展示的 automation 默认值必须与解析器完全一致。
+
+	手写副本会漂移：``platforms`` 字段删除后它仍留在 DEFAULTS 里被展示（配了不生效），
+	而 ``tabs`` / ``reply_strategy`` 等七个字段反而看不到。新增或删除字段却忘了同步
+	这份默认值时，这条断言会失败。
+	"""
+	listed = DEFAULTS["automation"]
+	assert set(listed) == set(AutomationConfig.__dataclass_fields__)
+	# 同一份数据交给正式解析器必须得到全新构造的默认配置，不再有任何兜底差异。
+	assert automation_config_from_dict(listed) == AutomationConfig()
+
+
+def test_defaults_crawl_lists_only_consumed_keys():
+	"""crawl 默认值只保留 run/start/configure 真正读取的键。
+
+	``hook_profile`` / ``hook_dir`` 曾出现在默认值里，但采集只能通过
+	``boss crawl run --hook-profile ... --hook-dir ...`` 显式指定，config.json 里的
+	同名键从未被读取。多一个「能配不生效」的键比少一个更糟。
+	"""
+	assert set(DEFAULTS["crawl"]) == {
+		"chrome_path",
+		"cdp_port",
+		"max_requests",
+		"max_details",
+		"max_seconds",
+		"max_retries",
+	}
+
+
 @pytest.mark.parametrize(
 	"value",
 	[
@@ -653,6 +734,16 @@ def test_config_reset_renders_confirmation_in_tty(tmp_path, monkeypatch):
 	assert "restored" in text
 
 
+def test_config_reset_renders_structured_default_as_json(tmp_path, monkeypatch):
+	"""恢复结构化配置时，默认值以完整 JSON 呈现而不是被折行的 repr。"""
+	_invoke("config", "set", "automation", '{"mode": "training"}', tmp_path=tmp_path)
+	code, text = _invoke_tty(tmp_path, monkeypatch, "config", "reset", "automation")
+	assert code == 0
+	assert "（JSON，见下方）" in text
+	assert '"mode": "autonomous"' in text
+	assert "'allowed_actions':" not in text
+
+
 def test_config_reset_unknown_key(tmp_path):
 	"""重置未知配置项应返回 Agent 可消费的 stdout JSON 错误包络。"""
 	runner = CliRunner()
@@ -747,3 +838,34 @@ def test_config_json_envelope_structure(tmp_path):
 	assert "command" in parsed
 	assert "data" in parsed
 	assert parsed["command"] == "config"
+
+
+@pytest.mark.parametrize("raw", ['"debug "', "3", "[]", "null", '"verbose"'])
+def test_startup_rejects_invalid_config_log_level(tmp_path, raw):
+	"""config.json 里的 log_level 坏值不能让每条命令静默按 error 阈值跑。
+
+	``Logger`` 对未知级别用 ``_LEVEL_ORDER.get(level, 3)``：用户以为打开了
+	debug 却什么都看不到；非字符串值还会在字典查找处抛 TypeError。
+	"""
+	(tmp_path / "config.json").write_text(f'{{"log_level": {raw}}}', encoding="utf-8")
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "status"])
+	parsed = _assert_single_stdout_json_error(result, command="boss", code="INVALID_PARAM")
+	assert "log_level" in parsed["error"]["message"]
+
+
+@pytest.mark.parametrize("raw", ['"30-60"', "30", "[]", "null"])
+def test_startup_rejects_invalid_request_delay_shape(tmp_path, raw):
+	"""坏形状不能被静默换成默认区间：用户以为节流生效，实际跑的是 30-60。"""
+	(tmp_path / "config.json").write_text(f'{{"request_delay": {raw}}}', encoding="utf-8")
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "status"])
+	parsed = _assert_single_stdout_json_error(result, command="boss", code="INVALID_PARAM")
+	assert "request_delay" in parsed["error"]["message"]
+
+
+@pytest.mark.parametrize("key, raw", [("log_level", '"verbose"'), ("request_delay", '"30-60"')])
+def test_config_reset_repairs_invalid_startup_config(tmp_path, key, raw):
+	"""坏值必须放行 config 子命令，否则用户没有命令行手段把它改回来。"""
+	(tmp_path / "config.json").write_text(f'{{"{key}": {raw}}}', encoding="utf-8")
+	code, parsed = _invoke("config", "reset", key, tmp_path=tmp_path)
+	assert code == 0
+	assert parsed["ok"] is True

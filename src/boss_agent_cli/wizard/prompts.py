@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence, cast
+from typing import Any, Callable, Mapping, Protocol, Sequence, cast
 
 import click
 
@@ -54,6 +54,10 @@ class MenuDriver(Protocol):
 	) -> str: ...
 
 	def text(self, label: str, *, default: str = "", required: bool = True) -> str: ...
+
+
+# 结果列表的后续输入构造函数签名一致：菜单驱动、列表项、平台名。
+_FollowUpBuilder = Callable[[MenuDriver, Mapping[str, Any], str], WizardInput | None]
 
 
 _BACK = "__wizard_back__"
@@ -339,7 +343,6 @@ class PromptToolkitMenu:
 			clear_wizard_screen()
 		items = _augment_menu_options(options, allow_back=allow_back, allow_exit=allow_exit)
 		selected = _default_select_index(items, default)
-		content_label_w, nav_label_w = _menu_label_widths(items)
 
 		def content() -> list[tuple[str, str]]:
 			return _menu_content_lines(items, selected=selected, title=title)
@@ -1223,7 +1226,9 @@ def _recruiter_job_follow_up(menu: MenuDriver, item: Mapping[str, Any], platform
 	)
 
 
-def _resolve_list_follow_up(run: Mapping[str, Any]) -> tuple[list[Mapping[str, Any]], str, Any] | None:
+def _resolve_list_follow_up(
+	run: Mapping[str, Any],
+) -> tuple[list[Mapping[str, Any]], str, _FollowUpBuilder] | None:
 	"""Return (items, result_kind, follow_up_builder) for a completed list-like run."""
 	role = str(run.get("role") or "")
 	goal = str(run.get("goal") or "")

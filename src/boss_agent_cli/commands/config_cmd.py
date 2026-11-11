@@ -72,6 +72,37 @@ def config_group(ctx: click.Context) -> None:
 		ctx.invoke(config_list_cmd)
 
 
+def _render_config_list(data: dict[str, Any]) -> None:
+	"""TTY 下的配置列表：结构化配置在表格里占位，完整 JSON 放到表格下方。
+
+	``automation`` 的字典 repr 有二十多行，塞进 ``max_width=25`` 的单元格后既挤满
+	表格，又会把两条话术截成省略号——用户反而看不到自己配的内容。
+	"""
+	items: list[dict[str, Any]] = data["items"]
+	structured = {item["key"]: item["value"] for item in items if isinstance(item["value"], dict)}
+	rows = [
+		{**item, "value": "（JSON，见下方）" if item["key"] in structured else item["value"]}
+		for item in items
+	]
+	render_simple_list(
+		rows,
+		f"配置 ({data['config_path']})",
+		[
+			("key", "key", "cyan"),
+			("value", "value", "green"),
+			("source", "source", "dim"),
+		],
+	)
+	if not structured:
+		return
+	from boss_agent_cli import display
+
+	for key, value in structured.items():
+		display.console.print()
+		display.console.print(f"[bold]{key}[/bold]")
+		display.console.print_json(json.dumps({key: value}, ensure_ascii=False, sort_keys=True))
+
+
 @config_group.command("list")
 @click.pass_context
 def config_list_cmd(ctx: click.Context) -> None:
@@ -105,17 +136,33 @@ def config_list_cmd(ctx: click.Context) -> None:
 		ctx,
 		"config",
 		data,
-		render=lambda d: render_simple_list(
-			d["items"],
-			f"配置 ({d['config_path']})",
-			[
-				("key", "key", "cyan"),
-				("value", "value", "green"),
-				("source", "source", "dim"),
-			],
-		),
+		render=_render_config_list,
 		hints=hints,
 	)
+
+
+def _render_config_result(data: dict[str, Any], *, title: str, next_actions: list[str]) -> None:
+	"""``config get/set/reset`` 的 TTY 渲染：结构化值改用格式化 JSON。
+
+	``automation`` 的 repr 把两段十一字段字典挤在一个面板里，单引号与折行让
+	「当前值」和「默认值 / 上一次的值」很难读，也难以对比。
+	"""
+	structured = {k: v for k, v in data.items() if isinstance(v, dict)}
+	flat = {**data, **{k: "（JSON，见下方）" for k in structured}}
+	render_action_result(flat, title=title, next_steps=next_actions)
+	if not structured:
+		return
+	payload: dict[str, Any] = {}
+	for key in ("value", "default", "previous"):
+		if key not in structured:
+			continue
+		# 与当前值相同的字段只展开一次：默认值场景下重复打印两份相同 JSON 没有信息量。
+		if key == "value" or structured[key] != structured.get("value"):
+			payload[key] = structured[key]
+	from boss_agent_cli import display
+
+	display.console.print()
+	display.console.print_json(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 @config_group.command("get")
@@ -144,7 +191,7 @@ def config_get_cmd(ctx: click.Context, key: str) -> None:
 		ctx,
 		"config",
 		data,
-		render=lambda d: render_action_result(d, title="config get", next_steps=next_actions),
+		render=lambda d: _render_config_result(d, title="config get", next_actions=next_actions),
 		hints={"next_actions": next_actions},
 	)
 
@@ -220,7 +267,7 @@ def config_set_cmd(ctx: click.Context, key: str, value: str) -> None:
 		ctx,
 		"config",
 		data,
-		render=lambda d: render_action_result(d, title="config set", next_steps=next_actions),
+		render=lambda d: _render_config_result(d, title="config set", next_actions=next_actions),
 		hints={"next_actions": next_actions},
 	)
 
@@ -253,7 +300,7 @@ def config_reset_cmd(ctx: click.Context, key: str) -> None:
 		ctx,
 		"config",
 		data,
-		render=lambda d: render_action_result(d, title="config reset", next_steps=next_actions),
+		render=lambda d: _render_config_result(d, title="config reset", next_actions=next_actions),
 		hints={"next_actions": next_actions},
 	)
 

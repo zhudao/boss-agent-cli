@@ -2,6 +2,52 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## [Unreleased]
+
+### Added
+- 文档补齐 `boss schema --format mcp-tools`：能力真源支持四种导出格式，但命令参考（中英）与两份 README 只列了 `native` / `openai-tools` / `anthropic-tools`，照文档读会以为没有 MCP Tools 导出（实际输出 78 个工具，与 `mcp_tools.TOOLS` 逐名一致）。现在命令参考示例与 README 的 schema 说明都补上 `mcp-tools`；文档命令可解析守卫的扫描范围同时扩展到 `mcp-server/README.md` / `.en.md`，受检示例由 245 条增至 253 条（共收集 269 行）。
+- 新增 eval 场景工具引用守卫 `tests/test_eval_harness.py::test_eval_scenarios_only_reference_shipped_tools_and_declared_arguments`：fixture 模式只重放脚本里的 `tool_calls` 并按同名断言，不经过工具解析——MCP 工具或参数改名后 fixture 仍 4/4 通过，只有人工跑外部 eval 才会暴露。现在逐个校验 `required_tools` / `required_arguments` / fixture `tool_calls` 的 13 处引用：工具名必须存在于 MCP 工具目录，参数名必须在对应工具的 `inputSchema.properties` 里；`forbidden_tools` 允许写不存在的「反面工具」（如 `browser_scrape`），不参与断言。变异验证：工具名改成 `boss_searchh`、参数名改成 `welfares` 均触发失败。
+- 新增 `boss_command_for_ctx` 字面量守卫 `tests/test_cli_invariants.py::test_boss_command_for_ctx_literals_are_accepted_by_the_cli`：`hints` / `recovery_action` 里的命令大多由 `boss_command_for_ctx(ctx, "...")` 拼出，实参不含 `boss` 前缀、也不经过现有 `next_actions` 字面量扫描，选项写错时只有 Agent 真正执行 hint 才会失败。现在按 AST 收集全部 195 个可静态求值的调用点（f-string 片段与 `<占位符>` 掩码成合法取值），跳过 `.split(" ")` 取前缀再拼接的 `batch-greet` 调用，逐条追加 `--help` 交给 CLI 解析（不执行命令）。变异验证：把 `digest --format md` 改成 `--formats` 即触发失败。
+- 新增文档命令可解析守卫 `tests/test_open_source_docs.py::test_documented_boss_commands_parse_with_click`：README 与 `docs/` 下 shell 代码块里以 `boss ` 开头的示例命令，会被提取并按 CLI 的 Group 树下钻到目标命令跑一次参数解析（不执行回调）；`<security_id>` 这类角度占位符掩码成合法取值后继续解析，JSON 片段、变量、PowerShell 续行与管道行整行跳过，另设 150 条检查下限防止提取失效——受检示例 245 条，占位符行里的选项拼写错误同样会被发现。审查当期即发现两处真实缺陷：中英文 README 的 `boss config reset` 缺少必需的 `KEY` 参数（照抄会收到 `Missing parameter: key`），已改为 `boss config reset log_level`。变异验证：还原旧示例、或把 `boss shortlist add <security_id> <job_id> --tags` 的 `--tags` 写成 `--tagz`，守卫均立即失败。
+- 新增 MCP 参数映射契约守卫 `tests/test_mcp_args_contract.py`：`_build_args` 是 MCP 与 CLI 之间唯一的手写映射层，参数名与选项名不一致（`tag` → `--label`、`limit` → `--count`）、枚举拼错或漏写 `--` 前缀时，工具目录与 schema 都看不出问题，只会在真实 MCP 会话里变成 Click 用法错误。现在按 78 个工具的 `inputSchema` 自动生成样例参数，解析到目标命令后跑一次完整的 Click 参数解析（不执行命令回调），映射写错会在本地门禁直接失败。变异验证：把 `mark` 的 `--label` 改成 `--tag` 即触发失败。
+- 新增 mypy 严格清单完整性守卫（Issue #785）：`CLAUDE.md` 要求新模块加入 `[[tool.mypy.overrides]]` 严格列表，但此前没有守卫，只能靠人肉发现；#783 收尾后仍有 8 个包的 `__init__.py` 漏登记。现在这 8 个包补入清单，`tests/test_quality_gates.py::test_mypy_strict_overrides_cover_every_source_module` 按 mypy 语义（`foo.bar` 不覆盖子模块，须写 `foo.bar.*`）双向断言：源码里每个模块都被严格条目覆盖，且清单里没有已不存在的模块。变异验证删条目 / 加假模块均能触发失败。
+- 新增 `docs/README.md` 与英文版作为文档索引（Issue #769）：`docs/` 下 20+ 篇文档此前没有导航页，GitHub 浏览时只能看到平铺文件列表；索引按入门 / 核心参考 / Agent 接入 / 边界与安全 / 集成 / ADR / 维护者 / 研究分类，只链接 git 跟踪的文件，双语文档守卫与相对链接守卫自动覆盖。同时把相对链接守卫扩展到尚未 `git add` 的新文件（`--others --exclude-standard`），本地新建文档里的死链也能在提交前发现。
+- 新增两条双语文档守卫（Issue #751）：`tests/test_open_source_docs.py::test_bilingual_docs_share_the_same_heading_structure` 要求 12 对中英对照文档的标题层级序列一致，一侧新增章节而另一侧没跟上就失败；`::test_troubleshooting_error_tables_list_the_same_registered_codes` 要求两个排障文档的错误码表列出同一组码，且每个码都在 `ERROR_CODES` 里登记。
+- 修复 Markdown 相对链接死链并加守卫（Issue #761）：`CHANGELOG.md` 曾链到从未提交的 `docs/research/platforms/zhaopin.md`，读者点开是 404；该历史条目改为纯文本路径。新增 `test_markdown_relative_links_resolve`，扫描 git 跟踪的全部 `.md`，去掉代码围栏后检查每个相对链接目标存在，并设 200 个链接的检查下限防止正则失效后空转。
+- README 中英「支持」节补上安全报告入口（Issue #759）：此前 `SECURITY.md` 只被 SUPPORT 与 issue 模板引用，README 正文没有链接；现在明确「安全漏洞请私密报告，不要公开提 Issue」，并把 README 的 `SECURITY.md` 可达性并入 `test_support_docs_route_every_request_channel` 守卫。
+- 行为准则接入入口文档（Issue #757）：`CODE_OF_CONDUCT.md` 此前在仓库根目录但全仓库没有任何链接，GitHub 社区健康页之外不可达；README 中英「贡献者」段落、CONTRIBUTING 中英开头均已加入口，并新增 `test_code_of_conduct_is_reachable_from_entry_docs` 守卫。
+- 新增 [SUPPORT.md](SUPPORT.md) 与英文版 [SUPPORT.en.md](SUPPORT.en.md)（Issue #755）：集中说明先看哪些文档、使用问题 / 可复现 Bug / 安全漏洞各自该走哪个渠道、提问要附的信息与脱敏要求、响应预期与 stale 策略；README 中英「支持」一节与 CONTRIBUTING 的「有问题？」段落加入口。双语文档标题结构守卫扩展到 SUPPORT（13 对），新增 `test_support_docs_route_every_request_channel` 守卫四类入口齐全且 README 可到达。
+
+### Changed
+- 配置默认值不再留「能配不生效」的键：`boss config list` 展示的 `automation.default` 改为从 `AutomationConfig()` 派生，与运行时解析器逐字段一致——此前是手写的五字段副本，`platforms` 删除后仍被展示成可用配置，而 `tabs` / `reply_strategy` 等七个真实字段反而看不到；`crawl.default` 删除 `hook_profile` / `hook_dir`，采集只能通过 `boss crawl run --hook-profile ... --hook-dir ...` 显式指定，config.json 里的同名键从未被读取。新增两条守卫：默认值交给正式解析器必须等于全新构造的默认配置，且 `crawl` 默认值只允许采集命令真正读取的六个键。
+- 删除自动化配置里两个从未有消费点的字段：`automation.platforms` 与 `automation.stop_on_page_text`。用户配置它们不会产生任何效果——实际平台由全局 `--platform` 决定，页面风控由 `api/zhipin_errors.py` 的 URL / HTML 内容检测负责。旧 `config.json` 中的这两个键继续被忽略、不会报错；解析结果里不再保留空字段，`AutomationConfig` 字段集合有测试锁住，防止死配置被重新加回。
+- CI 测试矩阵补回 Python 3.13（Issue #791）：`pyproject.toml` 声明支持 3.11–3.14，但矩阵自 #462 重写 CI 起就只有 `["3.11", "3.12", "3.14"]`——3.13 在原来 3.10/3.11/3.12/3.13 的矩阵里被无声丢掉，classifier 却一直保留。现在四个声明版本都在 CI 实测，并新增守卫 `test_ci_test_matrix_covers_declared_python_classifiers` 要求矩阵覆盖 classifiers 里每个 Python 3.x 版本，防止「声明了但不测」回归。CONTRIBUTING、branch-protection 与发布故事中的矩阵描述同步更新。
+- mypy 严格检查白名单补入 15 个遗留模块（Issue #783）：`api.cdp_risk_lock`、`api.egress`、`api.proxy`、`auth.page_identity`、`commands.wizard`、`services.json_files` 与 `wizard/` 下 9 个模块此前没进 `[[tool.mypy.overrides]]`，只做默认检查，而它们正处登录降级链、工作流执行与出口策略这些关键路径。打开严格检查后暴露两处 `no-any-return`，分别用 `_FollowUpBuilder` 类型别名与显式 `cast` 收敛，未使用 `type: ignore`；纯类型层改动，无运行时行为变化。
+- 本地提交门禁与 CI 统一到同一份 ruff（Issue #749）：pre-commit 的 ruff 钩子从 `ruff-pre-commit` v0.8.6 改为 `repo: local` + `uv run ruff check --fix`，直接用 `uv.lock` 里的版本；此前钩子自己装一份，与 CI 的 `uv run ruff check`（0.17.4）长期是两个 linter。`.github/dependabot.yml` 增加 `pre-commit` 生态，`pre-commit-hooks` 升到 v6.0.0；新增 `tests/test_quality_gates.py` 锁住「ruff 只在项目环境里跑」这一约束。
+- 加固 GitHub 工作流（Issue #747）：全部 18 处 `uses:` 从 `@v7` 这类可移动标签改为完整提交 SHA 并在行尾注明精确版本；`release.yml` 的标签名改用 `$GITHUB_REF_NAME`，不再在 `run:` 脚本里展开 `${{ github.ref_name }}`；发布构建关闭 `setup-uv` 缓存，避免 `master` 上 CI 写入的缓存被带进持有 PyPI 令牌的环境；不需要推送的任务（CI、Pages、发布）的 `actions/checkout` 设 `persist-credentials: false`。各工作流的触发条件与行为不变。`tests/test_open_source_docs.py` 新增 6 条离线守卫（SHA 钉版与版本注释、`run:` 不展开表达式、`pull_request_target` 不检出 PR head、发布不吃缓存、checkout 凭据逐任务登记），`docs/maintainer/branch-protection.md` 新增「Workflow rules」一节。
+
+### Fixed
+- 启动期不再静默忽略 `config.json` 里形状错误的 `log_level` 与 `request_delay`：`Logger` 对未知级别用 `_LEVEL_ORDER.get(level, 3)` 回退到 error 阈值，用户以为打开了 debug 却什么都看不到；`request_delay` 写成字符串 / 数字会被静默换成默认 30–60 秒区间，节流配置看起来生效、实际按默认跑。现在两者在启动期按与 `cdp_url` / `browser_source` 相同的规则报 `INVALID_PARAM`（带字段名与收到的值），并保留 `boss config reset <key>` 这条修复路径——config 子命令仍放行。
+- 自动化配置的 `tabs` 与话术字段不再静默变形：`tabs` 旧实现直接迭代给定值，用户把 `tabs` 写成字符串时会被逐字符拆成 `("新", "招", "呼")`——执行层匹配不到任何 tab，自动化空转却报成功；写成 `null` / 数字则抛未包装的 `TypeError`。`questionnaire_message` / `follow_up_message` 旧实现用 `str(...)` 强转，`null` 会变成 `"None"`、空串会发送空消息，而这两个值会原样发给候选人。现在三者都按形状校验：`tabs` 必须是字符串数组，话术必须是非空字符串，错误信息带字段名与收到的值。
+- `boss digest` 的终端输出不再把三段列表塞进面板：`new_matches` / `follow_ups` / `interviews` 都是完整结果项，直接插值进面板会渲染成一大段 dict repr，日报一天几十条时既撑爆面板，也没法扫读。现在面板只保留计数与摘要，三节分别用与 `pipeline` 一致的表格展示（公司 / 职位 / 关系 / 未读 / 最近时间 / 最近消息；面试节为面试时间与状态），空小节不打印占位。JSON 信封输出不变。
+- `boss watch run <名称>` 的终端输出不再把新增职位塞进面板：`new_items` 是完整搜索结果项的列表，一次几十条新职位时整段 dict repr 会撑爆面板，也没法扫读。现在面板只保留 `new_count` / `seen_count` / `total_count` 三个计数，新增职位改用与 `search` 一致的表格展示（标题 / 公司 / 薪资 / 城市）。JSON 信封输出不变。
+- `boss config get/set/reset` 的终端输出在遇到结构化配置时改用格式化 JSON：`automation` / `crawl` 的 Python repr 把两段十一字段字典挤进一个面板，单引号与折行让当前值、「默认值」和「上一次的值」都难读。现在面板内显示占位，完整 JSON 打印在下方；相同内容只展开一次，不同时并列便于对比。JSON 信封输出不变。
+- `boss config list` 的结构化配置不再被截断：`automation` 的字典 repr 有二十多行，塞进 25 宽的值列后挤满表格，两条话术还被截成省略号，用户恰恰看不到自己配了什么。现在表格内显示「（JSON，见下方）」，完整 JSON 以格式化形式打印在表格下方；JSON 信封输出与 `config get` 不受影响。
+- 自动化配置的 `allowed_actions` 不再 fail-open：旧实现把未知动作名静默过滤后 `actions or DEFAULT_ALLOWED_ACTIONS` 回退到默认全集，用户拼错一个枚举值（或写空列表想禁用自动动作）反而放开全部默认写动作。现在未知值与非数组（如字符串）一律报 `ValueError` 并列出有效值；空列表保持为空集合——执行层 `status_for_decision` 会把每个动作判为 `SKIPPED`，与消费点「不在白名单即跳过」的既有语义一致。新增三条测试，变异回旧实现时全部失败。
+- 错误码登记表给两个从未产生的码补上「当前版本不主动产生」标注：`RESUME_NOT_SHARED` 与 `RECRUITER_NOT_AUTHORIZED` 自招聘者模式引入（#379 之前的 f249908）起就登记在 `ERROR_CODES` 里，但源码中没有任何路径产生它们，`boss schema` 却把二者当作普通可恢复码暴露给 Agent。现在 message 与 `COMPLIANCE_BLOCKED` / `CRAWL_PERMISSION_REQUIRED` 等同状态码的措辞一致，并新增 `test_schema_error_codes_mark_never_emitted_codes` 守卫：登记表中未被任何源码字符串引用的码必须带该标注，再出现「登记了但没接线」会直接失败（`UNKNOWN` 这类单词码按完整字面量判断，避开错误码正则的漏判）。
+- 文本脱敏不再吞掉全角标点与后续中文（Issue #789）：`redact_sensitive_text` 用 `[^\s,;]+` 匹配凭据值，全角逗号 / 句号 / 分号 / 括号不是终止符，`stoken=abc）` 会把右括号一起替换掉，`Bearer x，然后` 连后续中文说明也消失——`boss status` 的就绪详情里因此出现过缺右括号的文案。现在值在全角标点处结束，标点与后续文本保留；引号包裹的值仍照常脱敏。新增四类场景测试（旧实现下先红后绿）。
+- 消除出口预检地区表的双真相源（Issue #787）：`api/egress.py` 的 `_REGION_EXPECTATIONS` 把国家映射到 `(语言地区, 时区前缀)`，但时区检查实际查的是 `_TZ_REGION_HINTS`，表里的时区前缀解包后从未使用（ruff RUF059）；两侧未来可能漂移，新增国家漏配时区时检查会静默跳过。现在表只保留语言地区，时区映射以 `_TZ_REGION_HINTS` 为唯一真源，并新增守卫断言两张表的覆盖国家集合一致。同类清理：删除 `wizard/prompts.py` 一处结果从未使用的 `_menu_label_widths` 调用。
+- `boss_favorites_list` 的 `page=0` 不再被静默丢弃（Issue #781）：`_build_args` 用真值判断页码，类型校验放行的 `page=0` 被换成默认第 1 页，调用「成功」却返回了没请求的数据；其他工具对 `page` 都用 `is not None`，非法页码由 CLI 的 `IntRange(1)` 返回 `INVALID_PARAM`。现在 favorites 与其余工具一致，新增两条参数映射测试覆盖 `page=0` 与未传两种情况。
+- MCP 工具的 `inputSchema` 声明 `additionalProperties: false`（Issue #779）：#776 让 `call_tool` 拒绝 `inputSchema.properties` 之外的顶层参数，但 78 个工具的 schema 仍默认允许额外字段，客户端按 schema 校验时不会拦下拼错的参数，Agent 只能靠一次失败的调用才知道契约。现在共享工具目录在构造时统一补上顶层声明，`tools/list` 与 `boss schema --format openai-tools / anthropic-tools / mcp-tools` 同步生效；嵌套对象（如 wizard 的 `inputs`）保持开放。`docs/agent-quickstart` 中英补充说明，并新增三条测试覆盖 MCP 工具目录、嵌套对象边界与三种导出格式。
+- `boss platforms` 的 TTY 表格改走 stderr（Issue #777）：`_render_platforms` 用 `click.echo` 没有 `err=True`，交互式终端下表格进入 stdout，与「stdout 只输出七键 JSON 信封」及 `display.console = Console(stderr=True)` 的约定不一致；管道场景因 `is_json_mode` 判断侥幸正常。两条终端渲染测试同时收紧为断言 `stdout == ""`。
+- MCP 服务端按 `inputSchema` 校验参数类型（Issue #775）：`_build_args` 用 truthiness / `is True` 判断布尔参数，客户端把 `dry_run` / `yes` 传成字符串时，标志位会被静默丢弃或反向生效——`boss_hr_greet` 同时传 `"true"` 会既不预览也不确认，`boss_batch_greet` 传 `"false"` 反而变成预览。现在 `call_tool` 在进入 CLI 前校验 boolean / integer / number / string / array / object，类型不符返回带参数名与期望类型的 `INVALID_PARAM`；未知工具名同样直接返回 `INVALID_PARAM`（提示 `tools/list`），不再落到 `boss <name>` 的 Click 用法错误。`docs/agent-quickstart` 中英同步说明，并新增三条测试覆盖类型拒绝、正常布尔翻译与未知工具。
+- 修正 ROADMAP 中已取代的运行模式描述（Issue #773）：中英「治理与合规」把「敏感命令默认阻断」（ADR 0001）与「schema / MCP 模式过滤」（ADR 0002）写成现行能力，而两份 ADR 顶部已标注 Superseded by the 2026-08 open-capability design，`compliance.py` 也明确两种模式权限一致。现在两项保留为历史完成项并注明取代关系与当前边界（平台风控 + 有界长流程），新增 `test_roadmap_describes_current_mode_semantics` 禁止旧表述回归。
+- 移除 README 残留的 MCP Toplist badge 并对齐政策（Issue #771）：两个 README 首屏的 `mcptoplist.com` badge 由外部提交于 2026-07-28 加入，与 2026-05-03 制定的 `docs/maintainer/readme-badge-policy.md`「第三方目录站导流 badge 默认不允许」冲突，且当时未走准入评审。现在删除 badge，政策文档新增「当前首页 badge 清单」记录五个真源 badge 与该移除项，并新增 `test_readme_badges_come_from_approved_sources` 守卫 README 中英的外链图片只能来自 `img.shields.io` / `github.com` / `codecov.io`，同时要求政策文档维持该清单。
+- 补全 `scripts/README.md` 的脚本索引（Issue #767）：`quality_baseline.py`、`capture_request_identity.py`、`package_portable.py`、`update_contributors.py` 此前没有条目，只能靠读源码发现；新增 `test_scripts_readme_indexes_every_script` 守卫，`scripts/` 下的非下划线脚本必须出现在索引里。
+- 对齐 CONTRIBUTING 的本地验证矩阵（Issue #765）：中英版本此前只列手搓的 pytest / ruff / mypy，没有仓库实际推荐的一键门禁 `scripts/quality_baseline.py`，也没提 `scripts/smoke_p0.py` 与 `evals/run_eval.py --mode fixture`；现在先给一键门禁，单步命令降为备选，并补上 MCP eval 必须独立终端运行的约束。新增守卫检查两份文档都提到这三个入口。
+- 对齐 `SECURITY.md` 的运行边界描述（Issue #763）：原文称「默认启用低风险辅助模式……不批量触达、不抓取平台数据」，与 `compliance.py` 的「两种模式权限一致」及实际 `batch-greet` / `crawl` 能力不符；现改为说明模式仅为兼容保留、真正边界是平台风控硬边界与有界长流程，保留原有 Cookie/Token、本地数据与导出防护条目。新增守卫禁止该过时表述回归。
+- 修复中英排障文档的结构漂移（Issue #751）：中文版此前只有 8 个 H2，缺英文版已有的「登录问题」「浏览器 / patchright 问题」「搜索 / 接口错误」「术语表」分节，以及 `JOB_NOT_FOUND`、`ALREADY_APPLIED`、`AI_API_ERROR`、`AI_PARSE_ERROR` 四个错误码；英文版缺 `PLATFORM_NOT_SUPPORTED` 与 Windows CDP 启动脚本。两版现按同一标题结构组织，`JOB_NOT_FOUND` / `ALREADY_APPLIED` 的恢复建议对齐 `ERROR_CODES` 登记表。
+
 ## [3.2.2] - 2026-11-09
 
 ### Added
@@ -815,7 +861,7 @@
 
 #### ZhilianPlatform 自证（PR #134）
 - `src/boss_agent_cli/platforms/zhilian.py` — 智联招聘 stub 实现
-- 包络适配按 [zhaopin.md](docs/research/platforms/zhaopin.md) §4 完整实现（`code==200` / `data` key / 401+403+429 映射）
+- 包络适配按 `docs/research/platforms/zhaopin.md` §4 完整实现（`code==200` / `data` key / 401+403+429 映射；该研究文档未随仓库发布，故不加链接）
 - P0/P1/P2 方法抛 `NotImplementedError("Week 2 待实现")`
 - 27 条契约测试覆盖元信息 / 包络适配 / stub 行为 / CLI 集成
 

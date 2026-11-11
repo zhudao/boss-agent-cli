@@ -4,6 +4,8 @@ Thanks for your interest in `boss-agent-cli`! This guide is the English companio
 
 Before your first contribution, complete the local preflight and developer verification in [Getting Started](docs/getting-started.en.md). Before changing code, read [Architecture](docs/architecture.en.md) to understand the envelope contract, platform abstraction and risk boundary.
 
+By participating (issues, pull requests, discussions) you agree to follow our [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Development Environment
 
 ```bash
@@ -33,14 +35,27 @@ Python **≥ 3.11** is required. We use [`uv`](https://github.com/astral-sh/uv) 
 
 ## Local Verification
 
-Run the full matrix before submitting code changes:
+Before submitting code changes, run the one-shot gate (ruff + full offline test suite + mypy):
+
+```bash
+uv run python scripts/quality_baseline.py
+```
+
+Run individual steps only to narrow down a failure:
 
 ```bash
 uv run pytest tests/ -q
-uv run ruff check src/ tests/
+uv run ruff check src/ tests/ scripts/ mcp-server/
 uv run mypy src/boss_agent_cli
 uv run boss --help
 uv run boss schema --format native
+```
+
+Before opening a PR, also run the offline smoke contract and the MCP eval (the eval must run in a standalone terminal, not nested inside an Agent session):
+
+```bash
+BOSS_SMOKE_DRY_RUN=1 uv run python scripts/smoke_p0.py
+uv run python evals/run_eval.py --mode fixture
 ```
 
 For documentation-only changes, run at least:
@@ -70,7 +85,7 @@ Before investing in promotion, examples, or integrations, check those passive si
    ```
 5. **Commit** atomically — one logical change per commit.
 6. **Push** and open a PR against `master`.
-7. **CI green** is a hard prerequisite before merge: the `CI` workflow runs ruff / mypy / pre-commit and tests on Python 3.11, 3.12 and 3.14 for every PR (fork PRs included, no secrets needed), plus CodeQL and GitGuardian scans. Tests are fully offline; don't add tests that need the network, a real browser or a real account.
+7. **CI green** is a hard prerequisite before merge: the `CI` workflow runs ruff / mypy / pre-commit and tests on Python 3.11, 3.12, 3.13 and 3.14 for every PR (fork PRs included, no secrets needed), plus CodeQL and GitGuardian scans. Tests are fully offline; don't add tests that need the network, a real browser or a real account.
 
 Maintainers will `squash merge`, so the squash title must follow the commit convention above.
 
@@ -198,4 +213,4 @@ You don't need to write code to help:
 
 ## Questions?
 
-Open a [Discussion](https://github.com/can4hou6joeng4/boss-agent-cli/discussions) or comment on a related [Issue](https://github.com/can4hou6joeng4/boss-agent-cli/issues).
+Open a [Discussion](https://github.com/can4hou6joeng4/boss-agent-cli/discussions) or comment on a related [Issue](https://github.com/can4hou6joeng4/boss-agent-cli/issues). For every channel and what to include, see [Getting Support](SUPPORT.en.md).
