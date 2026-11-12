@@ -121,8 +121,14 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_status",
-			description="检查 BOSS 直聘登录态",
-			input_schema={"type": "object", "properties": {}, "required": []},
+			description="检查 BOSS 直聘登录态；默认只查本地登录态，live 会发一次只读在线验证请求",
+			input_schema={
+				"type": "object",
+				"properties": {
+					"live": {"type": "boolean", "description": "执行一次只读在线验证（默认仅检查本地登录态）", "default": False},
+				},
+				"required": [],
+			},
 		),
 		ToolDefinition(
 			name="boss_doctor",
@@ -131,7 +137,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_search",
-			description="按关键词和筛选条件搜索 BOSS 直聘职位列表。支持城市、薪资、经验、学历、福利等多维度筛选。",
+			description="按关键词和筛选条件搜索 BOSS 直聘职位列表。支持城市、薪资、经验、学历、行业、公司规模、融资阶段、职位类型、福利等多维度筛选；成功时 pagination.index_snapshot 给出本次写入的索引快照（source/page/count/saved_at），与 boss_show 的编号配套使用。",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -140,6 +146,10 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"salary": {"type": "string", "description": "薪资范围（如 20-50K）"},
 					"experience": {"type": "string", "description": "经验要求（如 3-5年）"},
 					"education": {"type": "string", "description": "学历要求（如 本科）"},
+					"industry": {"type": "string", "description": "行业类型，支持逗号分隔多选"},
+					"scale": {"type": "string", "description": "公司规模（如 100-499人），支持逗号分隔多选"},
+					"stage": {"type": "string", "description": "融资阶段（如 已上市、A轮），支持逗号分隔多选"},
+					"job_type": {"type": "string", "description": "职位类型（全职/兼职/实习），支持逗号分隔多选"},
 					"welfare": {"type": "string", "description": "福利筛选，逗号分隔 AND 逻辑（如 双休,五险一金）"},
 					"active": {
 						"type": "string",
@@ -147,6 +157,8 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 						"description": "只保留 HR 活跃度不低于该档的职位；online 只看列表、请求量与普通搜索相同，其余档位列表看不出时会逐个查详情（更慢、风控风险更高），活跃度未知的职位会被排除并写进 hints.active_filter",
 					},
 					"page": {"type": "integer", "description": "页码", "default": 1},
+					"no_cache": {"type": "boolean", "description": "跳过缓存，强制重新请求", "default": False},
+					"with_score": {"type": "boolean", "description": "附加匹配分和原因（使用本地简历）", "default": False},
 					"sort": {"type": "string", "enum": ["relevance", "score"], "description": "排序方式", "default": "relevance"},
 				},
 				"required": ["query"],
@@ -155,11 +167,12 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		*crawl_tool_definitions(data),
 		ToolDefinition(
 			name="boss_recommend",
-			description="获取基于简历的个性化职位推荐",
+			description="获取基于简历的个性化职位推荐；成功时 pagination.index_snapshot 给出本次写入的索引快照（source/page/count/saved_at），与 boss_show 的编号配套使用。",
 			input_schema={
 				"type": "object",
 				"properties": {
 					"page": {"type": "integer", "description": "页码", "default": 1},
+					"with_score": {"type": "boolean", "description": "附加匹配分和原因（使用本地简历）", "default": False},
 				},
 				"required": [],
 			},
@@ -172,6 +185,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				"properties": {
 					"security_id": {"type": "string", "description": "职位的 security_id"},
 					"job_id": {"type": "string", "description": "encrypt_job_id，传入可走快速通道"},
+					"lid": {"type": "string", "description": "与 security_id 同一列表项的访问上下文（取自 search 结果，可选）"},
 				},
 				"required": ["security_id"],
 			},
@@ -190,20 +204,26 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_chat",
-			description="查看沟通列表，支持按发起方和时间筛选。返回项含稳定标识 uid，可用于 boss_chatmsg / boss_mark / boss_exchange。",
+			description="查看沟通列表，支持按发起方和时间筛选。返回项含稳定标识 uid，可用于 boss_chatmsg / boss_mark / boss_exchange。分页证据见 pagination.page / has_more（仅平台给出布尔 hasMore 时非 null）。",
 			input_schema={
 				"type": "object",
 				"properties": {
 					"from_who": {"type": "string", "enum": ["boss", "me"], "description": "筛选发起方"},
 					"days": {"type": "integer", "description": "只显示最近 N 天的记录"},
 					"page": {"type": "integer", "description": "页码", "default": 1},
+					"format": {
+						"type": "string",
+						"enum": ["html", "md", "csv", "json"],
+						"description": "导出格式；指定后把沟通列表写入文件而不是返回列表",
+					},
+					"output_file": {"type": "string", "description": "导出文件路径（不指定则保存到配置的 export_dir）"},
 				},
 				"required": [],
 			},
 		),
 		ToolDefinition(
 			name="boss_me",
-			description="获取当前登录用户信息（基本信息、简历、求职期望、投递记录）",
+			description="获取当前登录用户信息（基本信息、简历、求职期望、投递记录）；仅 section=deliver 的信封 pagination 给出投递列表分页证据，has_more 仅平台返回布尔 hasMore 时有效，缺失或类型不明确时为 null",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -212,6 +232,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 						"enum": ["user", "resume", "expect", "deliver"],
 						"description": "指定查看的部分",
 					},
+					"deliver_page": {"type": "integer", "minimum": 1, "description": "投递记录页码", "default": 1},
 				},
 				"required": [],
 			},
@@ -228,12 +249,18 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_history",
-			description="查看浏览历史",
-			input_schema={"type": "object", "properties": {}, "required": []},
+			description="查看浏览历史，支持 --page 翻页",
+			input_schema={
+				"type": "object",
+				"properties": {
+					"page": {"type": "integer", "description": "页码", "default": 1},
+				},
+				"required": [],
+			},
 		),
 		ToolDefinition(
 			name="boss_chatmsg",
-			description="查看与指定好友的聊天消息历史",
+			description="查看与指定好友的聊天消息历史；信封 pagination 给出所读消息页证据（page / has_more / has_more_source / total）",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -247,11 +274,13 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_chat_summary",
-			description="基于聊天历史生成结构化摘要与下一步建议",
+			description="基于聊天历史生成结构化摘要与下一步建议；信封 pagination 给出所读消息页证据（page / has_more / has_more_source / total）",
 			input_schema={
 				"type": "object",
 				"properties": {
 					"security_id": {"type": "string", "description": "好友的 uid（推荐，取自 boss_chat，跨请求稳定）或 security_id"},
+					"page": {"type": "integer", "description": "消息页码", "default": 1},
+					"count": {"type": "integer", "description": "每页消息数量", "default": 20},
 				},
 				"required": ["security_id"],
 			},
@@ -294,13 +323,20 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_batch_greet",
-			description="搜索后批量打招呼（上限 10）",
+			description="搜索后批量打招呼（上限 10）；筛选条件与搜索一致，未传时默认最多 5 个",
 			input_schema={
 				"type": "object",
 				"properties": {
 					"query": {"type": "string", "description": "搜索关键词"},
 					"city": {"type": "string", "description": "城市名称"},
-					"limit": {"type": "integer", "description": "最大打招呼数量", "default": 5},
+					"salary": {"type": "string", "description": "薪资范围（如 20-50K）"},
+					"experience": {"type": "string", "description": "经验要求（如 3-5年）"},
+					"education": {"type": "string", "description": "学历要求（如 本科）"},
+					"industry": {"type": "string", "description": "行业类型（可选值见 boss schema）"},
+					"scale": {"type": "string", "description": "公司规模（如 100-499人）"},
+					"stage": {"type": "string", "description": "融资阶段（如 已上市、A轮）"},
+					"job_type": {"type": "string", "description": "职位类型（全职/兼职/实习）"},
+					"limit": {"type": "integer", "description": "最大打招呼数量", "default": 5, "minimum": 0, "maximum": 10},
 					"dry_run": {"type": "boolean", "description": "预览模式", "default": False},
 				},
 				"required": ["query"],
@@ -308,7 +344,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_show",
-			description="按编号快速查看上次搜索或推荐结果中的职位详情",
+			description="按编号快速查看上次搜索或推荐结果中的职位详情；返回的 index_snapshot 给出编号所属快照的来源、页码、条数与保存时间",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -344,7 +380,13 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		ToolDefinition(
 			name="boss_pipeline",
 			description="聚合聊天和面试数据，生成统一候选进度视图",
-			input_schema={"type": "object", "properties": {}, "required": []},
+			input_schema={
+				"type": "object",
+				"properties": {
+					"days_stale": {"type": "integer", "minimum": 0, "description": "超过 N 天未推进则标记为 follow_up", "default": 3},
+				},
+				"required": [],
+			},
 		),
 		ToolDefinition(
 			name="boss_follow_up",
@@ -391,6 +433,13 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				"properties": {
 					"dry_run": {"type": "boolean", "description": "仅预览不删除", "default": False},
 					"all": {"type": "boolean", "description": "全量清理", "default": False},
+					"days": {
+						"type": "integer",
+						"minimum": 0,
+						"maximum": 36500,
+						"description": "清理超过指定天数的快照和导出文件",
+						"default": 30,
+					},
 				},
 				"required": [],
 			},
@@ -402,6 +451,8 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				"type": "object",
 				"properties": {
 					"days": {"type": "integer", "description": "统计窗口天数", "default": 30},
+					"format": {"type": "string", "enum": ["json", "html"], "description": "输出格式；html 生成自包含报表", "default": "json"},
+					"output_file": {"type": "string", "description": "HTML 输出路径（仅 format=html 时生效）"},
 				},
 				"required": [],
 			},
@@ -671,7 +722,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_favorites_list",
-			description="预览 BOSS 职位收藏单页及有效状态（不落库）",
+			description="预览 BOSS 职位收藏单页及有效状态（不落库）。分页证据见 pagination.has_more / has_more_source（缺失 hasMore 时为 null）。",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -688,6 +739,11 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				"properties": {
 					"security_id": {"type": "string", "description": "职位安全 ID"},
 					"job_id": {"type": "string", "description": "加密职位 ID"},
+					"title": {"type": "string", "default": "", "description": "职位名称（可选，便于本地列表识别）"},
+					"company": {"type": "string", "default": "", "description": "公司名称（可选）"},
+					"city": {"type": "string", "default": "", "description": "城市（可选）"},
+					"salary": {"type": "string", "default": "", "description": "薪资（可选）"},
+					"source": {"type": "string", "default": "manual", "description": "来源，如 search/recommend/show/manual"},
 					"lid": {"type": "string", "default": "", "description": "与 security_id 同一列表项的访问上下文（可选；不推断有效期）"},
 					"tags": {"type": "string", "description": "本地标签，逗号分隔"},
 					"note": {"type": "string", "description": "本地备注"},
@@ -745,6 +801,10 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"salary": {"type": "string", "description": "薪资范围（可选）"},
 					"experience": {"type": "string", "description": "经验要求（可选）"},
 					"education": {"type": "string", "description": "学历要求（可选）"},
+					"industry": {"type": "string", "description": "行业类型，支持逗号分隔多选（可选）"},
+					"scale": {"type": "string", "description": "公司规模，支持逗号分隔多选（可选）"},
+					"stage": {"type": "string", "description": "融资阶段，支持逗号分隔多选（可选）"},
+					"job_type": {"type": "string", "description": "职位类型（全职/兼职/实习），支持逗号分隔多选（可选）"},
 					"welfare": {"type": "string", "description": "福利筛选（可选）"},
 					"active": {
 						"type": "string",
@@ -776,6 +836,13 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"query": {"type": "string", "description": "搜索关键词"},
 					"city": {"type": "string", "description": "城市（可选）"},
 					"salary": {"type": "string", "description": "薪资范围（可选）"},
+					"experience": {"type": "string", "description": "经验要求（可选）"},
+					"education": {"type": "string", "description": "学历要求（可选）"},
+					"industry": {"type": "string", "description": "行业类型，支持逗号分隔多选（可选）"},
+					"scale": {"type": "string", "description": "公司规模，支持逗号分隔多选（可选）"},
+					"stage": {"type": "string", "description": "融资阶段，支持逗号分隔多选（可选）"},
+					"job_type": {"type": "string", "description": "职位类型（全职/兼职/实习），支持逗号分隔多选（可选）"},
+					"welfare": {"type": "string", "description": "福利筛选（可选）"},
 				},
 				"required": ["name", "query"],
 			},
@@ -798,7 +865,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_hr_applications",
-			description="招聘者模式：查看候选人投递申请列表",
+			description="招聘者模式：查看候选人投递申请列表；结果信封 pagination 给出平台 hasMore 证据（缺失为 null）",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -811,7 +878,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_hr_candidates",
-			description="招聘者模式：搜索候选人",
+			description="招聘者模式：搜索候选人；结果信封 pagination 给出平台 hasMore 证据（缺失为 null）",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -833,7 +900,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_hr_recommendations",
-			description="招聘者模式：读取推荐牛人完整卡片和首次开聊所需参数",
+			description="招聘者模式：读取推荐牛人完整卡片和首次开聊所需参数；结果信封 pagination 给出平台 hasMore 证据（缺失为 null）",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -863,21 +930,45 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 			},
 		),
 		ToolDefinition(
+			name="boss_hr_location",
+			description="招聘者模式：向已有会话发送工作地点卡片；需操作者明确批准，同一会话不重复发送",
+			input_schema={
+				"type": "object",
+				"properties": {
+					"friend_id": {"type": "integer", "minimum": 1, "description": "候选人会话 friend_id"},
+					"yes": {
+						"type": "boolean",
+						"default": False,
+						"description": "人工确认位；只有操作者明确批准向该会话发送工作地点后才置 true，不得自行推断",
+					},
+					"dry_run": {"type": "boolean", "default": False, "description": "只预览，不请求平台、不写发送记录"},
+				},
+				"required": ["friend_id"],
+			},
+		),
+		ToolDefinition(
 			name="boss_hr_chat",
-			description="招聘者模式：查看与候选人的沟通列表（含未读数和最近消息摘要）",
+			description="招聘者模式：查看与候选人的沟通列表（含未读数和最近消息摘要）；结果信封 pagination 给出平台 hasMore 证据（缺失为 null）",
 			input_schema={
 				"type": "object",
 				"properties": {
 					"page": {"type": "integer", "description": "页码", "default": 1},
 					"job_id": {"type": "string", "description": "按职位筛选"},
 					"label_id": {"type": "integer", "description": "标签筛选（0=全部, 1=新招呼, 2=沟通中）", "default": 0},
+					"summary_limit": {
+						"type": "integer",
+						"description": "最多给前多少个会话补最近消息（每 50 个一次串行请求；0=不请求，上限 300）",
+						"default": 100,
+						"minimum": 0,
+						"maximum": 300,
+					},
 				},
 				"required": [],
 			},
 		),
 		ToolDefinition(
 			name="boss_hr_chatmsg",
-			description="招聘者模式：查看与指定候选人的聊天消息历史",
+			description="招聘者模式：查看与指定候选人的聊天消息历史；信封 pagination 给出游标分页证据（has_more / next_max_msg_id）",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -890,7 +981,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_hr_last_messages",
-			description="招聘者模式：批量查看候选人最近消息摘要",
+			description="招聘者模式：批量查看候选人最近消息摘要；按页取沟通列表时信封 pagination 给出平台 hasMore 证据（--friend-id 直查为 null）",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -902,6 +993,13 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"page": {"type": "integer", "description": "沟通列表页码", "default": 1},
 					"job_id": {"type": "string", "description": "按职位筛选"},
 					"label_id": {"type": "integer", "description": "标签筛选（0=全部, 1=新招呼, 2=沟通中）", "default": 0},
+					"limit": {
+						"type": "integer",
+						"description": "最多查询多少个会话（每 50 个一次串行请求，上限 300）",
+						"default": 100,
+						"minimum": 1,
+						"maximum": 300,
+					},
 				},
 				"required": [],
 			},

@@ -15,6 +15,7 @@ from boss_agent_cli.api.request_budget import RequestBudgetExceeded, request_con
 from boss_agent_cli.auth.manager import AuthRequired, TokenRefreshFailed
 from boss_agent_cli.display import (
 	INTERNAL_ERROR_TYPES,
+	boss_command,
 	error_contract_for_code,
 	risk_error_contract,
 	risk_error_message,
@@ -69,6 +70,8 @@ class WorkflowControl:
 	step_name: str
 	store: WorkflowStore
 	deadline: float | None = None
+	# 超时恢复命令必须回到本次运行的数据目录；None 时保持通用示例。
+	resume_action: str | None = None
 
 	def poll(self) -> str | None:
 		run = self.store.get(self.run_id)
@@ -100,7 +103,8 @@ class WorkflowControl:
 				"WORKFLOW_TIMEOUT",
 				"workflow 超过设定时限",
 				recoverable=True,
-				recovery_action=f"boss wizard --resume {shell_argument(self.run_id)}",
+				recovery_action=self.resume_action
+				or f"boss wizard --resume {shell_argument(self.run_id)}",
 			)
 
 
@@ -122,6 +126,13 @@ class WorkflowRunner:
 		if max_retries < 0:
 			raise ValueError("max_retries must be >= 0")
 		started_at = time.monotonic()
+		data_dir = getattr(context, "data_dir", None)
+		login_action = boss_command("login", platform_name=plan.platform, data_dir=data_dir)
+
+		def resume_action_for(target: str) -> str:
+			return boss_command(
+				f"wizard --resume {shell_argument(target)}", platform_name=plan.platform, data_dir=data_dir
+			)
 		deadline = started_at + timeout_seconds if timeout_seconds is not None else None
 		run_id = run_id or f"wrn_{secrets.token_urlsafe(12)}"
 		existing = self._store.get(run_id)
@@ -148,7 +159,14 @@ class WorkflowRunner:
 				continue
 			if step["status"] == WorkflowStatus.COMPLETED.value:
 				prior_results[step["step_name"]] = step["result"]
-			elif step["status"] == WorkflowStatus.WAITING_INPUT.value:
+			elif step["status"] in {
+				WorkflowStatus.WAITING_INPUT.value,
+				WorkflowStatus.FAILED.value,
+				WorkflowStatus.RUNNING.value,
+			}:
+				# 失败/中断的步骤仍会重跑，但它可能已通过 bind_inner_run 绑定了内部可恢复
+				# 任务（如 crawl run_id）：把 result 交给 action，让 crawl_start 续跑而不是
+				# 新建一份采集（Issue #882）。
 				waiting_priors[step["step_name"]] = step["result"]
 		pending_steps = [name for name in plan.requested_steps if name not in prior_results]
 		if pending_steps and pending_steps[0] in blocked_steps:
@@ -183,7 +201,7 @@ class WorkflowRunner:
 					step_name,
 					code="WORKFLOW_TIMEOUT",
 					message=f"workflow 超过 {timeout_seconds:g} 秒未完成",
-					recovery_action=f"boss wizard --resume {shell_argument(run_id)}",
+					recovery_action=resume_action_for(run_id),
 				)
 			if on_event:
 				on_event("step_started", step_name, None)
@@ -192,8 +210,14 @@ class WorkflowRunner:
 				status=WorkflowStatus.RUNNING.value,
 				current_step=step_name,
 			)
-			self._store.update_step(run_id, step_name, status=WorkflowStatus.RUNNING.value)
-			control = WorkflowControl(run_id, step_name, self._store, deadline)
+			self._store.update_step(
+				run_id,
+				step_name,
+				status=WorkflowStatus.RUNNING.value,
+				# 重跑前保留此前的 result（可能含内部 crawl 绑定），否则中断后再恢复就找不到原任务。
+				result=waiting_priors.get(step_name),
+			)
+			control = WorkflowControl(run_id, step_name, self._store, deadline, resume_action=resume_action_for(run_id))
 			with_control = getattr(context, "with_workflow_control", None)
 			action_context = with_control(control) if callable(with_control) else context
 			try:
@@ -221,10 +245,10 @@ class WorkflowRunner:
 						if on_event:
 							on_event("step_retrying", step_name, {"attempt": attempt, "code": exc.code})
 			except AuthRequired as exc:
-				error = WorkflowActionError("AUTH_REQUIRED", str(exc), recoverable=True, recovery_action="boss login")
+				error = WorkflowActionError("AUTH_REQUIRED", str(exc), recoverable=True, recovery_action=login_action)
 			except TokenRefreshFailed as exc:
 				error = WorkflowActionError(
-					"TOKEN_REFRESH_FAILED", str(exc), recoverable=True, recovery_action="boss login"
+					"TOKEN_REFRESH_FAILED", str(exc), recoverable=True, recovery_action=login_action
 				)
 			except NotImplementedError as exc:
 				error = WorkflowActionError(
@@ -234,6 +258,14 @@ class WorkflowRunner:
 					recovery_action="切换平台或 workflow goal 后重试",
 				)
 			except WorkflowActionError as exc:
+				if (
+					exc.code in {"AUTH_REQUIRED", "AUTH_EXPIRED", "TOKEN_REFRESH_FAILED"}
+					and exc.recoverable
+					and exc.replay_safe
+					and exc.recovery_action == error_contract_for_code(exc.code)[1]
+				):
+					# action 的通用认证指引在写入 checkpoint 前补齐本次运行目录。
+					exc.recovery_action = login_action
 				error = exc
 			except WorkflowInputError as exc:
 				# inputs 写错（类型不对）不是网络问题：落到下面的通用兜底会变成
@@ -331,7 +363,7 @@ class WorkflowRunner:
 						step_name,
 						code="WORKFLOW_TIMEOUT",
 						message=f"workflow 超过 {timeout_seconds:g} 秒未完成",
-						recovery_action=f"boss wizard --resume {shell_argument(run_id)}",
+						recovery_action=resume_action_for(run_id),
 						preserve_result=True,
 					)
 				self._store.update_run(
@@ -423,18 +455,21 @@ class WorkflowRunner:
 			"recoverable": True,
 			"recovery_action": recovery_action,
 		}
-		if not preserve_result:
-			self._store.update_step(run_id, step_name, status=WorkflowStatus.FAILED.value, error=error)
 		stored_run = self._store.get(run_id) or {}
-		last_result = next(
+		step_result = next(
 			(step.get("result") for step in stored_run.get("steps", []) if step["step_name"] == step_name),
 			None,
 		)
+		if not preserve_result:
+			# 超时/失败同样保留此前写入的结果（如 inner_run_id），恢复时才能续跑内部任务（Issue #882）。
+			self._store.update_step(
+				run_id, step_name, status=WorkflowStatus.FAILED.value, result=step_result, error=error
+			)
 		self._store.update_run(
 			run_id,
 			status=WorkflowStatus.FAILED.value,
 			current_step=step_name,
-			last_result=last_result,
+			last_result=step_result,
 			error=error,
 		)
 		return self._store.get(run_id) or {}

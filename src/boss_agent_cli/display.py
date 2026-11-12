@@ -5,9 +5,11 @@ Pipe mode (Agent): JSON envelope to stdout.
 --json flag: Force JSON to stdout even in TTY.
 """
 
+import datetime
 import sys
 import threading
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Callable
 
 import click
@@ -16,7 +18,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-from boss_agent_cli.output import emit_success, is_local_io_error
+from boss_agent_cli.output import emit_success, is_local_io_error, redact_sensitive_text
 from boss_agent_cli.schema.error_codes import ERROR_CODES
 
 # Rich output goes to stderr so stdout stays clean for Agent JSON
@@ -43,18 +45,28 @@ def shell_argument(value: str) -> str:
 	return "'" + value.replace("'", "'\\''") + "'"
 
 
-def boss_command_for_ctx(ctx: Any, command: str) -> str:
-	"""Return a platform-aware boss subcommand."""
-	platform_name = "zhipin"
-	if ctx and getattr(ctx, "obj", None):
-		platform_name = ctx.obj.get("platform") or "zhipin"
+def boss_command(command: str, *, platform_name: str = "zhipin", data_dir: Path | None = None) -> str:
+	"""构造后继命令；依赖本地状态时显式保留数据目录。"""
 	prefix = "boss" if platform_name == "zhipin" else f"boss --platform {platform_name}"
+	if data_dir is not None:
+		prefix += f" --data-dir {shell_argument(str(data_dir.resolve()))}"
 	return f"{prefix} {command}".strip()
 
 
+def boss_command_for_ctx(ctx: Any, command: str, *, include_data_dir: bool = False) -> str:
+	"""构造平台感知命令，可选择保留当前数据目录。"""
+	platform_name = "zhipin"
+	data_dir = None
+	if ctx and getattr(ctx, "obj", None):
+		platform_name = ctx.obj.get("platform") or "zhipin"
+		if include_data_dir:
+			data_dir = ctx.obj.get("data_dir")
+	return boss_command(command, platform_name=platform_name, data_dir=data_dir)
+
+
 def login_action_for_ctx(ctx: Any) -> str:
-	"""Return the platform-aware login recovery command."""
-	return boss_command_for_ctx(ctx, "login")
+	"""登录恢复使用原平台与数据目录，避免登录后原命令仍无会话。"""
+	return boss_command_for_ctx(ctx, "login", include_data_dir=True)
 
 
 def auth_required_hints(ctx: Any) -> dict[str, list[str]]:
@@ -183,12 +195,19 @@ def handle_error_output(
 	from boss_agent_cli.output import emit_error
 
 	# 调用方未显式声明时按登记表补齐，TTY 与 JSON 两条路径看到同一份恢复契约。
-	if recoverable is None or recovery_action is None:
-		registered_recoverable, registered_recovery_action = error_contract_for_code(code)
-		if recoverable is None:
-			recoverable = registered_recoverable
-		if recovery_action is None:
-			recovery_action = registered_recovery_action
+	registered_recoverable, registered_recovery_action = error_contract_for_code(code)
+	if recoverable is None:
+		recoverable = registered_recoverable
+	if recovery_action is None:
+		recovery_action = registered_recovery_action
+	if (
+		code in {"AUTH_REQUIRED", "AUTH_EXPIRED", "TOKEN_REFRESH_FAILED"}
+		and recoverable
+		and recovery_action == registered_recovery_action
+	):
+		# 登记表是无运行上下文的示例；只补齐通用登录动作，不覆盖写操作的人工核对要求。
+		recovery_action = login_action_for_ctx(ctx)
+		hints = {**auth_required_hints(ctx), **(hints or {})}
 
 	if is_json_mode(ctx):
 		emit_error(
@@ -201,9 +220,13 @@ def handle_error_output(
 			hints=hints,
 		)
 	else:
-		console.print(f"[red]error[/red] [{code}] {message}")
-		if recovery_action:
-			console.print(f"  [dim]recovery: {recovery_action}[/dim]")
+		# JSON 路径由 output.py 脱敏；TTY 分支同样不能把异常文本里的凭据
+		# 明文打到终端（Issue #880）。
+		safe_message = redact_sensitive_text(message)
+		safe_recovery = redact_sensitive_text(recovery_action) if recovery_action else recovery_action
+		console.print(f"[red]error[/red] [{code}] {safe_message}")
+		if safe_recovery:
+			console.print(f"  [dim]recovery: {safe_recovery}[/dim]")
 		render_operator_actions(hints)
 		raise SystemExit(1)
 
@@ -308,6 +331,16 @@ def render_job_table(
 		console.print(f"  [dim]{hint_next}[/dim]")
 
 
+def _snapshot_time_label(value: Any) -> str:
+	"""把索引快照的 Unix 秒渲染成本地时间；损坏缓存里的非数值按 "-" 处理。"""
+	if isinstance(value, bool) or not isinstance(value, (int, float)):
+		return "-"
+	try:
+		return datetime.datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+	except (OverflowError, OSError, ValueError):
+		return "-"
+
+
 def render_job_detail(data: dict[str, Any], *, greet_command: str | None = None) -> None:
 	"""Render job detail as a rich panel."""
 	title = data.get("title", "-")
@@ -340,6 +373,20 @@ def render_job_detail(data: dict[str, Any], *, greet_command: str | None = None)
 
 	panel = Panel(text, title="job detail", border_style="cyan")
 	console.print(panel)
+
+	# 编号绑定的是索引快照，不是职位本身：把来源和保存时间放在详情下方，
+	# 重搜之后一眼就能看出这条编号是不是已经指向另一次搜索。
+	snapshot = data.get("index_snapshot")
+	if isinstance(snapshot, dict):
+		source = escape(str(snapshot.get("source") or "-"))
+		count = snapshot.get("count")
+		count_label = str(count) if isinstance(count, int) and not isinstance(count, bool) else "-"
+		page = snapshot.get("page")
+		page_label = f"第 {page} 页 · " if isinstance(page, int) and not isinstance(page, bool) else ""
+		index = data.get("index", "-")
+		console.print(
+			f"  [dim]#{index} · {page_label}{source} · 共 {count_label} 条 · 保存于 {_snapshot_time_label(snapshot.get('saved_at'))}[/dim]"
+		)
 
 	sid = data.get("security_id", "")
 	jid = data.get("job_id", "")
@@ -854,7 +901,10 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					recovery_action=nav_recovery,
 					details=e.details(),
 					hints={
-						"next_actions": ["boss doctor", "boss login"],
+						"next_actions": [
+							boss_command_for_ctx(ctx, "doctor", include_data_dir=True),
+							login_action_for_ctx(ctx),
+						],
 						"operator_actions": [
 							"浏览器通道会先打开 https://www.zhipin.com/ 再请求接口；--url 只解析筛选条件，不会改走搜索页",
 							"首页在自动化下偶发加载卡住，CLI 已跳到空白页并重试。仍失败时，用带调试端口的 Chrome 打开官网并确认首页能加载，再执行 boss --cdp-url http://127.0.0.1:9222 <命令>",

@@ -127,7 +127,7 @@ SCHEMA_DATA = {
 			},
 		},
 		"search": {
-			"description": "按关键词和筛选条件搜索职位列表，可传入 BOSS 直聘搜索页 URL 复用网页筛选参数",
+			"description": "按关键词和筛选条件搜索职位列表，可传入 BOSS 直聘搜索页 URL 复用网页筛选参数；成功时 pagination.index_snapshot 给出本次写入的索引快照（source/page/count/saved_at），与 show 的编号配套使用",
 			"args": [
 				{"name": "query", "required": False, "description": "搜索关键词；提供 --url 时可省略"},
 			],
@@ -328,7 +328,7 @@ SCHEMA_DATA = {
 			},
 		},
 		"recommend": {
-			"description": "基于用户登录态获取个性化职位推荐。",
+			"description": "基于用户登录态获取个性化职位推荐；成功时 pagination.index_snapshot 给出本次写入的索引快照（source/page/count/saved_at），与 show 的编号配套使用。",
 			"args": [],
 			"options": {
 				"--page": {"type": "int", "default": 1, "minimum": 1, "description": "页码"},
@@ -375,7 +375,7 @@ SCHEMA_DATA = {
 			"options": {},
 		},
 		"me": {
-			"description": "获取当前登录用户的个人信息（基本信息、简历、求职期望、投递记录）",
+			"description": "获取当前登录用户的个人信息（基本信息、简历、求职期望、投递记录）；仅 --section deliver 的信封 pagination 给出投递列表分页证据，has_more 仅平台返回布尔 hasMore 时有效，缺失或类型不明确时为 null",
 			"args": [],
 			"options": {
 				"--section": {
@@ -443,7 +443,7 @@ SCHEMA_DATA = {
 			},
 		},
 		"chatmsg": {
-			"description": "查看与指定好友的聊天消息历史；--raw 输出保真结构化消息字段。",
+			"description": "查看与指定好友的聊天消息历史；--raw 输出保真结构化消息字段。信封 pagination 给出所读消息页证据：has_more 仅在平台返回布尔 hasMore 时为 true / false。",
 			"args": [
 				{
 					"name": "security_id",
@@ -462,7 +462,7 @@ SCHEMA_DATA = {
 			},
 		},
 		"chat-summary": {
-			"description": "基于聊天历史生成结构化摘要与下一步建议。",
+			"description": "基于聊天历史生成结构化摘要与下一步建议。信封 pagination 给出所读消息页证据：has_more 仅在平台返回布尔 hasMore 时为 true / false。",
 			"args": [
 				{
 					"name": "security_id",
@@ -982,7 +982,7 @@ SCHEMA_DATA = {
 			"args": [],
 			"options": {
 				"--dry-run": {"type": "bool", "default": False, "description": "仅预览将清理的内容"},
-				"--all": {"type": "bool", "default": False, "description": "清理全部缓存"},
+				"--all": {"type": "bool", "default": False, "description": "清理全部缓存（包括未过期的搜索缓存、打招呼/投递记录、招聘者打招呼记录、职位描述缓存和工作地点发送记录）"},
 				"--days": {"type": "int", "default": 30, "minimum": 0, "maximum": 36500, "description": "清理超过指定天数的快照和导出"},
 				"--privacy": {
 					"type": "bool",
@@ -1363,7 +1363,7 @@ SCHEMA_DATA = {
 			"args": [],
 			"options": {
 				"applications": {
-				"description": "查看候选人投递申请列表。",
+				"description": "查看候选人投递申请列表。信封 pagination 给出分页证据：has_more 仅平台返回布尔 hasMore 时有效，缺失为 null。",
 					"--job-id": {"type": "string", "default": None, "description": "按职位筛选"},
 					"--label-id": {"type": "int", "default": 0, "minimum": 0, "description": "按标签筛选（0=全部, 1=新招呼, 2=沟通中）"},
 					"--page": {"type": "int", "default": 1, "minimum": 1, "description": "页码"},
@@ -1388,7 +1388,7 @@ SCHEMA_DATA = {
 					"--raw": {"type": "bool", "default": False, "description": "输出原始 API 数据（不解析）"},
 				},
 				"chat": {
-				"description": "查看与候选人的沟通列表。",
+				"description": "查看与候选人的沟通列表。信封 pagination 给出分页证据：has_more 仅平台返回布尔 hasMore 时有效，缺失为 null。",
 					"--page": {"type": "int", "default": 1, "minimum": 1, "description": "页码"},
 					"--job-id": {"type": "string", "default": None, "description": "按职位筛选"},
 					"--label-id": {"type": "int", "default": 0, "minimum": 0, "description": "按标签筛选（0=全部, 1=新招呼, 2=沟通中）"},
@@ -1401,7 +1401,7 @@ SCHEMA_DATA = {
 					},
 				},
 				"chatmsg": {
-				"description": "与指定候选人的聊天消息历史。",
+				"description": "与指定候选人的聊天消息历史。信封 pagination 给出游标分页证据：has_more 仅平台返回布尔 hasMore 时非 null，next_max_msg_id 是本页最旧消息 ID。",
 					"args": [
 						{"name": "friend_id", "required": True, "description": "候选人会话 friend_id"},
 					],
@@ -1409,7 +1409,7 @@ SCHEMA_DATA = {
 					"--max-msg-id": {"type": "int", "default": None, "minimum": 1, "description": "向前翻页的最大消息 ID"},
 				},
 				"last-messages": {
-				"description": "批量查看候选人最近消息摘要。",
+				"description": "批量查看候选人最近消息摘要。从平台取沟通列表时信封 pagination 给出分页证据；--friend-id 直查时为 null。",
 					"--page": {"type": "int", "default": 1, "minimum": 1, "description": "沟通列表页码"},
 					"--job-id": {"type": "string", "default": None, "description": "按职位筛选"},
 					"--label-id": {"type": "int", "default": 0, "minimum": 0, "description": "按标签筛选（0=全部, 1=新招呼, 2=沟通中）"},
@@ -1430,7 +1430,7 @@ SCHEMA_DATA = {
 					],
 				},
 				"candidates": {
-				"description": "搜索候选人。",
+				"description": "搜索候选人。信封 pagination 给出分页证据：has_more 仅平台返回布尔 hasMore 时有效，缺失为 null。",
 					"args": [
 						{"name": "query", "required": False, "description": "按关键词过滤候选人摘要；省略时列出全部"},
 					],
@@ -1447,7 +1447,7 @@ SCHEMA_DATA = {
 					"--page": {"type": "int", "default": 1, "minimum": 1, "description": "页码"},
 				},
 				"recommendations": {
-				"description": "读取推荐牛人完整卡片和首次开聊参数。",
+				"description": "读取推荐牛人完整卡片和首次开聊参数。信封 pagination 给出分页证据：has_more 仅平台返回布尔 hasMore 时有效，缺失为 null。",
 					"--job-id": {"type": "string", "required": True, "description": "招聘职位的加密 ID"},
 					"--page": {"type": "int", "default": 1, "minimum": 1, "description": "页码"},
 				},
@@ -1466,6 +1466,18 @@ SCHEMA_DATA = {
 						"description": "操作者明确批准该候选人和话术后才可发送",
 					},
 					"--dry-run": {"type": "bool", "default": False, "description": "只预览，不发送"},
+				},
+				"location": {
+				"description": "向已有会话发送该职位的工作地点卡片。securityId 与内部 jobId 取自本次 friend_detail，不使用推荐卡片上的 securityId。",
+					"args": [
+						{"name": "friend_id", "required": True, "description": "候选人会话 friend_id"},
+					],
+					"--yes": {
+						"type": "bool",
+						"default": False,
+						"description": "操作者明确批准向该会话发送工作地点后才可发送",
+					},
+					"--dry-run": {"type": "bool", "default": False, "description": "只预览，不请求平台、不写发送记录"},
 				},
 				"accept-resume": {
 				"description": "同意接收指定附件简历请求，不主动索要、不下载附件。",
@@ -1492,7 +1504,7 @@ SCHEMA_DATA = {
 				"jobs": {
 				"description": "管理职位发布。",
 					"list": {
-					"description": "查看已发布的职位列表。",
+					"description": "查看已发布的职位列表；信封 pagination 返回平台 page / hasMore / totalSize（hasMore 缺失时为 null）。",
 						"--page": {
 							"type": "int",
 							"default": 1,
@@ -1526,7 +1538,7 @@ SCHEMA_DATA = {
 				"applications": "查看候选人投递申请列表",
 				"resume": "查看候选人在线简历或发起联系方式交换",
 				"chat": "查看与候选人的沟通列表（含未读数和最近消息摘要）",
-				"chatmsg": "查看与指定候选人的聊天消息历史",
+				"chatmsg": "查看与指定候选人的聊天消息历史；信封 pagination 给出游标分页证据（next_max_msg_id）",
 				"last-messages": "批量查看候选人最近消息摘要",
 				"jobs": "管理职位发布（list 读取职位管理 data/list，可用 --page；offline/online/detail）",
 				"candidates": "搜索候选人",
@@ -1536,6 +1548,7 @@ SCHEMA_DATA = {
 				"download-resume": "检查权限并下载已收到的附件简历，不自动同意请求",
 				"recommendations": "读取推荐牛人完整卡片和首次开聊参数",
 				"greet": "单次建立候选人会话并发送首次招呼（需 --yes），不修改已读状态",
+				"location": "向已有会话发送工作地点卡片（需 --yes）；同一会话不重复发送，停止开关打开时拒绝",
 			},
 		},
 	},

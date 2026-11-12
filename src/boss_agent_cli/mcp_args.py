@@ -34,11 +34,17 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 
 	if name == "search":
 		args = [name, arguments["query"]]
-		for opt in ("city", "salary", "experience", "education", "welfare", "active"):
+		for opt in ("city", "salary", "experience", "education", "industry", "scale", "stage", "welfare", "active"):
 			if opt in arguments and arguments[opt]:
 				args.extend([f"--{opt}", str(arguments[opt])])
+		if arguments.get("job_type"):
+			args.extend(["--job-type", str(arguments["job_type"])])
 		if "page" in arguments:
 			args.extend(["--page", str(arguments["page"])])
+		if arguments.get("no_cache"):
+			args.append("--no-cache")
+		if arguments.get("with_score"):
+			args.append("--with-score")
 		if arguments.get("sort"):
 			args.extend(["--sort", str(arguments["sort"])])
 		return args
@@ -70,12 +76,16 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		args = [name]
 		if "page" in arguments:
 			args.extend(["--page", str(arguments["page"])])
+		if arguments.get("with_score"):
+			args.append("--with-score")
 		return args
 
 	if name == "detail":
 		args = [name, arguments["security_id"]]
 		if "job_id" in arguments and arguments["job_id"]:
 			args.extend(["--job-id", arguments["job_id"]])
+		if arguments.get("lid"):
+			args.extend(["--lid", str(arguments["lid"])])
 		return args
 
 	if name == "greet":
@@ -89,12 +99,18 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 			args.extend(["--days", str(arguments["days"])])
 		if "page" in arguments:
 			args.extend(["--page", str(arguments["page"])])
+		if arguments.get("format"):
+			args.extend(["--export", str(arguments["format"])])
+		if arguments.get("output_file"):
+			args.extend(["--output", str(arguments["output_file"])])
 		return args
 
 	if name == "me":
 		args = [name]
 		if "section" in arguments and arguments["section"]:
 			args.extend(["--section", arguments["section"]])
+		if arguments.get("deliver_page") is not None:
+			args.extend(["--deliver-page", str(arguments["deliver_page"])])
 		return args
 
 	if name == "chatmsg":
@@ -108,7 +124,12 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		return args
 
 	if name == "chat_summary":
-		return ["chat-summary", arguments["security_id"]]
+		args = ["chat-summary", arguments["security_id"]]
+		if arguments.get("page") is not None:
+			args.extend(["--page", str(arguments["page"])])
+		if arguments.get("count") is not None:
+			args.extend(["--count", str(arguments["count"])])
+		return args
 
 	if name == "mark":
 		# MCP 侧参数名是 tag，CLI 的选项名是 --label；两者不是同一个词，写错会让
@@ -126,8 +147,11 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 
 	if name == "batch_greet":
 		args = ["batch-greet", arguments["query"]]
-		if "city" in arguments and arguments["city"]:
-			args.extend(["--city", arguments["city"]])
+		for opt in ("city", "salary", "experience", "education", "industry", "scale", "stage"):
+			if arguments.get(opt):
+				args.extend([f"--{opt}", str(arguments[opt])])
+		if arguments.get("job_type"):
+			args.extend(["--job-type", str(arguments["job_type"])])
 		# MCP 侧参数名是 limit，CLI 选项名是 --count。默认值要显式下发：不传就落到
 		# CLI 的默认 10，比工具声明的 5 多打一倍招呼。
 		args.extend(["--count", str(arguments.get("limit", 5))])
@@ -219,6 +243,8 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 			args.append("--dry-run")
 		if arguments.get("all"):
 			args.append("--all")
+		if arguments.get("days") is not None:
+			args.extend(["--days", str(arguments["days"])])
 		return args
 
 	if name == "digest":
@@ -235,6 +261,10 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		args = [name]
 		if "days" in arguments:
 			args.extend(["--days", str(arguments["days"])])
+		if arguments.get("format"):
+			args.extend(["--format", str(arguments["format"])])
+		if arguments.get("output_file"):
+			args.extend(["--output", str(arguments["output_file"])])
 		return args
 
 	if name == "ai_reply":
@@ -330,8 +360,18 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 			args.extend(["--page", str(arguments["page"])])
 		return args
 
+	if name == "history":
+		args = ["history"]
+		# 与 favorites_list 同一取舍：显式传入的 0 交给 CLI 拒绝，不静默改写。
+		if arguments.get("page") is not None:
+			args.extend(["--page", str(arguments["page"])])
+		return args
+
 	if name == "shortlist_add":
 		args = ["shortlist", "add", arguments["security_id"], arguments["job_id"]]
+		for opt in ("title", "company", "city", "salary", "source"):
+			if arguments.get(opt):
+				args.extend([f"--{opt}", str(arguments[opt])])
 		if arguments.get("lid"):
 			args.extend(["--lid", str(arguments["lid"])])
 		if arguments.get("tags"):
@@ -346,7 +386,9 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 			args.extend(["--add-tag", str(tag)])
 		for tag in arguments.get("remove_tags") or []:
 			args.extend(["--remove-tag", str(tag)])
-		if arguments.get("note"):
+		# `--note ""` 在 CLI 是「替换为空」，即清空备注；用 truthiness 会把空串
+		# 丢掉，旧备注保留而信封仍回 updated=true（Issue #872）。
+		if "note" in arguments and arguments["note"] is not None:
 			args.extend(["--note", str(arguments["note"])])
 		return args
 
@@ -361,9 +403,9 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 
 	if name == "preset_add":
 		args = ["preset", "add", arguments["name"], arguments["query"]]
-		for opt in ("city", "salary", "experience", "education", "welfare", "active"):
+		for opt in ("city", "salary", "experience", "education", "industry", "scale", "stage", "job_type", "welfare", "active"):
 			if arguments.get(opt):
-				args.extend([f"--{opt}", str(arguments[opt])])
+				args.extend([f"--{opt.replace('_', '-')}", str(arguments[opt])])
 		return args
 
 	if name == "preset_remove":
@@ -371,9 +413,9 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 
 	if name == "watch_add":
 		args = ["watch", "add", arguments["name"], arguments["query"]]
-		for opt in ("city", "salary"):
+		for opt in ("city", "salary", "experience", "education", "industry", "scale", "stage", "job_type", "welfare"):
 			if arguments.get(opt):
-				args.extend([f"--{opt}", str(arguments[opt])])
+				args.extend([f"--{opt.replace('_', '-')}", str(arguments[opt])])
 		return args
 
 	if name == "watch_remove":
@@ -413,6 +455,8 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 			args.extend(["--job-id", str(arguments["job_id"])])
 		if "label_id" in arguments:
 			args.extend(["--label-id", str(arguments["label_id"])])
+		if "summary_limit" in arguments:
+			args.extend(["--summary-limit", str(arguments["summary_limit"])])
 		return args
 
 	if name == "hr_chatmsg":
@@ -433,6 +477,8 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 			args.extend(["--job-id", str(arguments["job_id"])])
 		if "label_id" in arguments:
 			args.extend(["--label-id", str(arguments["label_id"])])
+		if "limit" in arguments:
+			args.extend(["--limit", str(arguments["limit"])])
 		return args
 
 	if name == "hr_resume":
@@ -488,6 +534,14 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 			args.append("--dry-run")
 		return args
 
+	if name == "hr_location":
+		args = ["hr", "location", str(arguments["friend_id"])]
+		if arguments.get("yes") is True:
+			args.append("--yes")
+		if arguments.get("dry_run") is True:
+			args.append("--dry-run")
+		return args
+
 	if name == "hr_jobs":
 		action = arguments.get("action", "list")
 		args = ["hr", "jobs", action]
@@ -500,5 +554,17 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 	if name == "hr_jobs_detail":
 		return ["hr", "jobs", "detail", str(arguments["enc_job_id"])]
 
-	# 无参数命令：status, doctor, cities, interviews, history, pipeline
+	if name == "status":
+		args = [name]
+		if arguments.get("live"):
+			args.append("--live")
+		return args
+
+	if name == "pipeline":
+		args = [name]
+		if arguments.get("days_stale") is not None:
+			args.extend(["--days-stale", str(arguments["days_stale"])])
+		return args
+
+	# 无参数命令：doctor, cities, interviews
 	return [name]

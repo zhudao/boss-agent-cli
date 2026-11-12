@@ -1,11 +1,16 @@
 import json
+import shlex
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from click.testing import CliRunner
 from boss_agent_cli.display import risk_error_message
+from boss_agent_cli.index_cache import save_index
 from boss_agent_cli.main import cli
 from boss_agent_cli.search_filters import SearchPipelinePlatformError
+
+_DEFAULT_DATA_DIR = str((Path.home() / ".boss-agent").resolve())
 
 
 def _ctx_mock(mock_cls):
@@ -45,7 +50,9 @@ def test_login_cdp_connection_error_returns_json_envelope(mock_auth_cls):
 	assert parsed["error"]["code"] == "CDP_UNAVAILABLE"
 	assert "Chrome 调试连接不可用" in parsed["error"]["message"]
 	assert parsed["error"]["recoverable"] is True
-	assert parsed["error"]["recovery_action"] == "boss login"
+	assert shlex.split(parsed["error"]["recovery_action"]) == [
+		"boss", "--data-dir", _DEFAULT_DATA_DIR, "login",
+	]
 
 
 @patch("boss_agent_cli.commands.status.AuthManager")
@@ -117,7 +124,10 @@ def test_status_live_success_points_at_business_commands(mock_auth_cls, mock_cli
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["data"]["user_name"] == "tester"
-	assert parsed["hints"]["next_actions"] == ["boss recommend", "boss search <关键词>"]
+	assert [shlex.split(action) for action in parsed["hints"]["next_actions"]] == [
+		["boss", "--data-dir", _DEFAULT_DATA_DIR, "recommend"],
+		["boss", "--data-dir", _DEFAULT_DATA_DIR, "search", "<关键词>"],
+	]
 	assert parsed["hints"]["operator_actions"]
 
 
@@ -138,7 +148,9 @@ def test_status_reports_user_info_error(mock_auth_cls, mock_client_cls):
 	assert parsed["error"]["code"] == "TOKEN_REFRESH_FAILED"
 	assert parsed["error"]["message"] == "stoken expired"
 	assert parsed["error"]["recoverable"] is True
-	assert parsed["error"]["recovery_action"] == "boss login"
+	assert shlex.split(parsed["error"]["recovery_action"]) == [
+		"boss", "--data-dir", _DEFAULT_DATA_DIR, "login",
+	]
 	assert parsed["hints"]["auth_health"]["primary_name"] == "wt2"
 
 
@@ -416,6 +428,34 @@ def test_recommend_success(mock_auth_cls, mock_client_cls, mock_cache_cls):
 @patch("boss_agent_cli.commands.recommend.CacheStore")
 @patch("boss_agent_cli.commands.recommend.get_platform_instance")
 @patch("boss_agent_cli.commands.recommend.AuthManager")
+def test_recommend_pagination_reports_index_snapshot_for_show(mock_auth_cls, mock_client_cls, mock_cache_cls, tmp_path):
+	from boss_agent_cli.index_cache import get_index_info
+
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.is_greeted.return_value = False
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.recommend_jobs.return_value = {
+		"zpData": {
+			"hasMore": False,
+			"jobList": [{"encryptJobId": "j1", "securityId": "sec_r1", "jobName": "Go 开发"}],
+		},
+	}
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "recommend"])
+	assert result.exit_code == 0, result.output
+	snapshot = json.loads(result.output)["pagination"]["index_snapshot"]
+	info = get_index_info(tmp_path)
+	assert snapshot == {
+		"source": info["source"], "page": info["page"], "count": info["count"], "saved_at": info["saved_at"],
+	}
+	assert snapshot["source"] == "recommend"
+	assert snapshot["page"] == 1
+	assert snapshot["count"] == 1
+
+
+@patch("boss_agent_cli.commands.recommend.CacheStore")
+@patch("boss_agent_cli.commands.recommend.get_platform_instance")
+@patch("boss_agent_cli.commands.recommend.AuthManager")
 def test_recommend_with_score(mock_auth_cls, mock_client_cls, mock_cache_cls):
 	mock_cache = _ctx_mock(mock_cache_cls)
 	mock_cache.is_greeted.return_value = False
@@ -456,6 +496,29 @@ def test_recommend_with_score(mock_auth_cls, mock_client_cls, mock_cache_cls):
 	parsed = json.loads(result.output)
 	assert parsed["data"][0]["match_score"] >= 0
 	assert "match_reasons" in parsed["data"][0]
+
+
+@patch("boss_agent_cli.commands.recommend.CacheStore")
+@patch("boss_agent_cli.commands.recommend.get_platform_instance")
+@patch("boss_agent_cli.commands.recommend.AuthManager")
+def test_recommend_next_page_hint_keeps_with_score(mock_auth_cls, mock_client_cls, mock_cache_cls):
+	"""翻页提示必须保留 --with-score：否则下一页的 match_score 静默消失。"""
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.is_greeted.return_value = False
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.resume_expect.return_value = {"zpData": {"city": "广州"}}
+	mock_client.recommend_jobs.return_value = {
+		"zpData": {
+			"hasMore": True,
+			"jobList": [{"encryptJobId": "j1", "securityId": "sec_r1", "jobName": "Go 开发"}],
+		},
+	}
+
+	result = CliRunner().invoke(cli, ["--json", "recommend", "--with-score", "--page", "2"])
+
+	assert result.exit_code == 0, result.output
+	next_pages = [a for a in json.loads(result.stdout)["hints"]["next_actions"] if "recommend --page" in a]
+	assert next_pages == ["boss recommend --page 3 --with-score"]
 
 
 @patch("boss_agent_cli.commands.recommend.CacheStore")
@@ -536,7 +599,7 @@ def test_recommend_with_score_reports_expect_error(mock_auth_cls, mock_client_cl
 	assert parsed["error"]["code"] == "TOKEN_REFRESH_FAILED"
 	assert parsed["error"]["message"] == "stoken expired"
 	assert parsed["error"]["recoverable"] is True
-	assert parsed["error"]["recovery_action"] == "boss login"
+	assert shlex.split(parsed["error"]["recovery_action"]) == ["boss", "--data-dir", _DEFAULT_DATA_DIR, "login"]
 
 
 @patch("boss_agent_cli.commands.recommend.CacheStore")
@@ -693,7 +756,7 @@ def test_search_cache_key_includes_current_result_schema(mock_client_cls, mock_a
 
 	assert result.exit_code == 0
 	cache_params = mock_cache.get_search.call_args.args[0]
-	assert cache_params["cache_schema"] == 4
+	assert cache_params["cache_schema"] == 5
 	assert "account" in cache_params
 	mock_pipeline.assert_not_called()
 
@@ -785,6 +848,31 @@ def test_search_cache_hit_recomputes_greeted_for_current_account(
 	assert result.exit_code == 0
 	assert [item["greeted"] for item in json.loads(result.output)["data"]] == [True, False]
 	assert mock_cache.is_greeted.call_args_list[0].kwargs == {"job_id": "job_1", "account": "acct_a"}
+	mock_pipeline.assert_not_called()
+
+
+@patch("boss_agent_cli.commands.search.run_search_pipeline")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.AuthManager")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+def test_search_cache_hit_reports_fresh_index_snapshot(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline, tmp_path):
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.get_search.return_value = json.dumps({
+		"data": [{"security_id": "sec_1", "job_id": "job_1", "greeted": False}],
+		"pagination": {"page": 1, "has_more": False, "total": 1},
+		"hints": None,
+	})
+	mock_auth_cls.return_value.account_fingerprint.return_value = "acct_a"
+	mock_cache.is_greeted.return_value = False
+
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "--json", "search", "产品"])
+
+	assert result.exit_code == 0, result.output
+	snapshot = json.loads(result.output)["pagination"]["index_snapshot"]
+	assert snapshot["source"] == "search:产品"
+	assert snapshot["page"] == 1
+	assert snapshot["count"] == 1
+	assert snapshot["saved_at"] > 0
 	mock_pipeline.assert_not_called()
 
 
@@ -933,6 +1021,50 @@ def test_search_json_hints_expose_available_candidate_actions(mock_client_cls, m
 	]
 	assert all("使用 " not in action and " — " not in action for action in actions)
 	mock_save_index.assert_called_once()
+
+
+@patch("boss_agent_cli.commands.search.run_search_pipeline")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.AuthManager")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+def test_search_pagination_reports_index_snapshot_for_show(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline, tmp_path):
+	from boss_agent_cli.index_cache import get_index_info
+
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.get_search.return_value = None
+	_ctx_mock(mock_client_cls)
+	mock_pipeline.return_value = SimpleNamespace(
+		items=[{
+			"job_id": "j1",
+			"title": "Go 开发",
+			"company": "TestCo",
+			"salary": "20K",
+			"city": "广州",
+			"security_id": "sec_001",
+			"greeted": False,
+		}],
+		has_more=False,
+		total=1,
+		stats=SimpleNamespace(
+			pages_scanned=1,
+			jobs_seen=1,
+			jobs_prefiltered=0,
+			detail_checks=0,
+		),
+	)
+
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "--json", "search", "golang"])
+
+	assert result.exit_code == 0, result.output
+	parsed = json.loads(result.output)
+	snapshot = parsed["pagination"]["index_snapshot"]
+	info = get_index_info(tmp_path)
+	assert snapshot == {
+		"source": info["source"], "page": info["page"], "count": info["count"], "saved_at": info["saved_at"],
+	}
+	assert snapshot["source"] == "search:golang"
+	assert snapshot["page"] == 1
+	assert snapshot["count"] == 1
 
 
 @patch("boss_agent_cli.commands.export.get_platform_instance")
@@ -1100,6 +1232,40 @@ def test_chat_from_boss_filter(mock_auth_cls, mock_client_cls):
 
 @patch("boss_agent_cli.commands.chat.get_platform_instance")
 @patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_pagination_reports_platform_page_evidence(mock_auth_cls, mock_client_cls):
+	"""--page 必须有分页证据：只有平台 hasMore=true 才提示下一页。"""
+	import time
+	now_ms = int(time.time() * 1000)
+	_ctx_mock(mock_client_cls)
+	runner = CliRunner()
+	for raw_has_more, expected in ((True, True), (False, False), ("missing", None)):
+		platform_data = {"result": [_make_friend_item("张HR", "阿里", 1, now_ms)]}
+		if raw_has_more != "missing":
+			platform_data["hasMore"] = raw_has_more
+		mock_client_cls.return_value.friend_list.reset_mock()
+		mock_client_cls.return_value.friend_list.return_value = {"zpData": platform_data}
+
+		result = runner.invoke(cli, ["chat", "--page", "2", "--from", "boss", "--days", "7"])
+
+		assert result.exit_code == 0, result.output
+		payload = json.loads(result.output)
+		pagination = payload["pagination"]
+		assert pagination["page"] == 2
+		assert pagination["has_more"] is expected
+		assert pagination["has_more_source"] == ("unknown" if expected is None else "platform_hasMore")
+		assert pagination["total"] == 1
+		assert pagination["total_kind"] == "returned_page_count"
+		next_pages = [action for action in payload["hints"]["next_actions"] if "chat --page" in action]
+		assert len(next_pages) == (1 if expected is True else 0)
+		if expected is True:
+			assert next_pages[0] == "boss chat --page 3 --from boss --days 7"
+		if expected is None:
+			assert payload["hints"]["operator_actions"]
+		mock_client_cls.return_value.friend_list.assert_called_once_with(page=2)
+
+
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
 def test_chat_days_filter(mock_auth_cls, mock_client_cls):
 	"""--days 3 只返回最近 3 天的记录"""
 	import time
@@ -1201,7 +1367,7 @@ def test_chat_reports_friend_list_error(mock_auth_cls, mock_client_cls):
 	assert parsed["error"]["code"] == "TOKEN_REFRESH_FAILED"
 	assert parsed["error"]["message"] == "stoken expired"
 	assert parsed["error"]["recoverable"] is True
-	assert parsed["error"]["recovery_action"] == "boss login"
+	assert shlex.split(parsed["error"]["recovery_action"]) == ["boss", "--data-dir", _DEFAULT_DATA_DIR, "login"]
 
 
 @patch("boss_agent_cli.commands.chat.get_platform_instance")
@@ -1835,7 +2001,7 @@ def test_pipeline_reports_friend_list_error_contract(mock_auth_cls, mock_client_
 	assert parsed["error"]["code"] == "TOKEN_REFRESH_FAILED"
 	assert parsed["error"]["message"] == "stoken expired"
 	assert parsed["error"]["recoverable"] is True
-	assert parsed["error"]["recovery_action"] == "boss login"
+	assert shlex.split(parsed["error"]["recovery_action"]) == ["boss", "--data-dir", _DEFAULT_DATA_DIR, "login"]
 
 
 @patch("boss_agent_cli.commands.pipeline.get_platform_instance")
@@ -1904,7 +2070,7 @@ def test_digest_reports_friend_list_error_contract(mock_auth_cls, mock_client_cl
 	assert parsed["error"]["code"] == "TOKEN_REFRESH_FAILED"
 	assert parsed["error"]["message"] == "stoken expired"
 	assert parsed["error"]["recoverable"] is True
-	assert parsed["error"]["recovery_action"] == "boss login"
+	assert shlex.split(parsed["error"]["recovery_action"]) == ["boss", "--data-dir", _DEFAULT_DATA_DIR, "login"]
 
 
 @patch("boss_agent_cli.commands.digest.get_platform_instance")
@@ -2011,7 +2177,7 @@ def test_search_pipeline_auth_expired_is_recoverable(mock_client_cls, mock_auth_
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "AUTH_EXPIRED"
 	assert parsed["error"]["recoverable"] is True
-	assert parsed["error"]["recovery_action"] == "boss login"
+	assert shlex.split(parsed["error"]["recovery_action"]) == ["boss", "--data-dir", _DEFAULT_DATA_DIR, "login"]
 
 
 @patch("boss_agent_cli.commands.search.CacheStore")
@@ -2094,9 +2260,13 @@ def test_detail_json_hints_expose_available_candidate_actions(mock_client_cls, m
 @patch("boss_agent_cli.commands.show.CacheStore")
 @patch("boss_agent_cli.commands.show.AuthManager")
 @patch("boss_agent_cli.commands.show.get_platform_instance")
+@patch("boss_agent_cli.commands.show.get_index_info")
 @patch("boss_agent_cli.commands.show.get_job_by_index")
-def test_show_json_hints_expose_available_candidate_actions(mock_get_job, mock_client_cls, mock_auth_cls, mock_cache_cls):
+def test_show_json_hints_expose_available_candidate_actions(
+	mock_get_job, mock_get_info, mock_client_cls, mock_auth_cls, mock_cache_cls,
+):
 	mock_get_job.return_value = {"security_id": "sec_001"}
+	mock_get_info.return_value = {"exists": True, "source": "search:Go", "count": 1, "saved_at": 1700000000.0}
 	mock_cache = _ctx_mock(mock_cache_cls)
 	mock_cache.is_greeted.return_value = False
 	mock_client = _ctx_mock(mock_client_cls)
@@ -2126,6 +2296,39 @@ def test_show_json_hints_expose_available_candidate_actions(mock_get_job, mock_c
 	actions = parsed["hints"]["next_actions"]
 	assert "boss apply <security_id> <job_id>" in actions
 	assert "boss greet <security_id> <job_id>" in actions
+
+
+@patch("boss_agent_cli.commands.show.CacheStore")
+@patch("boss_agent_cli.commands.show.AuthManager")
+@patch("boss_agent_cli.commands.show.get_platform_instance")
+def test_show_json_data_binds_number_to_its_search_snapshot(mock_client_cls, mock_auth_cls, mock_cache_cls, tmp_path):
+	"""编号只对某一次 search / recommend 的快照有效，show 必须同时返回快照身份。"""
+	save_index(
+		tmp_path,
+		[
+			{"security_id": "sec_001", "job_id": "j1", "title": "Go 开发"},
+			{"security_id": "sec_002", "job_id": "j2", "title": "Python 后端"},
+		],
+		source="search:Golang",
+		page=2,
+	)
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.is_greeted.return_value = False
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.job_card.return_value = {
+		"zpData": {"jobCard": {"encryptJobId": "j2", "jobName": "Python 后端", "brandName": "TestCo"}},
+	}
+
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "show", "2"])
+
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["data"]["index"] == 2
+	snapshot = parsed["data"]["index_snapshot"]
+	assert snapshot["source"] == "search:Golang"
+	assert snapshot["page"] == 2
+	assert snapshot["count"] == 2
+	assert snapshot["saved_at"] > 0
 
 
 @patch("boss_agent_cli.commands.stats._collect_stats")

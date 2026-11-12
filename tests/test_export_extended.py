@@ -5,12 +5,15 @@
 
 import csv
 import json
+import shlex
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 from boss_agent_cli.main import cli
+
+_DEFAULT_DATA_DIR = str((Path.home() / ".boss-agent").resolve())
 
 
 def _ctx_mock(mock_cls):
@@ -535,6 +538,16 @@ def test_sanitize_csv_cell_escapes_formula_prefixes():
 	assert _sanitize_csv_cell("@cmd") == "'@cmd"
 
 
+def test_job_export_sanitizer_is_shared_with_chat_export():
+	"""两份实现曾经分叉：job_export 的副本不剥 Tab/CR，同类数据两种导出结果不同（Issue #876）。"""
+	from boss_agent_cli.services.chat_utils import sanitize_csv_cell
+	from boss_agent_cli.services import job_export
+
+	assert job_export._sanitize_csv_cell is sanitize_csv_cell
+	for value in ("a\tb", "a\rb", "=\tcmd"):
+		assert job_export._sanitize_csv_cell(value) == sanitize_csv_cell(value)
+
+
 def test_sanitize_csv_cell_passes_other_specials():
 	from boss_agent_cli.services.job_export import _sanitize_csv_cell
 
@@ -628,7 +641,7 @@ def test_export_search_auth_expired_is_recoverable(mock_auth_cls, mock_client_cl
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "AUTH_EXPIRED"
 	assert parsed["error"]["recoverable"] is True
-	assert parsed["error"]["recovery_action"] == "boss login"
+	assert shlex.split(parsed["error"]["recovery_action"]) == ["boss", "--data-dir", _DEFAULT_DATA_DIR, "login"]
 
 
 @patch("boss_agent_cli.commands.export.get_platform_instance")

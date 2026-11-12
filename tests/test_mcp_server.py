@@ -3,6 +3,7 @@ import asyncio
 import inspect
 import json
 import re
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -271,7 +272,7 @@ def test_crawl_tools_only_read_or_locally_shortlist_existing_runs():
 
 def test_tool_count():
 	"""工具总数应与当前注册一致。"""
-	assert len(TOOLS) == 78
+	assert len(TOOLS) == 79
 
 
 def test_mcp_tool_count_matches_readme():
@@ -401,7 +402,7 @@ def test_call_tool_is_error_mirrors_envelope_ok(monkeypatch, ok, expected):
 	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
 	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
 
-	async def fake_run(*args):
+	async def fake_run(*args, **kwargs):
 		return {"ok": ok, "error": None if ok else {"code": "AUTH_REQUIRED"}}
 
 	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
@@ -425,7 +426,7 @@ def test_call_tool_rejects_unknown_arguments(monkeypatch):
 	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
 	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
 
-	async def fake_run(*args):
+	async def fake_run(*args, **kwargs):
 		raise AssertionError("未知参数不应触达 CLI")
 
 	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
@@ -460,7 +461,7 @@ def test_call_tool_rejects_non_boolean_flags(monkeypatch):
 	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
 	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
 
-	async def fake_run(*args):
+	async def fake_run(*args, **kwargs):
 		raise AssertionError("类型错误不应触达 CLI")
 
 	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
@@ -499,7 +500,7 @@ def test_call_tool_accepts_boolean_flags(monkeypatch):
 
 	seen: list[tuple[str, ...]] = []
 
-	async def fake_run(*args):
+	async def fake_run(*args, **kwargs):
 		seen.append(args)
 		return {"ok": True, "error": None}
 
@@ -552,7 +553,7 @@ def test_call_tool_rejects_unknown_tool_name(monkeypatch):
 	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
 	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
 
-	async def fake_run(*args):
+	async def fake_run(*args, **kwargs):
 		raise AssertionError("未知工具不应触达 CLI")
 
 	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
@@ -624,6 +625,12 @@ def test_build_args_status():
 	assert _build_args("boss_status", {}) == ["status"]
 
 
+def test_build_args_status_forwards_live():
+	"""--live 会发一次只读在线验证请求，显式传 true 才下发。"""
+	assert _build_args("boss_status", {"live": True}) == ["status", "--live"]
+	assert _build_args("boss_status", {"live": False}) == ["status"]
+
+
 def test_build_args_wizard_run_and_controls():
 	args = _build_args("boss_wizard", {
 		"role": "candidate",
@@ -667,6 +674,15 @@ def test_build_args_history():
 	assert _build_args("boss_history", {}) == ["history"]
 
 
+def test_build_args_history_forwards_page():
+	assert _build_args("boss_history", {"page": 3}) == ["history", "--page", "3"]
+
+
+def test_build_args_history_forwards_explicit_zero_page():
+	"""page=0 原样下发，由 CLI 的 IntRange(1) 拒绝，不静默换成第 1 页。"""
+	assert _build_args("boss_history", {"page": 0}) == ["history", "--page", "0"]
+
+
 def test_build_args_search_basic():
 	"""搜索只传 query 时应返回最小参数。"""
 	args = _build_args("boss_search", {"query": "python"})
@@ -696,6 +712,33 @@ def test_build_args_search_with_score_sort():
 	assert args == ["search", "python", "--sort", "score"]
 
 
+def test_build_args_search_forwards_industry_scale_stage_job_type():
+	"""CLI 已支持的筛选参数必须都能从 MCP 透传，否则 Agent 只能加大结果集再自行过滤。"""
+	args = _build_args("boss_search", {
+		"query": "golang",
+		"industry": "互联网",
+		"scale": "100-499人",
+		"stage": "A轮",
+		"job_type": "全职",
+		"welfare": "双休",
+		"active": "online",
+	})
+	assert args == [
+		"search", "golang",
+		"--industry", "互联网",
+		"--scale", "100-499人",
+		"--stage", "A轮",
+		"--welfare", "双休",
+		"--active", "online",
+		"--job-type", "全职",
+	]
+
+
+def test_build_args_search_forwards_cache_and_score_flags():
+	args = _build_args("boss_search", {"query": "python", "no_cache": True, "with_score": True})
+	assert args == ["search", "python", "--no-cache", "--with-score"]
+
+
 def test_build_args_search_ignores_empty_options():
 	"""空选项不应出现在参数中。"""
 	args = _build_args("boss_search", {"query": "java", "city": "", "salary": None})
@@ -713,6 +756,11 @@ def test_build_args_recommend_with_page():
 	assert args == ["recommend", "--page", "3"]
 
 
+def test_build_args_recommend_forwards_with_score():
+	args = _build_args("boss_recommend", {"page": 3, "with_score": True})
+	assert args == ["recommend", "--page", "3", "--with-score"]
+
+
 def test_build_args_detail_basic():
 	args = _build_args("boss_detail", {"security_id": "abc123"})
 	assert args == ["detail", "abc123"]
@@ -722,6 +770,11 @@ def test_build_args_detail_with_job_id():
 	args = _build_args("boss_detail", {"security_id": "abc", "job_id": "j456"})
 	assert "--job-id" in args
 	assert "j456" in args
+
+
+def test_build_args_detail_with_lid():
+	args = _build_args("boss_detail", {"security_id": "abc", "lid": "lid-1"})
+	assert args == ["detail", "abc", "--lid", "lid-1"]
 
 
 def test_build_args_greet():
@@ -743,6 +796,12 @@ def test_build_args_chat_with_all_options():
 	assert "--page" in args
 
 
+def test_build_args_chat_forwards_export_options():
+	"""导出走 CLI 的 --export / --output，MCP 侧用 format / output_file 命名。"""
+	args = _build_args("boss_chat", {"format": "md", "output_file": "/tmp/chat.md"})
+	assert args == ["chat", "--export", "md", "--output", "/tmp/chat.md"]
+
+
 def test_build_args_me_no_section():
 	args = _build_args("boss_me", {})
 	assert args == ["me"]
@@ -751,6 +810,12 @@ def test_build_args_me_no_section():
 def test_build_args_me_with_section():
 	args = _build_args("boss_me", {"section": "resume"})
 	assert args == ["me", "--section", "resume"]
+
+
+def test_build_args_me_forwards_deliver_page():
+	assert _build_args("boss_me", {"section": "deliver", "deliver_page": 2}) == [
+		"me", "--section", "deliver", "--deliver-page", "2",
+	]
 
 
 # ── 新增工具参数构建 ────────────────────────────────────────────────
@@ -769,6 +834,12 @@ def test_build_args_chatmsg_raw():
 def test_build_args_chat_summary():
 	args = _build_args("boss_chat_summary", {"security_id": "s1"})
 	assert args == ["chat-summary", "s1"]
+
+
+def test_build_args_chat_summary_forwards_paging():
+	"""摘要也读聊天记录，页码与条数决定请求预算与上下文长度。"""
+	args = _build_args("boss_chat_summary", {"security_id": "s1", "page": 2, "count": 50})
+	assert args == ["chat-summary", "s1", "--page", "2", "--count", "50"]
 
 
 def test_build_args_mark():
@@ -799,12 +870,43 @@ def test_build_args_batch_greet():
 	assert default_args == ["batch-greet", "python", "--count", "5"]
 
 
+def test_build_args_batch_greet_forwards_filters():
+	"""批量招呼必须能带全筛选条件：漏传会把范围放大到整页搜索结果。"""
+	args = _build_args("boss_batch_greet", {
+		"query": "golang",
+		"city": "北京",
+		"salary": "20-40K",
+		"experience": "3-5年",
+		"education": "本科",
+		"industry": "电子商务",
+		"scale": "100-499人",
+		"stage": "A轮",
+		"job_type": "全职",
+	})
+	assert args == [
+		"batch-greet", "golang",
+		"--city", "北京",
+		"--salary", "20-40K",
+		"--experience", "3-5年",
+		"--education", "本科",
+		"--industry", "电子商务",
+		"--scale", "100-499人",
+		"--stage", "A轮",
+		"--job-type", "全职",
+		"--count", "5",
+	]
+
+
 def test_build_args_show():
 	assert _build_args("boss_show", {"number": 5}) == ["show", "5"]
 
 
 def test_build_args_pipeline():
 	assert _build_args("boss_pipeline", {}) == ["pipeline"]
+
+
+def test_build_args_pipeline_forwards_days_stale():
+	assert _build_args("boss_pipeline", {"days_stale": 7}) == ["pipeline", "--days-stale", "7"]
 
 
 def test_build_args_follow_up():
@@ -841,6 +943,12 @@ def test_build_args_clean():
 	assert "clean" in args
 	assert "--dry-run" in args
 	assert "--all" in args
+
+
+def test_build_args_clean_forwards_days():
+	"""保留天数要能下发；显式 0 也必须原样交给 CLI，不能被真值判断丢掉。"""
+	assert _build_args("boss_clean", {"days": 7}) == ["clean", "--days", "7"]
+	assert _build_args("boss_clean", {"days": 0}) == ["clean", "--days", "0"]
 
 
 # ── CLI 调用逻辑 ───────────────────────────────────────────────────
@@ -931,6 +1039,136 @@ def test_run_boss_timeout(mock_run):
 	mock_run.return_value = MagicMock(stdout='{"ok": true}', stderr="")
 	_run_boss("doctor")
 	assert mock_run.call_args[1]["timeout"] == 120
+
+
+@patch("server.subprocess.run")
+def test_run_boss_read_only_timeout_is_replay_safe(mock_run):
+	"""只读命令超时不能继承写操作的「结果未知」：读取没有副作用，可以直接重试。"""
+	mock_run.side_effect = subprocess.TimeoutExpired("boss", 120)
+
+	result = _run_boss("show", "3", may_write=False)
+
+	assert result["ok"] is False
+	assert result["error"]["code"] == "WORKFLOW_TIMEOUT"
+	assert result["error"]["recoverable"] is True
+	assert result["error"]["details"]["outcome_unknown"] is False
+	assert result["error"]["details"]["replay_safe"] is True
+	assert "可直接重新调用" in result["error"]["recovery_action"]
+
+
+@patch("server.subprocess.run")
+def test_run_boss_write_timeout_still_requires_outcome_check(mock_run):
+	"""未声明只读的工具默认按写操作处理：超时后必须先核对平台结果。"""
+	mock_run.side_effect = subprocess.TimeoutExpired("boss", 120)
+
+	result = _run_boss("apply", "s", "j")
+
+	assert result["error"]["recoverable"] is False
+	assert result["error"]["details"]["outcome_unknown"] is True
+	assert result["error"]["details"]["replay_safe"] is False
+	assert "未确认的写操作不要直接重试" in result["error"]["recovery_action"]
+
+
+def test_read_only_tool_classification_covers_real_tools_only():
+	"""只读白名单不能引用不存在的工具，也不能把已知写工具放进去。"""
+	from boss_agent_cli import mcp_server
+
+	catalog = {tool.name for tool in TOOLS}
+	assert mcp_server._READ_ONLY_TOOL_NAMES <= catalog
+	write_tools = {
+		"boss_apply", "boss_greet", "boss_batch_greet", "boss_mark", "boss_exchange",
+		"boss_wizard", "boss_clean", "boss_crawl_shortlist", "boss_agent_run",
+		"boss_agent_review_approve", "boss_agent_review_reject",
+		"boss_shortlist_add", "boss_shortlist_annotate", "boss_shortlist_remove",
+		"boss_preset_add", "boss_preset_remove", "boss_watch_add", "boss_watch_remove",
+		"boss_hr_greet", "boss_hr_location", "boss_hr_reply", "boss_hr_request_resume",
+		"boss_hr_accept_resume", "boss_hr_exchange",
+	}
+	assert not (mcp_server._READ_ONLY_TOOL_NAMES & write_tools)
+	# 按参数判写的工具同样必须在只读白名单里，否则规则本身就没机会生效。
+	assert mcp_server._TOOL_WRITE_MODES.keys() <= mcp_server._READ_ONLY_TOOL_NAMES
+
+
+def test_write_modes_only_reference_declared_enum_actions():
+	"""写模式必须是 schema 里真实存在的 action 枚举值，不能凭工具名猜。"""
+	from boss_agent_cli import mcp_server
+
+	by_name = {tool.name: tool for tool in TOOLS}
+	for tool_name, modes in mcp_server._TOOL_WRITE_MODES.items():
+		tool = by_name[tool_name]
+		allowance = tool.input_schema["properties"]["action"]
+		assert set(allowance["enum"]) >= modes
+		assert allowance.get("default", "list") not in modes
+
+
+@pytest.mark.parametrize(
+	"arguments,may_write",
+	[
+		({"action": "online", "job_id": "j"}, True),
+		({"action": "offline", "job_id": "j"}, True),
+		({"action": "list"}, False),
+		({}, False),
+	],
+)
+def test_hr_jobs_write_classification_depends_on_action(arguments, may_write):
+	"""`boss_hr_jobs` 的 online/offline 会 POST 平台状态变更，不能整体算只读（Issue #869）。"""
+	from boss_agent_cli import mcp_server
+
+	assert mcp_server._tool_may_write("boss_hr_jobs", arguments) is may_write
+
+
+def test_hr_jobs_offline_timeout_requires_outcome_check(monkeypatch):
+	"""超时信封必须与参数级写判定一致：offline 不能说自己「不产生平台写入」。"""
+	from boss_agent_cli import mcp_server
+	from mcp.types import CallToolRequestParams
+
+	monkeypatch.setattr(mcp_server, "TextContent", MagicMock())
+	monkeypatch.setattr(mcp_server, "CallToolResult", MagicMock())
+	captured: dict[str, bool] = {}
+
+	async def fake_run(*args, **kwargs):
+		captured["may_write"] = kwargs["may_write"]
+		return {"ok": True}
+
+	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
+	asyncio.run(
+		mcp_server.call_tool(
+			None,
+			CallToolRequestParams(name="boss_hr_jobs", arguments={"action": "offline", "job_id": "j"}),
+		)
+	)
+	assert captured == {"may_write": True}
+
+
+def test_call_tool_passes_per_tool_write_classification(monkeypatch):
+	"""超时 / 取消的保守程度必须按工具区分，而不是所有工具一律「结果未知」。"""
+	from types import SimpleNamespace
+
+	from boss_agent_cli import mcp_server
+	from mcp.types import CallToolRequestParams
+
+	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
+	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
+	captured: dict[str, bool] = {}
+
+	async def fake_run(*args, **kwargs):
+		captured["may_write"] = kwargs["may_write"]
+		return {"ok": True}
+
+	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
+
+	asyncio.run(
+		mcp_server.call_tool(None, CallToolRequestParams(name="boss_show", arguments={"number": 1}))
+	)
+	assert captured == {"may_write": False}
+
+	asyncio.run(
+		mcp_server.call_tool(
+			None,
+			CallToolRequestParams(name="boss_apply", arguments={"security_id": "s", "job_id": "j"}),
+		)
+	)
+	assert captured == {"may_write": True}
 
 
 @patch("server.subprocess.run")
@@ -1058,6 +1296,11 @@ def test_build_args_stats_with_days():
 	assert args == ["stats", "--days", "7"]
 
 
+def test_build_args_stats_forwards_html_export():
+	args = _build_args("boss_stats", {"format": "html", "output_file": "/tmp/report.html"})
+	assert args == ["stats", "--format", "html", "--output", "/tmp/report.html"]
+
+
 def test_build_args_agent_run_and_stop():
 	assert _build_args("boss_agent_run", {"dry_run": True, "limit": 2}) == [
 		"agent", "run", "--dry-run", "--limit", "2",
@@ -1183,12 +1426,26 @@ def test_build_args_favorites_list_omits_page_when_absent():
 
 def test_tool_count_after_pr41():
 	"""协议服务工具总数应与当前 MCP 暴露能力完全一致。"""
-	assert len(TOOLS) == 78
+	assert len(TOOLS) == 79
 
 
 def test_build_args_shortlist_add():
 	args = _build_args("boss_shortlist_add", {"security_id": "s1", "job_id": "j1", "tags": "远程,双休", "note": "优先"})
 	assert args == ["shortlist", "add", "s1", "j1", "--tags", "远程,双休", "--note", "优先"]
+
+
+def test_build_args_shortlist_add_forwards_metadata():
+	"""候选池元数据要能随添加写入，否则 MCP 侧列表只能看到空标题/空公司。"""
+	args = _build_args("boss_shortlist_add", {
+		"security_id": "s1", "job_id": "j1",
+		"title": "后端工程师", "company": "某公司", "city": "北京",
+		"salary": "30-50K", "source": "search",
+	})
+	assert args == [
+		"shortlist", "add", "s1", "j1",
+		"--title", "后端工程师", "--company", "某公司", "--city", "北京",
+		"--salary", "30-50K", "--source", "search",
+	]
 
 
 def test_build_args_shortlist_annotate():
@@ -1202,6 +1459,16 @@ def test_build_args_shortlist_annotate():
 		"--remove-tag", "外包",
 		"--note", "优先",
 	]
+
+
+def test_build_args_shortlist_annotate_forwards_empty_note_to_clear_it():
+	"""空串是「清空备注」的显式意图，不能在映射层被当成未传（Issue #872）。"""
+	assert _build_args(
+		"boss_shortlist_annotate", {"security_id": "s1", "job_id": "j1", "note": ""}
+	) == ["shortlist", "annotate", "s1", "j1", "--note", ""]
+	assert _build_args(
+		"boss_shortlist_annotate", {"security_id": "s1", "job_id": "j1"}
+	) == ["shortlist", "annotate", "s1", "j1"]
 
 
 def test_build_args_shortlist_compare():
@@ -1229,6 +1496,19 @@ def test_build_args_preset_add_full():
 	assert "--welfare" in args and "双休" in args
 
 
+def test_build_args_preset_add_forwards_structured_filters():
+	"""预设要能保存行业/规模/阶段/职位类型，否则 search --preset 拿不到完整条件。"""
+	args = _build_args("boss_preset_add", {
+		"name": "p1", "query": "golang",
+		"industry": "电子商务", "scale": "100-499人", "stage": "A轮", "job_type": "全职",
+	})
+	assert args == [
+		"preset", "add", "p1", "golang",
+		"--industry", "电子商务", "--scale", "100-499人",
+		"--stage", "A轮", "--job-type", "全职",
+	]
+
+
 def test_build_args_preset_remove():
 	assert _build_args("boss_preset_remove", {"name": "p1"}) == ["preset", "remove", "p1"]
 
@@ -1237,6 +1517,20 @@ def test_build_args_watch_add():
 	args = _build_args("boss_watch_add", {"name": "w1", "query": "rust", "city": "北京"})
 	assert args[:4] == ["watch", "add", "w1", "rust"]
 	assert "--city" in args and "北京" in args
+
+
+def test_build_args_watch_add_forwards_filters():
+	"""监控保存的筛选条件必须完整，否则增量结果会在每次运行时被放大。"""
+	args = _build_args("boss_watch_add", {
+		"name": "w1", "query": "rust",
+		"experience": "3-5年", "education": "本科", "industry": "电子商务",
+		"scale": "100-499人", "stage": "A轮", "job_type": "全职", "welfare": "双休",
+	})
+	assert args == [
+		"watch", "add", "w1", "rust",
+		"--experience", "3-5年", "--education", "本科", "--industry", "电子商务",
+		"--scale", "100-499人", "--stage", "A轮", "--job-type", "全职", "--welfare", "双休",
+	]
 
 
 def test_build_args_watch_remove():
@@ -1294,6 +1588,17 @@ def test_build_args_hr_chat():
 	assert args == ["hr", "chat", "--page", "2", "--job-id", "55", "--label-id", "1"]
 
 
+def test_build_args_hr_chat_forwards_summary_limit():
+	# 0 = 只读沟通列表、不额外请求最近消息，MCP 调用方能显式关闭补充请求。
+	args = _build_args("boss_hr_chat", {"page": 2, "summary_limit": 0})
+	assert args == ["hr", "chat", "--page", "2", "--summary-limit", "0"]
+
+
+def test_build_args_hr_chat_omits_unset_summary_limit():
+	args = _build_args("boss_hr_chat", {"page": 2})
+	assert "--summary-limit" not in args
+
+
 def test_build_args_hr_chatmsg():
 	args = _build_args("boss_hr_chatmsg", {"friend_id": 12345, "count": 10, "max_msg_id": 9001})
 	assert args == ["hr", "chatmsg", "12345", "--count", "10", "--max-msg-id", "9001"]
@@ -1302,6 +1607,13 @@ def test_build_args_hr_chatmsg():
 def test_build_args_hr_last_messages():
 	args = _build_args("boss_hr_last_messages", {"friend_ids": [12345, 67790], "page": 2})
 	assert args == ["hr", "last-messages", "--friend-id", "12345", "--friend-id", "67790", "--page", "2"]
+
+
+def test_build_args_hr_last_messages_forwards_limit():
+	# limit 控制串行请求批次数量，默认 100 时不下发，显式值原样透传。
+	args = _build_args("boss_hr_last_messages", {"page": 2, "limit": 40})
+	assert args == ["hr", "last-messages", "--page", "2", "--limit", "40"]
+	assert "--limit" not in _build_args("boss_hr_last_messages", {"page": 2})
 
 
 def test_build_args_hr_resume():

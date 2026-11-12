@@ -11,6 +11,7 @@ from boss_agent_cli.services.job_identity import deduplicate_job_result
 
 _SEARCH_TTL = 86400  # 24 hours
 _MAX_SEARCH_CACHE = 100
+_MAX_JOB_DESC_CACHE = 1000
 
 
 class SavedSearchParamsError(ValueError):
@@ -185,6 +186,13 @@ class CacheStore:
 				status TEXT NOT NULL,
 				updated_at REAL NOT NULL,
 				PRIMARY KEY (geek_id, job_id)
+			);
+			CREATE TABLE IF NOT EXISTS recruiter_location_records (
+				friend_id TEXT NOT NULL PRIMARY KEY,
+				job_id TEXT NOT NULL,
+				name TEXT NOT NULL,
+				status TEXT NOT NULL,
+				updated_at REAL NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS search_cache (
 				cache_key TEXT PRIMARY KEY,
@@ -854,6 +862,57 @@ class CacheStore:
 				(status, time.time(), geek_id, job_id),
 			)
 
+	def location_send_status(self, friend_id: int) -> str | None:
+		"""读取工作地点发送记录。没有记录时返回 None，不创建新行。"""
+		row = self._conn.execute(
+			"SELECT status FROM recruiter_location_records WHERE friend_id = ?",
+			(str(friend_id),),
+		).fetchone()
+		return str(row[0]) if row else None
+
+	def claim_location_send(self, friend_id: int) -> str | None:
+		"""原子预约工作地点发送。已有记录时返回状态，禁止对同一会话再发一次。
+
+		进程退出或响应丢失时保留 pending，后续调用不得自动重发。
+		"""
+		key = str(friend_id)
+		with self._conn:
+			cursor = self._conn.execute(
+				"INSERT OR IGNORE INTO recruiter_location_records (friend_id, job_id, name, status, updated_at) "
+				"VALUES (?, '', '', 'pending', ?)",
+				(key, time.time()),
+			)
+			if cursor.rowcount:
+				return None
+			row = self._conn.execute(
+				"SELECT status FROM recruiter_location_records WHERE friend_id = ?",
+				(key,),
+			).fetchone()
+			return str(row[0]) if row else None
+
+	def record_location_send(self, friend_id: int, *, job_id: str) -> None:
+		"""把已确认发出的工作地点记为 sent。没有对应预约时抛错，避免假装记上了。
+
+		只保留去重所需的会话与职位标识，不保存候选人姓名。
+		"""
+		with self._conn:
+			cursor = self._conn.execute(
+				"UPDATE recruiter_location_records SET status = 'sent', job_id = ?, name = '', updated_at = ? "
+				"WHERE friend_id = ?",
+				(job_id, time.time(), str(friend_id)),
+			)
+			if cursor.rowcount != 1:
+				raise sqlite3.OperationalError("工作地点发送记录不存在，无法标记为已发送")
+
+	def release_location_send(self, friend_id: int) -> bool:
+		"""撤销确定未发出的预约。只删除 pending，已发送或结果未知的记录保持原样。"""
+		with self._conn:
+			cursor = self._conn.execute(
+				"DELETE FROM recruiter_location_records WHERE friend_id = ? AND status = 'pending'",
+				(str(friend_id),),
+			)
+			return bool(cursor.rowcount)
+
 	def release_recruiter_greet(self, geek_id: str, job_id: str) -> bool:
 		"""撤销确定未发出的预约；只删 pending，已发送或结果未知的记录保持原样。
 
@@ -927,7 +986,7 @@ class CacheStore:
 		return cast("str", row[0])
 
 	def put_job_desc(self, job_id: str, description: str) -> None:
-		"""缓存职位描述（仅当 job_id 与描述非空时写入）。"""
+		"""缓存非空职位描述，超过容量时淘汰保存时间最早的条目。"""
 		if not job_id or not description:
 			return
 		self._conn.execute(
@@ -935,6 +994,18 @@ class CacheStore:
 			(job_id, description, time.time()),
 		)
 		self._conn.commit()
+		self._evict_old_job_desc_cache()
+
+	def _evict_old_job_desc_cache(self) -> None:
+		count = self._conn.execute("SELECT COUNT(*) FROM job_desc_cache").fetchone()[0]
+		if count > _MAX_JOB_DESC_CACHE:
+			excess = count - _MAX_JOB_DESC_CACHE
+			self._conn.execute(
+				"DELETE FROM job_desc_cache WHERE job_id IN "
+				"(SELECT job_id FROM job_desc_cache ORDER BY created_at ASC, rowid ASC LIMIT ?)",
+				(excess,),
+			)
+			self._conn.commit()
 
 	def _evict_old_search_cache(self) -> None:
 		count = self._conn.execute("SELECT COUNT(*) FROM search_cache").fetchone()[0]

@@ -1,10 +1,10 @@
 # boss-agent-cli
 
-> A BOSS Zhipin (BOSS 直聘) CLI for people and AI agents. Job discovery with real welfare filtering, applications, recruiter workflows, resumes, AI assistance and recoverable crawling share one capability set behind a single JSON envelope. Current version: 3.2.2.
+> A BOSS Zhipin (BOSS 直聘) CLI for people and AI agents. Job discovery with real welfare filtering, applications, recruiter workflows, resumes, AI assistance and recoverable crawling share one capability set behind a single JSON envelope. Current version: 3.3.0.
 
 ## Capability source of truth
 
-Run `boss schema` (also supports `--format native | openai-tools | anthropic-tools | mcp-tools`). 39 top-level commands, 14 first-level recruiter subcommands, 78 implemented MCP tools. The sole registered platform is zhipin (BOSS Zhipin).
+Run `boss schema` (also supports `--format native | openai-tools | anthropic-tools | mcp-tools`). 39 top-level commands, 15 first-level recruiter subcommands, 79 implemented MCP tools. The sole registered platform is zhipin (BOSS Zhipin).
 
 ## Start here
 

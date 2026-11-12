@@ -62,6 +62,14 @@ boss logout && boss login
 
 停止当前 workflow，保留 run ID 或 checkpoint。处理登录或安全页状态后，再显式恢复；不要切换多种通道反复重试。
 
+扫码登录路径遇到风险时，`error.details.login_diagnostic` 可提供本地诊断上下文：
+
+- `origin` / `stage`：页面检查、会话探测或响应监听，以及当时的登录阶段。
+- `top_path` / `open_pages`：白名单顶层路径和可读取的当前 context 页数；未知路径只返回占位符，不包含查询参数或片段。
+- 响应事件还可能包含 `status`、`resource_type`、`is_navigation_request`、`frame_scope`（`main_frame` / `child_frame` / `other_page` / `unknown`）。
+
+字段只读取已有页面/响应对象的属性，不发额外请求，也不采集正文、Cookie 或 Token。不可用的信息省略或标记未知；这些字段不能证明响应无害、登录成功或风险已解除，原停止与锁存规则不变。此改动不新增保留失败窗口或自动恢复能力。
+
 ### v3.0.0：从 Browser Bridge 迁移
 
 Browser Bridge daemon、Chrome 扩展及 `[bridge]` 安装 extra 已移除。`boss doctor` 不再探测旧 daemon，也不再输出扩展检查项。
@@ -308,11 +316,13 @@ httpx 带着从 Chrome 拷出来的 Cookie，把 `__zp_stoken__` 当查询参数
 | `JOB_NOT_FOUND` | 职位不存在或已下架 | 用 `boss search <关键词>` 重新搜索，或 `boss recommend` 查看推荐职位 |
 | `INVALID_PARAM` | 参数错误 | 修正参数 |
 | `ALREADY_GREETED` | 已打过招呼 | 跳过 |
-| `CONFIRMATION_REQUIRED` | 未确认操作目标与内容 | 先用 `hr greet --dry-run` 或 `hr accept-resume <friend_id> --message-id <mid> --dry-run` 预览；操作者明确批准后才加 `--yes`，Agent 不可自行补确认 |
+| `CONFIRMATION_REQUIRED` | 未确认操作目标与内容 | 先用 `hr greet --dry-run`、`hr accept-resume <friend_id> --message-id <mid> --dry-run` 或 `hr location <friend_id> --dry-run` 预览；操作者明确批准后才加 `--yes`，Agent 不可自行补确认 |
 | `RESUME_ACCEPT_RESULT_UNKNOWN` | 同意附件简历请求的结果未确认 | 保留 `accepted=null`，在官方页面核对请求状态；禁止自动重试同意操作 |
 | `ACTION_UNCONFIRMED` | 招聘者交换联系方式或求简历的页面动作已执行，但未确认是否发出 | 动作可能已生效，先用 `boss hr chatmsg <friend_id>` 核实，勿直接重试；`error.details` 里有页面日志、WS 统计（`ws_evidence`，含 `ws_send_without_text`：有发送帧但读不出文本的条数）与历史回读核对结果（`history_checked` / `history_matched_count` / `history_attempts` / `history_new_count` / `history_self_count` / `history_recipient_count`） |
 | `EXCHANGE_NOT_AVAILABLE` | 换电话/换微信按钮还没解锁（你还没在这个会话里发过消息），本次未发出任何请求 | 先回复候选人（`boss hr reply <friend_id> <消息>` 或 `boss hr request-resume <friend_id>`），再重新交换；`error.details` 里有命中的禁用信号 |
 | `GREET_RESULT_UNKNOWN` | 已预约发送，但结果未确认 | 用 `boss hr chat --job-id <id>` 核对会话，禁止自动重发；本地保留预约，必要时在官方页面处理 |
+| `LOCATION_ALREADY_SENT` | 同一候选人会话已发送过工作地点卡片，本地记录阻止重复发送 | 用 `boss hr chatmsg <friend_id>` 核对地点卡；不要删除本地记录来重发 |
+| `LOCATION_RESULT_UNKNOWN` | 工作地点发送结果未确认 | 保留本地预约，用 `boss hr chatmsg <friend_id>` 核对是否已发出；禁止自动重发 |
 | `LOCAL_STATE_WRITE_FAILED` | 平台操作已完成，但本地状态保存失败 | 先在官方页面核对本次操作是否已生效；不要自动重发，确认磁盘空间与缓存目录权限后再继续 |
 | `LOCAL_IO_ERROR` | 本地文件读写失败（导出路径、`config.json`、缓存等） | 不要自动重试：确认目标路径是可写目录（而不是同名的已有文件）、权限与磁盘空间正常后再执行 |
 | `MODEL_REGISTRY_INVALID` | 本地模型登记表 `models/registry.json` 损坏（写一半被中断、手工编辑写坏） | 修正或删除该文件后重试；删除只会丢失已导入模型的登记，模型文件仍在磁盘上，重新执行 `boss ai local import` 即可重建 |

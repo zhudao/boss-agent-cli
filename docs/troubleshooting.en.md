@@ -54,6 +54,14 @@ boss logout && boss login
 
 Stop the current workflow and retain its run ID or checkpoint. Resolve the login or security-page state before an explicit resume; do not retry through multiple transports.
 
+Risk errors in the QR login paths may include local context in `error.details.login_diagnostic`:
+
+- `origin` / `stage`: a page check, session probe or response event, and the login stage at observation time.
+- `top_path` / `open_pages`: an allowlisted top-level path and the current context's page count when available. Unknown paths use a placeholder; queries and fragments are never included.
+- Response events may also include `status`, `resource_type`, `is_navigation_request`, and `frame_scope` (`main_frame` / `child_frame` / `other_page` / `unknown`).
+
+Only existing page/response object properties are read: no extra requests, bodies, cookies, or tokens. Unavailable metadata is omitted or marked unknown. These fields do not establish that a response is harmless, login succeeded, or risk was resolved; stopping and lock persistence remain unchanged. This does not add a failure-window hold or automatic recovery mode.
+
 ### Migrating from Browser Bridge in v3.0.0
 
 The Browser Bridge daemon, Chrome extension, and `[bridge]` installation extra have been removed. `boss doctor` no longer probes the old daemon or reports extension checks.
@@ -312,11 +320,13 @@ Every error response contains `code`, `recoverable`, and `recovery_action`, so a
 | `RESUME_FILE_INVALID` | A local resume file is corrupt or has wrong field types, so `boss resume show` / `edit` / `export` / `clone` / `diff` cannot read it (`boss resume list` reports these files in `hints.corrupt`) | Fix the matching `.json` under `resumes/` and retry, or run `boss resume delete <name>` and recreate it; the file exists only on this machine |
 | `JOB_NOT_FOUND` | Job removed or invalid | Re-search with `boss search <keywords>`, or check `boss recommend` |
 | `ALREADY_GREETED` | Already messaged recruiter | Skip |
-| `CONFIRMATION_REQUIRED` | Operation target and content not approved | Preview with `hr greet --dry-run` or `hr accept-resume <friend_id> --message-id <mid> --dry-run`; set `--yes` only after explicit operator approval. Agents must not infer approval. |
+| `CONFIRMATION_REQUIRED` | Operation target and content not approved | Preview with `hr greet --dry-run`, `hr accept-resume <friend_id> --message-id <mid> --dry-run`, or `hr location <friend_id> --dry-run`; set `--yes` only after explicit operator approval. Agents must not infer approval. |
 | `RESUME_ACCEPT_RESULT_UNKNOWN` | Resume acceptance result is unconfirmed | Keep `accepted=null` and check the request on the official page; never automatically retry acceptance. |
 | `ACTION_UNCONFIRMED` | A recruiter contact-exchange or resume-request page action ran, but sending was not confirmed | The action may already have taken effect; check `boss hr chatmsg <friend_id>` before doing anything and never retry blindly. `error.details` contains the page log, WebSocket counts (`ws_evidence`, including `ws_send_without_text`: frames with no readable text) and history read-back evidence (`history_checked` / `history_matched_count` / `history_attempts` / `history_new_count` / `history_self_count` / `history_recipient_count`). |
 | `EXCHANGE_NOT_AVAILABLE` | The phone/WeChat exchange button is still locked (you have not sent a message in this conversation yet); nothing was sent | Reply to the candidate first (`boss hr reply <friend_id> <message>` or `boss hr request-resume <friend_id>`), then retry the exchange. `error.details` lists the disabled signals that were hit. |
 | `GREET_RESULT_UNKNOWN` | Send reserved, outcome unconfirmed | Check `boss hr chat --job-id <id>`; never automatically resend. Keep the local reservation and use the official page if needed. |
+| `LOCATION_ALREADY_SENT` | A work-location card was already sent in this conversation, and the local record blocks a duplicate | Check the card with `boss hr chatmsg <friend_id>`; do not delete the local record to resend |
+| `LOCATION_RESULT_UNKNOWN` | Work-location send outcome is unconfirmed | Keep the local reservation and check `boss hr chatmsg <friend_id>` for the card; never resend automatically |
 | `LOCAL_STATE_WRITE_FAILED` | The platform action completed but local state could not be saved | Check the official page for the actual result first; never automatically resend, and confirm disk space and cache-directory permissions before continuing |
 | `LOCAL_IO_ERROR` | A local file could not be read or written (export path, `config.json`, cache) | Do not retry automatically: make sure the target path is a writable directory (not an existing file of the same name) with enough disk space, then run the command again |
 | `MODEL_REGISTRY_INVALID` | The local model registry `models/registry.json` is unreadable (interrupted write, broken manual edit) | Fix or delete the file and retry; deleting it only drops the registry entries — the model files stay on disk, and re-running `boss ai local import` rebuilds them |

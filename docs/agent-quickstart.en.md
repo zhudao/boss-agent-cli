@@ -55,6 +55,7 @@ Parsing contract:
 - Read JSON envelopes from `stdout` only
 - `ok=true` means success; when `ok=false`, inspect `error.code` and `error.recovery_action`
 - `boss schema` also returns `supported_platforms`, `supported_recruiter_platforms`, and per-command `availability`, so agents can route tools by `role/platform`
+- A `boss show <#>` number is bound to the latest `search` / `recommend` snapshot; `data.index_snapshot` reports `source`, `page`, `count`, and `saved_at`, and `pagination.index_snapshot` on `search` / `recommend` reports the same identity for direct comparison. After a rerun or page change the old number points at new results, so locate it again
 
 ### Agent authorization boundary
 
@@ -125,6 +126,7 @@ Common recovery actions:
 - `RATE_LIMITED`: declared replay-safe reads can use bounded cooldowns; verify write outcomes first
 - `REQUEST_BUDGET_EXHAUSTED`: the shared lease, rolling 60-second budget or cooldown exceeded this acquisition's wait limit; the current operation was not sent. Keep the checkpoint, inspect concurrency and `retry_after_seconds`, then explicitly resume without automatic retries or unlocking. A common `data_dir` shares limits by default; `request_budget_dir` explicitly groups directories. See [shared budget settings](commands.en.md#shared-request-budget-and-cooldown). Interrupted confirmation after a write remains `ACTION_UNCONFIRMED`; verify the outcome first
 - `NOT_SUPPORTED`: switch to a platform or workflow goal reported as available by schema
+- Writes with an unknown outcome: both CLI and MCP envelopes carry `error.details.replay_safe`; when it is `false` (or `outcome_unknown=true`), the action may already have taken effect — verify the platform state and never retry automatically. Interrupted reads report `replay_safe=true` and may be retried under the channel rules
 - `WORKFLOW_TIMEOUT`: a normal wizard timeout retains its `run_id`; adjust the deadline and explicitly run `boss wizard --resume <run_id>`. If MCP reports `outcome_unknown=true`, verify unconfirmed actions before retrying
 - `INVALID_PARAM`: correct the input parameters, such as city, welfare filters, or page number; on the MCP side this also covers unknown tool names, argument types that do not match the declared `inputSchema` (for example passing `dry_run` as the string `"true"`), and argument names outside `inputSchema.properties` (every tool schema declares top-level `additionalProperties: false`)
 
@@ -138,7 +140,7 @@ boss schema --format anthropic-tools
 boss schema --format mcp-tools
 ```
 
-All three tool formats use the shared runtime catalog of 78 MCP tools, with matching names and input parameters. Native schema continues to describe the CLI's 39 top-level commands.
+All three tool formats use the shared runtime catalog of 79 MCP tools, with matching names and input parameters. Native schema continues to describe the CLI's 39 top-level commands.
 
 Further reading:
 - [Agent Host Examples](agent-hosts.en.md)

@@ -55,6 +55,7 @@ boss --json wizard --resume <run_id>
 - `stdout` 只读 JSON 信封
 - `ok=true` 代表成功，`ok=false` 时读取 `error.code` 与 `error.recovery_action`
 - `boss schema` 除了返回 `supported_platforms` / `supported_recruiter_platforms`，还会给每个命令附带 `availability`，可直接按 `role/platform` 做工具路由
+- `boss show <#>` 的编号绑定最近一次 `search` / `recommend` 的快照，`data.index_snapshot` 给出 `source` / `page` / `count` / `saved_at`；`search` / `recommend` 的 `pagination.index_snapshot` 返回同一份快照身份，可直接与 `show` 的字段比对。重跑搜索或翻页后旧编号会指向新结果，必须重新定位
 
 ### Agent 授权边界
 
@@ -125,6 +126,7 @@ boss status
 - `RATE_LIMITED`：已声明可重放的读取可有限冷却；写操作先核对是否生效
 - `REQUEST_BUDGET_EXHAUSTED`：共享执行锁、60 秒预算或冷却超出本次等待时限，本次操作未发出；保留 checkpoint，检查并发与 `retry_after_seconds` 后显式恢复，不自动重试或清锁。同 `data_dir` 默认共享，可用 `request_budget_dir` 显式分组；见 [共享预算配置](commands.md#共享请求预算与冷却)。写后确认中断仍为 `ACTION_UNCONFIRMED`，先核对结果
 - `NOT_SUPPORTED`：切换 schema catalog 中支持该 goal 的平台或 workflow
+- 结果未知的写操作：CLI 与 MCP 信封的 `error.details` 都带 `replay_safe`；为 `false`（或 `outcome_unknown=true`）时动作可能已生效，先核对平台实际状态，禁止自动重试。读取被中断时 `replay_safe=true`，可按通道规则重试
 - `WORKFLOW_TIMEOUT`：正常 wizard 超时保留 `run_id`，调整超时后显式 `boss wizard --resume <run_id>`；若 MCP 返回 `outcome_unknown=true`，先核对未确认的动作，禁止直接重试
 - `INVALID_PARAM`：校正参数（城市、福利、页码等）；MCP 侧还包括未知工具名、不符合 `inputSchema` 声明类型的参数（例如把 `dry_run` 传成字符串 `"true"`），以及 `inputSchema.properties` 之外的未知参数（工具的 schema 已声明顶层 `additionalProperties: false`）
 
@@ -140,7 +142,7 @@ boss schema --format anthropic-tools  # Claude Tool Use API
 boss schema --format mcp-tools        # Model Context Protocol Tools
 ```
 
-三个工具格式均来自运行时共享的 78 个 MCP 工具目录，名称与输入参数保持一致；原生格式继续按 39 个顶层命令描述 CLI。
+三个工具格式均来自运行时共享的 79 个 MCP 工具目录，名称与输入参数保持一致；原生格式继续按 39 个顶层命令描述 CLI。
 
 输出可直接喂给对应 host，无需手写适配。
 

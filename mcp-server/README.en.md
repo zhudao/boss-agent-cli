@@ -49,7 +49,7 @@ Add the server in Cursor Settings -> MCP Servers:
 
 ## Available tools
 
-The current MCP server exposes **78 implemented tools**.
+The current MCP server exposes **79 implemented tools**.
 
 ### Shared workflow
 
@@ -70,7 +70,7 @@ The current MCP server exposes **78 implemented tools**.
 
 | Tool | Description |
 |------|-------------|
-| `boss_search` | Search jobs with city, salary, and welfare filters |
+| `boss_search` | Search jobs with city, salary, experience, education, industry, company scale, funding stage, job type, welfare, and activity filters |
 | `boss_detail` | Fetch job details |
 | `boss_show` | Open a job from the previous search result by index |
 | `boss_export` | Export search results to CSV / JSON / HTML (supports `url` for replaying web filters; redacts job_id/security_id/boss_name by default) |
@@ -130,6 +130,7 @@ Fine-grained crawl tools read or import existing tasks; `boss_wizard` goals `cra
 | `boss_hr_applications` / `boss_hr_candidates` | Applications and candidate search |
 | `boss_hr_accept_resume` / `boss_hr_download_resume` | Accept a specific resume request and download a received attachment after checking access |
 | `boss_hr_recommendations` / `boss_hr_greet` | Recommended candidates, greeting preview, and operator-approved first contact without changing read status |
+| `boss_hr_location` | Send a work-location card into an existing conversation; requires explicit operator approval and never repeats for the same friend |
 | `boss_hr_resume` / `boss_hr_exchange` / `boss_hr_request_resume` | Online resumes, contact exchange, and attached-resume requests |
 | `boss_hr_chat` / `boss_hr_chatmsg` / `boss_hr_last_messages` / `boss_hr_reply` | Recruiter conversation reads and replies |
 

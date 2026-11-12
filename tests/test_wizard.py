@@ -2,6 +2,7 @@ import json
 import os
 import pty
 import select
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -291,6 +292,38 @@ def test_wizard_unknown_goal_envelope_lists_goals_and_schema_hint(tmp_path):
 	assert payload["hints"]["next_actions"] == ["boss schema"]
 
 
+def test_wizard_duplicate_requested_steps_returns_invalid_param_envelope(tmp_path):
+	"""重复步骤会撞 workflow_steps 主键；必须在建 plan 时拒绝并给出信封（Issue #879）。"""
+	result = CliRunner().invoke(
+		cli,
+		[
+			"--json",
+			"--data-dir",
+			str(tmp_path),
+			"wizard",
+			"--input-json",
+			json.dumps(
+				{
+					"role": "candidate",
+					"platform": "zhipin",
+					"goal": "shortlist",
+					"inputs": {},
+					"requested_steps": ["local_shortlist", "local_shortlist"],
+					"mode": "headless",
+				}
+			),
+		],
+	)
+	assert result.exit_code == 1
+	payload = json.loads(result.stdout)
+	assert set(payload) == {"ok", "schema_version", "command", "data", "pagination", "error", "hints"}
+	assert payload["error"]["code"] == "INVALID_PARAM"
+	assert "不能重复" in payload["error"]["message"]
+	# 与「未知 goal」同一路径：输入本身不成立，需要改成新输入而不是原样重试。
+	assert payload["error"]["recoverable"] is False
+	assert payload["hints"]["next_actions"] == ["boss schema"]
+
+
 class _FakeCandidatePlatform:
 	def __init__(self):
 		self.calls = []
@@ -355,6 +388,31 @@ def _action_context(tmp_path, *, role="candidate", candidate=None, recruiter=Non
 		candidate_factory=(lambda name, auth, delay, cdp_url, browser_source=None: candidate if candidate is not None else None),
 		recruiter_factory=(lambda name, auth, delay, cdp_url, browser_source=None: recruiter if recruiter is not None else None),
 	)
+
+
+def test_candidate_pipeline_action_aggregates_every_friend_list_page(tmp_path):
+	"""向导 pipeline 只看第 1 页会静默漏掉后续页的沟通（Issue #881）。"""
+	from boss_agent_cli.wizard.actions import _candidate_pipeline_data
+
+	class PagedPlatform(_FakeCandidatePlatform):
+		def friend_list(self, *, page=1):
+			self.calls.append(("friend_list", page))
+			page_one = [{"uid": 10001, "securityId": "sid_1", "name": "联系人甲", "friendSource": 0}]
+			page_two = [{"uid": 10002, "securityId": "sid_2", "name": "联系人乙", "friendSource": 0}]
+			return {
+				"code": 0,
+				"data": {"result": page_one if page == 1 else page_two, "hasMore": page == 1},
+			}
+
+		def interview_data(self):
+			return {"code": 0, "data": {"interviewList": []}}
+
+	platform = PagedPlatform()
+	context = _action_context(tmp_path, candidate=platform)
+	items = _candidate_pipeline_data(context, {})
+
+	assert [page for _, page in platform.calls if _ == "friend_list"] == [1, 2]
+	assert {item["security_id"] for item in items} == {"sid_1", "sid_2"}
 
 
 def test_candidate_write_actions_persist_idempotence_records(tmp_path):
@@ -626,7 +684,9 @@ def test_crawl_actions_use_fixture_service_and_persist_stop(tmp_path, monkeypatc
 		)
 	status = DEFAULT_ACTIONS["crawl_status"](context, {"run_id": "crawl-existing"}, {})
 	assert status.data["run_id"] == "crawl-existing"
-	assert status.data["checkpoint"]["resume_command"] == "boss crawl resume crawl-existing"
+	assert shlex.split(status.data["checkpoint"]["resume_command"]) == [
+		"boss", "--data-dir", str(tmp_path.resolve()), "crawl", "resume", "crawl-existing",
+	]
 	resumed = DEFAULT_ACTIONS["crawl_resume"](
 		context,
 		{"run_id": "crawl-existing", "pages": 4, "with_detail": True},
@@ -964,8 +1024,9 @@ def test_runner_normalizes_auth_and_network_failures(tmp_path):
 	last = auth_run["last_result"]
 	assert last["status"] == "waiting_input"
 	assert last["data"]["authenticated"] is False
-	assert last["next_action"] == "boss wizard --resume auth-required-run"
-	assert any("boss --platform zhipin login" in action for action in last["operator_actions"])
+	assert shlex.split(last["next_action"]) == ["boss", "--data-dir", str(tmp_path.resolve()), "wizard", "--resume", "auth-required-run"]
+	login_action = f"boss --data-dir {shlex.quote(str(tmp_path.resolve()))} login"
+	assert any(login_action in action for action in last["operator_actions"])
 
 
 def test_runner_auth_wait_quotes_run_id_in_resume_next_action(tmp_path):
@@ -985,7 +1046,9 @@ def test_runner_auth_wait_quotes_run_id_in_resume_next_action(tmp_path):
 			run_id="auth; echo pwn",
 		)
 	assert run["status"] == "waiting_input"
-	assert run["last_result"]["next_action"] == "boss wizard --resume 'auth; echo pwn'"
+	assert shlex.split(run["last_result"]["next_action"]) == [
+		"boss", "--data-dir", str(tmp_path.resolve()), "wizard", "--resume", "auth; echo pwn",
+	]
 
 	def broken(context, inputs, prior):
 		raise OSError("offline")
@@ -1293,6 +1356,71 @@ def test_workflow_stop_forwards_to_bound_crawl_run(tmp_path):
 
 	assert run["status"] == "stopped"
 	assert inner["stop_requested"] is True
+
+
+def test_resume_after_timeout_forwards_bound_inner_checkpoint_to_action(tmp_path):
+	"""超时后恢复：failed 步骤的 inner_run_id 必须传给 action，且不能被重跑清空（Issue #882）。"""
+	priors = []
+	store_seen = []
+
+	with WorkflowStore(tmp_path) as store:
+
+		def flaky(context, inputs, prior):
+			store.update_step(
+				"run-resume-bound", "crawl_start", status="running", result={"inner_run_id": "crw_inner"}
+			)
+			raise WorkflowActionError(
+				"WORKFLOW_TIMEOUT",
+				"workflow 超过设定时限",
+				recoverable=True,
+				recovery_action="boss crawl resume crw_inner",
+			)
+
+		runner = WorkflowRunner(store, {"crawl_start": flaky})
+		plan = WorkflowPlan(
+			role="candidate",
+			platform="zhipin",
+			goal="crawl_start",
+			inputs={"query": "Python", "city": "北京"},
+			requested_steps=("crawl_start",),
+			mode="headless",
+		)
+		first = runner.run(plan, object(), run_id="run-resume-bound")
+		assert first["error"]["code"] == "WORKFLOW_TIMEOUT"
+		assert first["steps"][0]["result"] == {"inner_run_id": "crw_inner"}
+
+		def recovered(context, inputs, prior):
+			priors.append(prior)
+			step = next(s for s in store.get("run-resume-bound")["steps"] if s["step_name"] == "crawl_start")
+			store_seen.append(step["result"])
+			return StepResult({"ok": True})
+
+		runner._actions["crawl_start"] = recovered
+		second = runner.run(plan, object(), run_id="run-resume-bound")
+	assert second["status"] == "completed"
+	assert priors[0]["crawl_start"] == {"inner_run_id": "crw_inner"}
+	# 重跑开始时不得清空已写入的绑定，否则再次中断就永久丢失内部任务。
+	assert store_seen[0] == {"inner_run_id": "crw_inner"}
+
+
+def test_deadline_before_step_keeps_bound_inner_checkpoint(tmp_path):
+	"""恢复时 deadline 已过：_fail_controlled 也不能清掉上次绑定（Issue #882）。"""
+	plan = WorkflowPlan(
+		role="candidate",
+		platform="zhipin",
+		goal="crawl_start",
+		inputs={"query": "Python", "city": "北京"},
+		requested_steps=("crawl_start",),
+		mode="headless",
+	)
+	with WorkflowStore(tmp_path) as store:
+		store.create("run-deadline-bind", plan)
+		store.update_run("run-deadline-bind", status="running", current_step="crawl_start")
+		store.update_step("run-deadline-bind", "crawl_start", status="running", result={"inner_run_id": "crw_inner"})
+		runner = WorkflowRunner(store, {"crawl_start": lambda c, i, p: StepResult({"ok": True})})
+		run = runner.run(plan, object(), run_id="run-deadline-bind", timeout_seconds=0)
+	assert run["error"]["code"] == "WORKFLOW_TIMEOUT"
+	assert run["steps"][0]["result"] == {"inner_run_id": "crw_inner"}
 
 
 def test_runner_records_timeout_at_action_boundary(tmp_path):
@@ -2182,6 +2310,58 @@ def test_crawl_start_resumes_existing_run_from_prior_waiting_result():
 	assert result.status.value == "completed"
 
 
+def test_crawl_start_resumes_bound_inner_run_from_interrupted_step():
+	"""中断步骤只留下 {inner_run_id}：恢复时续跑该 crawl，不新建第二份采集（Issue #882）。"""
+	from boss_agent_cli.wizard.actions import DEFAULT_ACTIONS
+
+	resumed = []
+	created = []
+
+	class _Svc:
+		def resume(self, run_id, **kwargs):
+			resumed.append(run_id)
+			return CrawlOutcome(
+				run_id=run_id,
+				status="completed",
+				jobs_seen=1,
+				pages_completed=1,
+				next_page=2,
+				requests_attempted=1,
+				detail_requests_attempted=0,
+				detail_checks=0,
+				elapsed_seconds=1,
+				output_paths={"json": f"/tmp/{run_id}.json"},
+				error="",
+				hooks=[],
+			)
+
+		def create_and_run(self, settings):
+			created.append(settings)
+			raise AssertionError("中断后恢复不应新建采集任务")
+
+	ctx = ActionContext(
+		data_dir=Path("/tmp"),
+		platform="zhipin",
+		role="candidate",
+		logger=Logger("error"),
+	)
+	import boss_agent_cli.wizard.actions as actions_mod
+
+	orig = actions_mod._crawl_service
+	actions_mod._crawl_service = lambda context, cache: _Svc()
+	try:
+		result = DEFAULT_ACTIONS["crawl_start"](
+			ctx,
+			{"query": "Golang", "city": "广州"},
+			{"crawl_start": {"inner_run_id": "crw_bound"}},
+		)
+	finally:
+		actions_mod._crawl_service = orig
+	assert resumed == ["crw_bound"]
+	assert created == []
+	assert result.status.value == "completed"
+
+
 def test_augment_menu_options_dedupes_exit_label():
 	from boss_agent_cli.wizard.prompts import _EXIT, _augment_menu_options
 
@@ -2817,7 +2997,7 @@ def test_wizard_status_and_stop_use_explicit_run_id(tmp_path):
 	assert envelope["error"]["code"] == "WORKFLOW_NOT_FOUND"
 	# 任务记录缺失是本地状态问题：Agent 需要一条能直接执行的重建入口。
 	assert envelope["error"]["recovery_action"]
-	assert envelope["hints"]["next_actions"] == ["boss wizard"]
+	assert envelope["hints"]["next_actions"] == [f"boss --data-dir {tmp_path.resolve()} wizard"]
 
 
 def test_wizard_status_reports_resume_next_action(tmp_path):
@@ -2837,11 +3017,14 @@ def test_wizard_status_reports_resume_next_action(tmp_path):
 	envelope = json.loads(status.stdout)
 	assert envelope["data"]["run_id"] == run_id
 	assert envelope["data"]["status"] == "completed"
-	assert envelope["hints"]["next_actions"] == ["boss wizard", f"boss wizard --status {run_id}"]
+	assert [shlex.split(action) for action in envelope["hints"]["next_actions"]] == [
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard"],
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard", "--status", run_id],
+	]
 
 
-def test_wizard_status_and_stop_after_stop_report_resume(tmp_path):
-	"""被停掉的 run 断点还在本地：`--stop` 与随后的 `--status` 都要给出 `--resume`。"""
+def test_wizard_status_and_stop_after_stop_report_only_terminals(tmp_path):
+	"""stopped 是终态：不能给 `--resume`，否则 Agent 会陷入永远 ok 的空转（Issue #870）。"""
 	plan = WorkflowPlan(
 		role="candidate",
 		platform="zhipin",
@@ -2857,16 +3040,47 @@ def test_wizard_status_and_stop_after_stop_report_resume(tmp_path):
 	assert stop.exit_code == 0
 	stopped = json.loads(stop.stdout)
 	assert stopped["data"]["status"] == "stopped"
-	assert stopped["hints"]["next_actions"] == [
-		"boss wizard --resume wrn_stopped",
-		"boss wizard --status wrn_stopped",
+	expected = [
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard"],
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard", "--status", "wrn_stopped"],
 	]
+	assert [shlex.split(action) for action in stopped["hints"]["next_actions"]] == expected
 
 	status = CliRunner().invoke(cli, ["--json", "--data-dir", str(tmp_path), "wizard", "--status", "wrn_stopped"])
 	envelope = json.loads(status.stdout)
-	assert envelope["hints"]["next_actions"] == [
-		"boss wizard --resume wrn_stopped",
-		"boss wizard --status wrn_stopped",
+	assert [shlex.split(action) for action in envelope["hints"]["next_actions"]] == expected
+
+
+def test_wizard_stopped_run_offers_bound_crawl_resume(tmp_path):
+	"""绑定了内部 crawl 的 stopped run：先给恢复了数据目录的 crawl resume（Issue #870）。"""
+	plan = WorkflowPlan(
+		role="candidate",
+		platform="zhipin",
+		goal="crawl_start",
+		inputs={"query": "Python", "city": "北京"},
+		requested_steps=("crawl_start",),
+		mode="headless",
+	)
+	with WorkflowStore(tmp_path) as store:
+		store.create("wrn_crawl", plan)
+		store.update_run("wrn_crawl", status="running", current_step="crawl_start")
+		store.update_step(
+			"wrn_crawl", "crawl_start", status="running", result={"inner_run_id": "crw_inner"}
+		)
+		store._cache.create_crawl_run(
+			"crw_inner",
+			{"query": "Python"},
+			str(tmp_path / "crawl" / "runs" / "crw_inner"),
+		)
+		store.request_stop("wrn_crawl")
+
+	status = CliRunner().invoke(cli, ["--json", "--data-dir", str(tmp_path), "wizard", "--status", "wrn_crawl"])
+	envelope = json.loads(status.stdout)
+	assert envelope["data"]["status"] == "stopped"
+	assert [shlex.split(action) for action in envelope["hints"]["next_actions"]] == [
+		["boss", "--data-dir", str(tmp_path.resolve()), "crawl", "resume", "crw_inner"],
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard"],
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard", "--status", "wrn_crawl"],
 	]
 
 
@@ -2886,9 +3100,9 @@ def test_wizard_stop_hints_quote_run_id_with_shell_metacharacters(tmp_path):
 
 	stop = CliRunner().invoke(cli, ["--json", "--data-dir", str(tmp_path), "wizard", "--stop", run_id])
 	assert stop.exit_code == 0, stop.stdout
-	assert json.loads(stop.stdout)["hints"]["next_actions"] == [
-		"boss wizard --resume 'wrn; echo pwn'",
-		"boss wizard --status 'wrn; echo pwn'",
+	assert [shlex.split(action) for action in json.loads(stop.stdout)["hints"]["next_actions"]] == [
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard"],
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard", "--status", run_id],
 	]
 
 
@@ -2949,7 +3163,7 @@ def test_auth_status_operator_actions_are_natural_language(tmp_path):
 			_auth_plan(), _action_context(tmp_path), run_id="operator-actions-run"
 		)
 	last = run["last_result"]
-	assert last["next_action"] == "boss wizard --resume operator-actions-run"
+	assert shlex.split(last["next_action"]) == ["boss", "--data-dir", str(tmp_path.resolve()), "wizard", "--resume", "operator-actions-run"]
 	actions = last["operator_actions"]
 	assert len(actions) == 2
 	assert any("扫码" in action for action in actions)
@@ -2959,7 +3173,7 @@ def test_auth_status_without_workflow_control_falls_back(tmp_path):
 	"""直接调 action（无 WorkflowControl）时 resume 命令要有兜底，不能抛 AttributeError。"""
 	result = DEFAULT_ACTIONS["auth_status"](_action_context(tmp_path), {}, {})
 	assert result.status is WorkflowStatus.WAITING_INPUT
-	assert result.next_action == "boss wizard"
+	assert shlex.split(result.next_action) == ["boss", "--data-dir", str(tmp_path.resolve()), "wizard"]
 	assert result.operator_actions
 
 
@@ -3017,6 +3231,42 @@ def test_waiting_panel_falls_back_for_legacy_runs(monkeypatch):
 		},
 	)
 	assert "采集用 Chrome 已保持打开" in body
+
+
+@pytest.mark.parametrize(
+	"status, error_code",
+	[
+		("risk_stopped", None),
+		("budget_stopped", None),
+		("timeout_stopped", "WORKFLOW_TIMEOUT"),
+		("workflow_stopped", "WORKFLOW_STOPPED"),
+		("stopped", "WORKFLOW_STOPPED"),
+		("failed", "NETWORK_ERROR"),
+	],
+)
+def test_crawl_outcome_recovery_keeps_checkpoint_directory(tmp_path, status, error_code):
+	"""向导等待和错误路径都复用采集服务提供的恢复命令。"""
+	from boss_agent_cli.wizard.actions import _crawl_outcome_result
+
+	run_id = "run 'one'; $RUN"
+	data_dir = tmp_path / "state 'one'; $STATE"
+	outcome = replace(
+		_crawl_outcome(run_id, status),
+		data_dir=data_dir,
+		error="stop requested" if status in {"workflow_stopped", "stopped"} else "fixture stop",
+	)
+	expected = ["boss", "--data-dir", str(data_dir.resolve()), "crawl", "resume", run_id]
+	if error_code is not None:
+		with pytest.raises(WorkflowActionError) as exc_info:
+			_crawl_outcome_result(outcome)
+		assert exc_info.value.code == error_code
+		assert shlex.split(exc_info.value.recovery_action) == expected
+	else:
+		result = _crawl_outcome_result(outcome)
+		assert result.status is WorkflowStatus.WAITING_INPUT
+		assert shlex.split(result.next_action) == expected
+		assert result.next_action == result.data["checkpoint"]["resume_command"]
+		assert any(result.next_action in action for action in result.operator_actions)
 
 
 def test_crawl_risk_stop_emits_browser_operator_actions():

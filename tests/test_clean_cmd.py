@@ -1,9 +1,12 @@
 """clean 命令测试 — 覆盖缓存清理的各种场景。"""
 
 import json
+import os
+import shlex
 import sqlite3
 import time
 
+import pytest
 from click.testing import CliRunner
 
 from boss_agent_cli.main import cli
@@ -19,7 +22,7 @@ def _invoke(*args, tmp_path=None):
 	return result.exit_code, json.loads(result.output) if result.output.strip() else None
 
 
-def _setup_db(tmp_path, *, expired_search=0, fresh_search=0, greets=0, applies=0):
+def _setup_db(tmp_path, *, expired_search=0, fresh_search=0, greets=0, recruiter_greets=0, applies=0, locations=0, job_descs=0):
 	"""在临时目录中创建测试数据库。"""
 	db_dir = tmp_path / "cache"
 	db_dir.mkdir(parents=True, exist_ok=True)
@@ -28,7 +31,10 @@ def _setup_db(tmp_path, *, expired_search=0, fresh_search=0, greets=0, applies=0
 	conn.executescript("""
 		CREATE TABLE IF NOT EXISTS search_cache (cache_key TEXT PRIMARY KEY, response TEXT NOT NULL, created_at REAL NOT NULL);
 		CREATE TABLE IF NOT EXISTS greet_records (security_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, greeted_at REAL NOT NULL);
+		CREATE TABLE IF NOT EXISTS recruiter_greet_records (geek_id TEXT NOT NULL, job_id TEXT NOT NULL, status TEXT NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY (geek_id, job_id));
 		CREATE TABLE IF NOT EXISTS apply_records (security_id TEXT NOT NULL, job_id TEXT NOT NULL, applied_at REAL NOT NULL, PRIMARY KEY (security_id, job_id));
+		CREATE TABLE IF NOT EXISTS recruiter_location_records (friend_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL, updated_at REAL NOT NULL);
+		CREATE TABLE IF NOT EXISTS job_desc_cache (job_id TEXT PRIMARY KEY, description TEXT NOT NULL, created_at REAL NOT NULL);
 	""")
 	now = time.time()
 	for i in range(expired_search):
@@ -37,8 +43,17 @@ def _setup_db(tmp_path, *, expired_search=0, fresh_search=0, greets=0, applies=0
 		conn.execute("INSERT INTO search_cache VALUES (?, ?, ?)", (f"fresh_{i}", f"resp_{i}", now))
 	for i in range(greets):
 		conn.execute("INSERT INTO greet_records VALUES (?, ?, ?)", (f"s{i}", f"j{i}", now))
+	for i in range(recruiter_greets):
+		conn.execute("INSERT INTO recruiter_greet_records VALUES (?, ?, ?, ?)", (f"g{i}", f"j{i}", "sent", now))
 	for i in range(applies):
 		conn.execute("INSERT INTO apply_records VALUES (?, ?, ?)", (f"s{i}", f"j{i}", now))
+	for i in range(locations):
+		conn.execute(
+			"INSERT INTO recruiter_location_records VALUES (?, ?, ?, ?, ?)",
+			(str(i), f"j{i}", "", "sent", now),
+		)
+	for i in range(job_descs):
+		conn.execute("INSERT INTO job_desc_cache VALUES (?, ?, ?)", (f"j{i}", f"desc_{i}", now))
 	conn.commit()
 	conn.close()
 	return db_path
@@ -87,18 +102,54 @@ def test_clean_deletes_expired_search_cache(tmp_path):
 
 def test_clean_all_deletes_everything(tmp_path):
 	"""全量清理应删除所有缓存和记录。"""
-	_setup_db(tmp_path, expired_search=2, fresh_search=3, greets=5, applies=2)
+	_setup_db(
+		tmp_path,
+		expired_search=2,
+		fresh_search=3,
+		greets=5,
+		recruiter_greets=4,
+		applies=2,
+		locations=3,
+		job_descs=6,
+	)
 	code, parsed = _invoke("clean", "--all", tmp_path=tmp_path)
 	assert code == 0
 	search_result = next(r for r in parsed["data"]["results"] if r["target"] == "搜索缓存")
 	assert search_result["cleaned"] == 5  # 全部
 	greet_result = next(r for r in parsed["data"]["results"] if r["target"] == "打招呼记录")
 	assert greet_result["cleaned"] == 5
+	recruiter_greet_result = next(r for r in parsed["data"]["results"] if r["target"] == "招聘者打招呼记录")
+	assert recruiter_greet_result["cleaned"] == 4
 	apply_result = next(r for r in parsed["data"]["results"] if r["target"] == "投递记录")
 	assert apply_result["cleaned"] == 2
+	location_result = next(r for r in parsed["data"]["results"] if r["target"] == "工作地点发送记录")
+	assert location_result["cleaned"] == 3
+	job_desc_result = next(r for r in parsed["data"]["results"] if r["target"] == "职位描述缓存")
+	assert job_desc_result["cleaned"] == 6
+	conn = sqlite3.connect(str(tmp_path / "cache" / "boss_agent.db"))
+	assert conn.execute("SELECT COUNT(*) FROM recruiter_location_records").fetchone()[0] == 0
+	assert conn.execute("SELECT COUNT(*) FROM recruiter_greet_records").fetchone()[0] == 0
+	assert conn.execute("SELECT COUNT(*) FROM job_desc_cache").fetchone()[0] == 0
+	conn.close()
 
 
 # ── 索引缓存 ────────────────────────────────────────────────────────
+
+
+def test_clean_default_leaves_recruiter_records_and_job_desc_cache(tmp_path):
+	"""默认 clean 不触碰招聘者打招呼记录和职位描述缓存，避免悄悄删掉去重记录。"""
+	_setup_db(tmp_path, greets=1, recruiter_greets=2, job_descs=3)
+
+	code, parsed = _invoke("clean", tmp_path=tmp_path)
+
+	assert code == 0
+	target_names = {r["target"] for r in parsed["data"]["results"]}
+	assert "招聘者打招呼记录" not in target_names
+	assert "职位描述缓存" not in target_names
+	conn = sqlite3.connect(str(tmp_path / "cache" / "boss_agent.db"))
+	assert conn.execute("SELECT COUNT(*) FROM recruiter_greet_records").fetchone()[0] == 2
+	assert conn.execute("SELECT COUNT(*) FROM job_desc_cache").fetchone()[0] == 3
+	conn.close()
 
 
 def test_clean_index_cache(tmp_path):
@@ -186,18 +237,81 @@ def test_clean_json_envelope(tmp_path):
 	assert "total_bytes_freed_display" in parsed["data"]
 
 
-def test_clean_hints_after_dry_run(tmp_path):
-	"""预览模式后应提示执行实际清理。"""
-	code, parsed = _invoke("clean", "--dry-run", tmp_path=tmp_path)
-	actions = parsed.get("hints", {}).get("next_actions", [])
-	assert any("clean" in a for a in actions)
+@pytest.mark.parametrize(
+	"flags, days",
+	[
+		([], 0),
+		([], 7),
+		(["--all"], 7),
+		(["--privacy"], 7),
+		(["--all", "--privacy"], 7),
+	],
+	ids=["zero-days", "seven-days", "all", "privacy", "all-and-privacy"],
+)
+def test_clean_dry_run_hint_executes_previewed_scope(tmp_path, monkeypatch, flags, days):
+	"""实际执行预演返回的命令，只清理原目录，并保留原清理范围与天数。"""
+	data_dir = tmp_path / "preview data ' $scope"
+	other_dir = tmp_path / "default-data"
+	data_option = next(param for param in cli.params if param.name == "data_dir")
+	monkeypatch.setattr(data_option, "default", str(other_dir))
+	_setup_db(data_dir, fresh_search=1, greets=1, recruiter_greets=1, job_descs=1)
+	files = [
+		data_dir / "chat-history" / "old.json",
+		data_dir / "chat-history" / "recent.json",
+		data_dir / "resumes" / "draft.json",
+		other_dir / "chat-history" / "old.json",
+	]
+	for path in files:
+		path.parent.mkdir(parents=True, exist_ok=True)
+		path.write_text("{}", encoding="utf-8")
+	old, recent, resume, other = files
+	old_time = time.time() - 10 * 86400
+	recent_time = time.time() - 2 * 86400
+	os.utime(old, (old_time, old_time))
+	os.utime(other, (old_time, old_time))
+	os.utime(recent, (recent_time, recent_time))
+
+	code, preview = _invoke("clean", *flags, "--days", str(days), "--dry-run", tmp_path=data_dir)
+
+	assert code == 0
+	assert all(path.exists() for path in files)
+	actions = preview["hints"]["next_actions"]
+	assert len(actions) == 1
+	argv = shlex.split(actions[0])
+	assert argv[0] == "boss"
+	assert "--dry-run" not in argv
+	assert "--data-dir" in argv
+	assert argv[argv.index("--data-dir") + 1] == str(data_dir)
+	result = CliRunner().invoke(cli, argv[1:])
+	assert result.exit_code == 0, result.output
+	assert json.loads(result.stdout)["ok"] is True
+	assert not old.exists()
+	assert recent.exists() is (days != 0 and "--privacy" not in flags)
+	assert resume.exists() is ("--privacy" not in flags)
+	assert other.exists()
+	with sqlite3.connect(str(data_dir / "cache" / "boss_agent.db")) as conn:
+		for table in ("search_cache", "greet_records", "recruiter_greet_records", "job_desc_cache"):
+			assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == (0 if "--all" in flags else 1)
+
+
+def test_clean_risk_preview_keeps_scoped_command_only_in_operator_actions(tmp_path):
+	"""清锁命令只交给真人，并携带同一目录、范围与保留天数。"""
+	data_dir = tmp_path / "preview data ' $scope"
+	code, preview = _invoke(
+		"clean", "--all", "--privacy", "--days", "7", "--risk-lock", "--dry-run", tmp_path=data_dir,
+	)
+	assert code == 0
+	assert preview["hints"]["next_actions"] == []
+	manual = next(item for item in preview["hints"]["operator_actions"] if "预演未解除锁" in item)
+	argv = shlex.split(manual.split("执行 ", 1)[1])
+	assert argv == ["boss", "--data-dir", str(data_dir), "clean", "--all", "--privacy", "--days", "7", "--risk-lock"]
 
 
 def test_clean_hints_after_actual(tmp_path):
-	"""实际清理后应提示检查环境。"""
+	"""实际清理后应提示在同一目录检查环境。"""
 	code, parsed = _invoke("clean", tmp_path=tmp_path)
-	actions = parsed.get("hints", {}).get("next_actions", [])
-	assert any("doctor" in a for a in actions)
+	assert code == 0
+	assert shlex.split(parsed["hints"]["next_actions"][0]) == ["boss", "--data-dir", str(tmp_path), "doctor"]
 
 
 def test_clean_privacy_dry_run_does_not_delete_sensitive_files(tmp_path):
@@ -237,8 +351,10 @@ def test_clean_privacy_deletes_sensitive_files_and_hints_relogin(tmp_path):
 
 	assert code == 0
 	assert all(not file.exists() for file in files)
-	actions = parsed.get("hints", {}).get("next_actions", [])
-	assert any("login" in a for a in actions)
+	assert [shlex.split(action) for action in parsed["hints"]["next_actions"]] == [
+		["boss", "--data-dir", str(tmp_path), "login"],
+		["boss", "--data-dir", str(tmp_path), "doctor"],
+	]
 
 
 def test_clean_privacy_tolerates_database_without_crawl_tables(tmp_path):
@@ -266,7 +382,10 @@ def test_clean_all_tolerates_tables_missing_from_old_database(tmp_path):
 	targets = {r["target"]: r for r in parsed["data"]["results"]}
 	assert targets["搜索缓存"]["cleaned"] == 0
 	assert targets["打招呼记录"]["cleaned"] == 0
+	assert targets["招聘者打招呼记录"]["cleaned"] == 0
 	assert targets["投递记录"]["cleaned"] == 0
+	assert targets["工作地点发送记录"]["cleaned"] == 0
+	assert targets["职位描述缓存"]["cleaned"] == 0
 
 
 def test_clean_corrupt_database_returns_envelope_before_deleting(tmp_path):

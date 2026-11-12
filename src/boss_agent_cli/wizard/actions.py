@@ -16,6 +16,7 @@ from boss_agent_cli.ai.service import AIService, AIServiceError, recovery_action
 from boss_agent_cli.cache.store import CacheStore, SavedSearchParamsError
 from boss_agent_cli.platforms.factory import build_platform_instance, build_recruiter_platform_instance
 from boss_agent_cli.services.contact_lookup import FriendLookupLimitExceeded, find_friend
+from boss_agent_cli.services.friend_list_pages import collect_friend_list_items
 from boss_agent_cli.services.output_path import prepare_output_path
 from boss_agent_cli.crawler.operations import crawl_status
 from boss_agent_cli.crawler.service import (
@@ -29,7 +30,7 @@ from boss_agent_cli.crawler.service import (
 )
 from boss_agent_cli.crawler.transport import DrissionCrawlerSession
 from boss_agent_cli.digest import build_digest
-from boss_agent_cli.display import RISK_ERROR_CONTRACTS, risk_error_contract, risk_error_message, shell_argument
+from boss_agent_cli.display import RISK_ERROR_CONTRACTS, boss_command, risk_error_contract, risk_error_message, shell_argument
 from boss_agent_cli.output import Logger
 from boss_agent_cli.pipeline_state import build_pipeline_items, select_follow_up_candidates
 from boss_agent_cli.resume.models import resume_to_text
@@ -295,6 +296,7 @@ def _classify_action_error(code: str, message: str) -> tuple[str, bool, str]:
 		recovery, _ = risk_error_contract(code)
 		return code, False, recovery
 	recoverable = code in {
+		"AUTH_REQUIRED",
 		"AUTH_EXPIRED",
 		"RATE_LIMITED",
 		"NETWORK_ERROR",
@@ -302,8 +304,8 @@ def _classify_action_error(code: str, message: str) -> tuple[str, bool, str]:
 		"NOT_SUPPORTED",
 		"INVALID_PARAM",
 	}
-	if code in {"AUTH_EXPIRED", "TOKEN_REFRESH_FAILED"}:
-		recovery = "boss login"
+	if code in {"AUTH_REQUIRED", "AUTH_EXPIRED", "TOKEN_REFRESH_FAILED"}:
+		recovery = str(ERROR_CODES[code]["recovery_action"])
 	elif code == "NOT_SUPPORTED":
 		recovery = "切换平台或 workflow goal 后重试"
 	elif code == "INVALID_PARAM":
@@ -432,9 +434,13 @@ def _auth_status(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 		# 未登录不是失败，是「在等人」。返回 WAITING_INPUT 让 run 挂起可恢复，
 		# 而不是把整个 workflow 打成 failed 逼用户从头重走向导。
 		# 刻意不阻塞轮询等待扫码——Agent 与真人都不该被卡在这里。
-		login_command = f"boss --platform {context.platform} login"
+		login_command = boss_command("login", platform_name=context.platform, data_dir=context.data_dir)
 		control = context.workflow_control
-		resume_command = f"boss wizard --resume {shell_argument(control.run_id)}" if control else "boss wizard"
+		resume_command = boss_command(
+			f"wizard --resume {shell_argument(control.run_id)}" if control else "wizard",
+			platform_name=context.platform,
+			data_dir=context.data_dir,
+		)
 		return StepResult(
 			{"authenticated": False, "platform": context.platform, "role": context.role},
 			status=WorkflowStatus.WAITING_INPUT,
@@ -660,9 +666,12 @@ def _candidate_chat_history(context: ActionContext, inputs: Mapping[str, Any], p
 
 def _candidate_pipeline_data(context: ActionContext, inputs: Mapping[str, Any]) -> list[dict[str, Any]]:
 	with context.candidate_platform() as platform:
-		chat_data = _unwrap(platform, platform.friend_list(page=1), "沟通列表获取失败")
+		# 沟通列表是分页的：只看第 1 页会静默漏掉后续页里待跟进的沟通，
+		# 与顶层 `boss pipeline` / `boss digest` 的聚合结果不一致（Issue #881）。
+		chat_items, friend_error = collect_friend_list_items(platform)
+		if friend_error is not None:
+			_unwrap(platform, friend_error, "沟通列表获取失败")
 		interview_data = _unwrap(platform, platform.interview_data(), "面试列表获取失败")
-	chat_items = chat_data.get("result") or chat_data.get("friendList") or []
 	interview_items = interview_data.get("interviewList") or []
 	return build_pipeline_items(
 		chat_items=chat_items,
@@ -826,6 +835,7 @@ def _crawl_seed_session(context: ActionContext) -> tuple[dict[str, str], str]:
 	"""Load boss-login cookies for the isolated crawl browser profile."""
 	from boss_agent_cli.auth.manager import AuthRequired
 
+	login_action = boss_command("login", platform_name=context.platform, data_dir=context.data_dir)
 	try:
 		token = context.auth().get_token()
 	except AuthRequired as exc:
@@ -833,7 +843,7 @@ def _crawl_seed_session(context: ActionContext) -> tuple[dict[str, str], str]:
 			"AUTH_REQUIRED",
 			str(exc),
 			recoverable=True,
-			recovery_action=f"boss --platform {context.platform} login",
+			recovery_action=login_action,
 		) from exc
 	raw_cookies = token.get("cookies") if isinstance(token, dict) else None
 	if not isinstance(raw_cookies, dict) or not raw_cookies:
@@ -841,7 +851,7 @@ def _crawl_seed_session(context: ActionContext) -> tuple[dict[str, str], str]:
 			"AUTH_REQUIRED",
 			"本地登录态缺少 Cookie，采集浏览器无法自动登录",
 			recoverable=True,
-			recovery_action=f"boss --platform {context.platform} login",
+			recovery_action=login_action,
 		)
 	cookies = {str(name): str(value) for name, value in raw_cookies.items() if name and value is not None}
 	if context.platform in {"zhipin", ""} and "wt2" not in cookies:
@@ -849,7 +859,7 @@ def _crawl_seed_session(context: ActionContext) -> tuple[dict[str, str], str]:
 			"AUTH_REQUIRED",
 			"登录态缺少 wt2，采集浏览器会被当成未登录并立即退出",
 			recoverable=True,
-			recovery_action="boss login",
+			recovery_action=login_action,
 		)
 	user_agent = str(token.get("user_agent") or "")
 	return cookies, user_agent
@@ -894,6 +904,10 @@ def _attach_wizard_jobs(data: dict[str, Any], cache: CacheStore, run_id: str) ->
 
 def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> StepResult:
 	data = outcome.as_dict()
+	checkpoint = data.get("checkpoint") if isinstance(data, dict) else None
+	resume_command = checkpoint.get("resume_command") if isinstance(checkpoint, dict) else None
+	if not isinstance(resume_command, str) or not resume_command:
+		resume_command = f"boss crawl resume {shell_argument(outcome.run_id)}"
 	if cache is not None:
 		data = _attach_wizard_jobs(data if isinstance(data, dict) else {}, cache, str(outcome.run_id))
 	if outcome.status == "timeout_stopped":
@@ -901,14 +915,14 @@ def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> Step
 			"WORKFLOW_TIMEOUT",
 			outcome.error or "workflow 超过设定时限",
 			recoverable=True,
-			recovery_action=f"boss crawl resume {shell_argument(outcome.run_id)}",
+			recovery_action=resume_command,
 		)
 	if outcome.status in {"workflow_stopped", "stopped"} and "stop requested" in str(outcome.error or ""):
 		raise WorkflowActionError(
 			"WORKFLOW_STOPPED",
 			outcome.error or "crawl 已停止",
 			recoverable=True,
-			recovery_action=f"boss crawl resume {shell_argument(outcome.run_id)}",
+			recovery_action=resume_command,
 		)
 	if outcome.status in {"risk_stopped", "budget_stopped"}:
 		# 风控停止时 service 会 keep Chrome；把标记写入结果供向导文案使用。
@@ -921,7 +935,6 @@ def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> Step
 				"browser_kept_open": browser_kept_open,
 				"cdp_port": browser.get("cdp_port") or data.get("cdp_port"),
 			}
-		resume_command = f"boss crawl resume {shell_argument(outcome.run_id)}"
 		operator_actions: tuple[str, ...]
 		if browser_kept_open:
 			operator_actions = (
@@ -947,7 +960,7 @@ def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> Step
 			"NETWORK_ERROR",
 			outcome.error or f"crawl 以状态 {outcome.status} 停止",
 			recoverable=True,
-			recovery_action=f"boss crawl resume {shell_argument(outcome.run_id)}",
+			recovery_action=resume_command,
 		)
 	return StepResult(data, artifacts=tuple(outcome.output_paths.values()))
 
@@ -958,9 +971,13 @@ def _crawl_start(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 	if existing_run_id is None:
 		prior_step = prior.get("crawl_start")
 		if isinstance(prior_step, Mapping):
-			data = prior_step.get("data") if isinstance(prior_step.get("data"), Mapping) else prior_step
-			if isinstance(data, Mapping):
-				existing_run_id = _optional_str(data.get("run_id"))
+			# 已完成的结果是 {data: {run_id}}；中断/超时留下的绑定是 {inner_run_id}（bind_inner_run）。
+			# 两者都指向同一个内部 crawl，恢复时必须续跑而不是新建（Issue #882）。
+			existing_run_id = _optional_str(prior_step.get("inner_run_id"))
+			if existing_run_id is None:
+				data = prior_step.get("data") if isinstance(prior_step.get("data"), Mapping) else prior_step
+				if isinstance(data, Mapping):
+					existing_run_id = _optional_str(data.get("run_id"))
 	if existing_run_id:
 		return _crawl_resume(context, {"run_id": existing_run_id, **dict(inputs)}, prior)
 
@@ -1032,7 +1049,7 @@ def _crawl_status(context: ActionContext, inputs: Mapping[str, Any], prior: Mapp
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		try:
 			run_id = str(_required(inputs, "run_id"))
-			data = crawl_status(cache, run_id)
+			data = crawl_status(cache, run_id, data_dir=context.data_dir)
 			data = _attach_wizard_jobs(data, cache, run_id)
 		except KeyError as exc:
 			raise WorkflowActionError("CRAWL_RUN_NOT_FOUND", str(exc)) from exc

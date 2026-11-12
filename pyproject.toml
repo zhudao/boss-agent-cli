@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "boss-agent-cli"
-version = "3.2.2"
+version = "3.3.0"
 description = "AI Agent 专用的 BOSS 直聘求职 CLI 工具"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -164,6 +164,7 @@ module = [
 	"boss_agent_cli.resume.store",
 	"boss_agent_cli.commands.cities",
 	"boss_agent_cli.services.chat_utils",
+	"boss_agent_cli.services.pagination",
 	"boss_agent_cli.commands.history",
 	"boss_agent_cli.commands.login",
 	"boss_agent_cli.commands.logout",
@@ -222,6 +223,7 @@ module = [
 	"boss_agent_cli.api.browser_client",
 	"boss_agent_cli.api.browser_source",
 	"boss_agent_cli.auth.browser",
+	"boss_agent_cli.auth.login_diagnostics",
 	"boss_agent_cli.platforms",
 	"boss_agent_cli.platforms.base",
 	"boss_agent_cli.platforms.zhipin",
@@ -253,6 +255,7 @@ module = [
 	"boss_agent_cli.commands.recruiter.jobs",
 	"boss_agent_cli.commands.recruiter.reply",
 	"boss_agent_cli.commands.recruiter.recommendations",
+	"boss_agent_cli.commands.recruiter.location",
 	"boss_agent_cli.commands.recruiter.accept_resume",
 	"boss_agent_cli.commands.recruiter.download_resume",
 	"boss_agent_cli.commands.recruiter.request_resume",

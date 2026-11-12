@@ -59,6 +59,10 @@ TTY 下只把 `operator_actions` 渲染到 stderr；`next_actions` 是纯 Agent 
 | `boss doctor` | 诊断环境、依赖、凭据完整性和网络；默认仅本地诊断，不读取浏览器 Cookie。`--probe-cookies` 才提取浏览器 Cookie，`--live-probe` 才执行低频只读探测。探测到求职者侧登录态时先标出身份，不继续请求招聘者接口 |
 | `boss me` | 我的信息（用户/简历/期望/投递记录） |
 
+登录恢复命令保留原数据目录：使用 `--data-dir` 时，认证错误的 `error.recovery_action`、`hints.next_actions` 和真人扫码指引会携带经过 shell 参数转义的绝对目录，换工作目录后仍可照提示登录。登录成功后的状态检查、搜索与推荐提示，以及 `status` 的后继操作，使用同一目录。向导等待登录时的登录与续跑指引、认证失败与超时 checkpoint、任务不存在或记录损坏时的恢复提示，以及 `status` / `doctor` 信封里的 `auth_health` 诊断字段（含检查项的恢复动作），也保留目录，避免被引导到默认目录下的其他会话。静态 `boss schema` 仍展示通用命令示例。
+
+`boss me --section deliver --deliver-page 2` 单独查看投递记录时，信封 `pagination` 给出分页证据：`page` 优先使用平台返回的有效页码，否则回显请求页；`has_more` 仅在平台返回布尔 `hasMore` 时为 `true` / `false`，缺失或类型不明确时为 `null`，`has_more_source=unknown`。`total` 是本页 `list` 数组的条数（`total_kind=returned_page_count`）；列表字段缺失或类型不符时为 `null`，不代表全量投递数。仅 `has_more=true` 时附加下一页命令；未知时 `operator_actions` 说明不能凭本页数量判断。默认 `boss me` 汇总四段信息、或只查其他 section 时，顶层 `pagination` 保持 `null`。MCP 对应调用是 `boss_me(section="deliver", deliver_page=2)`。
+
 BOSS 的 code `31`（IP/环境限制）/ `32`（账号限制）/ `35` / `36`、环境类或含糊的 code `37`、HTTP 403 和官方 `403.html` 访问受限页及 `verify.html` / `security.html` 安全页会停止请求并锁存本地状态。明确的凭据过期才能进入有限刷新；仅出现 `token` / `stoken` 或同时要求安全验证时不能刷新。风险锁沿用 `cdp_risk_lock.json` 文件名，覆盖候选人与招聘者的 httpx、CDP、headless、聊天页动作、登录、导入、刷新和同 `data_dir` 的独立 crawl；更换令牌或通道不会自动清除锁。`error.details.risk_lock` 保留原始风险原因、可用业务码与 `explicit_resume_required`；账号风险仍返回 `ACCOUNT_RISK`，历史环境锁继续返回 `ENVIRONMENT_RISK_LOCKED`。
 
 由用户在原会话的官方目标业务页确认恢复后，执行 `boss clean --risk-lock` 解除本地阻断，再显式恢复原任务。主页可访问不代表职位页或聊天页已恢复；该清理命令不解除服务器风险，也不验证线上恢复。`--dry-run` 仅预览；再次命中风险会立即重锁。Agent 不应自行执行清锁。
@@ -93,7 +97,11 @@ pbpaste | boss login --curl-file -
 | `boss show <#>` | 按编号查看上次搜索结果 |
 | `boss cities` | 44 个支持城市（含不限城市的「全国」） |
 
-`recommend` 的 `pagination.has_more` 只在平台返回布尔 `hasMore` 时取 `true` 或 `false`；缺失或类型不明确时为 `null`，`has_more_source=unknown`，不会给出下一页执行提示。仅 `true` 提示翻页；`false` 与 `null` 不触发额外探测。兼容字段 `total` 仍是本次返回条数，`total_kind=returned_page_count`，不代表全量职位数。
+`recommend` 的 `pagination.has_more` 只在平台返回布尔 `hasMore` 时取 `true` 或 `false`；缺失或类型不明确时为 `null`，`has_more_source=unknown`，不会给出下一页执行提示。仅 `true` 提示翻页；`false` 与 `null` 不触发额外探测。兼容字段 `total` 仍是本次返回条数，`total_kind=returned_page_count`，不代表全量职位数。下一页命令保留本次的 `--with-score`，翻页后仍返回 `match_score`。
+
+`search` 的下一页命令（信封 `hints.next_actions` 与终端 `more:` 提示是同一条）保留本次调用生效的全部条件：位置参数关键词、`--url`、城市 / 薪资 / 经验 / 学历 / 行业 / 规模 / 融资阶段 / 职位类型、`--with-score`、`--sort score`、`--no-cache`，只把 `--page` 换成 N+1；`--preset` 展开成等价的显式筛选。所有值按 POSIX shell 规则转义，可直接复制执行。带 `--welfare` / `--active` 的搜索需要逐个查详情，分页语义不同，不提供下一页提示。
+
+`boss show <#>` 的编号只对最近一次 `search` / `recommend` 建立的索引快照有效：每次搜索或推荐都会整份覆盖缓存，重跑任一命令后旧编号会静默指向新结果。成功信封的 `data.index_snapshot` 返回 `source`（`search:<关键词>` 或 `recommend`）、`page`（建立快照的页码，旧版本缓存为 `null`）、`count` 与 `saved_at`（Unix 秒）；`search` / `recommend` 成功写入索引后也会在 `pagination.index_snapshot` 返回同一份快照身份，写入失败或没有缓存时该字段缺失——此时不要把本次结果与旧编号配对。Agent 应把编号和这份快照身份一起保存，发现来源、页码或时间不匹配时重新搜索定位，而不是继续使用旧编号。
 
 ## 可恢复批量采集
 
@@ -119,11 +127,15 @@ boss crawl stop <run_id>
 | `boss crawl stop <run_id>` | 请求运行中任务在下一个安全点停止并保留 checkpoint |
 | `boss crawl shortlist <run_id> (--all \| --selector <csel_...>)` | 将 crawl 结果导入原项目的本地候选池；不请求平台，保留内部职位关联和详情缓存供 `boss ai fit` 使用 |
 
+采集任务的状态、结果、停止、恢复及候选池后继命令，以及 `checkpoint.resume_command`，都显式携带原 `--data-dir` 的绝对路径；换一个工作目录执行提示时仍定位同一份本地任务。任务不存在或记录损坏时的核对提示同样保留目录。采集服务、向导采集动作与 `agent crawl` 返回的任务恢复指引也保留目录，避免误读或停止默认目录中的同名任务。风险停止仍须先完成人工恢复；人工解锁提示中的 `boss clean --risk-lock` 也携带原数据目录，解锁后显式执行恢复命令。
+
+`crawl results` 的后继导入命令还携带本次返回职位的全部 `--selector`，只导入所见结果；`--page` / `--detail-status` 的筛选范围因此保持不变。空结果改为提示查看同一 run 的 `crawl status`。路径、run_id 和 selector 按 shell 参数转义，终端与信封使用同一条命令。
+
 默认 Hook 为 `none`。`screenshot-full` 仅在用户明确选择 `--hook-profile screenshot-full --hook-dir <目录>` 时启用；目录必须由用户拥有相应授权，并提供原始 7 个脚本及 `SHA256SUMS`。项目不再发布这些第三方脚本，运行前逐文件校验 SHA-256 并记录脚本标识与摘要；不记录 Cookie、请求头或完整请求体。
 
 候选人侧可用 `boss agent crawl --run-id <run_id> --resume <简历名>` 执行“完成的 crawl → shortlist → ai fit → 按匹配分排序”，不会启动浏览器；`boss agent crawl --query <关键词> --city <城市> --resume <简历名>` 会新建真实采集。已有同 `data_dir` 风险锁时，run/start/resume 和 agent 的新采集在浏览器构造、连接及后台拉起前阻断；resume 只恢复自身断点，不能清锁。新风险保持 `risk_stopped` outcome、已采集队列与 checkpoint，并在 `data.risk_lock` 保留结构化原因和可用业务码，未知业务码为 `null`；人工恢复步骤只放在 `hints.operator_actions`，不提供可自动执行的恢复动作。状态、结果、本地 shortlist 导入和读取已完成 run 仍可用。
 
-每页完成后更新 `<data-dir>/crawl/runs/<run_id>/jobs.json`、`jobs.csv` 和带筛选/冻结首行的 `jobs.xlsx`。XLSX 保留完整值但所有数据行固定为单行和统一行高，长内容仅在表格中截断显示。JSON/CSV/XLSX 和 `crawl results` 默认不包含 `security_id`、职位 ID、selector、招聘者姓名或职位；这些仅保留在受限本地 SQLite 状态，`boss clean --privacy` 会删除 crawl 运行、预算和导出。风险码 `31` / `32` / `35` / `36` / `37`、code `38` 的身份资料流程、安全页、职位列表容器异常、预算耗尽或 stop 请求都会保存断点并停止；code `38` 不等同于验证码。stdout 始终只输出 JSON 信封和恢复命令。
+每页完成后更新 `<data-dir>/crawl/runs/<run_id>/jobs.json`、`jobs.csv` 和带筛选/冻结首行的 `jobs.xlsx`。XLSX 保留完整值但所有数据行固定为单行和统一行高，长内容仅在表格中截断显示。JSON/CSV/XLSX 不包含 `security_id`、职位 ID、selector、招聘者姓名或职位；`crawl results` 同样不暴露平台标识与招聘者信息，但会返回供本地导入使用的 selector。真实平台标识保留在受限本地 SQLite 状态，`boss clean --privacy` 会删除 crawl 运行、预算和导出。风险码 `31` / `32` / `35` / `36` / `37`、code `38` 的身份资料流程、安全页、职位列表容器异常、预算耗尽或 stop 请求都会保存断点并停止；code `38` 不等同于验证码。stdout 始终只输出 JSON 信封和恢复命令。
 
 ## 求职动作
 
@@ -131,6 +143,8 @@ boss crawl stop <run_id>
 |------|------|
 | `boss greet <sid> <jid>` | 向指定招聘者打招呼；重复记录返回 `ALREADY_GREETED` |
 | `boss batch-greet <query>` | 搜索后按显式 `--count` 批量打招呼，支持 `--dry-run`；命中 `ACCOUNT_RISK` / `ENVIRONMENT_RISK` 立即停批并返回 `ok:false`，已成功项随 `error.details.greeted` 带回 |
+
+`batch-greet --dry-run` 的执行提示保留本次数据目录以及显式给出的 `--browser-source` / `--cdp-url` / `--delay`，只去掉 `--dry-run`；照提示执行时使用的登录态、去重缓存、浏览器通道与节流区间与预览一致。
 | `boss apply <sid> <jid>` | 发起投递或立即沟通；重复记录返回 `ALREADY_APPLIED` |
 | `boss exchange <uid-or-sid>` | 请求交换手机号或微信；优先使用 `boss chat` 输出的稳定 `uid` |
 
@@ -144,6 +158,10 @@ boss crawl stop <run_id>
 | `boss mark <uid-or-sid> --label X` | 添加或移除联系人标签；优先使用稳定 `uid` |
 | `boss interviews` | 面试邀请 |
 | `boss history` | 浏览历史 |
+
+`boss chat --page N` 返回 `pagination`：`page` 是本次请求页；`has_more` 只在平台返回布尔 `hasMore` 时取 `true` 或 `false`，缺失或类型不明确时为 `null`，`has_more_source` 相应为 `platform_hasMore` 或 `unknown`；`total` 是本页经 `--from` / `--days` 筛选后的条数，`total_kind=returned_page_count`，不代表平台上的会话总数。只有 `has_more=true` 时 `hints.next_actions` 才附加下一页命令并保留筛选参数；`has_more=null` 时 `hints.operator_actions` 说明不能仅凭本页条数判断是否还有记录。
+
+`boss chatmsg <uid> --page N` 与 `boss chat-summary <uid> --page N` 同样返回所读消息页的分页证据：`page` 优先使用平台返回的有效页码，否则回显请求页；`has_more` 仅在平台返回布尔 `hasMore` 时为 `true` / `false`，缺失或类型不明确时为 `null`（`has_more_source=unknown`）；`total` 是本页消息条数（`total_kind=returned_page_count`），不代表会话消息总数。仅 `has_more=true` 时附加下一页命令并保留本次 `--count`；`chatmsg --raw` 的翻页命令同时保留 `--raw`，下一页继续输出保真字段。`null` 时 `operator_actions` 说明不能凭本页数量判断。`messages` 缺失或类型不符时按 `historyMsgList` 回退，两者都不可用时按空列表处理、`total=0`。
 
 ## 流水线监控
 
@@ -159,6 +177,8 @@ boss crawl stop <run_id>
 
 `boss shortlist add <sid> <jid> --lid <lid>` 可保存与 `sid` 同一列表项的访问上下文，`list` / `compare` 会返回该值；crawl 和 favorites 导入也保留对应上下文，favorites 预览继续脱敏。`lid` 可省略，保存不代表其仍有效，不推断有效期或跨账号身份。
 
+`history` / `favorites list` 的 `pagination.has_more` 与 `recommend` / `chat` 同一口径：只有平台返回布尔 `hasMore` 时才是 `true` / `false`；缺失或类型不明确时为 `null`、`has_more_source=unknown`，不会默认成 `false`，也不提示下一页。`total` 始终是本页返回条数（`total_kind=returned_page_count`）。
+
 ## 招聘者模式
 
 `boss hr whoami` 只读 `getUserInfo`。`identity` 为 1 表示当前登录态在招聘者侧，`ready` 为 true。`profile_recruit` 对应账号资料里的 `recruit`，只回显，不参与判断。双身份账号停在求职者侧时 `ready` 为 false，需要在官方页面切换到「我要招聘」后再查；命令本身不切换身份。
@@ -172,7 +192,7 @@ boss crawl stop <run_id>
 | `boss hr chat` | 查看候选人沟通列表 |
 | `boss hr chatmsg <friend_id>` | 查看候选人聊天记录 |
 | `boss hr last-messages [--friend-id <id>]` | 批量查看候选人最近消息摘要 |
-| `boss hr jobs list [--page N]` / `offline` / `online` | 职位管理列表与上下线。`list` 读取 `data/list`，默认第 1 页 |
+| `boss hr jobs list [--page N]` / `offline` / `online` | 职位管理列表与上下线。`list` 读取 `data/list`，默认第 1 页，并把平台的 `page` / `hasMore` / `totalSize` 映射到信封 `pagination`（`hasMore` 缺失时为 `null`） |
 | `boss hr candidates <keyword>` | 搜索和筛选候选人 |
 | `boss hr reply <friend_id> <message>` | 回复候选人消息 |
 | `boss hr request-resume <friend_id>` | 请求候选人分享附件简历 |
@@ -180,6 +200,7 @@ boss crawl stop <run_id>
 | `boss hr download-resume <friend_id> --message-id <mid> --output <文件路径>` | 检查权限后下载已收到的指定附件，不覆盖旧文件 |
 | `boss hr recommendations --job-id <encJobId>` | 读取推荐牛人完整卡片和首次开聊参数 |
 | `boss hr greet ... --message <话术> --yes` | 建立候选人会话并单次发送首次招呼，不修改已读状态 |
+| `boss hr location <friend_id> --yes` | 向已有会话发送该职位的工作地点卡片；同一会话不重复发送 |
 
 先在同一组候选人参数和话术后加 `--dry-run` 预览；操作者明确批准该候选人和话术后，才改为 `--yes` 发送。MCP 的 `yes` 默认不传，Agent 不得自行确认；预览本身不构成人工批准。
 
@@ -187,7 +208,18 @@ boss crawl stop <run_id>
 
 `hr chat` 的沟通列表接口只返回基础会话信息（friendId、姓名、updateTime 等），未读数、最后一条消息和时间按以下顺序补全：CDP 模式下先读聊天页里已加载的会话列表（geek-list 组件的 vue-rx 订阅 `list$` / `allList$`，只读页面内存，不发请求；只覆盖页面已滚动加载的会话，`hints.summary_sources.page_snapshot` 给出条数和 `has_more`，未读数只能从这里拿到）；页面里没有覆盖到的会话再调用最近消息接口 `userLastMsg`：按 friendSource 分组、每批 50 个串行请求，默认只补列表前 100 个会话（最多 2 次请求），`--summary-limit <n>`（0–300，0=不请求）可调整，任一批失败即停止；超出上限的会话按下面的兜底处理，`hints.summary_sources.last_messages_skipped` 标明条数。`last_time` 取消息的毫秒时间戳；`msg_status`（未读/已读）只对自己发出的最后一条消息有值，候选人发来的为 `null`。`hr last-messages` 同样分批，`--limit` 默认 100；都拿不到时 `unread` / `msg_status` / `last_msg` 为 `null`，`last_time` 退回会话的 `updateTime` 并标注 `last_time_source: "updateTime"`（这是会话更新时间，不一定是最后一条消息的时间）。每条记录的 `summary_source` 标明来源（`page` / `last_messages` / `friend_list`），`hints.summary_sources` 给出各来源条数和最近消息接口的错误（如有）。不再输出 `-`、`未知` 这类占位。`hints.total_unread` 是聊天页显示的未读总数（页面 `uncountTab$` 第 1 项，覆盖全部会话），`hints.unread_by_tab` 是原始分项计数（第 2、3 项含义未确认），`hints.total_unread_source` 标明来源；只读页面内存，页面不可用时均为 `null`。
 
+`hr applications` / `hr chat` / `hr candidates` / `hr recommendations` / `hr last-messages` 的列表响应在信封 `pagination` 给出分页证据：`has_more` 只在平台返回布尔 `hasMore` 时为 `true` / `false`，缺失或类型不明确时为 `null`（`has_more_source=unknown`）；`total` 是本页返回条数（`total_kind=returned_page_count`），不代表平台全集。只有 `has_more=true` 才在 `hints.next_actions` 附加保留筛选条件的下一页命令；`null` 时 `hints.operator_actions` 说明不能仅凭本页条数判断是否还有记录。`hr last-messages` 用 `--friend-id` 直查时没有列表页，`pagination` 为 `null`。
+
+`hr chatmsg` 用 `--max-msg-id` 游标向更早消息翻页，信封 `pagination` 相应给出游标证据：`has_more` 只在平台返回布尔 `hasMore` 时取 `true` / `false`，缺失或类型不明确时为 `null`（`has_more_source=unknown`）；`total` 是本页消息条数（`total_kind=returned_page_count`）；`next_max_msg_id` 是本页最旧的可用 `mid`，没有可解析的消息 ID 时为 `null`。只有 `has_more=true` 且存在游标时，`hints.next_actions` 才附加保留本次 `--count` 的下一页命令；`null` 时 `hints.operator_actions` 说明不能凭本页条数判断。游标分页没有页码，因此该命令的 `pagination` 不含 `page`。
+
 `greet` 只发送首次招呼，不建立 MQTT 连接、不清理红点。成功返回 `sent=true`；若发送后本地记录失败，错误信封仍在 `error.details.sent=true` 保留已发送事实，不能因此重发。BOSS 外层 `code=0` 也可能返回权益拦截页；CLI 会识别这类业务拒绝，返回 `GREET_LIMIT`、`error.details.sent=false` 和脱敏平台提示，保留拒绝状态以阻止重发。平台可能按职位限制免费沟通人数，不能把调用方配置的日额度当作平台保证。`chat` / `last-messages` 中未知未读数保留为 `null`，不当作零。
+
+`hr location` 向**已经存在**的候选人会话发送该职位的工作地点卡片。它不接受推荐卡片上的 `securityId`：真正发送前先读本次 `friend_detail`，用其中的会话级 `securityId` 和内部 `jobId` 调用 `POST /wapi/zpchat/message/sendJobLocation`（表单字段 `jobId`、`toUserId`、`securityId`），并且只发一次。不加参数时返回 `CONFIRMATION_REQUIRED`；`--dry-run` 只预览、不登录、不请求平台。`boss agent stop` 打开的 `automation/stop.json` 会在任何请求之前拒绝。同一 `friend_id` 已发送过记为 `LOCATION_ALREADY_SENT`；发送结果未确认时保留本地预约并返回 `LOCATION_RESULT_UNKNOWN`，禁止自动重发。成功信封的 `data.sent` 为 `true`，并给出 `job_id` / `job_name`，不回显 `securityId`。
+
+```bash
+boss hr location 10001 --dry-run
+boss hr location 10001 --yes
+```
 
 `request-resume` 与 `resume --exchange` 在聊天页里调用官方组件完成动作，只点击本次动作新弹出的确认框。成功需要动作后回读聊天记录看到自己新发出的已知请求文案或已识别类型的动作卡片。只有 outgoing WS 帧、页面调用返回成功或未知手机号动作编号时不能确认发送；这些情况返回 `ACTION_UNCONFIRMED`（`recoverable=false`），`error.details` 附带页面日志、确认按钮状态、WS 统计与历史回读核对结果（`history_checked` / `history_matched_count` / `history_attempts` / `history_new_count` / `history_self_count` / `history_recipient_count`）。此时动作可能已经生效，先用 `boss hr chatmsg <friend_id>` 核实，不要直接重试。聊天记录证据也不证明接收方已收到或已读。换手机或微信时如果同时看到了求简历消息，成功结果会带 `side_effects: ["resume_request_detected"]`。动作前或回读时首次命中风险立即停止，不继续轮询；禁用或仍在加载的编辑器不会被强制开启，目标好友必须唯一匹配。
 
@@ -197,7 +229,7 @@ boss crawl stop <run_id>
 
 在同一浏览器、同一账号完成官方验证并确认原先受阻页面正常后，由操作者明确恢复：`boss --role recruiter agent run --resume`。该选项解除本地停止状态并复用已确认动作与队列，不代表平台风险已经解除；普通 `agent run` 不解锁。MCP `boss_agent_run` 的 `resume` 默认 `false`，Agent 只有收到操作者明确恢复指令后才可设置为 `true`。wizard 和 crawl 的可恢复 run 继续使用各自的 `--resume <run_id>` / `crawl resume <run_id>`；已被 `wizard --stop` 置为 `stopped` 的 run 保持终止，应新建 workflow 或恢复其内部任务。结果未知的写动作（`ACTION_UNCONFIRMED`，或平台已成功但本地记账失败）会把 `replay_safe: false` 写入步骤错误；`--resume` 不会重跑该步骤，只返回原失败与核对指引，确认平台实际状态后应新建 workflow。
 
-MCP 的长运行使用异步子进程，运行期间仍能调用停止/状态工具。取消或超时会尝试中断并回收子进程；强制终止后可能有未知副作用，`error.details.outcome_unknown=true` 时不可自动重试。正常返回的 wizard 超时保留可恢复结果，MCP 等待覆盖其显式超时及保存进度的宽限期。
+MCP 的长运行使用异步子进程，运行期间仍能调用停止/状态工具。取消或超时会尝试中断并回收子进程；写操作被强制终止后可能有未知副作用，`error.details.outcome_unknown=true` 时不可自动重试；只读工具（如 search / show / status）返回 `outcome_unknown=false` 与 `replay_safe=true`，确认子进程已退出后可直接重试。正常返回的 wizard 超时保留可恢复结果，MCP 等待覆盖其显式超时及保存进度的宽限期。
 
 平台要求招聘者先在会话里发过消息，换电话/换微信按钮才会解锁（求简历不受限）。交换前会先看按钮组件是否处于禁用状态（`disabled` 属性、`aria-disabled`、`disabled`/`gray` 等 class、`pointer-events: none`，或组件 props/data 里的禁用标记）；页面上判断不了时，再看动作前读到的完整聊天记录里有没有你发出的消息。确定未解锁时不调用页面交换动作，直接返回 `EXCHANGE_NOT_AVAILABLE`（`recoverable=true`），先回复候选人再试即可；信号拿不准时不拦截，按原流程执行。
 
@@ -243,14 +275,18 @@ boss hr download-resume <friend_id> --message-id <attachment_mid> --output ./res
 
 > 支持 Claude 4.7 / GPT-5 / DeepSeek-V3 / Qwen3 等最新模型，详见 [推荐模型与入口](integrations/ai-models.md)。
 
+简历名是自由文本，可含空格、引号与 shell 元字符。所有以简历名为参数的后继提示（`resume show` / `edit` / `export` / `delete`，含错误消息正文）都按 POSIX shell 规则转义，`shlex.split` 后还原为同一个名字；`resume list` 与 `resume show` / `clone` 遇到损坏文件返回 `RESUME_FILE_INVALID`，给出的 `resume delete` 提示同样可直接复制执行。
+
 ## 系统管理
 
 | 命令 | 说明 |
 |------|------|
 | `boss config list/set/reset` | 配置管理 |
-| `boss clean` | 清理缓存；`--risk-lock` 在用户确认官方目标业务页恢复后显式清除本地风险锁，`--dry-run` 不解除锁，不宣称平台解封 |
+| `boss clean` | 清理缓存；`--all` 清理全部缓存（含搜索缓存、打招呼/投递记录、招聘者打招呼记录、职位描述缓存和工作地点发送记录）；`--risk-lock` 在用户确认官方目标业务页恢复后显式清除本地风险锁，`--dry-run` 不解除锁，不宣称平台解封 |
 | `boss stats` | 投递转化漏斗统计（greeted/applied/shortlist） |
 | `boss export <query>` | 导出结果（CSV/JSON/HTML，支持 `--url` 网页筛选） |
+
+`clean --dry-run` 返回的执行提示会去掉 `--dry-run`，保留本次 `--data-dir`、`--all` / `--privacy` 与 `--days`；路径会正确转义，照提示执行时仍操作预演的数据目录与清理范围。清理后的登录、自检提示也沿用该目录。带 `--risk-lock` 的预演只在 `hints.operator_actions` 提供保留范围的人工执行命令。
 
 ### 平台配置校验
 
