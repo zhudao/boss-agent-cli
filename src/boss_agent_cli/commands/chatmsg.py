@@ -9,7 +9,7 @@ from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._contact_lookup import current_friend_security_id_or_emit, resolve_friend_or_emit
 from boss_agent_cli.commands._platform import get_platform_instance
 from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_not_supported, handle_output, handle_platform_error_output, render_simple_list
-from boss_agent_cli.services.chat_utils import message_list
+from boss_agent_cli.services.chat_utils import int_code, message_list
 from boss_agent_cli.services.pagination import UNKNOWN_HAS_MORE_OPERATOR_ACTION, list_pagination
 
 _MSG_TYPE_MAP = {
@@ -87,8 +87,8 @@ def chatmsg_cmd(ctx: click.Context, security_id: str, page: int, count: int, sho
 			)
 
 		hints: dict[str, Any] = {"next_actions": [
-			boss_command_for_ctx(ctx, "chat"),
-			boss_command_for_ctx(ctx, f"detail {fresh_security_id}"),
+			boss_command_for_ctx(ctx, "chat", include_data_dir=True),
+			boss_command_for_ctx(ctx, f"detail {fresh_security_id}", include_data_dir=True),
 		]}
 		if pagination["has_more"] is True:
 			# 翻页命令必须保留 --raw：只写 --page / --count 时下一页的
@@ -97,7 +97,7 @@ def chatmsg_cmd(ctx: click.Context, security_id: str, page: int, count: int, sho
 			next_page = f"chatmsg {gid} --page {pagination['page'] + 1} --count {count}"
 			if show_raw:
 				next_page += " --raw"
-			hints["next_actions"].append(boss_command_for_ctx(ctx, next_page))
+			hints["next_actions"].append(boss_command_for_ctx(ctx, next_page, include_data_dir=True))
 		elif pagination["has_more"] is None:
 			hints["operator_actions"] = [UNKNOWN_HAS_MORE_OPERATOR_ACTION]
 
@@ -161,8 +161,10 @@ def _message_body(msg: dict[str, Any]) -> dict[str, Any]:
 
 
 def _message_type_label(msg_type: Any) -> str:
-	if isinstance(msg_type, int):
-		return _MSG_TYPE_MAP.get(msg_type, f"其他({msg_type})")
+	# JSON 布尔不是平台消息类型编码：True 不能显示成「文本」（Issue #915）。
+	code = int_code(msg_type)
+	if code is not None:
+		return _MSG_TYPE_MAP.get(code, f"其他({code})")
 	return f"其他({msg_type})"
 
 

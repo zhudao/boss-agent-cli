@@ -48,6 +48,10 @@ def prepare_render_data(
 			parts.append(f"消失 {removed_count} 条")
 		if new_unread_count:
 			parts.append(f"新消息 {new_unread_count} 条")
+		if diff_result.get("complete") is False:
+			# 部分页或筛选结果缺少“谁不在列表里”的证据，不能显示“无变化”
+			# 让读者以为已确认联系人仍在（Issue #911）。
+			parts.append("本次采集不完整，未判断消失")
 		diff_summary = {
 			"prev_date": prev_date,
 			"change": "，".join(parts) if parts else "无变化",
@@ -211,7 +215,9 @@ def _render_markdown(
 		lines.append("| 编号 | 公司/联系人 | 联系人标识（uid 优先） |")
 		lines.append("|------|------------|--------------------------|")
 		for ref, key, label in rd["id_map"]:
-			lines.append(f"| {ref} | {label} | {key} |")
+			# label 含平台外部可控的联系人 / 公司名称：不转义时一个 `|` 就能让
+			# uid 落错列，换行还能凭空插入伪造的映射行（Issue #895）。
+			lines.append(f"| {ref} | {escape_md_cell(label)} | {escape_md_cell(key)} |")
 		lines.append("")
 		lines.append("</details>")
 		lines.append("")

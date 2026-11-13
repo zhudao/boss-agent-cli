@@ -343,6 +343,14 @@ class TestLoginActionForCtx:
 		ctx.obj = {"platform": "otherplat"}
 		assert boss_command_for_ctx(ctx, "status") == "boss --platform otherplat status"
 
+	def test_role_and_data_dir_are_kept_before_subcommand(self, tmp_path):
+		"""agent 等不在 hr 组下的招聘者命令必须在全局选项区保留角色。"""
+		ctx = MagicMock()
+		ctx.obj = {"data_dir": tmp_path, "platform": "zhipin"}
+		assert boss_command_for_ctx(ctx, "agent stats", include_data_dir=True, role="recruiter") == (
+			f"boss --data-dir {tmp_path.resolve()} --role recruiter agent stats"
+		)
+
 	def test_default_platform_uses_plain_login(self):
 		ctx = MagicMock()
 		ctx.obj = {}
@@ -392,6 +400,27 @@ class TestHandleErrorOutputTTY:
 				handle_error_output(ctx, "test", code="NETWORK_ERROR", message="请求失败")
 
 		assert ERROR_CODES["NETWORK_ERROR"]["recovery_action"] in stream.getvalue()
+
+	@pytest.mark.parametrize("path", ["/tmp/jobs [x] team", "/tmp/jobs [/bold] team"])
+	def test_tty_mode_recovery_renders_bracket_paths_literally(self, monkeypatch, path):
+		"""恢复命令里的目录按字面显示：Rich 标签不能吞路径，未配对闭合标签也不能抛错。"""
+		ctx = MagicMock()
+		ctx.obj = {"json_output": False}
+		stream = _capture_display_console(monkeypatch)
+		with patch.object(sys, "stdout") as mock_out:
+			mock_out.isatty.return_value = True
+			with pytest.raises(SystemExit):
+				handle_error_output(
+					ctx,
+					"show",
+					code="INVALID_PARAM",
+					message="当前数据目录没有缓存的搜索结果",
+					recovery_action=f"先执行 boss --data-dir '{path}' search <关键词> 建立结果缓存",
+				)
+
+		output = stream.getvalue()
+		assert path in output
+		assert "recovery:" in output
 
 
 # ── handle_auth_errors AccountRiskError 分支 ─────────────────
@@ -524,6 +553,7 @@ class TestRenderers:
 			title="jobs",
 			page=1,
 			hint_next="next hint",
+			show_command="boss show <#>",
 		)
 
 		output = stream.getvalue()
@@ -967,6 +997,16 @@ class TestRenderNextSteps:
 		render_next_steps(None)
 
 		assert stream.getvalue() == ""
+
+	@pytest.mark.parametrize("path", ["/tmp/jobs [bold] team", "/tmp/jobs [/bold] team"])
+	def test_renders_commands_with_rich_tags_literally(self, monkeypatch, path):
+		"""命令里的数据目录是原样文本：Rich 标签不能吞掉它或抛 MarkupError。"""
+		from boss_agent_cli.display import render_next_steps
+
+		stream = _capture_display_console(monkeypatch)
+		render_next_steps([f"boss --data-dir {path} config list"])
+
+		assert f"--data-dir {path} config list" in stream.getvalue()
 
 
 class TestRenderActionResult:

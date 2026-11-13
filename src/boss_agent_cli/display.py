@@ -25,6 +25,17 @@ from boss_agent_cli.schema.error_codes import ERROR_CODES
 console = Console(stderr=True)
 
 
+def escape_markup(value: Any) -> str:
+	"""把平台 / 用户外部字符串转成 Rich 按字面渲染的文本。
+
+	Rich 默认把字符串当 markup 解析：未配对的闭合标签（``[/bold]``）直接抛
+	MarkupError 让整条 TTY 输出崩掉，``[link=...]`` 则会把终端渲染成可点击
+	超链接（OSC 8）。公司名、职位名、职位描述、聊天内容、昵称都是平台外部
+	输入，进入 Rich 前一律经过这里；代码自身的样式标签保持不变。
+	"""
+	return escape(str(value))
+
+
 _SHELL_METACHARACTERS = frozenset("'\"`$\\!*?[]{}()<>|&;#")
 
 
@@ -45,23 +56,43 @@ def shell_argument(value: str) -> str:
 	return "'" + value.replace("'", "'\\''") + "'"
 
 
-def boss_command(command: str, *, platform_name: str = "zhipin", data_dir: Path | None = None) -> str:
+def boss_command(command: str, *, platform_name: str = "zhipin", data_dir: Path | None = None, role: str | None = None) -> str:
 	"""构造后继命令；依赖本地状态时显式保留数据目录。"""
 	prefix = "boss" if platform_name == "zhipin" else f"boss --platform {platform_name}"
 	if data_dir is not None:
 		prefix += f" --data-dir {shell_argument(str(data_dir.resolve()))}"
+	if role:
+		# 部分命令组（如 agent）不在 hr 组下，重放时必须显式带角色。
+		prefix += f" --role {role}"
 	return f"{prefix} {command}".strip()
 
 
-def boss_command_for_ctx(ctx: Any, command: str, *, include_data_dir: bool = False) -> str:
-	"""构造平台感知命令，可选择保留当前数据目录。"""
+def boss_command_for_ctx(
+	ctx: Any,
+	command: str,
+	*,
+	include_data_dir: bool = False,
+	role: str | None = None,
+) -> str:
+	"""构造平台感知命令，可选择保留当前数据目录与角色。"""
 	platform_name = "zhipin"
 	data_dir = None
 	if ctx and getattr(ctx, "obj", None):
 		platform_name = ctx.obj.get("platform") or "zhipin"
 		if include_data_dir:
 			data_dir = ctx.obj.get("data_dir")
-	return boss_command(command, platform_name=platform_name, data_dir=data_dir)
+	return boss_command(command, platform_name=platform_name, data_dir=data_dir, role=role)
+
+
+def show_command_for_ctx(ctx: Any, *, index_saved: bool) -> str | None:
+	"""编号查看命令：只有本次列表写入了编号索引时才可用。
+
+	``boss show <#>`` 读的是索引里最近一次写入的列表，不是屏幕上这张表；
+	没写索引时给出编号会让用户打开另一条职位（Issue #925）。
+	"""
+	if not index_saved:
+		return None
+	return boss_command_for_ctx(ctx, "show <#>", include_data_dir=True)
 
 
 def login_action_for_ctx(ctx: Any) -> str:
@@ -157,7 +188,7 @@ def render_operator_actions(hints: dict[str, Any] | None) -> None:
 	console.print()
 	for index, action in enumerate(actions):
 		prefix = "↓ 你需要：" if index == 0 else "　　　　　"
-		console.print(f"[yellow]{prefix}[/yellow]{action}")
+		console.print(f"[yellow]{prefix}[/yellow]{escape_markup(action)}")
 
 
 def handle_output(
@@ -224,9 +255,11 @@ def handle_error_output(
 		# 明文打到终端（Issue #880）。
 		safe_message = redact_sensitive_text(message)
 		safe_recovery = redact_sensitive_text(recovery_action) if recovery_action else recovery_action
-		console.print(f"[red]error[/red] [{code}] {safe_message}")
+		# 命令文本里可能带数据目录：方括号内容会被 Rich 当作样式标签吞掉，
+		# 未配对的闭合标签还会直接抛 MarkupError，恢复指引必须按字面显示。
+		console.print(f"[red]error[/red] [{code}] {escape(safe_message)}")
 		if safe_recovery:
-			console.print(f"  [dim]recovery: {safe_recovery}[/dim]")
+			console.print(f"  [dim]recovery: {escape(safe_recovery)}[/dim]")
 		render_operator_actions(hints)
 		raise SystemExit(1)
 
@@ -297,8 +330,13 @@ def render_job_table(
 	*,
 	page: int = 1,
 	hint_next: str = "",
+	show_command: str | None = None,
 ) -> None:
-	"""Render a list of jobs as a rich table."""
+	"""渲染职位表。
+
+	``show_command`` 只在调用方已把这批职位写进编号索引时传入：`boss show <#>`
+	读的是索引而不是屏幕上的表格，没写索引的列表给出编号提示会打开另一条职位。
+	"""
 	if not items:
 		console.print("[yellow]no results[/yellow]")
 		return
@@ -316,19 +354,20 @@ def render_job_table(
 	for i, job in enumerate(items, 1):
 		table.add_row(
 			str(i),
-			job.get("title", job.get("jobName", "-")),
-			job.get("company", job.get("brandName", "-")),
-			job.get("salary", job.get("salaryDesc", "-")),
-			job.get("employment_type") or "-",
-			job.get("experience", job.get("jobExperience", "-")),
-			job.get("education", job.get("jobDegree", "-")),
-			job.get("city", job.get("cityName", "-")),
+			escape_markup(job.get("title", job.get("jobName", "-"))),
+			escape_markup(job.get("company", job.get("brandName", "-"))),
+			escape_markup(job.get("salary", job.get("salaryDesc", "-"))),
+			escape_markup(job.get("employment_type") or "-"),
+			escape_markup(job.get("experience", job.get("jobExperience", "-"))),
+			escape_markup(job.get("education", job.get("jobDegree", "-"))),
+			escape_markup(job.get("city", job.get("cityName", "-"))),
 		)
 
 	console.print(table)
-	console.print("  [dim]use: boss show <#> to view details[/dim]")
+	if show_command:
+		console.print(f"  [dim]use: {escape(show_command)} to view details[/dim]")
 	if hint_next:
-		console.print(f"  [dim]{hint_next}[/dim]")
+		console.print(f"  [dim]{escape(hint_next)}[/dim]")
 
 
 def _snapshot_time_label(value: Any) -> str:
@@ -343,18 +382,18 @@ def _snapshot_time_label(value: Any) -> str:
 
 def render_job_detail(data: dict[str, Any], *, greet_command: str | None = None) -> None:
 	"""Render job detail as a rich panel."""
-	title = data.get("title", "-")
-	salary = data.get("salary", "-")
-	exp = data.get("experience", "-")
-	edu = data.get("education", "-")
-	city = data.get("city", "-")
-	company = data.get("company", "-")
-	boss = data.get("boss_name", "-")
-	boss_title = data.get("boss_title", "-")
-	desc = data.get("description", "")
+	title = escape_markup(data.get("title", "-"))
+	salary = escape_markup(data.get("salary", "-"))
+	exp = escape_markup(data.get("experience", "-"))
+	edu = escape_markup(data.get("education", "-"))
+	city = escape_markup(data.get("city", "-"))
+	company = escape_markup(data.get("company", "-"))
+	boss = escape_markup(data.get("boss_name", "-"))
+	boss_title = escape_markup(data.get("boss_title", "-"))
+	desc = str(data.get("description", ""))
 
 	skills = data.get("skills", [])
-	skill_str = ", ".join(skills) if skills else "-"
+	skill_str = ", ".join(escape_markup(skill) for skill in skills) if skills else "-"
 
 	text = (
 		f"[bold cyan]{title}[/bold cyan]  [yellow]{salary}[/yellow]\n"
@@ -369,7 +408,8 @@ def render_job_detail(data: dict[str, Any], *, greet_command: str | None = None)
 	if desc:
 		if len(desc) > 500:
 			desc = desc[:500] + "..."
-		text += f"\n[bold]description:[/bold]\n{desc}"
+		# 先截断再转义：截断可能落在转义序列中间。
+		text += f"\n[bold]description:[/bold]\n{escape_markup(desc)}"
 
 	panel = Panel(text, title="job detail", border_style="cyan")
 	console.print(panel)
@@ -392,20 +432,20 @@ def render_job_detail(data: dict[str, Any], *, greet_command: str | None = None)
 	jid = data.get("job_id", "")
 	if sid and jid:
 		greet_command = greet_command or "boss greet <security_id> <job_id>"
-		console.print(f"  [dim]next: {greet_command}[/dim]")
+		console.print(f"  [dim]next: {escape(greet_command)}[/dim]")
 
 
 def render_status(data: dict[str, Any], *, login_action: str = "boss login") -> None:
 	"""Render login status."""
 	if data.get("logged_in"):
-		name = data.get("user_name", "unknown")
+		name = escape_markup(data.get("user_name", "unknown"))
 		console.print(f"[green]logged in[/green] as [bold]{name}[/bold]")
 	else:
 		console.print(f"[yellow]not logged in[/yellow] - run: {login_action}")
 	lock = data.get("cdp_risk_lock")
 	if isinstance(lock, dict) and lock.get("locked"):
-		since = lock.get("locked_at") or "unknown"
-		reason = lock.get("reason") or "ENVIRONMENT_RISK"
+		since = escape_markup(lock.get("locked_at") or "unknown")
+		reason = escape_markup(lock.get("reason") or "ENVIRONMENT_RISK")
 		console.print(
 			f"[yellow]BOSS 本地风控锁定中[/yellow]（{since} 起，{reason}）：确认官方目标业务页已恢复后，"
 			"由用户执行 boss clean --risk-lock 再显式恢复任务；令牌变化不会自动解锁"
@@ -433,7 +473,7 @@ def render_simple_list(
 	for i, item in enumerate(items, 1):
 		row = [str(i)]
 		for _, key, _ in columns:
-			row.append(str(item.get(key, "-")))
+			row.append(escape_markup(item.get(key, "-")))
 		table.add_row(*row)
 
 	console.print(table)
@@ -446,7 +486,7 @@ def render_message_panel(data: dict[str, Any], *, title: str = "result") -> None
 	"""Render a simple key-value result as a panel."""
 	lines = []
 	for k, v in data.items():
-		lines.append(f"[bold]{k}:[/bold] {v}")
+		lines.append(f"[bold]{escape_markup(k)}:[/bold] {escape_markup(v)}")
 	panel = Panel("\n".join(lines), title=title, border_style="green")
 	console.print(panel)
 
@@ -470,10 +510,10 @@ def render_batch_operation_summary(data: dict[str, Any], *, title: str = "batch 
 		table.add_column("title", style="cyan", max_width=25)
 		table.add_column("company", style="green", max_width=20)
 		for item in greeted:
-			table.add_row(item.get("title", "-"), item.get("company", "-"))
+			table.add_row(escape_markup(item.get("title", "-")), escape_markup(item.get("company", "-")))
 		console.print(table)
 	if data.get("stopped_reason"):
-		console.print(f"  [yellow]stopped: {data['stopped_reason']}[/yellow]")
+		console.print(f"  [yellow]stopped: {escape_markup(data['stopped_reason'])}[/yellow]")
 
 
 def render_sectioned_record(data: dict[str, Any], *, title: str = "info") -> None:
@@ -484,11 +524,11 @@ def render_sectioned_record(data: dict[str, Any], *, title: str = "info") -> Non
 			for k, v in content.items():
 				if isinstance(v, (list, dict)):
 					v = str(v)[:200]
-				lines.append(f"[bold]{k}:[/bold] {v or '-'}")
+				lines.append(f"[bold]{escape_markup(k)}:[/bold] {escape_markup(v or '-')}")
 			panel = Panel("\n".join(lines) if lines else "[dim]empty[/dim]", title=section, border_style="cyan")
 			console.print(panel)
 		else:
-			console.print(f"[bold]{section}:[/bold] {content}")
+			console.print(f"[bold]{escape_markup(section)}:[/bold] {escape_markup(content)}")
 
 
 def render_string_grid(items: list[str], title: str, *, columns: int = 4) -> None:
@@ -505,7 +545,7 @@ def render_string_grid(items: list[str], title: str, *, columns: int = 4) -> Non
 		row = items[i : i + columns]
 		while len(row) < columns:
 			row.append("")
-		table.add_row(*row)
+		table.add_row(*[escape_markup(item) for item in row])
 
 	console.print(table)
 
@@ -516,9 +556,11 @@ def render_export_summary(data: dict[str, Any]) -> None:
 	count = data.get("count", 0)
 	fmt = data.get("format", "")
 	if path:
-		console.print(f"[green]exported[/green] {count} jobs to [bold]{path}[/bold] ({fmt})")
+		console.print(f"[green]exported[/green] {count} jobs to [bold]{escape_markup(path)}[/bold] ({escape_markup(fmt)})")
 	else:
 		console.print(f"[green]exported[/green] {count} jobs ({fmt})")
+	if data.get("truncated"):
+		console.print("[yellow]注意：扫描到内部页数上限，结果可能不完整[/yellow]")
 
 
 def render_next_steps(actions: "Sequence[str] | None") -> None:
@@ -535,7 +577,9 @@ def render_next_steps(actions: "Sequence[str] | None") -> None:
 		return
 	console.print("\n  [bold]下一步：[/bold]")
 	for action in actions:
-		console.print(f"    [dim]{action}[/dim]")
+		# 命令里带数据目录等用户可控文本：不转义时 `[bold]` 会被 Rich 吞掉，
+		# 未配对的 `[/bold]` 直接抛 MarkupError，整个人工提示都打不出来。
+		console.print(f"    [dim]{escape(action)}[/dim]")
 
 
 def render_action_result(

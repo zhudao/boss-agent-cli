@@ -24,10 +24,13 @@ from boss_agent_cli.automation.models import (
 	ConversationFingerprint,
 	ConversationRef,
 	EventStatus,
+	PendingAction,
 	ReviewItem,
 	PlatformAction,
+	RunReport,
 )
 from boss_agent_cli.automation.runner import run_automation_cycle
+from boss_agent_cli.automation.reply_ai import parse_reply_draft
 from boss_agent_cli.automation.safety import SafetyGuard
 from boss_agent_cli.automation.storage import AutomationStore
 from boss_agent_cli.main import cli
@@ -304,6 +307,90 @@ def test_local_ai_parse_error_is_skipped_without_sending_or_review(tmp_path: Pat
 	assert store.read_reviews() == []
 
 
+@pytest.mark.parametrize(
+	("payload", "error"),
+	[
+		({"action": "send_questionnaire", "confidence": 0.9, "reply": None, "reason": "r", "risk_flags": []}, TypeError),
+		({"action": "send_questionnaire", "confidence": 0.9, "reply": 123, "reason": "r", "risk_flags": []}, TypeError),
+		({"action": 123, "confidence": 0.9, "reply": "您好", "reason": "r", "risk_flags": []}, TypeError),
+		({"action": "send_questionnaire", "confidence": "high", "reply": "您好", "reason": "r", "risk_flags": []}, ValueError),
+		({"action": "send_questionnaire", "confidence": 2.0, "reply": "您好", "reason": "r", "risk_flags": []}, ValueError),
+		({"action": "send_questionnaire", "confidence": float("nan"), "reply": "您好", "reason": "r", "risk_flags": []}, ValueError),
+		({"action": "send_questionnaire", "confidence": True, "reply": "您好", "reason": "r", "risk_flags": []}, TypeError),
+	],
+)
+def test_reply_draft_rejects_malformed_model_fields(payload, error) -> None:
+	"""模型输出是不可信外部输入：null 回复不能变成 "None" 发给候选人（Issue #893）。"""
+	with pytest.raises(error):
+		parse_reply_draft(json.dumps(payload, ensure_ascii=False))
+
+
+def test_reply_draft_accepts_numeric_string_confidence_and_strips_reply() -> None:
+	draft = parse_reply_draft(
+		json.dumps(
+			{
+				"action": "send_questionnaire",
+				"confidence": "0.88",
+				"reply": "  您好，方便沟通吗？  \n",
+				"reason": "r",
+				"risk_flags": [],
+			},
+			ensure_ascii=False,
+		)
+	)
+	assert draft.confidence == 0.88
+	assert draft.reply == "您好，方便沟通吗？"
+
+
+def _run_cycle_with_local_ai_draft(
+	tmp_path: Path, monkeypatch, payload: dict
+) -> tuple[RunReport, RecordingMockRecruiterAutomationPlatform]:
+	monkeypatch.setenv("BOSS_AGENT_MACHINE_ID", "test-machine")
+	store = AutomationStore(tmp_path)
+	ai_store = AIConfigStore(tmp_path)
+	ai_store.save_config(ai_provider="ollama", ai_model="qwen3:14b")
+	ai_store.save_api_key("local")
+	adapter = RecordingMockRecruiterAutomationPlatform(
+		"zhipin",
+		[_conversation("你好，我在上海做过3年销售，擅长客户沟通，大专，想看机会", "高分")],
+	)
+	response = MagicMock()
+	response.raise_for_status = MagicMock()
+	response.json.return_value = {
+		"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}]
+	}
+	with patch("boss_agent_cli.ai.service.httpx.post", return_value=response):
+		report = run_automation_cycle(
+			adapter,
+			store,
+			AutomationConfig(reply_strategy=ReplyStrategy.LOCAL_AI),
+			platform="zhipin",
+			dry_run=False,
+			limit=1,
+		)
+	return report, adapter
+
+
+@pytest.mark.parametrize(
+	"payload",
+	[
+		# null / 数字回复曾被 str() 变成 "None" / "123" 原样发给候选人。
+		{"action": "send_questionnaire", "confidence": 0.9, "reply": None, "reason": "r", "risk_flags": []},
+		{"action": "send_questionnaire", "confidence": 0.9, "reply": 123, "reason": "r", "risk_flags": []},
+		# 非数值 / 越界置信度曾让 cycle 崩溃或被静默接受。
+		{"action": "send_questionnaire", "confidence": "high", "reply": "您好", "reason": "r", "risk_flags": []},
+		{"action": "send_questionnaire", "confidence": 2.0, "reply": "您好", "reason": "r", "risk_flags": []},
+	],
+)
+def test_local_ai_malformed_draft_skips_without_sending(tmp_path: Path, monkeypatch, payload: dict) -> None:
+	"""畸形草稿统一降级为复核跳过：不发消息，也不把整轮自动化打成可重试网络错误。"""
+	report, adapter = _run_cycle_with_local_ai_draft(tmp_path, monkeypatch, payload)
+
+	assert adapter.messages == []
+	assert report.events[0].status == EventStatus.SKIPPED.value
+	assert "local ai parse failed" in report.events[0].reason
+
+
 def test_runner_dry_run_writes_events_without_review_queue(tmp_path: Path) -> None:
 	store = AutomationStore(tmp_path)
 	adapter = MockRecruiterAutomationPlatform(
@@ -359,6 +446,18 @@ def test_runner_creates_interview_lead_after_contact_exchange(tmp_path: Path) ->
 	)
 
 	assert report.events[0].action == PlatformAction.CREATE_INTERVIEW_LEAD.value
+	# 演练不落盘线索（Issue #889）：预览过一次就跑出一份真实面试清单，
+	# 会让后续 live 运行看起来像「已经安排过面试」。
+	assert not (tmp_path / "automation" / "interview-leads.csv").exists()
+
+	live = run_automation_cycle(
+		adapter,
+		store,
+		AutomationConfig(),
+		platform="zhipin",
+		dry_run=False,
+	)
+	assert live.events[0].action == PlatformAction.CREATE_INTERVIEW_LEAD.value
 	assert (tmp_path / "automation" / "interview-leads.csv").exists()
 
 
@@ -902,3 +1001,154 @@ def test_local_ai_null_content_falls_back_to_template_and_cycle_continues(tmp_pa
 		assert "local ai unavailable" in event.reason
 		assert "max_tokens=2048" in event.reason
 		assert "template fallback" in event.reason
+
+
+def test_dry_run_does_not_advance_conversation_phase(tmp_path: Path) -> None:
+	"""预览不能改写对话阶段：演练后 live 必须仍从问卷开始（Issue #889）。
+
+	旧实现把 DRY_RUN 也当成「已发送」写进 state.json，下一次真实运行据此
+	认为问卷已发、候选人已回复，直接跳过问卷发出跟进话术——而候选人从未
+	收到任何消息。
+	"""
+	store = AutomationStore(tmp_path)
+	text = "你好，我在上海做过3年销售，擅长客户沟通，大专，想看机会，可面试"
+	adapter = RecordingMockRecruiterAutomationPlatform(
+		"zhipin", [_conversation(text, "候选人A")],
+	)
+	config = AutomationConfig()
+
+	preview = run_automation_cycle(adapter, store, config, platform="zhipin", dry_run=True)
+	assert [event.status for event in preview.events] == [EventStatus.DRY_RUN.value]
+	assert store.read_state()["conversations"].get("候选人A", {}) == {}
+	assert adapter.messages == []
+
+	live = run_automation_cycle(adapter, store, config, platform="zhipin", dry_run=False)
+	assert [event.action for event in live.events] == [PlatformAction.SEND_QUESTIONNAIRE.value]
+	assert [event.status for event in live.events] == [EventStatus.AUTO_EXECUTED.value]
+	assert "近期是否看机会" in adapter.messages[0]
+
+
+def test_dry_run_keeps_pending_actions_for_the_next_live_run(tmp_path: Path) -> None:
+	"""演练不得消耗待执行队列（Issue #889）。
+
+	`_next_pending_status(DRY_RUN)` 曾返回 "dry-run"，该状态不在 `status ==
+	"pending"` 的重放过滤里：操作者 preview 一次，批准过的真实动作就永久丢失。
+	"""
+	store = AutomationStore(tmp_path)
+	store.append_pending(PendingAction(
+		id="approved-1",
+		ts="2026-11-12T00:00:00+00:00",
+		platform="zhipin",
+		candidate_key="候选人A",
+		action=PlatformAction.SEND_QUESTIONNAIRE.value,
+		status="pending",
+		confidence=0.9,
+		reason="approved review",
+		message="您好，想确认下近期是否看机会？",
+	))
+	# 会话扫描用一个必被跳过的候选人，确保 live 断言只覆盖队列动作本身。
+	adapter = RecordingMockRecruiterAutomationPlatform(
+		"zhipin", [_conversation("不要再联系", "风险候选人")],
+	)
+	config = AutomationConfig()
+
+	preview = run_automation_cycle(adapter, store, config, platform="zhipin", dry_run=True)
+	assert preview.events[0].status == EventStatus.DRY_RUN.value
+	assert [item.status for item in store.read_pending()] == ["pending"]
+	assert adapter.messages == []
+
+	live = run_automation_cycle(adapter, store, config, platform="zhipin", dry_run=False)
+	assert live.events[0].status == EventStatus.AUTO_EXECUTED.value
+	assert [item.status for item in store.read_pending()] == ["executed"]
+	assert adapter.messages == ["您好，想确认下近期是否看机会？"]
+
+
+def test_interview_lead_is_deduplicated_across_cycles(tmp_path: Path) -> None:
+	"""同一候选人的同一面试时间只记一次（Issue #889）。
+
+	候选人停留在同一段回复上时，每轮自动化都会重新命中 CREATE_INTERVIEW_LEAD；
+	旧实现每轮追加一行，运维清单里同一条面试被重复 N 次。
+	"""
+	store = AutomationStore(tmp_path)
+	store.write_state({"conversations": {"面试候选人": {"exchange_contact_at": "2026-06-23T00:00:00"}}})
+	adapter = MockRecruiterAutomationPlatform(
+		"zhipin",
+		[_conversation("我在上海做过3年销售，大专，想看机会，周二 14:00 面试", "面试候选人")],
+	)
+	config = AutomationConfig()
+
+	for _ in range(3):
+		report = run_automation_cycle(adapter, store, config, platform="zhipin", dry_run=False)
+		assert report.events[0].action == PlatformAction.CREATE_INTERVIEW_LEAD.value
+
+	lines = (tmp_path / "automation" / "interview-leads.csv").read_text(encoding="utf-8").splitlines()
+	assert len(lines) == 2
+	assert lines[0] == "candidate_key,interview_time,reason"
+
+
+def test_interview_lead_csv_escapes_external_candidate_names(tmp_path: Path) -> None:
+	"""候选人昵称是外部可控输入，不能破坏行结构或注入公式（Issue #889）。"""
+	import csv as csv_module
+	import io
+
+	store = AutomationStore(tmp_path)
+	store.append_interview_lead('=HYPERLINK("http://evil","click")', "周二 14:00", "ok")
+	store.append_interview_lead("张三\n伪造行,周二 23:00,hacked", "周二 14:00", "ok")
+	store.append_interview_lead("正常,候选人", "周二 14:00", "ok")
+
+	path = tmp_path / "automation" / "interview-leads.csv"
+	# 必须用 csv 解析带引号单元格里的换行；splitlines() 会把它当成两个数据行。
+	rows = list(csv_module.reader(io.StringIO(path.read_text(encoding="utf-8"), newline="")))
+	assert rows[0] == ["candidate_key", "interview_time", "reason"]
+	# 三行数据 + 表头：每个候选人恰好一行，换行与逗号都被正确引用。
+	assert len(rows) == 4
+	assert rows[1][0] == '\'=HYPERLINK("http://evil","click")'
+	assert rows[2][0] == "张三\n伪造行,周二 23:00,hacked"
+	assert rows[3][0] == "正常,候选人"
+	assert all(len(row) == 3 for row in rows)
+
+
+@pytest.mark.parametrize(
+	("text", "expected"),
+	[
+		("明天下午3点30面试", "明天下午3:30"),
+		("明天下午3点半有空", "明天下午3:30"),
+		("明天下午3点30分", "明天下午3:30"),
+		("明天下午3点05", "明天下午3:05"),
+		("周三上午9点半到公司", "周三上午9:30"),
+		("今天下午3点一刻", "今天下午3:15"),
+		("后天晚上7点三刻", "后天晚上7:45"),
+		("明天下午3:30", "明天下午3:30"),
+		("周二 14:00 面试", "周二 14:00"),
+		("明天10点", "明天10:00"),
+		("时间待定", ""),
+	],
+)
+def test_interview_time_parses_colloquial_minutes(text: str, expected: str) -> None:
+	"""口语分钟必须还原成合法 HH:MM（Issue #891）。
+
+	旧实现把「点」一律替换成 `:00`，于是「3点30」产出 `3:0030`、「3点半」
+	静默截成 `3:00`——操作者按 15:00 赴约而候选人说的是 15:30。
+	"""
+	from boss_agent_cli.automation.decision import _extract_interview_time
+
+	assert _extract_interview_time(text) == expected
+
+
+def test_interview_lead_records_colloquial_time_verbatim(tmp_path: Path) -> None:
+	"""会谈时间的口语形态要一路还原到 interview-leads.csv（Issue #891）。"""
+	from boss_agent_cli.automation.decision import _extract_interview_time
+
+	store = AutomationStore(tmp_path)
+	store.write_state({"conversations": {"面试候选人": {"exchange_contact_at": "2026-06-23T00:00:00"}}})
+	adapter = MockRecruiterAutomationPlatform(
+		"zhipin",
+		[_conversation("我在上海做过3年销售，大专，想看机会，明天下午3点30面试", "面试候选人")],
+	)
+	report = run_automation_cycle(adapter, store, AutomationConfig(), platform="zhipin", dry_run=False)
+
+	assert report.events[0].action == PlatformAction.CREATE_INTERVIEW_LEAD.value
+	csv_text = (tmp_path / "automation" / "interview-leads.csv").read_text(encoding="utf-8")
+	assert "明天下午3:30" in csv_text
+	assert "3:0030" not in csv_text
+	assert _extract_interview_time("明天下午3点半") == "明天下午3:30"

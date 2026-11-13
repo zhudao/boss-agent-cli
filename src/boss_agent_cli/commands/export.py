@@ -8,6 +8,7 @@ from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.commands._platform import get_platform_instance
 from boss_agent_cli.display import (
 	boss_command_for_ctx,
+	console,
 	handle_auth_errors,
 	handle_error_output,
 	handle_output,
@@ -35,8 +36,15 @@ from boss_agent_cli.search_filters import (
 )
 from boss_agent_cli.commands._filter_errors import emit_filter_error
 
-
 _EXPORT_FILTER_PAGE_ALLOWANCE = 5
+_TRUNCATED_OPERATOR_ACTION = (
+	"本次导出扫描到内部页数上限，结果可能不完整；请缩小筛选条件后重试，或用 --url 精确筛选"
+)
+
+
+def _hint_command(ctx: click.Context, command: str) -> str:
+	"""导出失败后的重试与后继命令沿用当前登录态与数据目录。"""
+	return boss_command_for_ctx(ctx, command, include_data_dir=True)
 
 
 @click.command("export")
@@ -81,13 +89,14 @@ def export_cmd(
 	# 与 search 同一口径：传了 --url 但值是空串时，「未提供 query」会读成
 	# 「你没传 --url」，真正的原因（flag 后面少了值）被掩盖。
 	if search_url is not None and not search_url.strip():
+		export_example = _hint_command(ctx, "export <关键词>")
 		handle_error_output(
 			ctx,
 			"export",
 			code="INVALID_PARAM",
 			message="--url 的值不能为空",
-			recovery_action="boss export <关键词> 或 boss export --url <搜索页URL>",
-			hints={"next_actions": ["boss export <关键词>"]},
+			recovery_action=f"{export_example} 或 {_hint_command(ctx, 'export --url <搜索页URL>')}",
+			hints={"next_actions": [export_example]},
 		)
 		return
 	# 与 search 同一口径：纯空白的 query 仍是「没给关键词」，不能当成一次
@@ -102,7 +111,7 @@ def export_cmd(
 		try:
 			parsed_url = parse_boss_search_url(search_url)
 		except SearchUrlParseError as exc:
-			export_cmd = boss_command_for_ctx(ctx, "export <关键词>")
+			export_cmd = _hint_command(ctx, "export <关键词>")
 			handle_error_output(
 				ctx,
 				"export",
@@ -122,7 +131,9 @@ def export_cmd(
 			code="INVALID_PARAM",
 			message="未提供 query，请传入搜索关键词或 --url",
 			recoverable=False,
-			recovery_action="boss export <query> 或 boss export --url <搜索页URL>",
+			recovery_action=(
+				f"{_hint_command(ctx, 'export <query>')} 或 {_hint_command(ctx, 'export --url <搜索页URL>')}"
+			),
 		)
 		return
 	query = query or ""
@@ -172,6 +183,9 @@ def export_cmd(
 		# 显式请求的 count 决定，避免 hasMore 异常时形成无界请求。
 		estimated_pages = max(1, (count + 14) // 15)
 		max_pages = estimated_pages + _EXPORT_FILTER_PAGE_ALLOWANCE
+		# 预算耗尽而仍未取满 count 时结果并不完整。必须把终止原因写进信封，
+		# 否则调用方无法区分「平台只有这些」和「本地扫描到上限」（Issue #907）。
+		stop_reason = "page_budget_exhausted"
 
 		while len(collected) < count and page <= max_pages:
 			logger.info(f"正在获取第 {page} 页...")
@@ -204,6 +218,7 @@ def export_cmd(
 			platform_data = platform.unwrap_data(raw) or {}
 			job_list = field_list(platform_data, "jobList")
 			if not job_list:
+				stop_reason = "empty_page"
 				break
 
 			for raw_item in job_list:
@@ -218,9 +233,18 @@ def export_cmd(
 					item = JobItem.from_api(raw_item)
 					all_items.append(item.to_dict())
 
-			if not platform_data.get("hasMore", False):
+			# 只有平台明确返回布尔 false 才算「没有下一页」。缺失或类型不明确的
+			# hasMore 被当成 false 会让 export 静默只导出第一页（Issue #903）；
+			# 与 crawler 的保守默认一致，继续翻页，仍受 count / max_pages /
+			# 空 jobList 三重终止约束。
+			if platform_data.get("hasMore") is False:
+				stop_reason = "platform_has_more_false"
 				break
 			page += 1
+
+		if len(collected) >= count:
+			stop_reason = "count_reached"
+		truncated = stop_reason == "page_budget_exhausted"
 
 		if output:
 			output = str(prepare_output_path(output))
@@ -237,18 +261,21 @@ def export_cmd(
 				"format": fmt,
 				"path": output,
 				"private_fields": _private_fields_state(fmt=fmt, include_private=include_private),
+				"truncated": truncated,
+				"stop_reason": stop_reason,
 			}
 			handle_output(
 				ctx,
 				"export",
 				data,
 				render=lambda d: render_export_summary(d),
-				hints={
-					"next_actions": [
-						boss_command_for_ctx(ctx, "search <query>"),
-						boss_command_for_ctx(ctx, "recommend"),
+				hints=_truncation_hints(
+					truncated,
+					next_actions=[
+						_hint_command(ctx, "search <query>"),
+						_hint_command(ctx, "recommend"),
 					],
-				},
+				),
 			)
 		elif html_mode:
 			# `--format html` 不能静默退化成职位记录数组：格式契约说 html，就该是 HTML。
@@ -264,32 +291,59 @@ def export_cmd(
 						"bytes": len(html_text.encode("utf-8")),
 						"count": len(html_items),
 						"private_fields": "omitted",
+						"truncated": truncated,
+						"stop_reason": stop_reason,
 					},
-					hints={"next_actions": [boss_command_for_ctx(ctx, "export <query> --format html -o <path>")],
-						"operator_actions": ["把 data.content 写成 .html 文件后打开"]},
+					hints=_truncation_hints(
+						truncated,
+						next_actions=[_hint_command(ctx, "export <query> --format html -o <path>")],
+						operator_actions=["把 data.content 写成 .html 文件后打开"],
+					),
 				)
 			else:
 				# stdout 直出 HTML（便于 `boss export <query> --format html > jobs.html`）
 				sys.stdout.write(html_text)
 				sys.stdout.flush()
+				if truncated:
+					# 直出模式没有信封，截断证据只能走 stderr，不能污染 stdout。
+					console.print(f"[yellow]注意：{_TRUNCATED_OPERATOR_ACTION}[/yellow]")
 		else:
 			write_items = all_items if include_private else [redact_export_item(item) for item in all_items]
 			data = {
 				"count": len(all_items),
 				"format": fmt,
 				"jobs": write_items,
+				"truncated": truncated,
+				"stop_reason": stop_reason,
 			}
 			handle_output(
 				ctx,
 				"export",
 				data,
 				render=lambda d: render_job_table(d.get("jobs", []), "export"),
-				hints={
-					"next_actions": [
-						boss_command_for_ctx(ctx, "export <query> -o file.csv"),
-					],
-				},
+				hints=_truncation_hints(
+					truncated,
+					next_actions=[_hint_command(ctx, "export <query> -o file.csv")],
+				),
 			)
+
+
+def _truncation_hints(
+	truncated: bool,
+	*,
+	next_actions: list[str] | None = None,
+	operator_actions: list[str] | None = None,
+) -> dict[str, list[str]]:
+	"""导出终止原因的后继提示：只有本地页数预算耗尽时才算不完整。"""
+	actions = list(operator_actions or [])
+	if truncated:
+		actions.append(_TRUNCATED_OPERATOR_ACTION)
+	hints: dict[str, list[str]] = {}
+	if next_actions:
+		hints["next_actions"] = next_actions
+	if actions:
+		hints["operator_actions"] = actions
+	return hints
 
 
 def _private_fields_state(*, fmt: str, include_private: bool) -> str:

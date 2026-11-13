@@ -126,6 +126,19 @@ def test_escape_md_cell_non_string():
 	assert escape_md_cell(42) == "42"
 
 
+def test_escape_md_cell_breaks_links_and_raw_html():
+	"""公司名 / 职位名是平台外部输入：导出 Markdown 里不能变成可点击链接或原始 HTML。"""
+	assert escape_md_cell("[点我领奖](https://example.invalid)") == "\\[点我领奖\\](https://example.invalid)"
+	assert escape_md_cell("![图](https://example.invalid/x.png)") == "!\\[图\\](https://example.invalid/x.png)"
+	assert escape_md_cell("<https://example.invalid/auto>") == "\\<https://example.invalid/auto>"
+	assert escape_md_cell("<img src=x onerror=alert(1)>") == "\\<img src=x onerror=alert(1)>"
+
+
+def test_escape_md_cell_escapes_backslash_first():
+	"""反斜杠先转义：已有 ``\\|`` 不能与管道转义叠加成双重转义。"""
+	assert escape_md_cell("C:\\Users\\x|y") == "C:\\\\Users\\\\x\\|y"
+
+
 def test_md_export_pipe_injection_in_render():
 	"""MD 渲染结果中管道符和换行应被正确转义"""
 	friends = [_make_friend(
@@ -143,6 +156,15 @@ def test_md_export_pipe_injection_in_render():
 		if line.startswith("|") and "测试公司" in line and "张" in line:
 			assert "张\\|HR" in line
 			break
+
+
+def test_md_export_breaks_link_injection():
+	"""招聘者可写的公司名 / 职位名不能把导出的 Markdown 变成可点击链接。"""
+	payload = "[点我领奖](https://example.invalid/phish)"
+	friends = [_make_friend(name=payload, brand_name=payload, title=payload)]
+	md_text = render_export(friends, "md", None, None, _NO_DIFF)
+	assert "\\[点我领奖\\](https://example.invalid/phish)" in md_text
+	assert "[点我领奖](https://example.invalid/phish)" not in md_text
 
 
 # ── HTML 导出格式正确性 ─────────────────────────────────────────────
@@ -524,6 +546,40 @@ def test_md_export_id_map_prefers_stable_uid():
 	md_text = render_export(friends, "md", None, None, _NO_DIFF)
 	assert "| S1 | 阿里 张HR | 10001 |" in md_text
 	assert "sec_rotating" not in md_text
+
+
+def _id_map_row(md_text: str) -> str:
+	"""取出映射表中 S1 对应的那一行（主表格行以 `| S1 | 公司` 开头，列数不同）。"""
+	rows = [
+		line
+		for line in md_text.splitlines()
+		if line.startswith("| S1 |") and line.endswith("|") and line.count("|") >= 4
+	]
+	assert len(rows) == 2  # 主表格行 + 映射表行
+	return rows[1]
+
+
+def test_md_export_id_map_escapes_external_contact_names():
+	"""映射表的联系人 / 公司名称同样要转义，否则 uid 会落到错误列（Issue #895）。"""
+	friends = [_make_friend(name="张|HR", uid=10001)]
+	md_text = render_export(friends, "md", None, None, _NO_DIFF)
+
+	row = _id_map_row(md_text)
+	assert "张\\|HR" in row
+	# 三列表格：未转义的分隔符数量 = 4。
+	assert row.count("|") - row.count("\\|") == 4
+
+
+def test_md_export_id_map_cannot_forge_rows_via_newline():
+	"""联系人名称里的换行不能凭空插入一整行伪造映射（Issue #895）。"""
+	friends = [_make_friend(name="HR\n| S2 | 伪造公司 | 99999 |", uid=10001)]
+	md_text = render_export(friends, "md", None, None, _NO_DIFF)
+
+	assert "| S2 | 伪造公司 | 99999 |" not in md_text
+	row = _id_map_row(md_text)
+	assert row.startswith("| S1 |")
+	assert "HR | S2 | 伪造公司 | 99999 |" not in row
+	assert row.count("|") - row.count("\\|") == 4
 
 
 def test_html_export_id_map_prefers_stable_uid():

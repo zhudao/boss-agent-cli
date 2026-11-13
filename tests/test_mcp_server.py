@@ -247,6 +247,40 @@ def test_required_tools_present():
 	assert not missing, f"缺少核心工具: {missing}"
 
 
+def test_call_tool_rejects_missing_required_arguments_for_every_tool(monkeypatch):
+	"""schema 声明的 required 参数，漏传一律 INVALID_PARAM（Issue #960）。
+
+	boss_config 的 action 曾在映射层私自默认成 list：schema 说 required、实现却
+	补默认值，绕过客户端校验的调用拿到 ok:true 的全量配置。这条守卫逐工具漏传
+	全部 required 参数，任何一处 schema/实现漂移都会在这里现形。
+	"""
+	from types import SimpleNamespace
+
+	from boss_agent_cli import mcp_server
+	from mcp.types import CallToolRequestParams
+
+	monkeypatch.setattr(mcp_server, "TextContent", SimpleNamespace)
+	monkeypatch.setattr(mcp_server, "CallToolResult", SimpleNamespace)
+
+	async def fake_run(*args, **kwargs):
+		raise AssertionError("required 漏传不应触达 CLI")
+
+	monkeypatch.setattr(mcp_server, "_run_boss_async", fake_run)
+
+	for tool in TOOLS:
+		if not tool.input_schema.get("required"):
+			continue
+		result = asyncio.run(
+			mcp_server.call_tool(None, CallToolRequestParams(name=tool.name, arguments={}))
+		)
+		payload = json.loads(result.content[0].text)
+		assert result.is_error is True, f"{tool.name} 漏传 required 应返回工具错误"
+		err = payload.get("error") or {}
+		assert payload["ok"] is False, f"{tool.name} 漏传 required 不应成功"
+		assert err.get("code") == "INVALID_PARAM", f"{tool.name}: {err.get('code')}"
+		assert "缺少必填参数" in err.get("message", ""), f"{tool.name}: {err.get('message')}"
+
+
 def test_crawl_tools_only_read_or_locally_shortlist_existing_runs():
 	names = {tool.name for tool in TOOLS}
 	assert {"boss_crawl_status", "boss_crawl_results", "boss_crawl_shortlist"} <= names
@@ -366,6 +400,9 @@ def test_every_tool_enum_value_parses_on_click_tree():
 	[
 		("boss_wizard", {"action": "status"}, "run_id"),
 		("boss_hr_jobs", {"action": "offline"}, "job_id"),
+		# action 在 boss_config 的 schema 里是 required（Issue #960）：映射层曾
+		# 私自默认成 list，漏传拿到 ok:true 的全量配置，schema 契约形同虚设。
+		("boss_config", {}, "action"),
 	],
 )
 def test_call_tool_reports_missing_conditional_argument(monkeypatch, tool_name, arguments, missing):
@@ -746,6 +783,16 @@ def test_build_args_search_ignores_empty_options():
 	assert "--salary" not in args
 
 
+def test_build_args_search_forwards_empty_query_verbatim():
+	"""schema 里 query 是 required，空串原样下发（Issue #958）。
+
+	CLI 把纯空白关键词归为 None 后报「未提供 query，请传入搜索关键词、--preset
+	或 --url」；这里钉住映射层不下场改写——至少 argv 必须如实反映 Agent 传了
+	空 query，而不是把它化装成没传。
+	"""
+	assert _build_args("boss_search", {"query": ""}) == ["search", ""]
+
+
 def test_build_args_recommend_no_page():
 	args = _build_args("boss_recommend", {})
 	assert args == ["recommend"]
@@ -997,6 +1044,39 @@ def test_run_boss_passes_args(mock_run):
 
 
 @patch("server.subprocess.run")
+def test_run_boss_export_empty_url_reaches_cli_dedicated_error(mock_run):
+	"""`boss_export {"url": ""}` 要把 CLI 的专门诊断原样带回（Issue #958）。
+
+	CLI 对 `export --url ""` 报「--url 的值不能为空」；映射层若用真值判断把
+	空串吞掉，Agent 收到的是误导性的「未提供 query，请传入搜索关键词或 --url」。
+	"""
+	empty_url_envelope = json.dumps(
+		{
+			"ok": False,
+			"schema_version": "1.0",
+			"command": "export",
+			"data": None,
+			"pagination": None,
+			"error": {
+				"code": "INVALID_PARAM",
+				"message": "--url 的值不能为空",
+				"recoverable": True,
+				"recovery_action": "boss export <query> 或 boss export --url <搜索页URL>",
+			},
+			"hints": {"next_actions": []},
+		},
+		ensure_ascii=False,
+	)
+	mock_run.return_value = MagicMock(stdout=empty_url_envelope, stderr="")
+	result = _run_boss("export", "--url", "")
+	assert result["ok"] is False
+	assert result["error"]["message"] == "--url 的值不能为空"
+	# 子进程 argv 里空 url 必须原样存在，不能在映射层被丢弃
+	cmd = mock_run.call_args[0][0]
+	assert cmd == ["boss", "--json", "export", "--url", ""]
+
+
+@patch("server.subprocess.run")
 def test_run_boss_passes_configured_global_args_before_command(mock_run):
 	"""MCP 宿主配置的全局参数应传给底层 boss CLI。"""
 	mock_run.return_value = MagicMock(stdout='{"ok": true}', stderr="")
@@ -1069,6 +1149,75 @@ def test_run_boss_write_timeout_still_requires_outcome_check(mock_run):
 	assert "未确认的写操作不要直接重试" in result["error"]["recovery_action"]
 
 
+@pytest.mark.parametrize("may_write", [True, False])
+@patch("server.subprocess.run")
+def test_run_boss_spawn_failure_points_at_install_not_platform_state(mock_run, may_write):
+	"""子进程没能启动时不能让 Agent 去核对 checkpoint 与平台结果（Issue #962）。
+
+	进程从未运行，写工具也不可能产生平台操作；要处理的是安装 / --boss-bin。
+	"""
+	mock_run.side_effect = FileNotFoundError(2, "No such file or directory", "boss")
+
+	result = _run_boss("apply", "s", "j", may_write=may_write)
+
+	assert result["ok"] is False
+	assert result["error"]["code"] == "CLI_ERROR"
+	assert result["error"]["recoverable"] is False
+	assert "无法启动底层 boss CLI" in result["error"]["message"]
+	assert "--boss-bin" in result["error"]["recovery_action"]
+	assert "未产生任何平台操作" in result["error"]["recovery_action"]
+	assert "checkpoint" not in result["error"]["recovery_action"]
+	assert result["error"]["details"]["outcome_unknown"] is False
+	assert result["error"]["details"]["replay_safe"] is True
+
+
+def test_run_boss_async_spawn_failure_points_at_install_not_platform_state(monkeypatch):
+	"""MCP handler 实际走异步路径，启动失败的指引要与同步路径一致（Issue #962）。"""
+	from boss_agent_cli import mcp_server
+
+	async def fail_spawn(*args, **kwargs):
+		raise PermissionError(13, "Permission denied", "boss")
+
+	monkeypatch.setattr(mcp_server.asyncio, "create_subprocess_exec", fail_spawn)
+
+	result = asyncio.run(mcp_server._run_boss_async("status", may_write=False))
+
+	assert result["error"]["code"] == "CLI_ERROR"
+	assert "--boss-bin" in result["error"]["recovery_action"]
+	assert "checkpoint" not in result["error"]["recovery_action"]
+	assert result["error"]["details"]["outcome_unknown"] is False
+
+
+@patch("server.subprocess.run")
+def test_run_boss_read_only_unparseable_output_is_not_described_as_write(mock_run):
+	"""只读工具输出不可解析时没有平台写入，不能套用写操作的中断文案（Issue #962）。"""
+	mock_run.return_value = MagicMock(stdout="Traceback ...", stderr="boom")
+
+	result = _run_boss("status", may_write=False)
+
+	assert result["error"]["code"] == "CLI_ERROR"
+	assert result["error"]["message"] == "boom"
+	assert result["error"]["recoverable"] is False
+	assert "不产生平台写入" in result["error"]["recovery_action"]
+	assert "未确认的写操作" not in result["error"]["recovery_action"]
+	assert result["error"]["details"]["outcome_unknown"] is False
+	assert result["error"]["details"]["replay_safe"] is True
+
+
+@patch("server.subprocess.run")
+def test_run_boss_write_unparseable_output_marks_outcome_unknown(mock_run):
+	"""写工具跑过却没给信封：结果未知，要与超时 / 取消一样带 outcome_unknown。"""
+	mock_run.return_value = MagicMock(stdout="", stderr="boom")
+
+	result = _run_boss("apply", "s", "j")
+
+	assert result["error"]["code"] == "CLI_ERROR"
+	assert result["error"]["recoverable"] is False
+	assert "未确认的写操作不要直接重试" in result["error"]["recovery_action"]
+	assert result["error"]["details"]["outcome_unknown"] is True
+	assert result["error"]["details"]["replay_safe"] is False
+
+
 def test_read_only_tool_classification_covers_real_tools_only():
 	"""只读白名单不能引用不存在的工具，也不能把已知写工具放进去。"""
 	from boss_agent_cli import mcp_server
@@ -1099,6 +1248,30 @@ def test_write_modes_only_reference_declared_enum_actions():
 		allowance = tool.input_schema["properties"]["action"]
 		assert set(allowance["enum"]) >= modes
 		assert allowance.get("default", "list") not in modes
+
+
+def test_read_only_tools_with_action_dimension_are_explicitly_classified():
+	"""只读白名单里带 action 的工具必须登记写模式，读写不能靠猜（Issue #968）。"""
+	from boss_agent_cli import mcp_server
+
+	unclassified = (
+		mcp_server._READ_ONLY_TOOL_NAMES
+		& mcp_server._ACTION_DIMENSION_TOOL_NAMES
+	) - mcp_server._TOOL_WRITE_MODES.keys()
+	assert unclassified == set()
+	# 当前唯一带 action 维度的只读工具；新增这类工具时必须同步核实写模式。
+	assert "boss_hr_jobs" in mcp_server._ACTION_DIMENSION_TOOL_NAMES
+
+
+def test_unregistered_action_dimension_defaults_to_write(monkeypatch):
+	"""写模式漏登记时保守按写处理，不能回落到 #869 的只读判定。"""
+	from boss_agent_cli import mcp_server
+
+	monkeypatch.setattr(mcp_server, "_TOOL_WRITE_MODES", {})
+	assert mcp_server._tool_may_write("boss_hr_jobs", {"action": "list"}) is True
+	assert mcp_server._tool_may_write("boss_hr_jobs", {}) is True
+	# 无 action 维度的只读工具不受影响。
+	assert mcp_server._tool_may_write("boss_search", {"query": "x"}) is False
 
 
 @pytest.mark.parametrize(
@@ -1696,6 +1869,18 @@ def test_build_args_export_url_only():
 	url_idx = args.index("--url")
 	positional = [a for i, a in enumerate(args) if not a.startswith("--") and a != "export" and i != url_idx + 1]
 	assert len(positional) == 0
+
+
+def test_build_args_export_forwards_empty_query_and_url_to_cli_diagnostics():
+	"""显式空串要原样下发（Issue #958）：CLI 对 `export --url ""` 有专门诊断
+	（「--url 的值不能为空」），真值判断会把空值化装成没传，Agent 收到的就是
+	误导性的「未提供 query」。与 #872 空备注清空同一取舍。"""
+	assert _build_args("boss_export", {"query": ""}) == ["export", ""]
+	assert _build_args("boss_export", {"url": ""}) == ["export", "--url", ""]
+	assert _build_args("boss_export", {"query": "python", "url": ""}) == ["export", "python", "--url", ""]
+	# 未传与传 None 仍等价：不出现裸位置参数 / --url
+	assert _build_args("boss_export", {}) == ["export"]
+	assert _build_args("boss_export", {"query": None, "url": None}) == ["export"]
 
 
 def test_build_args_export_format_default_omitted():

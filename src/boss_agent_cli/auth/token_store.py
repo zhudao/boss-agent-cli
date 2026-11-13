@@ -14,16 +14,23 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 
+from boss_agent_cli.services.private_files import chmod_best_effort, write_private_bytes
+
 _LOCK_TIMEOUT = 30
 
 
 class TokenStore:
 	def __init__(self, auth_dir: Path):
 		self._auth_dir = auth_dir
-		self._auth_dir.mkdir(parents=True, exist_ok=True)
+		self._auth_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+		# 历史安装的目录 / 文件可能是 0755 / 0644：打开时一并收紧。
+		chmod_best_effort(self._auth_dir, 0o700)
 		self._session_path = auth_dir / "session.enc"
 		self._salt_path = auth_dir / "salt"
 		self._lock_path = auth_dir / "refresh.lock"
+		for path in (self._salt_path, self._session_path):
+			if path.exists():
+				chmod_best_effort(path, 0o600)
 
 	def _get_machine_id(self) -> str:
 		# 允许显式覆盖，便于测试 / CI / 沙箱环境稳定运行
@@ -73,7 +80,7 @@ class TokenStore:
 		if self._salt_path.exists():
 			return self._salt_path.read_bytes()
 		salt = os.urandom(16)
-		self._salt_path.write_bytes(salt)
+		write_private_bytes(self._salt_path, salt)
 		return salt
 
 	def _derive_key(self) -> bytes:
@@ -92,7 +99,7 @@ class TokenStore:
 		fernet = Fernet(self._derive_key())
 		plaintext = json.dumps(token_data, ensure_ascii=False).encode()
 		encrypted = fernet.encrypt(plaintext)
-		self._session_path.write_bytes(encrypted)
+		write_private_bytes(self._session_path, encrypted)
 
 	def load(self) -> dict[str, Any] | None:
 		if not self._session_path.exists():

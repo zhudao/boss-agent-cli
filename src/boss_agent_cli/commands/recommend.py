@@ -7,10 +7,15 @@ from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.cache.store import CacheStore
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._platform import account_scope, get_platform_instance
-from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_not_supported, handle_output, handle_platform_error_output, render_job_table
+from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_not_supported, handle_output, handle_platform_error_output, render_job_table, show_command_for_ctx
 from boss_agent_cli.index_cache import get_index_snapshot, try_save_index
 from boss_agent_cli.match_score import score_job_dict
 from boss_agent_cli.services.job_identity import deduplicate_job_result
+
+
+def _hint_command(ctx: click.Context, command: str) -> str:
+	"""推荐翻页与后继操作沿用当前登录态和索引目录。"""
+	return boss_command_for_ctx(ctx, command, include_data_dir=True)
 
 
 @click.command("recommend")
@@ -76,9 +81,9 @@ def recommend_cmd(ctx: click.Context, page: int, with_score: bool) -> None:
 				pagination["index_snapshot"] = snapshot
 		hints = {
 			"next_actions": [
-				boss_command_for_ctx(ctx, "detail <security_id>"),
-				boss_command_for_ctx(ctx, "apply <security_id> <job_id>"),
-				boss_command_for_ctx(ctx, "greet <security_id> <job_id>"),
+				_hint_command(ctx, "detail <security_id>"),
+				_hint_command(ctx, "apply <security_id> <job_id>"),
+				_hint_command(ctx, "greet <security_id> <job_id>"),
 			],
 		}
 		if has_more is True:
@@ -87,11 +92,13 @@ def recommend_cmd(ctx: click.Context, page: int, with_score: bool) -> None:
 			next_page = f"recommend --page {page + 1}"
 			if with_score:
 				next_page += " --with-score"
-			hints["next_actions"].append(boss_command_for_ctx(ctx, next_page))
+			hints["next_actions"].append(_hint_command(ctx, next_page))
 		elif has_more is None:
 			hints["operator_actions"] = ["平台未提供可靠的下一页标记，不能仅凭本页数量判断是否还有结果"]
 		handle_output(
 			ctx, "recommend", items,
-			render=lambda data: render_job_table(data, "recommend", page=page),
+			render=lambda data: render_job_table(
+				data, "recommend", page=page, show_command=show_command_for_ctx(ctx, index_saved=saved),
+			),
 			pagination=pagination, hints=hints,
 		)

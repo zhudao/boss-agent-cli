@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "boss-agent-cli"
-version = "3.3.0"
+version = "3.4.1"
 description = "AI Agent 专用的 BOSS 直聘求职 CLI 工具"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -249,6 +249,7 @@ module = [
 	"boss_agent_cli.platforms.recruiter_base",
 	"boss_agent_cli.platforms.zhipin_recruiter",
 	"boss_agent_cli.commands.recruiter",
+	"boss_agent_cli.commands.recruiter._hints",
 	"boss_agent_cli.commands.recruiter.applications",
 	"boss_agent_cli.commands.recruiter.candidates",
 	"boss_agent_cli.commands.recruiter.chat",
@@ -274,6 +275,7 @@ module = [
 	"boss_agent_cli.services.contact_lookup",
 	"boss_agent_cli.services.friend_list_pages",
 	"boss_agent_cli.services.output_path",
+	"boss_agent_cli.services.private_files",
 	"boss_agent_cli.commands._recruiter_platform",
 	"boss_agent_cli.commands.crawl",
 	"boss_agent_cli.crawler.exporter",

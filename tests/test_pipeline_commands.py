@@ -1,4 +1,5 @@
 import json
+import shlex
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -69,6 +70,80 @@ def test_pipeline_command_returns_aggregated_items(mock_auth_cls, mock_client_cl
 	stages = {item["stage"] for item in parsed["data"]}
 	assert "reply_needed" in stages
 	assert "interview" in stages
+
+
+@patch("boss_agent_cli.commands.pipeline.get_platform_instance")
+@patch("boss_agent_cli.commands.pipeline.AuthManager")
+def test_pipeline_command_reports_chat_page_truncation(mock_auth_cls, mock_client_cls, legacy_args):
+	"""沟通列表翻满上限时信封必须带 truncated，否则 Agent 把前缀当全量（Issue #885）。"""
+	mock_client = _ctx_mock(mock_client_cls)
+
+	def endless_friend_list(*, page=1):
+		# 每页 uid 都不同，避免重复页守卫提前结束。
+		item = _chat_item(security_id=f"sec_{page}", job_id=f"job_{page}", uid=10000 + page)
+		return {"zpData": {"result": [item], "hasMore": True}}
+
+	mock_client.friend_list.side_effect = endless_friend_list
+	mock_client.interview_data.return_value = {"zpData": {"interviewList": []}}
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--json", *legacy_args, "pipeline"])
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["pagination"]["pages_scanned"] == 50
+	assert parsed["pagination"]["truncated"] is True
+	assert len(parsed["data"]) == 50
+
+
+@patch("boss_agent_cli.commands.pipeline.get_platform_instance")
+@patch("boss_agent_cli.commands.pipeline.AuthManager")
+def test_pipeline_command_reports_complete_scan_as_not_truncated(mock_auth_cls, mock_client_cls, legacy_args):
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.friend_list.return_value = {"zpData": {"result": [_chat_item(unread=1)], "hasMore": False}}
+	mock_client.interview_data.return_value = {"zpData": {"interviewList": []}}
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--json", *legacy_args, "pipeline"])
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["pagination"]["truncated"] is False
+	assert parsed["pagination"]["pages_scanned"] == 1
+
+
+@patch("boss_agent_cli.commands.pipeline.get_platform_instance")
+@patch("boss_agent_cli.commands.pipeline.AuthManager")
+def test_pipeline_hints_preserve_data_dir(mock_auth_cls, mock_client_cls, tmp_path):
+	"""后继命令必须保留自定义数据目录，否则 Agent 会读取另一份本地库（Issue #913）。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.friend_list.return_value = _friend_list_response([_chat_item(unread=1)])
+	mock_client.interview_data.return_value = {"zpData": {"interviewList": []}}
+
+	result = CliRunner().invoke(cli, ["--json", "--data-dir", str(tmp_path), "pipeline"])
+	assert result.exit_code == 0, result.output
+	parsed = json.loads(result.output)
+	expected = ["boss", "--data-dir", str(tmp_path.resolve())]
+	commands = parsed["hints"]["next_actions"]
+	assert commands
+	for command in commands:
+		assert shlex.split(command)[:3] == [*expected]
+
+
+@patch("boss_agent_cli.commands.pipeline.get_platform_instance")
+@patch("boss_agent_cli.commands.pipeline.AuthManager")
+def test_follow_up_hints_preserve_data_dir(mock_auth_cls, mock_client_cls, tmp_path):
+	"""follow-up 的 chat / mark 提示同样落在原数据目录（Issue #913）。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.friend_list.return_value = _friend_list_response([_chat_item(unread=1)])
+	mock_client.interview_data.return_value = {"zpData": {"interviewList": []}}
+
+	result = CliRunner().invoke(
+		cli, ["--json", "--data-dir", str(tmp_path), "follow-up", "--now-ts-ms", "1800000000000"]
+	)
+	assert result.exit_code == 0, result.output
+	parsed = json.loads(result.output)
+	for command in parsed["hints"]["next_actions"]:
+		assert shlex.split(command)[:3] == ["boss", "--data-dir", str(tmp_path.resolve())]
 
 
 @patch("boss_agent_cli.commands.pipeline.get_platform_instance")

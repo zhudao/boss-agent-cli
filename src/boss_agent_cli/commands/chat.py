@@ -12,7 +12,7 @@ from boss_agent_cli.services.output_path import prepare_output_path
 from boss_agent_cli.services.chat_snapshot import save_snapshot_and_diff, load_snapshot
 from boss_agent_cli.services.chat_utils import (
 	RELATION_LABELS, FROM_FILTER, MSG_STATUS_LABELS,
-	sanitize_csv_cell, escape_md_cell,
+	contact_identity, int_code, sanitize_csv_cell, escape_md_cell,
 )
 from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_error_output, handle_not_supported, handle_output, handle_platform_error_output, render_simple_list
 
@@ -66,36 +66,25 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 
 		# 发起方筛选值
 		relation_filter = _FROM_FILTER.get(from_who) if from_who else None
+		relation_label = _RELATION_LABELS.get(relation_filter) if relation_filter is not None else None
 
-		friends = []
-		for item in items:
-			# 时间筛选
-			last_ts = item.get("lastTS", 0)
-			if cutoff_ts and last_ts and last_ts < cutoff_ts:
-				continue
-
-			# 发起方筛选
-			relation_type = item.get("relationType")
-			if relation_filter is not None and relation_type != relation_filter:
-				continue
-
+		def _friend_record(item: dict[str, Any]) -> dict[str, Any]:
+			# lastTS / relationType / status / unreadMsgCount 都是平台数值编码：
+			# JSON 布尔不能当整数用，否则 True 会被翻译成「未读」「对方主动」
+			# 或参与未读计数（Issue #915）。
+			last_ts = int_code(item.get("lastTS")) or 0
 			if last_ts:
 				last_time_str = _format_ts(last_ts)
 			else:
 				last_time_str = item.get("lastTime", "-")
 			last_message_info = item.get("lastMessageInfo") or {}
 			message_status = last_message_info.get("status")
-			msg_status_label = (
-				_MSG_STATUS_LABELS.get(message_status, "未知")
-				if isinstance(message_status, int)
-				else "未知"
-			)
-
-			friends.append({
+			msg_status_label = _MSG_STATUS_LABELS.get(int_code(message_status), "未知")
+			return {
 				"name": item.get("name") or "-",
 				"title": item.get("title") or "-",
 				"brand_name": item.get("brandName") or "-",
-				"initiated_by": _RELATION_LABELS.get(relation_type, "未知"),
+				"initiated_by": _RELATION_LABELS.get(int_code(item.get("relationType")), "未知"),
 				"last_msg": item.get("lastMsg") or "-",
 				"last_time": last_time_str,
 				"last_ts": last_ts,
@@ -105,14 +94,49 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 				"uid": item.get("uid") or "",
 				"security_id": item.get("securityId") or "",
 				"encrypt_job_id": item.get("encryptJobId") or "",
-				"unread": item.get("unreadMsgCount") or 0,
-			})
+				"unread": int_code(item.get("unreadMsgCount")) or 0,
+			}
+
+		# 快照保存本次平台页面的完整观察结果；--from / --days 只影响导出内容。
+		# 用筛选后的列表做快照，会把用户没选中的联系人当成“已消失”（Issue #911）。
+		all_friends = [_friend_record(item) for item in items]
+
+		def _matches_filter(friend: dict[str, Any]) -> bool:
+			return (
+				(not cutoff_ts or not friend.get("last_ts") or friend["last_ts"] >= cutoff_ts)
+				and (relation_label is None or friend.get("initiated_by", "未知") == relation_label)
+			)
+
+		friends = [friend for friend in all_friends if _matches_filter(friend)]
+
+		raw_has_more = platform_data.get("hasMore")
+		has_more = raw_has_more if isinstance(raw_has_more, bool) else None
+		# 只有第 1 页且平台明确没有下一页，才能证明本次看到完整沟通列表；
+		# 部分页或未知 hasMore 不能作为“联系人已消失”的证据。
+		collection_complete = page == 1 and has_more is False
 
 		# ── 导出模式 ──────────────────────────────────────────────
 		if export_fmt:
 			# L3: 保存 JSON 快照 + diff
 			snapshot_dir = os.path.join(data_dir, "chat-history")
-			diff_result = save_snapshot_and_diff(snapshot_dir, friends, logger)
+			diff_result = save_snapshot_and_diff(
+				snapshot_dir, all_friends, logger, complete=collection_complete
+			)
+			# 变化摘要只报告导出范围内的联系人：筛选条件之外的新增 / 未读变化
+			# 不属于这份导出，不能出现在摘要里（Issue #911）。
+			exported_ids = {contact_identity(friend) for friend in friends}
+			diff_result = {
+				**diff_result,
+				"added": [
+					item for item in diff_result["added"] if contact_identity(item) in exported_ids
+				],
+				"removed": [item for item in diff_result["removed"] if _matches_filter(item)],
+				"new_unread": [
+					item
+					for item in diff_result["new_unread"]
+					if contact_identity(item) in exported_ids
+				],
+			}
 
 			content = render_export(friends, export_fmt, from_who, days, diff_result)
 
@@ -130,7 +154,7 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 						code="INVALID_PARAM",
 						message=f"export_dir 必须是目录路径字符串或 null，收到 {export_dir!r}",
 						recoverable=True,
-						recovery_action=boss_command_for_ctx(ctx, "config reset export_dir"),
+						recovery_action=boss_command_for_ctx(ctx, "config reset export_dir", include_data_dir=True),
 					)
 					ctx.exit(1)
 					return
@@ -160,8 +184,8 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 					f"已导出 {d['count']} 条到 {d['path']}", err=True
 				),
 					hints={"next_actions": [
-						boss_command_for_ctx(ctx, "detail <security_id>"),
-						boss_command_for_ctx(ctx, "chatmsg <uid>"),
+						boss_command_for_ctx(ctx, "detail <security_id>", include_data_dir=True),
+						boss_command_for_ctx(ctx, "chatmsg <uid>", include_data_dir=True),
 				]},
 			)
 			return
@@ -196,8 +220,6 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 		# --page 一直存在，但此前不从平台响应推导分页事实：Agent 翻页时既不知道
 		# 当前是哪一页，也没有「是否还有下一页」的证据。与 recommend 保持同一套
 		# 保守语义：只有平台返回布尔 hasMore 才据此给出下一页命令。
-		raw_has_more = platform_data.get("hasMore")
-		has_more = raw_has_more if isinstance(raw_has_more, bool) else None
 		pagination: dict[str, Any] = {
 			"page": page,
 			"has_more": has_more,
@@ -206,8 +228,8 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 			"total_kind": "returned_page_count",
 		}
 		next_actions = [
-			boss_command_for_ctx(ctx, "detail <security_id>"),
-			boss_command_for_ctx(ctx, "chatmsg <uid>"),
+			boss_command_for_ctx(ctx, "detail <security_id>", include_data_dir=True),
+			boss_command_for_ctx(ctx, "chatmsg <uid>", include_data_dir=True),
 		]
 		if has_more is True:
 			next_cmd = f"chat --page {page + 1}"
@@ -215,7 +237,7 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 				next_cmd += f" --from {from_who}"
 			if days is not None:
 				next_cmd += f" --days {days}"
-			next_actions.append(boss_command_for_ctx(ctx, next_cmd))
+			next_actions.append(boss_command_for_ctx(ctx, next_cmd, include_data_dir=True))
 		hints: dict[str, Any] = {"next_actions": next_actions}
 		if has_more is None:
 			hints["operator_actions"] = ["平台未提供可靠的下一页标记，不能仅凭本页数量判断是否还有记录"]

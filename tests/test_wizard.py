@@ -218,7 +218,7 @@ def test_candidate_search_helper_preserves_filters_welfare_and_pagination():
 
 	def pipeline(platform, cache, logger, **kwargs):
 		captured.update(kwargs)
-		return SimpleNamespace(items=[{"job_id": "job-1"}], has_more=True, total=27)
+		return SimpleNamespace(items=[{"job_id": "job-1"}], has_more=True, has_more_reported=True, total=27)
 
 	result = execute_candidate_search(
 		object(),
@@ -248,7 +248,7 @@ def test_candidate_search_normalizes_welfare_input_and_uses_detail_page_budget()
 
 	def pipeline(platform, cache, logger, **kwargs):
 		captured.update(kwargs)
-		return SimpleNamespace(items=[], has_more=False, total=0)
+		return SimpleNamespace(items=[], has_more=False, has_more_reported=False, total=0)
 
 	execute_candidate_search(
 		object(),
@@ -409,10 +409,12 @@ def test_candidate_pipeline_action_aggregates_every_friend_list_page(tmp_path):
 
 	platform = PagedPlatform()
 	context = _action_context(tmp_path, candidate=platform)
-	items = _candidate_pipeline_data(context, {})
+	items, pages_scanned, truncated = _candidate_pipeline_data(context, {})
 
 	assert [page for _, page in platform.calls if _ == "friend_list"] == [1, 2]
 	assert {item["security_id"] for item in items} == {"sid_1", "sid_2"}
+	assert pages_scanned == 2
+	assert truncated is False
 
 
 def test_candidate_write_actions_persist_idempotence_records(tmp_path):
@@ -476,6 +478,26 @@ def test_candidate_write_actions_mark_local_state_failure_as_not_retryable(tmp_p
 		("apply", "sec-1", "job-1", ""),
 		("greet", "sec-2", "job-2", "你好"),
 	]
+
+
+def test_candidate_search_action_reports_unknown_has_more_as_null(tmp_path):
+	"""向导 search 与顶层 `boss search` 同口径：平台没说下一页时 has_more 为 null（Issue #887）。"""
+	platform = _FakeCandidatePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	class _Result:
+		items = [{"job_id": "job-1"}]
+		has_more = False
+		has_more_reported = None
+		total = 1
+
+	with patch("boss_agent_cli.wizard.actions.execute_candidate_search", return_value=_Result()):
+		result = DEFAULT_ACTIONS["candidate_search"](context, {"query": "golang"}, {})
+
+	pagination = result.data["pagination"]
+	assert pagination["has_more"] is None
+	assert pagination["has_more_source"] == "unknown"
+	assert pagination["total_kind"] == "returned_page_count"
 
 
 def test_candidate_export_scopes_search_to_current_account(tmp_path):
@@ -550,6 +572,22 @@ def test_candidate_contact_actions_refresh_rotating_security_id(tmp_path):
 		("friend_list", 1),
 		("chat_history", "10001", "sid_current", 1, 20),
 	]
+
+
+@pytest.mark.parametrize("value", ["wecaht", "PHONE", "phone ", "wx", 2])
+def test_candidate_exchange_rejects_unknown_type(tmp_path, value):
+	"""非法交换类型不能静默按手机号发出请求（Issue #905）。"""
+	platform = _FakeCandidatePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	with pytest.raises(WorkflowActionError) as exc_info:
+		DEFAULT_ACTIONS["candidate_exchange"](
+			context, {"security_id": "10001", "type": value}, {}
+		)
+
+	assert exc_info.value.code == "INVALID_PARAM"
+	assert "wechat" in str(exc_info.value)
+	assert platform.calls == []
 
 
 def test_local_and_ai_actions_return_structured_recovery(tmp_path):
@@ -973,6 +1011,21 @@ def test_recruiter_read_write_and_job_actions_preserve_arguments(tmp_path):
 	]
 
 
+def test_recruiter_exchange_rejects_unknown_type(tmp_path):
+	"""招聘者侧非法交换类型同样不能静默按手机号发出请求（Issue #905）。"""
+	platform = _FakeRecruiterPlatform()
+	context = _action_context(tmp_path, role="recruiter", recruiter=platform)
+
+	with pytest.raises(WorkflowActionError) as exc_info:
+		DEFAULT_ACTIONS["recruiter_exchange_contact"](
+			context, {"friend_id": 42, "type": "wecaht"}, {}
+		)
+
+	assert exc_info.value.code == "INVALID_PARAM"
+	assert "wechat" in str(exc_info.value)
+	assert platform.calls == []
+
+
 def test_platform_error_and_not_supported_are_not_reported_as_success(tmp_path):
 	failing = _FakeRecruiterPlatform(fail=True)
 	context = _action_context(tmp_path, role="recruiter", recruiter=failing)
@@ -1303,6 +1356,39 @@ def test_runner_retries_only_recoverable_errors(tmp_path):
 
 	assert run["status"] == "completed"
 	assert attempts == 2
+
+
+def test_automatic_retry_reuses_newly_bound_inner_checkpoint(tmp_path):
+	"""同一次运行中的自动重试必须读取刚保存的内部绑定，不能另建采集任务。"""
+	seen_inner_ids = []
+	created_inner_ids = []
+
+	def crawl(context, inputs, prior):
+		# 刷新当前步骤 checkpoint 时，已完成前置步骤的结果也必须保留。
+		assert prior["auth_status"]["data"] == {"ok": True}
+		inner_run_id = prior.get("crawl_start", {}).get("inner_run_id")
+		seen_inner_ids.append(inner_run_id)
+		if inner_run_id is None:
+			inner_run_id = f"fixture-inner-{len(created_inner_ids) + 1}"
+			created_inner_ids.append(inner_run_id)
+			context.workflow_control.bind_inner_run(inner_run_id)
+		if len(seen_inner_ids) == 1:
+			raise WorkflowActionError("NETWORK_ERROR", "离线模拟采集中断", recoverable=True)
+		return StepResult({"run_id": inner_run_id})
+
+	plan = replace(
+		_plan("auth_status", "crawl_start"), goal="crawl_start", inputs={"query": "Python", "city": "北京"},
+	)
+	with WorkflowStore(tmp_path) as store:
+		run = WorkflowRunner(
+			store,
+			{"auth_status": lambda c, i, p: StepResult({"ok": True}), "crawl_start": crawl},
+		).run(plan, _action_context(tmp_path), run_id="run-retry-bound", max_retries=1)
+
+	assert run["status"] == "completed"
+	assert seen_inner_ids == [None, "fixture-inner-1"]
+	assert created_inner_ids == ["fixture-inner-1"]
+	assert run["steps"][1]["result"]["data"]["run_id"] == "fixture-inner-1"
 
 
 def test_runner_honors_persisted_stop_between_steps(tmp_path):
@@ -4196,3 +4282,71 @@ def test_structurally_drifted_workflow_params_nested_fields_report_envelope(tmp_
 	assert payload["error"]["code"] == "CACHE_RECORD_INVALID"
 	assert payload["error"]["recoverable"] is True
 	assert field in payload["error"]["message"]
+
+
+# ── 布尔输入类型校验（Issue #945）────────────────────────────────────
+
+
+def test_bool_input_only_accepts_json_booleans():
+	"""字符串与数字不能被当成 true；null 与缺省使用默认值。"""
+	from boss_agent_cli.wizard.actions import _bool_input
+
+	assert _bool_input({}, "flag") is False
+	assert _bool_input({"flag": None}, "flag") is False
+	assert _bool_input({"flag": True}, "flag") is True
+	assert _bool_input({"flag": False}, "flag", default=True) is False
+	for raw in ("false", "0", 1, 0, [], {}):
+		with pytest.raises(WorkflowInputError) as exc_info:
+			_bool_input({"flag": raw}, "flag")
+		assert "flag" in str(exc_info.value)
+		assert "布尔" in str(exc_info.value)
+
+
+def test_candidate_mark_rejects_string_remove_before_platform_calls(tmp_path):
+	""""false" 不能被当成 true 删除标签；非法输入不能先查联系人。"""
+	platform = _FakeCandidatePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	with pytest.raises(WorkflowInputError):
+		DEFAULT_ACTIONS["candidate_mark"](
+			context, {"security_id": "sid_current", "label": "沟通中", "remove": "false"}, {}
+		)
+
+	assert platform.calls == []
+
+	# 真正的布尔 false 仍然表示「添加标签」。
+	DEFAULT_ACTIONS["candidate_mark"](
+		context, {"security_id": "sid_current", "label": "沟通中", "remove": False}, {}
+	)
+	assert ("friend_label", "10001", 2, 0, False) in platform.calls
+
+
+def test_candidate_export_rejects_string_include_private_before_io(tmp_path):
+	"""未脱敏导出是隐私开关：字符串 "false" 必须在任何搜索 / 写文件之前被拒绝。"""
+	context = _action_context(tmp_path)
+
+	with pytest.raises(WorkflowInputError):
+		DEFAULT_ACTIONS["candidate_export"](context, {"query": "Python", "include_private": "false"}, {})
+
+	assert not (tmp_path / "exports").exists()
+
+
+def test_recruiter_candidates_rejects_string_select_before_request(tmp_path):
+	"""字符串 "false" 不能把 select=true 发给平台。"""
+	platform = _FakeRecruiterPlatform()
+	context = _action_context(tmp_path, role="recruiter", recruiter=platform)
+
+	with pytest.raises(WorkflowInputError):
+		DEFAULT_ACTIONS["recruiter_candidates"](context, {"query": "Python", "select": "false"}, {})
+
+	assert platform.calls == []
+
+
+def test_crawl_actions_reject_string_with_detail(tmp_path):
+	"""字符串 "false" 不能扩大采集范围。"""
+	context = _action_context(tmp_path)
+
+	with pytest.raises(WorkflowInputError):
+		DEFAULT_ACTIONS["crawl_start"](context, {"query": "Python", "city": "北京", "with_detail": "false"}, {})
+	with pytest.raises(WorkflowInputError):
+		DEFAULT_ACTIONS["crawl_resume"](context, {"run_id": "run-1", "with_detail": "false"}, {})

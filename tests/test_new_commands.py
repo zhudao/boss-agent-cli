@@ -584,7 +584,10 @@ def test_detail_empty_job_card_reports_not_found_with_next_steps(mock_auth_cls, 
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "JOB_NOT_FOUND"
 	assert parsed["error"]["recovery_action"]
-	assert parsed["hints"]["next_actions"] == ["boss search <关键词>", "boss recommend"]
+	assert parsed["hints"]["next_actions"] == [
+		f"boss --data-dir {_DEFAULT_DATA_DIR} search <关键词>",
+		f"boss --data-dir {_DEFAULT_DATA_DIR} recommend",
+	]
 
 
 @patch("boss_agent_cli.commands.detail.CacheStore")
@@ -709,7 +712,9 @@ def test_me_deliver_pagination_evidence(mock_auth_cls, mock_client_cls, tmp_path
 	}
 	next_pages = [action for action in parsed["hints"]["next_actions"] if "--deliver-page" in action]
 	if expected is True:
-		assert next_pages == [f"boss me --section deliver --deliver-page {page + 1}"]
+		assert [shlex.split(action) for action in next_pages] == [
+			["boss", "--data-dir", str(tmp_path.resolve()), "me", "--section", "deliver", "--deliver-page", str(page + 1)],
+		]
 	else:
 		assert next_pages == []
 	if expected is None:
@@ -735,7 +740,7 @@ def test_me_deliver_next_action_is_executable(mock_auth_cls, mock_client_cls, tm
 	first = runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "me", "--section", "deliver", "--deliver-page", "4"])
 	assert first.exit_code == 0
 	action = next(action for action in json.loads(first.output)["hints"]["next_actions"] if "--deliver-page" in action)
-	second = runner.invoke(cli, ["--data-dir", str(tmp_path), *shlex.split(action)[1:]])
+	second = runner.invoke(cli, ["--json", *shlex.split(action)[1:]])
 	assert second.exit_code == 0
 	assert json.loads(second.output)["pagination"]["page"] == 5
 	assert [call.kwargs for call in mock_client.deliver_list.call_args_list] == [{"page": 4}, {"page": 5}]
@@ -987,7 +992,8 @@ def test_history_pagination_reports_platform_evidence(mock_auth_cls, mock_client
 	assert pagination["total_kind"] == "returned_page_count"
 	next_pages = [action for action in parsed["hints"]["next_actions"] if "history --page" in action]
 	if expected is True:
-		assert next_pages == ["boss history --page 3"]
+		assert len(next_pages) == 1
+		assert next_pages[0].endswith("history --page 3")
 	else:
 		assert next_pages == []
 	if expected is None:
@@ -1061,7 +1067,7 @@ def test_interviews_success(mock_auth_cls, mock_client_cls):
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
-	assert parsed["hints"]["next_actions"][0] == "boss search <query>"
+	assert parsed["hints"]["next_actions"][0] == f"boss --data-dir {_DEFAULT_DATA_DIR} search <query>"
 
 
 @patch("boss_agent_cli.commands.interviews.get_platform_instance")
@@ -1079,7 +1085,7 @@ def test_interviews_supports_data_envelope(mock_auth_cls, mock_client_cls):
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["data"][0]["jobName"] == "测试岗位"
-	assert parsed["hints"]["next_actions"][0] == "boss search <query>"
+	assert parsed["hints"]["next_actions"][0] == f"boss --data-dir {_DEFAULT_DATA_DIR} search <query>"
 
 
 @patch("boss_agent_cli.commands.interviews.get_platform_instance")
@@ -1353,4 +1359,4 @@ def test_chatmsg_missing_contact_recovery_points_to_chat(mock_auth_cls, mock_cli
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "CONTACT_NOT_FOUND"
 	assert parsed["error"]["recovery_action"] == "boss chat"
-	assert parsed["hints"]["next_actions"] == ["boss chat"]
+	assert parsed["hints"]["next_actions"] == [f"boss --data-dir {_DEFAULT_DATA_DIR} chat"]

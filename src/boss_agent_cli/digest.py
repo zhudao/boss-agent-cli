@@ -1,6 +1,8 @@
 import time
 from typing import Any
 
+from boss_agent_cli.services.chat_utils import escape_md_cell as _escape_md_cell
+
 
 def build_digest(*, new_matches: list[dict[str, Any]], follow_ups: list[dict[str, Any]], interviews: list[dict[str, Any]]) -> dict[str, Any]:
 	return {
@@ -12,12 +14,6 @@ def build_digest(*, new_matches: list[dict[str, Any]], follow_ups: list[dict[str
 		"interviews": interviews,
 		"summary": f"{len(new_matches)} new matches, {len(follow_ups)} follow-ups, {len(interviews)} interviews",
 	}
-
-
-def _escape_md_cell(text: object) -> str:
-	"""Markdown 表格单元格内的 | 和换行转义，防止破坏表格结构。"""
-	s = "" if text is None else str(text)
-	return s.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
 
 def _fmt_follow_up(item: dict[str, Any]) -> str:
@@ -108,6 +104,12 @@ def render_digest_markdown(data: dict[str, Any], *, generated_at: str | None = N
 	lines.append(f"| 待跟进 | {len(follow_ups)} |")
 	lines.append(f"| 面试 | {len(interviews)} |")
 	lines.append("")
+	if data.get("truncated"):
+		# 达到沟通列表分页上限时计数只是前缀；这份 Markdown 常被直接转发，
+		# 不带说明会被当成全量日报（Issue #885）。
+		pages = data.get("chat_pages_scanned")
+		lines.append(f"> ⚠️ 沟通列表超过 {pages} 页上限，以上计数仅覆盖已扫描的前 {pages} 页。")
+		lines.append("")
 
 	lines.append("## 新匹配")
 	lines.append("")

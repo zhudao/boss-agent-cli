@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
+import pytest
 from click.testing import CliRunner
 from boss_agent_cli.display import risk_error_message
 from boss_agent_cli.index_cache import save_index
@@ -202,7 +203,7 @@ def test_greet_already_greeted(mock_cache_cls, mock_auth_cls, mock_client_cls):
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "ALREADY_GREETED"
 	# 已打招呼不是死胡同：恢复指引要给出跟进会话的路径。
-	assert "boss chat" in parsed["error"]["recovery_action"]
+	assert f"boss --data-dir {_DEFAULT_DATA_DIR} chat" in parsed["error"]["recovery_action"]
 
 
 @patch("boss_agent_cli.commands.greet.get_platform_instance")
@@ -231,8 +232,8 @@ def test_greet_rejects_blank_identifiers():
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "INVALID_PARAM"
-	assert parsed["hints"]["next_actions"] == ["boss search <关键词>"]
-	assert "boss search <关键词>" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"] == [f"boss --data-dir {_DEFAULT_DATA_DIR} search <关键词>"]
+	assert f"boss --data-dir {_DEFAULT_DATA_DIR} search <关键词>" in parsed["error"]["recovery_action"]
 
 
 def test_detail_rejects_blank_security_id():
@@ -242,8 +243,11 @@ def test_detail_rejects_blank_security_id():
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "INVALID_PARAM"
-	assert parsed["hints"]["next_actions"] == ["boss search <关键词>", "boss show <编号>"]
-	assert "boss search <关键词>" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"] == [
+		f"boss --data-dir {_DEFAULT_DATA_DIR} search <关键词>",
+		f"boss --data-dir {_DEFAULT_DATA_DIR} show <编号>",
+	]
+	assert f"boss --data-dir {_DEFAULT_DATA_DIR} search <关键词>" in parsed["error"]["recovery_action"]
 
 
 def test_apply_rejects_blank_identifiers():
@@ -253,7 +257,7 @@ def test_apply_rejects_blank_identifiers():
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "INVALID_PARAM"
-	assert parsed["hints"]["next_actions"] == ["boss search <关键词>"]
+	assert parsed["hints"]["next_actions"] == [f"boss --data-dir {_DEFAULT_DATA_DIR} search <关键词>"]
 
 
 @patch("boss_agent_cli.commands.greet.time")
@@ -518,7 +522,7 @@ def test_recommend_next_page_hint_keeps_with_score(mock_auth_cls, mock_client_cl
 
 	assert result.exit_code == 0, result.output
 	next_pages = [a for a in json.loads(result.stdout)["hints"]["next_actions"] if "recommend --page" in a]
-	assert next_pages == ["boss recommend --page 3 --with-score"]
+	assert next_pages == [f"boss --data-dir {_DEFAULT_DATA_DIR} recommend --page 3 --with-score"]
 
 
 @patch("boss_agent_cli.commands.recommend.CacheStore")
@@ -652,6 +656,7 @@ def test_search_with_score(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_
 			"greeted": False,
 		}],
 		has_more=False,
+		has_more_reported=False,
 		total=1,
 		stats=SimpleNamespace(
 			pages_scanned=1,
@@ -686,6 +691,7 @@ def test_search_sort_score_orders_by_local_match_score(mock_client_cls, mock_aut
 			{"job_id": "high", "title": "高分", "security_id": "s2", "match_score": 90},
 		],
 		has_more=False,
+		has_more_reported=False,
 		total=2,
 		stats=SimpleNamespace(
 			pages_scanned=1,
@@ -716,6 +722,7 @@ def test_search_supports_url_and_multiselect_filters(mock_client_cls, mock_auth_
 	mock_pipeline.return_value = SimpleNamespace(
 		items=[],
 		has_more=False,
+		has_more_reported=False,
 		total=0,
 		stats=SimpleNamespace(
 			pages_scanned=1,
@@ -756,9 +763,38 @@ def test_search_cache_key_includes_current_result_schema(mock_client_cls, mock_a
 
 	assert result.exit_code == 0
 	cache_params = mock_cache.get_search.call_args.args[0]
-	assert cache_params["cache_schema"] == 5
+	assert cache_params["cache_schema"] == 6
 	assert "account" in cache_params
 	mock_pipeline.assert_not_called()
+
+
+@patch("boss_agent_cli.commands.search.run_search_pipeline")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.AuthManager")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+def test_search_cache_schema_bump_invalidates_pre_887_entries(
+	mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline
+):
+	"""修复前写入的缓存 has_more 恒为布尔值，复用会让 Agent 继续读到谎报的 false（Issue #887）。"""
+	from boss_agent_cli.commands.search import _SEARCH_CACHE_SCHEMA
+
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.get_search.return_value = None
+	mock_pipeline.return_value = SimpleNamespace(
+		items=[],
+		has_more=False,
+		has_more_reported=None,
+		total=0,
+		stats=SimpleNamespace(pages_scanned=1, jobs_seen=0, jobs_prefiltered=0, detail_checks=0),
+	)
+	with patch("boss_agent_cli.index_cache.save_index"):
+		result = CliRunner().invoke(cli, ["--json", "search", "产品"])
+
+	assert result.exit_code == 0, result.output
+	# 缓存键必须带新版本：旧条目（schema 5）不会再被 get_search 命中。
+	assert _SEARCH_CACHE_SCHEMA >= 6
+	assert mock_cache.get_search.call_args.args[0]["cache_schema"] == _SEARCH_CACHE_SCHEMA
+	assert json.loads(result.stdout)["pagination"]["has_more"] is None
 
 
 @patch("boss_agent_cli.commands.search.run_search_pipeline")
@@ -775,6 +811,7 @@ def test_search_corrupt_cache_entry_falls_back_to_live_search(
 	mock_pipeline.return_value = SimpleNamespace(
 		items=[],
 		has_more=False,
+		has_more_reported=False,
 		total=0,
 		stats=SimpleNamespace(
 			pages_scanned=1,
@@ -808,6 +845,7 @@ def test_search_cache_scope_uses_current_account(mock_client_cls, mock_auth_cls,
 	mock_pipeline.return_value = SimpleNamespace(
 		items=[],
 		has_more=False,
+		has_more_reported=False,
 		total=0,
 		stats=SimpleNamespace(
 			pages_scanned=1,
@@ -822,6 +860,8 @@ def test_search_cache_scope_uses_current_account(mock_client_cls, mock_auth_cls,
 	assert result.exit_code == 0
 	assert mock_cache.get_search.call_args.args[0]["account"] == "acct_a"
 	assert mock_cache.put_search.call_args.args[0]["account"] == "acct_a"
+	# 只缓存结果与分页证据：hints 取决于调用上下文，写入后会在别的调用下失效。
+	assert "hints" not in json.loads(mock_cache.put_search.call_args.args[1])
 
 
 @patch("boss_agent_cli.commands.search.run_search_pipeline")
@@ -848,6 +888,37 @@ def test_search_cache_hit_recomputes_greeted_for_current_account(
 	assert result.exit_code == 0
 	assert [item["greeted"] for item in json.loads(result.output)["data"]] == [True, False]
 	assert mock_cache.is_greeted.call_args_list[0].kwargs == {"job_id": "job_1", "account": "acct_a"}
+	mock_pipeline.assert_not_called()
+
+
+@patch("boss_agent_cli.index_cache.save_index")
+@patch("boss_agent_cli.commands.search.run_search_pipeline")
+@patch("boss_agent_cli.commands.search.CacheStore")
+@patch("boss_agent_cli.commands.search.AuthManager")
+@patch("boss_agent_cli.commands.search.get_platform_instance")
+def test_search_cache_hit_rebuilds_hints_for_current_call(
+	mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline, mock_save_index, tmp_path,
+):
+	"""缓存命中不能复用别次调用的提示（Issue #919）。
+
+	缓存键不含 ``--sort``：旧实现把 hints 一起缓存，按相关度排序的调用会拿到
+	上次 ``--sort score`` 的翻页命令，提示里的数据目录也会丢失。命中时按本次
+	调用重建，翻页条件与数据目录都跟本次一致。
+	"""
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.get_search.return_value = json.dumps({
+		"data": [],
+		"pagination": {"page": 1, "has_more": True, "total": 0},
+		"hints": {"next_actions": ["boss search 产品 --sort score --page 2"]},
+	})
+	mock_auth_cls.return_value.account_fingerprint.return_value = "acct_a"
+
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "--json", "search", "产品"])
+
+	assert result.exit_code == 0, result.output
+	actions = json.loads(result.output)["hints"]["next_actions"]
+	assert "boss search 产品 --sort score --page 2" not in actions
+	assert actions[-1] == f"boss --data-dir {tmp_path.resolve()} search 产品 --page 2"
 	mock_pipeline.assert_not_called()
 
 
@@ -959,6 +1030,7 @@ def test_search_ignores_index_cache_write_failure(mock_client_cls, mock_auth_cls
 			"greeted": False,
 		}],
 		has_more=False,
+		has_more_reported=False,
 		total=1,
 		stats=SimpleNamespace(
 			pages_scanned=1,
@@ -980,7 +1052,7 @@ def test_search_ignores_index_cache_write_failure(mock_client_cls, mock_auth_cls
 @patch("boss_agent_cli.commands.search.CacheStore")
 @patch("boss_agent_cli.commands.search.AuthManager")
 @patch("boss_agent_cli.commands.search.get_platform_instance")
-def test_search_json_hints_expose_available_candidate_actions(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline, mock_save_index):
+def test_search_json_hints_expose_available_candidate_actions(mock_client_cls, mock_auth_cls, mock_cache_cls, mock_pipeline, mock_save_index, tmp_path):
 	mock_cache = _ctx_mock(mock_cache_cls)
 	mock_cache.get_search.return_value = None
 	_ctx_mock(mock_client_cls)
@@ -997,6 +1069,7 @@ def test_search_json_hints_expose_available_candidate_actions(mock_client_cls, m
 			"greeted": False,
 		}],
 		has_more=False,
+		has_more_reported=False,
 		total=1,
 		stats=SimpleNamespace(
 			pages_scanned=1,
@@ -1007,17 +1080,19 @@ def test_search_json_hints_expose_available_candidate_actions(mock_client_cls, m
 	)
 
 	runner = CliRunner()
-	result = runner.invoke(cli, ["search", "golang"])
+	result = runner.invoke(cli, ["--data-dir", str(tmp_path), "--json", "search", "golang"])
 
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
-	# next_actions 的每条都必须能直接执行：说明性文字放 operator_actions。
+	# next_actions 的每条都必须能直接执行：说明性文字放 operator_actions；
+	# 且必须在同一数据目录里执行（Issue #919）。
+	prefix = f"boss --data-dir {tmp_path.resolve()}"
 	assert actions == [
-		"boss detail <security_id>",
-		"boss apply <security_id> <job_id>",
-		"boss greet <security_id> <job_id>",
+		f"{prefix} detail <security_id>",
+		f"{prefix} apply <security_id> <job_id>",
+		f"{prefix} greet <security_id> <job_id>",
 	]
 	assert all("使用 " not in action and " — " not in action for action in actions)
 	mock_save_index.assert_called_once()
@@ -1044,6 +1119,7 @@ def test_search_pagination_reports_index_snapshot_for_show(mock_client_cls, mock
 			"greeted": False,
 		}],
 		has_more=False,
+		has_more_reported=False,
 		total=1,
 		stats=SimpleNamespace(
 			pages_scanned=1,
@@ -1232,6 +1308,51 @@ def test_chat_from_boss_filter(mock_auth_cls, mock_client_cls):
 
 @patch("boss_agent_cli.commands.chat.get_platform_instance")
 @patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_boolean_codes_are_not_labels_or_counts(mock_auth_cls, mock_client_cls, tmp_path):
+	"""JSON 布尔不是平台数值编码：不能变成「对方主动」「未读」或未读数（Issue #915）。"""
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {}}
+	_ctx_mock(mock_client_cls)
+	item = _make_friend_item("联系人甲", "示例公司甲", True, 1700000000000)
+	item["lastMessageInfo"] = {"status": True}
+	item["unreadMsgCount"] = True
+	mock_client_cls.return_value.friend_list.return_value = {"zpData": {"result": [item]}}
+
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "chat"])
+
+	assert result.exit_code == 0, result.output
+	row = json.loads(result.output)["data"][0]
+	assert row["initiated_by"] == "未知"
+	assert row["msg_status"] == "未知"
+	assert row["unread"] == 0
+	assert row["last_ts"] == 1700000000000
+
+
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_hints_preserve_data_dir(mock_auth_cls, mock_client_cls, tmp_path):
+	"""沟通列表的后继命令必须在同一数据目录执行（Issue #917）。"""
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {}}
+	_ctx_mock(mock_client_cls)
+	mock_client_cls.return_value.friend_list.return_value = {
+		"zpData": {
+			"result": [_make_friend_item("联系人甲", "示例公司甲", 1, 1700000000000)],
+			"hasMore": True,
+		},
+	}
+
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "chat"])
+
+	assert result.exit_code == 0, result.output
+	prefix = f"boss --data-dir {tmp_path.resolve()}"
+	assert json.loads(result.output)["hints"]["next_actions"] == [
+		f"{prefix} detail <security_id>",
+		f"{prefix} chatmsg <uid>",
+		f"{prefix} chat --page 2",
+	]
+
+
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
 def test_chat_pagination_reports_platform_page_evidence(mock_auth_cls, mock_client_cls):
 	"""--page 必须有分页证据：只有平台 hasMore=true 才提示下一页。"""
 	import time
@@ -1258,7 +1379,7 @@ def test_chat_pagination_reports_platform_page_evidence(mock_auth_cls, mock_clie
 		next_pages = [action for action in payload["hints"]["next_actions"] if "chat --page" in action]
 		assert len(next_pages) == (1 if expected is True else 0)
 		if expected is True:
-			assert next_pages[0] == "boss chat --page 3 --from boss --days 7"
+			assert next_pages[0] == f"boss --data-dir {_DEFAULT_DATA_DIR} chat --page 3 --from boss --days 7"
 		if expected is None:
 			assert payload["hints"]["operator_actions"]
 		mock_client_cls.return_value.friend_list.assert_called_once_with(page=2)
@@ -1422,6 +1543,107 @@ def test_chat_export_md(mock_auth_cls, mock_client_cls, tmp_path):
 	assert snapshot_dir.exists()
 	json_files = list(snapshot_dir.glob("*.json"))
 	assert len(json_files) == 1
+
+
+@pytest.mark.parametrize("filters", [["--from", "boss"], ["--days", "7"]], ids=["from", "days"])
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_export_filtering_does_not_mark_unselected_contacts_removed(mock_auth_cls, mock_client_cls, tmp_path, filters):
+	"""快照记录全部观察，导出正文与变化摘要使用相同筛选范围（Issue #911）。"""
+	import datetime
+	import time
+	now_ms = int(time.time() * 1000)
+	old_ms = now_ms - 14 * 24 * 3600 * 1000
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {}}
+	_ctx_mock(mock_client_cls)
+	selected = {**_make_friend_item("联系人甲", "示例公司甲", 1, now_ms), "uid": 101, "unreadMsgCount": 2}
+	unselected = {**_make_friend_item("联系人乙", "示例公司乙", 2, old_ms), "uid": 202, "unreadMsgCount": 3}
+	new_unselected = {**_make_friend_item("联系人丙", "示例公司丙", 2, old_ms), "uid": 303}
+	mock_client_cls.return_value.friend_list.return_value = {
+		"zpData": {"hasMore": False, "result": [selected, unselected, new_unselected]},
+	}
+	history = tmp_path / "chat-history"
+	history.mkdir()
+	yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+	(history / f"{yesterday}.json").write_text(
+		json.dumps([{"uid": 101, "name": "联系人甲"}, {"uid": 202, "name": "联系人乙"}]),
+		encoding="utf-8",
+	)
+
+	out_file = tmp_path / "chat.md"
+	result = CliRunner().invoke(cli, [
+		"--json", "--data-dir", str(tmp_path),
+		"chat", *filters, "--export", "md", "-o", str(out_file),
+	])
+
+	assert result.exit_code == 0, result.output
+	payload = json.loads(result.output)
+	assert payload["data"]["count"] == 1
+	assert payload["data"]["diff"]["removed"] == []
+	assert payload["data"]["diff"]["added"] == []
+	assert [row["uid"] for row in payload["data"]["diff"]["new_unread"]] == [101]
+	assert payload["data"]["diff"]["complete"] is True
+	content = out_file.read_text(encoding="utf-8")
+	assert "已消失" not in content
+	assert "联系人乙" not in content
+	assert "联系人丙" not in content
+	today = datetime.date.today().isoformat()
+	saved = json.loads((history / f"{today}.json").read_text(encoding="utf-8"))
+	assert {str(item["uid"]) for item in saved} == {"101", "202", "303"}
+
+
+@pytest.mark.parametrize(
+	("page", "paging", "fmt", "complete"),
+	[
+		pytest.param(1, {"hasMore": False}, "md", True, id="complete"),
+		pytest.param(1, {"hasMore": True}, "md", False, id="more-pages"),
+		pytest.param(2, {"hasMore": False}, "md", False, id="last-page-only"),
+		pytest.param(1, {}, "md", False, id="missing-marker"),
+		pytest.param(1, {"hasMore": None}, "md", False, id="null-marker"),
+		pytest.param(1, {"hasMore": "false"}, "md", False, id="ambiguous-marker"),
+		pytest.param(1, {"hasMore": True}, "html", False, id="html-partial"),
+	],
+)
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_export_removal_requires_complete_list(mock_auth_cls, mock_client_cls, tmp_path, page, paging, fmt, complete):
+	"""只有完整列表能证明联系人消失；部分观察在信封和正文说明局限（Issue #911）。"""
+	import datetime
+	import time
+	now_ms = int(time.time() * 1000)
+	mock_auth_cls.return_value.check_status.return_value = {"cookies": {}}
+	_ctx_mock(mock_client_cls)
+	first = {**_make_friend_item("联系人甲", "示例公司甲", 1, now_ms), "uid": 101}
+	mock_client_cls.return_value.friend_list.return_value = {
+		"zpData": {**paging, "result": [first]},
+	}
+	history = tmp_path / "chat-history"
+	history.mkdir()
+	yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+	(history / f"{yesterday}.json").write_text(
+		json.dumps([{"uid": 101, "name": "联系人甲"}, {"uid": 202, "name": "联系人乙"}]),
+		encoding="utf-8",
+	)
+
+	out_file = tmp_path / f"chat.{fmt}"
+	result = CliRunner().invoke(cli, [
+		"--json", "--data-dir", str(tmp_path),
+		"chat", "--page", str(page), "--export", fmt, "-o", str(out_file),
+	])
+
+	assert result.exit_code == 0, result.output
+	payload = json.loads(result.output)
+	assert payload["data"]["diff"]["complete"] is complete
+	content = out_file.read_text(encoding="utf-8")
+	if complete:
+		assert [row["uid"] for row in payload["data"]["diff"]["removed"]] == [202]
+		assert "已消失" in content
+		assert "本次采集不完整" not in content
+	else:
+		assert payload["data"]["diff"]["removed"] == []
+		assert "已消失" not in content
+		assert "本次采集不完整" in content
+	mock_client_cls.return_value.friend_list.assert_called_once_with(page=page)
 
 
 @patch("boss_agent_cli.commands.chat.get_platform_instance")
@@ -2253,8 +2475,8 @@ def test_detail_json_hints_expose_available_candidate_actions(mock_client_cls, m
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
-	assert "boss apply <security_id> <job_id>" in actions
-	assert "boss greet <security_id> <job_id>" in actions
+	assert f"boss --data-dir {_DEFAULT_DATA_DIR} apply <security_id> <job_id>" in actions
+	assert f"boss --data-dir {_DEFAULT_DATA_DIR} greet <security_id> <job_id>" in actions
 
 
 @patch("boss_agent_cli.commands.show.CacheStore")
@@ -2294,8 +2516,8 @@ def test_show_json_hints_expose_available_candidate_actions(
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
-	assert "boss apply <security_id> <job_id>" in actions
-	assert "boss greet <security_id> <job_id>" in actions
+	assert f"boss --data-dir {_DEFAULT_DATA_DIR} apply <security_id> <job_id>" in actions
+	assert f"boss --data-dir {_DEFAULT_DATA_DIR} greet <security_id> <job_id>" in actions
 
 
 @patch("boss_agent_cli.commands.show.CacheStore")
@@ -2347,7 +2569,7 @@ def test_stats_json_hints_expose_available_application_action(mock_collect_stats
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	actions = parsed["hints"]["next_actions"]
-	assert "boss apply <security_id> <job_id>" in actions
+	assert f"boss --data-dir {_DEFAULT_DATA_DIR} apply <security_id> <job_id>" in actions
 
 
 def test_corrupt_cache_database_returns_envelope_not_traceback(tmp_path):
@@ -2377,6 +2599,6 @@ def test_mark_rejects_blank_identifier(mock_auth_cls, mock_client_cls):
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "INVALID_PARAM"
-	assert parsed["hints"]["next_actions"] == ["boss chat"]
-	assert "boss chat" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["next_actions"] == [f"boss --data-dir {_DEFAULT_DATA_DIR} chat"]
+	assert f"boss --data-dir {_DEFAULT_DATA_DIR} chat" in parsed["error"]["recovery_action"]
 	mock_client.friend_list.assert_not_called()

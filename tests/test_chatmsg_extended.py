@@ -1,9 +1,11 @@
 """chatmsg.py 扩展测试 — 消息历史、空列表、无效好友、格式化逻辑。"""
 
 import json
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from click.testing import CliRunner
+from boss_agent_cli.commands.chatmsg import _message_type_label
 from boss_agent_cli.main import cli
 
 
@@ -488,6 +490,29 @@ def test_chatmsg_uses_client_context_manager(mock_auth_cls, mock_client_cls):
 	instance.__exit__.assert_called_once()
 
 
+def test_message_type_boolean_is_not_a_text_code():
+	"""JSON 布尔不是消息类型编码：True 不能显示成「文本」（Issue #915）。"""
+	assert _message_type_label(True) == "其他(True)"
+	assert _message_type_label(1) == "文本"
+	assert _message_type_label(99) == "其他(99)"
+
+
+@patch("boss_agent_cli.commands.chatmsg.get_platform_instance")
+@patch("boss_agent_cli.commands.chatmsg.AuthManager")
+def test_chatmsg_not_found_hint_preserves_data_dir(mock_auth_cls, mock_client_cls, tmp_path):
+	"""CONTACT_NOT_FOUND 的下一步是在同一数据目录刷新沟通列表（Issue #917）。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.friend_list.return_value = _friend_list_response([])
+
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "chatmsg", "sec_missing"])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "CONTACT_NOT_FOUND"
+	assert parsed["hints"]["next_actions"] == [f"boss --data-dir {tmp_path.resolve()} chat"]
+	mock_client.chat_history.assert_not_called()
+
+
 @patch("boss_agent_cli.commands.chatmsg.get_platform_instance")
 @patch("boss_agent_cli.commands.chatmsg.AuthManager")
 def test_chatmsg_rejects_blank_security_id(mock_auth_cls, mock_client_cls):
@@ -498,5 +523,6 @@ def test_chatmsg_rejects_blank_security_id(mock_auth_cls, mock_client_cls):
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
 	assert parsed["error"]["code"] == "INVALID_PARAM"
-	assert parsed["hints"]["next_actions"] == ["boss chat"]
+	default_data_dir = str((Path.home() / ".boss-agent").resolve())
+	assert parsed["hints"]["next_actions"] == [f"boss --data-dir {default_data_dir} chat"]
 	mock_client.friend_list.assert_not_called()

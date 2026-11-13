@@ -16,7 +16,7 @@ def test_more_hint_only_prefixes_the_given_command() -> None:
 	assert _more_hint("boss search golang --page 2") == "more: boss search golang --page 2"
 
 
-def _invoke_search(*args, tmp_path, has_more=True):
+def _invoke_search(*args, tmp_path, has_more=True, has_more_reported="same"):
 	with (
 		patch("boss_agent_cli.commands.search.AuthManager"),
 		patch("boss_agent_cli.commands.search.get_platform_instance"),
@@ -39,6 +39,7 @@ def _invoke_search(*args, tmp_path, has_more=True):
 				"greeted": False,
 			}],
 			has_more=has_more,
+			has_more_reported=has_more if has_more_reported == "same" else has_more_reported,
 			total=1,
 			stats=SimpleNamespace(
 				pages_scanned=1,
@@ -55,6 +56,11 @@ def _invoke_search(*args, tmp_path, has_more=True):
 	return json.loads(result.stdout)
 
 
+def _prefix(tmp_path) -> list[str]:
+	"""提示命令的前缀：保留当前数据目录（Issue #919）。"""
+	return ["boss", "--data-dir", str(tmp_path.resolve())]
+
+
 def _next_page(payload: dict) -> list[str]:
 	"""取出下一页提示并按 shell 解析成 argv。"""
 	actions = [action for action in payload["hints"]["next_actions"] if "search" in action and "--page" in action]
@@ -64,7 +70,7 @@ def _next_page(payload: dict) -> list[str]:
 
 def test_next_page_keeps_plain_query_unquoted(tmp_path) -> None:
 	assert _next_page(_invoke_search("golang", tmp_path=tmp_path)) == [
-		"boss", "search", "golang", "--page", "2",
+		*_prefix(tmp_path), "search", "golang", "--page", "2",
 	]
 
 
@@ -86,7 +92,7 @@ def test_next_page_keeps_every_filter_and_switch(tmp_path) -> None:
 		tmp_path=tmp_path,
 	)
 	assert _next_page(payload) == [
-		"boss", "search", "后端开发",
+		*_prefix(tmp_path), "search", "后端开发",
 		"--city", "北京",
 		"--salary", "20-50K",
 		"--experience", "3-5年",
@@ -111,7 +117,7 @@ def test_next_page_quotes_query_with_shell_metacharacters(tmp_path) -> None:
 	"""
 	for query in ('a"b', "$HOME", "全天*"):
 		parsed = _next_page(_invoke_search(query, tmp_path=tmp_path))
-		assert parsed == ["boss", "search", query, "--page", "2"]
+		assert parsed == [*_prefix(tmp_path), "search", query, "--page", "2"]
 
 
 def test_next_page_keeps_url_parameters(tmp_path) -> None:
@@ -122,17 +128,33 @@ def test_next_page_keeps_url_parameters(tmp_path) -> None:
 	"""
 	url = "https://www.zhipin.com/web/geek/jobs?query=Python&city=101280100&degree=203"
 	parsed = _next_page(_invoke_search("--url", url, tmp_path=tmp_path))
-	assert parsed == ["boss", "search", "Python", "--url", url, "--page", "2"]
+	assert parsed == [*_prefix(tmp_path), "search", "Python", "--url", url, "--page", "2"]
 
 
 def test_next_page_hint_is_accepted_by_the_cli(tmp_path) -> None:
 	"""提示要真能被 CLI 解析，而不只是看起来像命令。"""
 	payload = _invoke_search("golang", "--city", "北京", "--sort", "score", tmp_path=tmp_path)
+	# 提示自带数据目录，去掉开头的 boss 即可执行。
 	argv = _next_page(payload)[1:]
-	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), *argv, "--help"])
+	result = CliRunner().invoke(cli, [*argv, "--help"])
 	assert result.exit_code == 0, result.output
 
 
 def test_no_next_page_hint_when_platform_has_no_more(tmp_path) -> None:
 	payload = _invoke_search("golang", has_more=False, tmp_path=tmp_path)
 	assert not any("--page" in action for action in payload["hints"]["next_actions"])
+	assert payload["pagination"]["has_more"] is False
+	assert payload["pagination"]["has_more_source"] == "platform_hasMore"
+	assert payload["pagination"]["total_kind"] == "returned_page_count"
+
+
+def test_unknown_has_more_is_reported_as_null_not_false(tmp_path) -> None:
+	"""平台没给 hasMore 时信封必须是 null + unknown，不能谎报 false（Issue #887）。"""
+	payload = _invoke_search("golang", has_more=False, has_more_reported=None, tmp_path=tmp_path)
+
+	pagination = payload["pagination"]
+	assert pagination["has_more"] is None
+	assert pagination["has_more_source"] == "unknown"
+	assert pagination["total_kind"] == "returned_page_count"
+	assert not any("--page" in action for action in payload["hints"]["next_actions"])
+	assert any("下一页" in action for action in payload["hints"].get("operator_actions") or [])

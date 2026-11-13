@@ -1,4 +1,5 @@
 import json
+import shlex
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -61,6 +62,62 @@ def test_digest_command_returns_structured_sections(mock_auth_cls, mock_client_c
 	assert parsed["ok"] is True
 	assert parsed["data"]["follow_up_count"] >= 1
 	assert parsed["data"]["interview_count"] == 1
+
+
+@patch("boss_agent_cli.commands.digest.get_platform_instance")
+@patch("boss_agent_cli.commands.digest.AuthManager")
+def test_digest_hints_preserve_data_dir(mock_auth_cls, mock_client_cls, tmp_path):
+	"""digest 的 pipeline / follow-up / watch 后继命令必须保留原数据目录（Issue #913）。"""
+	_setup_digest_mocks(mock_client_cls)
+	expected = ["boss", "--data-dir", str(tmp_path.resolve())]
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--json", "--data-dir", str(tmp_path), "digest"])
+	assert result.exit_code == 0, result.output
+	for command in json.loads(result.output)["hints"]["next_actions"]:
+		assert shlex.split(command)[:3] == expected
+
+	md_result = runner.invoke(
+		cli, ["--json", "--data-dir", str(tmp_path), "digest", "--format", "md"]
+	)
+	assert md_result.exit_code == 0, md_result.output
+	md_hint = json.loads(md_result.output)["hints"]["next_actions"][0]
+	assert shlex.split(md_hint)[:3] == expected
+
+
+@patch("boss_agent_cli.commands.digest.get_platform_instance")
+@patch("boss_agent_cli.commands.digest.AuthManager")
+def test_digest_reports_chat_page_truncation(mock_auth_cls, mock_client_cls, legacy_args):
+	"""沟通列表翻满上限时 digest 必须显式标注截断，否则计数被当前缀（Issue #885）。"""
+	mock_client = _ctx_mock(mock_client_cls)
+
+	def endless_friend_list(*, page=1):
+		item = {
+			"name": f"张HR{page}",
+			"securityId": f"sec_{page}",
+			"uid": 10000 + page,
+			"title": "HR",
+			"brandName": "TestCo",
+			"friendSource": 0,
+			"encryptJobId": f"job_{page}",
+			"lastMsg": "请尽快回复",
+			"lastTS": 1700000001000,
+			"unreadMsgCount": 1,
+			"relationType": 1,
+			"lastMessageInfo": {"status": 1},
+		}
+		return {"zpData": {"result": [item], "hasMore": True}}
+
+	mock_client.friend_list.side_effect = endless_friend_list
+	mock_client.interview_data.return_value = {"zpData": {"interviewList": []}}
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--json", *legacy_args, "digest"])
+	assert result.exit_code == 0
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["truncated"] is True
+	assert parsed["data"]["chat_pages_scanned"] == 50
 
 
 @patch("boss_agent_cli.commands.digest.get_platform_instance")
