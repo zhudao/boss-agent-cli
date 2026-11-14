@@ -316,7 +316,9 @@ httpx 带着从 Chrome 拷出来的 Cookie，把 `__zp_stoken__` 当查询参数
 | `WIZARD_INPUT_REQUIRED` | headless workflow 缺少 role/platform/goal/inputs | 按 `boss schema` catalog 补齐 `--input-json` |
 | `WORKFLOW_TIMEOUT` | workflow 超过显式 timeout | 保留 `run_id`，调整 timeout 后执行 `boss wizard --resume <run_id>` |
 | `WORKFLOW_PLAN_MISMATCH` | 现有 `run_id` 与请求 plan 不一致 | 使用原 plan 恢复，或不传 `run_id` 创建新任务 |
+| `WORKFLOW_BUSY` | 同一 `run_id` 正在由另一次调用执行（另一个终端、Agent 或 MCP 调用）；本次调用没有执行任何步骤，也没有改动 checkpoint | 用 `boss wizard --status <run_id>` 查看进度，等当前执行结束后再 `--resume`；不要并发恢复同一个 `run_id` |
 | `WORKFLOW_NOT_FOUND` | 本地 workflow 任务不存在或 `run_id` 有误（`boss wizard --status` / `--stop` / `--resume`） | 执行 `boss wizard` 新建任务，或先用 `boss wizard --status <run_id>` 核对 ID |
+| `CRAWL_BUSY` | 同一采集任务正由另一次调用执行；本次调用未发出请求，也未修改采集断点 | 用返回的同一数据目录的 `boss crawl status <run_id>` 查看进度，等当前执行结束后再恢复；不要并发恢复同一任务；`status` / `results` / `stop` 仍可用 |
 | `CRAWL_RUN_NOT_FOUND` | 本地采集任务不存在或 `run_id` 有误（`boss crawl status` / `resume` / `results` 等） | 执行 `boss crawl start <query>` 新建任务，或用真实 `run_id` 执行 `boss crawl status <run_id>` 核对 |
 | `CONTACT_NOT_FOUND` | 沟通列表里没有这个联系人：`security_id` 可能已轮换，或对方已不在列表 | 先 `boss chat` 查看会话；已知 uid 时改用 uid 重试 |
 | `SAVED_SEARCH_NOT_FOUND` | 本地预设或 watch 不存在：`boss search --preset` / `boss watch run` 引用了没保存过的名字 | `boss preset list` / `boss watch list` 查看已有条目，需要时用 `boss preset add` / `boss watch add` 重建 |
@@ -327,7 +329,7 @@ httpx 带着从 Chrome 拷出来的 Cookie，把 `__zp_stoken__` 当查询参数
 | `ALREADY_GREETED` | 已打过招呼 | 跳过 |
 | `CONFIRMATION_REQUIRED` | 未确认操作目标与内容 | 先用 `hr greet --dry-run`、`hr accept-resume <friend_id> --message-id <mid> --dry-run` 或 `hr location <friend_id> --dry-run` 预览；操作者明确批准后才加 `--yes`，Agent 不可自行补确认 |
 | `RESUME_ACCEPT_RESULT_UNKNOWN` | 同意附件简历请求的结果未确认 | 保留 `accepted=null`，在官方页面核对请求状态；禁止自动重试同意操作 |
-| `ACTION_UNCONFIRMED` | 招聘者交换联系方式或求简历的页面动作已执行，但未确认是否发出 | 动作可能已生效，先用 `boss hr chatmsg <friend_id>` 核实，勿直接重试；`error.details` 里有页面日志、WS 统计（`ws_evidence`，含 `ws_send_without_text`：有发送帧但读不出文本的条数）与历史回读核对结果（`history_checked` / `history_matched_count` / `history_attempts` / `history_new_count` / `history_self_count` / `history_recipient_count`） |
+| `ACTION_UNCONFIRMED` | 写请求已发出，但响应中断、不是 JSON 或页面动作未确认，结果可能已生效（也包括执行进程在结果确认前被终止，`--resume` 结算出的同码失败） | 禁止自动重发：求职者用 `boss chat` 核对招呼、`boss me --section deliver` 核对投递；招聘者用 `boss hr chatmsg <friend_id>` 核对。信封带 `replay_safe: false` 与 `outcome_unknown: true`，后继命令保留本次数据目录；招聘者页面动作还可能带页面日志、WS 统计（`ws_evidence`，含 `ws_send_without_text`：有发送帧但读不出文本的条数）与历史回读证据（`history_checked` / `history_matched_count` / `history_attempts` / `history_new_count` / `history_self_count` / `history_recipient_count`） |
 | `EXCHANGE_NOT_AVAILABLE` | 换电话/换微信按钮还没解锁（你还没在这个会话里发过消息），本次未发出任何请求 | 先回复候选人（`boss hr reply <friend_id> <消息>` 或 `boss hr request-resume <friend_id>`），再重新交换；`error.details` 里有命中的禁用信号 |
 | `GREET_RESULT_UNKNOWN` | 已预约发送，但结果未确认 | 用 `boss hr chat --job-id <id>` 核对会话，禁止自动重发；本地保留预约，必要时在官方页面处理 |
 | `LOCATION_ALREADY_SENT` | 同一候选人会话已发送过工作地点卡片，本地记录阻止重复发送 | 用 `boss hr chatmsg <friend_id>` 核对地点卡；不要删除本地记录来重发 |
@@ -342,13 +344,13 @@ httpx 带着从 Chrome 拷出来的 Cookie，把 `__zp_stoken__` 当查询参数
 | `ALREADY_APPLIED` | 已发起过投递 / 立即沟通 | 跳过；用 `boss me --section deliver` 查看投递记录，或用 `boss chat` 跟进 |
 | `GREET_LIMIT` | 今日次数用完 | 告知用户 |
 | `NETWORK_ERROR` | 网络错误 | 重试 |
-| `UNKNOWN` | 平台返回了未识别的错误（无法按登录过期 / 限流 / 风控归类） | 不自动重试：先在官方页面核对本次操作是否生效，用 `boss doctor` 检查登录态与网络，确认后再执行一次；仍失败请附上命令与 `error.message` 提交 issue |
+| `UNKNOWN` | 平台返回了未识别的错误（无法按登录过期 / 限流 / 风控归类），写操作的响应无法证明动作没有发生 | 不自动重试：先在官方页面核对本次操作是否生效，用 `boss doctor` 检查登录态与网络，确认后再执行一次；仍失败请附上命令与 `error.message` 提交 issue。信封始终带 `replay_safe: false`；浏览器通道对写请求拿到非 JSON 响应时会直接归为 `ACTION_UNCONFIRMED` |
 | `INTERNAL_ERROR` | CLI 内部错误或平台返回了未预期的数据结构 | 不要重试；升级到最新版本，仍出现时附上命令与 error.message 提交 issue |
 | `AI_NOT_CONFIGURED` | AI 未配置 | `boss ai config` |
 | `AI_API_ERROR` | AI 服务调用失败 | 检查网络连接和密钥配置，重试 |
 | `AI_PARSE_ERROR` | AI 返回结果解析失败 | 重试（模型输出不稳定时可能发生） |
 | `PLATFORM_NOT_SUPPORTED` | 当前平台不支持该角色或子命令 | 切换到支持的平台 |
-| `BROWSER_KERNEL_MISSING` | patchright 浏览器内核缺失或版本不匹配 | `patchright install chromium`；缺 headless shell 时运行 `patchright install chromium-headless-shell` |
+| `BROWSER_KERNEL_MISSING` | patchright 浏览器内核缺失或版本不匹配（含非登录命令：`search` / `detail` / `greet` / `chat` / `me` / `wizard` 等启动浏览器时，以及 `resume export --format pdf`） | `patchright install chromium`；缺 headless shell 时运行 `patchright install chromium-headless-shell`。这是确定性失败，重试不会成功 |
 
 ## Windows smoke checklist
 

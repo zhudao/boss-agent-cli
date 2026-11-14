@@ -59,6 +59,7 @@ ERROR_LABELS = {
 	"NETWORK_ERROR": "网络请求失败",
 	"INTERNAL_ERROR": "程序内部出错",
 	"BROWSER_NAV_TIMEOUT": "浏览器首页加载超时",
+	"BROWSER_KERNEL_MISSING": "浏览器内核缺失或版本不匹配",
 	"RATE_LIMITED": "请求过于频繁",
 	"ACCOUNT_RISK": "平台已暂停本次操作",
 	"ENVIRONMENT_RISK": "平台判定当前访问环境异常",
@@ -71,6 +72,8 @@ ERROR_LABELS = {
 	"WORKFLOW_NOT_FOUND": "没有找到该任务记录",
 	"WORKFLOW_TIMEOUT": "任务运行超时",
 	"WORKFLOW_STOPPED": "任务已停止",
+	"WORKFLOW_BUSY": "该任务正在另一个窗口或进程中执行",
+	"CRAWL_BUSY": "该采集任务正在另一个窗口或进程中执行",
 	"WORKFLOW_PLAN_MISMATCH": "任务信息与已有记录不一致",
 	"INVALID_PARAM": "请求参数无效",
 	"AUTH_EXPIRED": "登录状态已过期",
@@ -95,6 +98,7 @@ RECOVERY_LABELS = {
 	"NETWORK_ERROR": "请检查网络后重试，或返回主菜单选择其他事项。",
 	"INTERNAL_ERROR": "这不是网络问题，重试不会有帮助。请升级到最新版本，仍出现时把这次的命令和报错反馈给维护者。",
 	"BROWSER_NAV_TIMEOUT": "请用已登录的 Chrome 调试端口重试，或先重新登录后再恢复任务。",
+	"BROWSER_KERNEL_MISSING": "这不是网络问题，重试不会有帮助。请退出向导，运行 patchright install chromium 安装浏览器内核后重新执行命令。",
 	"RATE_LIMITED": "请稍后再试。",
 	"ACCOUNT_RISK": "请停止自动操作并在平台内检查账号状态；确认风险解除后，由你本人执行 boss clean --risk-lock，再重新启动向导恢复任务。",
 	"ENVIRONMENT_RISK": "请停止自动操作，保留当前浏览器 profile，在平台官方页面确认风险解除后，由你本人执行 boss clean --risk-lock，再重新启动向导恢复任务。",
@@ -123,6 +127,8 @@ RECOVERY_LABELS = {
 	"UNKNOWN": "不要自动重试：先在平台官方页面核对操作是否生效，并用 boss doctor 检查登录态与网络。",
 	"WIZARD_INPUT_REQUIRED": "headless 模式请通过 --input-json 提供完整输入，或用 run_id 恢复。",
 	"WORKFLOW_STOPPED": "任务已停止；如需继续，请选择“恢复已有任务”。",
+	"WORKFLOW_BUSY": "请等它结束，或选择“查看任务状态”确认进度后再恢复。",
+	"CRAWL_BUSY": "请等它结束；需要确认进度时执行 boss crawl status <run_id>，不要并发恢复同一个任务。",
 }
 
 # 这些步骤对真人噪声大，TTY 进度里默认静默。

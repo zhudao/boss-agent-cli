@@ -4,6 +4,53 @@
 
 ## [Unreleased]
 
+### Fixed
+- Agent 快速上手补上 `CRAWL_BUSY`（Issue #1033）：3.4.4 的采集执行互斥已写进命令参考与排障文档，但 Agent 快速上手的错误码清单只有同类的 `WORKFLOW_BUSY`，中英文都缺这一条——Agent 遇到并发恢复被拒时找不到处理说明，容易重试或 `--stop` 让位，正是该错误码要阻止的行为。现在两份快速上手的错误码清单与采集编排一节都写明「查 `crawl status <run_id>`、等当前执行结束再恢复，`status` / `results` / `stop` 不受影响」，并新增文档守卫要求两个并发码在中英两侧同时出现。
+- HTML / JSON 导出的通用失败不再提示安装浏览器内核（Issue #1031）：`resume export` 的失败分流在内核缺失与本地 IO 之外，第三条「渲染 / 模板错误」仍直接复用错误码登记表里拆分前的 `EXPORT_FAILED` 恢复文案「检查 patchright 安装」——HTML / JSON 导出只用本地模板与文件写入，从不启动浏览器，照做只会装一个没用到的内核。现在 PDF 保留内核提示（浏览器确实参与渲染），HTML / JSON 改为提示检查简历文件内容与导出选项，并说明该格式不使用浏览器内核；新增回归要求 HTML 渲染失败的信封里不出现 `patchright`，PDF 的通用失败仍保留原指引。
+- Node 回归脚本的子进程超时统一为 30 秒（Issue #1029）：`test_fetch_script_marks_non_json_body` 等四条用例的预算原为 5–15 秒，相对脚本实测的约 40 毫秒本有余量，但 CI 跑步机在四个矩阵任务与 lint 并发时会出现秒级冷启动卡顿，`Test (Python 3.14)` 因此把必需检查打成假红一次，重跑才恢复。现在四条用例与其余 Node 回归一样使用 30 秒预算；脚本真的挂起仍会在 30 秒内失败，断言与重试策略不变。
+
+## [3.4.4] - 2026-11-14
+
+### Fixed
+- 采集执行器收到退出信号时不再把未完成任务误记为完成（Issue #1024）：`SystemExit`、`GeneratorExit` 等非普通异常此前会跳过错误分支，再由 `finally` 写回默认的 `completed`，导致普通恢复直接返回而不再抓取剩余页面或补全详情。现在保存 `stopped` 与现有页游标、待补详情和请求预算，完成清理后原样传播退出信号；显式恢复只续跑未完成工作，已提交页面不重抓。回归覆盖浏览器打开、列表抓取和详情补全三个阶段，并验证真实子进程保留原退出码。
+- 同一采集任务的重叠恢复不再重复抓页（Issue #1023）：执行器现在先取得该 `run_id` 的跨进程独占执行权，再读取页游标、待补详情与预算，持有至本次运行结束。后到者返回 `CRAWL_BUSY`（`recoverable: true`，`--exit-codes sysexits` 下为 75），不发出请求、不推进断点、不清除停止请求；`hints.next_actions` 只给同一数据目录的状态查询，向导失败信封与失败任务的状态查询也遵守这一口径。新建、后台 worker 与向导采集共用这条执行路径，创建回调发布编号后也会重读最新断点。状态、结果与停止请求继续可用；进程崩溃后内核自动释放执行权，无法建立锁时返回 `LOCAL_IO_ERROR` 并拒绝执行。Python API 可捕获 `CrawlBusyError`，当前执行结束后再恢复。
+- 阻塞的失败 run 不再被建议 `--resume`（Issue #1021）：失败步骤的结果无法重放（`replay_safe: false`，如 `ACTION_UNCONFIRMED`、平台已成功但本地记账失败）时，runner 的恢复只会原样返回同一个失败，但 `boss wizard --status` 的 `hints.next_actions` 一直把 `--resume` 放在第一条，照做的 Agent 很容易把它读成「再试一次」而反复空转；同一状态下 TTY 的「恢复已有任务」列表却已经排除该 run。现在这类 run 只给 `--status` 与新建 workflow，步骤级的核对命令仍随状态返回；可重放的失败保留 `--resume`。阻塞判定从 TTY 菜单收进 `wizard/runner.has_blocked_step`，命令层与 TTY 共用同一口径。
+- wizard 执行进程在写步骤进行中被终止后，恢复不再重放同一个写操作（Issue #1019）：执行器在写请求发出后、结果确认前被 kill / 关闭终端 / 断电（或 MCP 超时后宽限期内没退出被强制回收）时，步骤与 run 都停在 `running`，没有任何「结果未知」的记录，`boss wizard --resume <run_id>` 会把同一动作再执行一遍——离线复现中 `recruiter_reply` 对同一会话发送了两次，恢复后 run 显示 `completed`，与「结果未知的写操作不得重放」的契约相悖。现在 10 个写动作（求职者的投递 / 打招呼 / 联系方式交换 / 联系人标签，招聘者的查看简历 / 回复 / 请求附件简历 / 交换联系方式 / 职位上线 / 职位下线）在平台请求发出之前，先把 `ACTION_UNCONFIRMED`（`replay_safe: false`）与该动作的核对命令落到当前步骤上；结果确认后由实际结果覆盖。恢复时取得执行权后发现步骤仍是 `running` 却带着这条记录，说明上一个执行器没有记录结果就消失了：不执行动作，把步骤与 run 记为失败并返回 `ACTION_UNCONFIRMED` 与核对指引，之后的恢复同样不重放。只读步骤、crawl 续跑、尚未走到写请求的中断照常重跑；动作明确报告的可重放失败（如限流）会作废上一次尝试落盘的记录，自动重试之间被终止不影响恢复。记录落不了盘时不发出写请求。执行期间 `--status` 看到 `running` 步骤带 `ACTION_UNCONFIRMED` 即表示写请求在途。
+- 同一 workflow 的重叠恢复不再重复执行写操作（Issue #1017）：两次 `boss wizard --resume <run_id>` 重叠时（两个终端、Agent 重试，或 MCP 超时后的再次调用），后到者读到的是旧执行快照，会把先到者已保存的 `completed` 步骤覆盖回 `running`，再把同一个动作执行一遍——离线复现中 `recruiter_reply` 对同一会话发送了两次，两次调用都返回 `completed`。现在执行器在读取快照之前取得该 `run_id` 的独占执行权（操作系统文件锁，不等待），持有到本次运行返回或抛出；取不到时返回新错误码 `WORKFLOW_BUSY`（`recoverable: true`，`--exit-codes sysexits` 下为 75），不执行任何步骤、不改动 checkpoint，`hints.next_actions` 只给同一数据目录的 `wizard --status <run_id>`。`--status` / `--stop` 不取执行权，执行期间照常可用；不同 `run_id` 互不阻塞。锁由内核持有，进程崩溃或被 kill 后自动释放，没有需要手工清理的陈旧锁；锁文件位于 `<data_dir>/cache/workflow-locks/`，以 `run_id` 的摘要命名，释放时删除。加不了锁（锁目录不可用、数据目录所在的文件系统不支持文件锁）时返回 `LOCAL_IO_ERROR` 并拒绝执行，不会退化成无锁执行；`--status` 此时仍可用。Python API 的 `WorkflowRunner.run()` 在同样情况下抛出 `WORKFLOW_BUSY` 的 `WorkflowActionError`。请求预算租约与执行权共用 `services.file_lock` 里的同一套平台加锁原语。
+- 输出路径前置检查覆盖全部祖先目录（Issue #1015）：`export` / `chat --export` 的 `-o` 若形如 `blocker/nested/report.csv`，且 `blocker` 是普通文件，此前仅检查紧邻父目录，会漏检并先请求平台，沟通导出还会写入会话快照。现在向上检查至已有目录，遇到被文件或悬空符号链接占用的任意一级父路径即返回 `LOCAL_IO_ERROR`；有效目录链接与可创建的缺失目录继续允许，检查本身不创建目录或文件。
+- 命令组兜底的本地 IO 错误补上可执行指引（Issue #1013）：没有 `@handle_auth_errors` 的本地命令（`stats` / `cities` / `config set` 等）写文件失败时由 `BossCliGroup` 的 `except OSError` 统一出 `LOCAL_IO_ERROR`，但信封的 `hints` 一直是 `null`——`recovery_action` 里的「确认目标路径是可写目录、磁盘空间正常」只是自然语言，Agent 读到的是空动作列表。现在 `LOCAL_IO_ERROR` 补 `hints.operator_actions`，`NETWORK_ERROR` 保持不补（「检查磁盘」对网络异常是误导）。
+- `export` / `chat --export` 的 `-o` 参数错误在第一次平台请求之前暴露（Issue #1011）：此前 `-o` 指向目录时，`export --count 40` 会先翻 5 页平台数据、`chat --export` 会先取完整沟通列表并写 JSON 快照，之后才由 `prepare_output_path` 报一个与真正原因无关的信封——既消耗请求预算，也可能触发风控，而该做的只是换个文件名。现在新增 `services.output_path.inspect_output_path`（无副作用，不建目录）与 `commands/_output_path.validate_output_path_or_emit`，两条命令在调用平台之前完成校验：目标是目录或非普通文件 → `INVALID_PARAM`，父路径不是目录 → `LOCAL_IO_ERROR`。
+- `resume export` 的失败信封按原因分流，不再一律指向浏览器内核（Issue #1009）：该命令没有统一异常装饰器，导出的三层失败此前都归成 `EXPORT_FAILED` +「检查 patchright 安装」。但 `--format html` / `json` 只用本地模板与文件写入、完全不碰 patchright：`-o` 指向目录或父目录不可写时，用户被告知去装浏览器内核，与真正该做的「换个路径」无关；PDF 导出命中内核缺失时又把整段 patchright 安装横幅和本机绝对路径塞进 `error.message`。现在内核缺失返回 `BROWSER_KERNEL_MISSING`（确定性失败，`next_actions` 附带本次数据目录的 `doctor`，异常文本只留首行进 `details.cause`），本地文件读写失败返回 `LOCAL_IO_ERROR`（不可自动重试，附可执行路径建议），其余渲染错误保持 `EXPORT_FAILED`；`prepare_output_path` 建父目录的失败也纳入同一出口，不再落进顶层网兜被报成「resume 本地文件读写失败」。
+- 非登录命令不再把浏览器内核缺失报成可重试的 `NETWORK_ERROR`（Issue #1007）：patchright 升级后所需修订版 Chromium 未安装时，`sync_playwright().start()` / `chromium.launch()` 抛 `Executable doesn't exist` 或 `Playwright was just installed`，命令装饰器、`me` 的兜底与 wizard runner 此前都把它归成 `NETWORK_ERROR` +「重试 / 重试当前 run_id」。这是确定性失败，重试（含 `--resume` 与 runner 自动重试）永远复现，且每次都白起一个浏览器进程。登录链路早已识别该错误，现在识别逻辑收敛到 `services/browser_runtime.is_browser_kernel_missing` 供四处共用；`search` / `detail` / `greet` / `chat` 等装饰器命令、`me` 与 wizard 统一返回 `BROWSER_KERNEL_MISSING`，恢复动作为 `patchright install chromium`，`next_actions` 附带本次数据目录的 `doctor`，异常文本只保留首行进 `error.details.cause`。
+
+## [3.4.3] - 2026-11-14
+
+### Fixed
+- `boss_wizard.action` 的非法取值不再静默新建运行（Issue #1002）：映射层原先把 `resume` / `status` / `stop` 之外的一切（`resum`、`STOP`、空串）都送进 `run` 分支，调用方以为恢复或停止已生效，实际却新建了一次 workflow 并丢弃 `run_id`。现在进入 CLI 前返回 `INVALID_PARAM` 并列出合法取值；缺省或 `null` 仍落回默认 `run`。新增覆盖全部工具枚举参数的守卫，禁止非法值被静默替换。
+- 创建失败且同时被取消时，MCP 恢复指引改为指向安装 / `--boss-bin`（Issue #1000）：此前该分支沿用写操作中断文案，让 Agent 去核对并不存在的平台 checkpoint。子进程从未运行，现在与同步启动失败路径一致，保留 `WORKFLOW_STOPPED` 错误码与 `outcome_unknown=false`。
+- MCP 在创建子进程期间被取消时不再丢失恢复标识（Issue #998）：该分支会回收底层 CLI，却丢弃其 stdout，`error.details` 缺少 `checkpoint_result`，与运行期间取消和超时路径不一致。现在两条中断路径共用同一信封构造逻辑，子进程输出的 checkpoint / `run_id` 在 `error.details.checkpoint_result` 保留；写工具仍标结果未知，只读工具可直接重调。
+- 离线评估改为验证当前的平台风控停止契约（Issue #996）：过时场景曾将已取消的模式级 `COMPLIANCE_BLOCKED` 当作通过条件。现在用当前 `ACCOUNT_RISK` 信封验证不可自动恢复、单次模拟搜索后停止及恢复指引；评分器拒绝额外工具调用和未在信封中确认的风险码，回归覆盖账号与环境风险，双语评估说明同步。
+- 发布后 PyPI 安装验收定向刷新目标包索引（Issue #994）：新虚拟环境仍会复用 uv 的旧索引缓存，刚发布的版本此前可能被误报为不存在，导致验收假失败。`verify_release.py --pypi-version` 现在为目标包指定 `--refresh-package boss-agent-cli`，依赖包继续复用缓存；本地 wheel 验收保持原语义。
+
+## [3.4.2] - 2026-11-13
+
+### Fixed
+- 浏览器通道的非 JSON 写响应不再引导或触发重复写入（Issue #990）：此前这类响应被归为 `UNKNOWN`，单次 `greet` / `apply` 提示重试，`batch-greet` 与 wizard 会自动重发；招聘者交换动作抛错后也可能在下一轮自动化中重发。现在写请求返回 `ACTION_UNCONFIRMED` 与 `replay_safe: false`，未识别的写响应同样禁止自动重试，批量与 wizard 就地停止，恢复时不重跑该写步骤；读取仍允许按通道规则重试。单次命令、批量与 wizard 的求职者恢复指引分别通过同一数据目录的 `chat` 与 `me --section deliver` 核对招呼和投递；招聘者按会话或职位状态核对。副作用声明未知的招聘者简历端点也不再重放未识别的结果；交换动作抛错明确标记结果未确认，提示先核实。
+
+- 结果未知的写操作信封统一声明 `replay_safe`（Issue #988）：`hr greet` 的 `GREET_RESULT_UNKNOWN`、`hr location` 的 `LOCATION_RESULT_UNKNOWN`、`hr accept-resume` 的 `RESUME_ACCEPT_RESULT_UNKNOWN` 以及 `apply` / `greet` / `hr location` 的 `LOCAL_STATE_WRITE_FAILED` 表示写操作可能已生效，但 `error.details` 原先只有 `sent: null` / `accepted: null`，没有快速入门文档承诺的 `replay_safe`；Agent 读不到判定，只能凭错误码文案猜，与本仓库「未知结果禁止自动重试」的契约脱节（wizard 路径一直正确携带）。现在错误码登记表为这些码声明 `replay_safe: false`，`output.envelope_error` 按登记表补齐；前三个「结果未确认」码同时声明并补 `outcome_unknown: true`，`LOCAL_STATE_WRITE_FAILED` 的平台结果已确认、只补 `replay_safe`。调用方给出的更精确值优先。新增守卫：文案承诺「禁止自动重发 / 重试」的码必须声明该字段。
+
+- 子命令选择错误的下一步提示改为帮助命令（Issue #986）：`boss resume`、`boss resume bogus` 等缺少或写错子命令的调用，此前直接返回裸子命令，`resume clone` 会再次缺参，`resume init` 则会直接创建默认简历。现在两类错误都返回各子命令的 `--help`，供 Agent 读取用法后选择动作；回归逐组重放提示并拦截业务回调，覆盖嵌套组及两类错误。
+
+- 批量招呼对结果未知的发送自动重发，并以 `ok:true` 回报（Issue #984）：`batch-greet` 把所有非风控异常统一「sleep 后重试一次」，包括 `ACTION_UNCONFIRMED`——该码表示请求已发出但响应中断（平台层 `__cli_error_details__` 明确 `replay_safe: false`、`outcome: unknown`）。第一次结果未知时再发一次招呼，就是在不知道是否已送达的情况下重复写操作；两次都未知后还输出 `ok:true` + `failed[0].error` 字符串，Agent 无从知道「这条可能已经发出」。现在 `ACTION_UNCONFIRMED`（响应字典与异常两种形态）与风控、预算停止同级：立即停批、不 sleep、不重试，返回 `ok:false`，`error.details` 带 `outcome_unknown: true` / `replay_safe: false` 与该未知项的完整详情，已成功项仍随 `details.greeted` 带回。普通网络错误（请求未发出）的一次重试语义不变。
+
+- MCP 工具对枚举参数保留显式空串，CLI 的取值诊断不再被静默吞掉（Issue #982）：`mcp_args._build_args` 对 `sort` / `detail_status` / `from_who` / `format` / `section` / `tone` / `lang` / `type` 用真值判断，调用方传 `{"format": ""}`（模板渲染失败、拼写留空、编排器把缺失值序列化成空串）时被当成「没传」：`boss_stats(format="")` 静默按默认 `json` 执行、`boss_search(sort="")` 静默按默认相关性排序，信封仍是 `ok:true`，Agent 没有信号。现在这些枚举参数的空串原样下发，CLI 返回 `INVALID_PARAM` + 可选值列表；`null` 与缺键仍等价于未传（与 #958 的 `query` / `url` 一致），自由文本参数（`city` / `note` / `tone` 之外的 `context` 等）语义不变。新增结构门禁：schema 里声明 enum 的字符串参数必须登记在 `_ENUM_KEYS`，新增枚举参数漏登记时测试失败。
+
+- 浏览器来源耗尽信封的恢复命令保留数据目录与平台（Issue #980）：`api/browser_source.py` 的 `POLICIES` 是 `BrowserSourceUnavailable` 信封的文案真源，其中内嵌的 `boss doctor`、`boss status --live` 与 `httpx-only` 指引里的 `boss clean --risk-lock` / `boss login --cdp` 都是裸命令。自定义 `--data-dir` 下 `doctor` 诊断的是默认目录的登录态、缓存与风险锁，`clean --risk-lock` 走错目录还会静默返回 `local_lock_removed: false`（同 #978）。现在 `display.handle_auth_errors` 与 `wizard/runner.py` 在拿到运行上下文时把策略文案里的命令改写成带平台与按 shell 参数转义的绝对目录的形式（`browser_policy_text` / `browser_policy_text_for_ctx`）；策略表本身保持无上下文的通用文案。新增结构门禁：策略文案里出现的 `boss <cmd>` 字面量必须登记在 `display._BROWSER_POLICY_COMMANDS`，新增来源漏登记会在测试现形。
+
+- 风控停止契约的恢复命令保留数据目录与平台（Issue #978）：`display.RISK_ERROR_CONTRACTS` 是所有风控信封（`ACCOUNT_RISK` / `ENVIRONMENT_RISK` / `ENVIRONMENT_RISK_LOCKED`）的唯一真源，其中 `recovery_action` 与 `hints.next_actions` 嵌的 `boss clean --risk-lock` / `boss doctor` 是裸命令。风险锁写在 `<data_dir>/.cdp_risk_lock`：使用自定义 `--data-dir` 时，照抄提示的 Agent / 用户会在默认目录执行 `clean --risk-lock`，命令回 `ok` 且 `local_lock_removed: false` 不报错，原目录的锁原样保留，随后每次重试都撞同一个锁；`doctor` 诊断的也是另一份目录。现在 `risk_error_contract` / `platform_error_contract` 接受触发错误的数据目录（命令层传 `ctx`，wizard 传 `ActionContext`，无上下文的纯函数调用保持登记表通用示例），`doctor` 的 `cdp_risk_lock` 检查项与解锁指引同样定位本次诊断目录；风险判定、锁存语义与「必须由用户确认后显式解锁」的硬边界不变，静态 `boss schema` 仍展示通用示例。
+
+- 向导动作层的恢复命令保留数据目录与平台（Issue #976）：`wizard/actions.py` 里 AI 未配置时的 `boss ai config ...`、AI API 报错时 `recovery_action_for` 生成的 `ai config` 建议、watch 参数损坏时的 `boss watch remove` / `boss watch add` 重建命令、不支持的 `hook_profile` 指引与 `boss config reset crawl` 都是裸命令。wizard 的 headless / MCP 调用可带 `--data-dir`：照抄提示会把新 AI 密钥、配置重置、watch 删除重建或 crawl 重建落到默认目录，原目录的问题原样保留（与 #913 / #919 等命令层迁移同一接缝，动作层此前漏迁）。现在这些命令统一经本地 `_hint_command` 包装携带按 shell 参数转义的绝对目录与平台；`_crawl_outcome_result` 的兜底恢复命令同样保留 `CrawlOutcome.data_dir`。
+
 ## [3.4.1] - 2026-11-13
 
 ### Fixed

@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from pathlib import Path
 from types import TracebackType
 from typing import Any
 
 from boss_agent_cli.cache.store import CacheRecordInvalid, CacheStore
+from boss_agent_cli.services.file_lock import exclusive_file_lock, run_lock_path
 from boss_agent_cli.wizard.models import WorkflowPlan
 
 
 class WorkflowStore:
 	def __init__(self, data_dir: Path) -> None:
 		self._cache = CacheStore(data_dir / "cache" / "boss_agent.db")
+		self._lock_dir = data_dir / "cache" / "workflow-locks"
 		self._corrupt_run_ids: list[str] = []
+
+	def execution_lock(self, run_id: str) -> AbstractContextManager[bool]:
+		"""同一 run 的执行权：跨进程独占、不等待，进程退出时由操作系统释放。
+
+		只约束「执行步骤」。状态查询与 stop 请求不取这把锁，执行期间照常可用；
+		不同 run 各用各的锁文件，互不阻塞。文件名取 run_id 的摘要，调用方传入
+		的任意字符串都不会变成路径的一部分。
+		"""
+		return exclusive_file_lock(run_lock_path(self._lock_dir, run_id))
 
 	def create(self, run_id: str, plan: WorkflowPlan) -> None:
 		self._cache.create_workflow_run(
@@ -73,6 +85,10 @@ class WorkflowStore:
 
 	def update_step(self, run_id: str, step_name: str, **kwargs: Any) -> bool:
 		return self._cache.update_workflow_step(run_id, step_name, **kwargs)
+
+	def set_step_error(self, run_id: str, step_name: str, error: dict[str, Any] | None) -> bool:
+		"""只改步骤的 error：状态、结果（含内部任务绑定）与时间戳保持原样。"""
+		return self._cache.set_workflow_step_error(run_id, step_name, error)
 
 	def request_stop(self, run_id: str) -> bool:
 		run = self.get(run_id)

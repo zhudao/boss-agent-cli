@@ -340,6 +340,30 @@ async def _stop_cli_process(
 			return b"", b""
 
 
+def _interrupted_failure(
+	args: tuple[str, ...],
+	code: str,
+	stdout: bytes,
+	*,
+	may_write: bool,
+) -> dict[str, Any]:
+	# A child envelope can carry the committed checkpoint/run id. Killing a child
+	# never proves an action had no effect; both the spawn-time cancel path and the
+	# running-child path must surface that envelope (Issue #998).
+	try:
+		checkpoint_result = json.loads(stdout)
+	except (json.JSONDecodeError, UnicodeDecodeError):
+		checkpoint_result = None
+	return _cli_failure(
+		args,
+		code,
+		"MCP 调用已取消" if code == "WORKFLOW_STOPPED" else "底层 CLI 超时",
+		outcome_unknown=may_write,
+		recovery_action=_WRITE_INTERRUPT_RECOVERY if may_write else _READ_INTERRUPT_RECOVERY,
+		checkpoint_result=checkpoint_result if isinstance(checkpoint_result, dict) else None,
+	)
+
+
 async def _run_boss_async(*args: str, may_write: bool = True) -> dict[str, Any]:
 	if args and args[0] == "wizard" and not any(flag in args for flag in ("--timeout", "--status", "--stop")):
 		args = (*args, "--timeout", str(_CLI_TIMEOUT_SECONDS))
@@ -359,37 +383,27 @@ async def _run_boss_async(*args: str, may_write: bool = True) -> dict[str, Any]:
 	except asyncio.CancelledError:
 		try:
 			process = await asyncio.shield(spawn)
-		except OSError:
-			return _cli_failure(args, "WORKFLOW_STOPPED", "MCP 调用已取消", outcome_unknown=False)
+		except OSError as exc:
+			# The child never ran, so the interrupted call left no platform effect.
+			# Point at installation/path, not at a checkpoint that cannot exist
+			# (Issue #1000).
+			return _cli_failure(
+				args,
+				"WORKFLOW_STOPPED",
+				f"无法启动底层 boss CLI：{exc}",
+				outcome_unknown=False,
+				recovery_action=_SPAWN_FAILURE_RECOVERY,
+			)
 		output = asyncio.create_task(process.communicate())
-		await asyncio.shield(_stop_cli_process(process, output))
-		return _cli_failure(
-			args,
-			"WORKFLOW_STOPPED",
-			"MCP 调用已取消",
-			outcome_unknown=may_write,
-			recovery_action=_WRITE_INTERRUPT_RECOVERY if may_write else _READ_INTERRUPT_RECOVERY,
-		)
+		stdout, _ = await asyncio.shield(_stop_cli_process(process, output))
+		return _interrupted_failure(args, "WORKFLOW_STOPPED", stdout, may_write=may_write)
 	output = asyncio.create_task(process.communicate())
 	try:
 		stdout, stderr = await asyncio.wait_for(asyncio.shield(output), _cli_timeout(args))
 	except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
 		stdout, _ = await asyncio.shield(_stop_cli_process(process, output))
 		code = "WORKFLOW_STOPPED" if isinstance(exc, asyncio.CancelledError) else "WORKFLOW_TIMEOUT"
-		# A child envelope can carry the committed checkpoint/run id. Preserve it
-		# inside the failure; killing a child never proves an action had no effect.
-		try:
-			checkpoint_result = json.loads(stdout)
-		except (json.JSONDecodeError, UnicodeDecodeError):
-			checkpoint_result = None
-		return _cli_failure(
-			args,
-			code,
-			"MCP 调用已取消" if code == "WORKFLOW_STOPPED" else "底层 CLI 超时",
-			outcome_unknown=may_write,
-			recovery_action=_WRITE_INTERRUPT_RECOVERY if may_write else _READ_INTERRUPT_RECOVERY,
-			checkpoint_result=checkpoint_result if isinstance(checkpoint_result, dict) else None,
-		)
+		return _interrupted_failure(args, code, stdout, may_write=may_write)
 	return _parse_cli_output(
 		args,
 		stdout.decode("utf-8", errors="replace"),
@@ -503,6 +517,9 @@ async def call_tool(ctx: Any, params: CallToolRequestParams) -> CallToolResult:
 		# CLI 的错误信封返回，至少带上 INVALID_PARAM、缺失参数名与恢复指引。
 		missing = str(exc.args[0]) if exc.args else "参数"
 		return _tool_argument_error(params.name, f"缺少必填参数：{missing}")
+	except ValueError as exc:
+		# 映射层自己拒绝的非法枚举值（Issue #1002）：不能落进默认分支。
+		return _tool_argument_error(params.name, f"参数取值非法：{exc}")
 	result = await _run_boss_async(*args, may_write=_tool_may_write(params.name, arguments))
 	# 信封的 ok 是唯一真源，但 MCP 客户端还需要 is_error 才能把失败标成工具错误；
 	# 两者不一致时，ok:false 会被当成一次成功的工具调用。

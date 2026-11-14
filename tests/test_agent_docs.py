@@ -92,6 +92,18 @@ def test_agent_quickstart_exists_and_has_core_sections():
 	assert "[Capability Matrix](capability-matrix.md)" in content
 
 
+def test_agent_quickstart_documents_both_busy_contracts():
+	"""两个并发互斥错误码要在两份快速上手里同时出现（Issue #1033）。
+
+	3.4.4 新增 `CRAWL_BUSY` 后，Agent 的错误码清单只写了同类的 `WORKFLOW_BUSY`；
+	只补一侧或只补一个码，都会让 Agent 在并发恢复被拒时找不到处理说明。
+	"""
+	for name in ("docs/agent-quickstart.md", "docs/agent-quickstart.en.md"):
+		content = _read(name)
+		assert "`WORKFLOW_BUSY`" in content, name
+		assert "`CRAWL_BUSY`" in content, name
+
+
 def test_capability_matrix_exists_and_covers_core_capabilities():
 	path = ROOT / "docs/capability-matrix.md"
 	assert path.exists(), "docs/capability-matrix.md should exist"
@@ -344,12 +356,26 @@ def test_readme_links_offline_evals():
 
 
 def test_evals_readme_documents_scenario_criteria():
-	"""评测说明要有「场景 → 通过信号 → 失败信号」表，失败时能直接定位原因。"""
-	content = _read("evals/README.md")
-	assert "## Scenario Criteria" in content
-	for scenario in ("福利筛选", "详情+候选池", "合规边界", "错误恢复"):
-		assert scenario in content
-	assert "| Scenario | Pass signal (with-MCP) | Failure signals |" in content
+	"""双语说明都要有「场景 → 通过信号 → 失败信号」表，且场景反映当前运行契约。"""
+	for path, heading, scenarios, table in (
+		(
+			"evals/README.md",
+			"## 场景判据",
+			("福利筛选", "详情与候选池", "平台风控停止", "认证恢复"),
+			"| 场景 | 通过信号 | 失败信号 |",
+		),
+		(
+			"evals/README.en.md",
+			"## Scenario Criteria",
+			("Welfare filtering", "Detail + shortlist", "Platform risk stop", "Auth recovery"),
+			"| Scenario | Pass signal | Failure signals |",
+		),
+	):
+		content = _read(path)
+		assert heading in content
+		for scenario in scenarios:
+			assert scenario in content
+		assert table in content
 
 
 def test_english_agent_docs_exist_and_are_linked_from_english_entrypoints():

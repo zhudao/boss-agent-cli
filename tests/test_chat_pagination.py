@@ -12,6 +12,7 @@
 
 import json
 import shlex
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -20,6 +21,8 @@ from click.testing import CliRunner
 from boss_agent_cli.display import error_contract_for_code
 from boss_agent_cli.main import cli
 from boss_agent_cli.services.pagination import UNKNOWN_HAS_MORE_OPERATOR_ACTION
+
+_DEFAULT_DATA_DIR = str((Path.home() / ".boss-agent").resolve())
 
 CHAT_COMMANDS = [
 	pytest.param("boss_agent_cli.commands.chatmsg", "chatmsg", id="chatmsg"),
@@ -234,5 +237,77 @@ def test_chat_failure_has_no_pagination(module, name, code, recoverable):
 	assert parsed["pagination"] is None
 	assert parsed["error"]["code"] == code
 	assert parsed["error"]["recoverable"] is recoverable
-	assert parsed["error"]["recovery_action"] == error_contract_for_code(code)[1]
+	if code in {"ACCOUNT_RISK", "ENVIRONMENT_RISK", "ENVIRONMENT_RISK_LOCKED"}:
+		# 风控解锁命令定位本次运行的数据目录，而不是默认目录（Issue #978）。
+		assert error_contract_for_code(code)[1].replace(
+			"boss clean --risk-lock", f"boss --data-dir {_DEFAULT_DATA_DIR} clean --risk-lock"
+		).replace(
+			"boss doctor", f"boss --data-dir {_DEFAULT_DATA_DIR} doctor"
+		) == parsed["error"]["recovery_action"]
+	else:
+		assert parsed["error"]["recovery_action"] == error_contract_for_code(code)[1]
 	client.chat_history.assert_called_once_with("10001", "sid_current", page=1, count=20)
+
+
+# ── -o 参数错误在平台请求之前暴露 ─────────────────────────────────────
+
+
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_export_invalid_output_path_makes_no_platform_request(mock_auth_cls, mock_client_cls, tmp_path: Path):
+	"""chat --export 的 `-o` 指向目录时应先报参数错误，不请求沟通列表。
+
+	此前要等拿到整份列表、写好 JSON 快照之后才由 ``prepare_output_path`` 抛出，
+	既白打一次平台、又留下一份与本次导出无关的快照。
+	"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.friend_list.return_value = _friend_list_response([_friend_item()])
+
+	result = CliRunner().invoke(
+		cli,
+		["--data-dir", str(tmp_path), "--json", "chat", "--export", "md", "-o", str(tmp_path)],
+	)
+
+	assert result.exit_code == 1, result.output
+	payload = json.loads(result.output)
+	assert payload["error"]["code"] == "INVALID_PARAM"
+	assert payload["error"]["recoverable"] is False
+	assert mock_client.friend_list.call_count == 0
+
+
+@pytest.mark.parametrize("suffix", ["chat.md", "nested/chat.md", "nested/deeper/chat.md"])
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_export_blocked_ancestor_stops_before_request_and_snapshot(mock_auth_cls, mock_client_cls, tmp_path: Path, suffix: str):
+	"""输出路径的祖先是文件时，不请求平台也不保存会话快照。"""
+	blocker = tmp_path / "blocker"
+	blocker.write_text("not a directory", encoding="utf-8")
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.friend_list.return_value = _friend_list_response([_friend_item()])
+
+	result = CliRunner().invoke(cli, [
+		"--data-dir", str(tmp_path), "--json", "chat", "--export", "md",
+		"-o", str(blocker / suffix),
+	])
+
+	assert result.exit_code == 1, result.output
+	payload = json.loads(result.stdout)
+	assert payload["error"]["code"] == "LOCAL_IO_ERROR"
+	assert payload["error"]["recoverable"] is False
+	mock_client_cls.assert_not_called()
+	mock_client.friend_list.assert_not_called()
+	assert not (tmp_path / "chat-history").exists()
+
+
+@patch("boss_agent_cli.commands.chat.get_platform_instance")
+@patch("boss_agent_cli.commands.chat.AuthManager")
+def test_chat_without_export_ignores_output_path_check(mock_auth_cls, mock_client_cls, tmp_path: Path):
+	"""没传 --export 时 `-o` 不生效，不能因此拒绝一次普通查看。"""
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.friend_list.return_value = _friend_list_response([_friend_item()])
+
+	result = CliRunner().invoke(
+		cli, ["--data-dir", str(tmp_path), "--json", "chat", "-o", str(tmp_path)]
+	)
+
+	assert result.exit_code == 0, result.output

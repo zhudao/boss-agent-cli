@@ -34,7 +34,7 @@ from boss_agent_cli.wizard.renderer import (
 	render_run,
 	wizard_screen,
 )
-from boss_agent_cli.wizard.runner import WorkflowActionError, WorkflowRunner
+from boss_agent_cli.wizard.runner import WorkflowActionError, WorkflowRunner, has_blocked_step
 from boss_agent_cli.wizard.store import WorkflowStore
 
 
@@ -129,12 +129,42 @@ def _workflow_next_actions(ctx: click.Context, run: Mapping[str, Any]) -> list[s
 			)
 		actions.append(status_cmd)
 		return actions
+	if status == "failed":
+		busy_hints = _busy_hints(ctx, run.get("error") or {})
+		if busy_hints is not None:
+			return busy_hints["next_actions"]
+	if status == "failed" and has_blocked_step(run):
+		# 失败步骤的结果无法重放（replay_safe=false）：--resume 只会原样返回同一个失败，
+		# 照做的 Agent 会把它读成「再试一次」而空转。先看 --status 里该步骤的核对命令，
+		# 确认平台实际状态后再决定；与 TTY「恢复已有任务」列表的筛选口径一致（Issue #1021）。
+		return [status_cmd, prefix]
 	if status in {"failed", "waiting_input"}:
 		# 断点仍在本地：恢复是唯一能接着往下跑的动作，status 方便先核对。
 		return [f"{prefix} --resume {shell_argument(run_id)}", status_cmd]
 	if status in {"running", "pending"}:
 		return [status_cmd, f"{prefix} --stop {shell_argument(run_id)}"]
 	return [prefix, status_cmd]
+
+
+def _busy_hints(ctx: click.Context, error: Mapping[str, Any]) -> dict[str, list[str]] | None:
+	"""workflow 或其内部采集正由另一次调用执行时，只建议查看对应任务的状态。
+
+	不给 ``--resume``（照做只会再撞一次）也不给 ``--stop``（照做会打断一次正常
+	的执行）；要不要停由查到状态之后的调用方决定。
+	"""
+	details = error.get("details")
+	if not isinstance(details, Mapping):
+		return None
+	run_id = details.get("run_id")
+	if not run_id:
+		return None
+	if error.get("code") == "WORKFLOW_BUSY":
+		status_cmd = boss_command_for_ctx(ctx, f"wizard --status {shell_argument(str(run_id))}", include_data_dir=True)
+	elif error.get("code") == "CRAWL_BUSY":
+		status_cmd = boss_command_for_ctx(ctx, f"crawl status {shell_argument(str(run_id))}", include_data_dir=True)
+	else:
+		return None
+	return {"next_actions": [status_cmd]}
 
 
 def _plan_from_run(run: Mapping[str, Any]) -> WorkflowPlan:
@@ -785,6 +815,8 @@ def _run_wizard_command(
 				message=str(exc),
 				recoverable=exc.recoverable,
 				recovery_action=exc.recovery_action,
+				details=exc.details,
+				hints=_busy_hints(ctx, exc.to_dict()),
 			)
 			return
 
@@ -801,6 +833,7 @@ def _run_wizard_command(
 			recoverable=bool(error.get("recoverable")),
 			recovery_action=error.get("recovery_action"),
 			details={"run": run},
+			hints=_busy_hints(ctx, error),
 		)
 		return
 	handle_output(

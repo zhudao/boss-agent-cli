@@ -9,6 +9,7 @@ from boss_agent_cli.display import (
 	risk_error_contract,
 	risk_error_message,
 )
+from boss_agent_cli.services.browser_runtime import is_browser_kernel_missing
 
 
 def classify_login_error(exc: Exception, ctx: click.Context) -> dict[str, object]:
@@ -48,7 +49,7 @@ def classify_login_error(exc: Exception, ctx: click.Context) -> dict[str, object
 
 	if isinstance(exc, PlatformRiskError):
 		# 复用登录态的只读探测命中风控：与其他命令共用同一份终止契约，不建议重试登录。
-		recovery, hints = risk_error_contract(exc.code)
+		recovery, hints = risk_error_contract(exc.code, ctx=ctx)
 		return {
 			"code": exc.code,
 			# 风控信封不透传平台响应文本（可能带临时凭据），只给登记表文案。
@@ -80,7 +81,7 @@ def classify_login_error(exc: Exception, ctx: click.Context) -> dict[str, object
 			],
 		)
 
-	if "executable doesn't exist" in message or "playwright was just installed" in message:
+	if is_browser_kernel_missing(message):
 		return payload(
 			"BROWSER_KERNEL_MISSING",
 			f"patchright 浏览器内核缺失或与所需修订版不匹配: {raw_message}",

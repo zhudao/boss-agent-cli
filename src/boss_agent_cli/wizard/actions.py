@@ -21,6 +21,7 @@ from boss_agent_cli.services.output_path import prepare_output_path
 from boss_agent_cli.crawler.operations import crawl_status
 from boss_agent_cli.crawler.service import (
 	CrawlBudget,
+	CrawlBusyError,
 	CrawlService,
 	CrawlSettings,
 	crawl_cdp_port,
@@ -41,6 +42,16 @@ from boss_agent_cli.wizard.models import StepResult, WorkflowInputError, Workflo
 from boss_agent_cli.wizard.runner import Action, WorkflowActionError, WorkflowControl
 
 PlatformFactory = Callable[[str, AuthManager, tuple[float, float], str | None, str | None], Any]
+
+
+def _hint_command(context: ActionContext, command: str) -> str:
+	"""动作层恢复命令必须定位触发它的数据目录与平台。
+
+	wizard 的 headless / MCP 调用可以带 ``--data-dir``：恢复指引写成裸 ``boss ...``
+	时，Agent 照抄会把新 AI 密钥、``config reset``、watch 删除重建或 crawl 重建
+	落到默认目录，原目录的问题原样保留（与 #913 / #919 的命令层迁移同一接缝）。
+	"""
+	return boss_command(command, platform_name=context.platform, data_dir=context.data_dir)
 
 
 @dataclass(frozen=True)
@@ -84,6 +95,20 @@ class ActionContext:
 			cdp_url=self.cdp_url,
 			browser_source=self.browser_source,
 		)
+
+
+def _risk_commands(context: "ActionContext | None") -> dict[str, str]:
+	"""风控契约里的解锁 / 诊断命令：指向触发本次 workflow 的目录与平台。
+
+	风险锁写在 ``<data_dir>/.cdp_risk_lock``；裸 ``boss clean --risk-lock``
+	会让 Agent 去默认目录解锁，命令不报错但原锁仍在（Issue #978）。
+	"""
+	if context is None:
+		return {}
+	return {
+		"clean_command": _hint_command(context, "clean --risk-lock"),
+		"doctor_command": _hint_command(context, "doctor"),
+	}
 
 
 def execute_candidate_search(
@@ -312,14 +337,32 @@ def _required_int(inputs: Mapping[str, Any], name: str, *, minimum: int = 0) -> 
 	return _check_minimum(_coerce_int(raw, name), raw, name, minimum)
 
 
-def _classify_action_error(code: str, message: str) -> tuple[str, bool, str]:
-	"""Map platform error codes into wizard-facing code/recoverable/recovery."""
+def _classify_action_error(
+	code: str,
+	message: str,
+	*,
+	clean_command: str | None = None,
+	doctor_command: str | None = None,
+	write: bool = False,
+) -> tuple[str, bool, str]:
+	"""Map platform error codes into wizard-facing code/recoverable/recovery.
+
+	``clean_command`` / ``doctor_command`` 指向本次 workflow 的数据目录：
+	风险锁写在 ``<data_dir>`` 下，裸命令会让 Agent 去默认目录空转（Issue #978）。
+
+	``write`` 标记产生该响应的平台调用是写操作。写请求拿到未识别的响应时不能
+	沿用「当作网络抖动、稍后重试」的兜底：响应无法证明动作没有生效，重试就是
+	重放写操作（Issue #990）。
+	"""
 	text = message or ""
 	if code == "UNKNOWN":
 		if any(token in text for token in ("缺少必要参数", "参数错误", "非法参数", "invalid param")):
 			code = "INVALID_PARAM"
-		else:
+		elif not write:
 			code = "NETWORK_ERROR"
+	if code == "UNKNOWN":
+		# 写操作的未识别响应：沿用登记表的「先核对、勿自动重试」契约。
+		return code, False, str(ERROR_CODES[code]["recovery_action"])
 	if code == "ACTION_UNCONFIRMED":
 		# 写操作可能已生效：沿用登记表的「先核实、勿重试」契约，不落到「稍后重试」兜底。
 		return code, False, str(ERROR_CODES[code]["recovery_action"])
@@ -330,7 +373,7 @@ def _classify_action_error(code: str, message: str) -> tuple[str, bool, str]:
 		return code, True, str(ERROR_CODES[code]["recovery_action"])
 	if code in RISK_ERROR_CONTRACTS:
 		# 风控码：与单次命令路径共用同一份 recovery_action，绝不落到「稍后重试」兜底。
-		recovery, _ = risk_error_contract(code)
+		recovery, _ = risk_error_contract(code, clean_command=clean_command, doctor_command=doctor_command)
 		return code, False, recovery
 	recoverable = code in {
 		"AUTH_REQUIRED",
@@ -352,24 +395,79 @@ def _classify_action_error(code: str, message: str) -> tuple[str, bool, str]:
 	return code, recoverable, recovery
 
 
-def _unwrap(platform: Any, response: dict[str, Any], fallback: str) -> Any:
+def _unwrap(
+	platform: Any,
+	response: dict[str, Any],
+	fallback: str,
+	*,
+	context: ActionContext | None = None,
+	write: bool = False,
+	check_command: str | None = None,
+) -> Any:
+	"""解包平台响应；失败时转成 ``WorkflowActionError``。
+
+	``write`` 标记本次调用是写操作：未识别的响应（``UNKNOWN``）无法证明动作
+	没有生效，必须按「先核对、勿自动重试」处理，且 ``replay_safe=False`` 让
+	runner 的自动重试与 ``--resume`` 都不再重跑该步骤（Issue #990）。
+	"""
 	if platform.is_success(response):
 		return platform.unwrap_data(response) or {}
 	code, message = platform.parse_error(response)
 	text = message or fallback
-	code, recoverable, recovery = _classify_action_error(code, text)
+	risk_commands = _risk_commands(context)
+	code, recoverable, recovery = _classify_action_error(
+		code,
+		text,
+		clean_command=risk_commands.get("clean_command"),
+		doctor_command=risk_commands.get("doctor_command"),
+		write=write,
+	)
 	if code in RISK_ERROR_CONTRACTS:
 		# 风控响应原文可能带临时凭据，不进 workflow 结果；停止指引由 recovery_action 承载。
 		text = risk_error_message(code)
 	details = response.get("__cli_error_details__") if isinstance(response, dict) else None
+	# 写操作的结果未知一律禁止重放：ACTION_UNCONFIRMED 明确结果未知，UNKNOWN 则
+	# 无法证明动作没有发生（读取的 UNKNOWN 会先被映射成可重试的 NETWORK_ERROR）。
+	replay_safe = not (code == "ACTION_UNCONFIRMED" or (code == "UNKNOWN" and write))
+	if not replay_safe and context is not None:
+		recovery = _unconfirmed_write_recovery(context, check_command)
 	raise WorkflowActionError(
 		code,
 		text,
 		recoverable=recoverable,
 		recovery_action=recovery,
 		details=details if isinstance(details, dict) and details else None,
-		replay_safe=code != "ACTION_UNCONFIRMED",
+		replay_safe=replay_safe,
 	)
+
+
+def _unconfirmed_write_recovery(context: ActionContext, check_command: str | None) -> str:
+	"""写操作结果未知时的核对指引：沿用当前角色和数据目录；求职者不能被引到招聘者会话。"""
+	command = check_command or ("hr chat" if context.role == "recruiter" else "chat")
+	return f"操作可能已生效：先用 {_hint_command(context, command)} 核对平台记录，不要自动重试"
+
+
+def _write_call(
+	context: ActionContext,
+	platform: Any,
+	call: Callable[[], dict[str, Any]],
+	fallback: str,
+	*,
+	check_command: str | None = None,
+) -> Any:
+	"""发出一次写请求并按写语义解包响应；所有写动作都经由这里。
+
+	请求发出之前先把「结果未知」连同本动作的核对命令落到当前步骤上。执行进程若在
+	结果确认前消失（被 kill、终端关闭、断电），步骤停在 running、什么都来不及记，
+	``--resume`` 凭这条记录拒绝重放（Issue #1019）。``call`` 只负责发请求：参数的
+	校验与前置读取放在调用之前，那时被终止的步骤没有记录，恢复后照常重跑。
+
+	不经 runner 直接调用动作时没有步骤可记，直接执行。
+	"""
+	control = context.workflow_control
+	if control is not None:
+		control.begin_write(_unconfirmed_write_recovery(context, check_command))
+	return _unwrap(platform, call(), fallback, context=context, write=True, check_command=check_command)
 
 
 def execute_candidate_detail(
@@ -380,6 +478,7 @@ def execute_candidate_detail(
 	lid: str = "",
 	data_dir: Path | None = None,
 	account: str = "",
+	context: ActionContext | None = None,
 ) -> dict[str, Any]:
 	"""Fetch job detail with the same httpx → job_card fallback as `boss detail`.
 
@@ -431,7 +530,13 @@ def execute_candidate_detail(
 		else:
 			code, message = platform.parse_error(raw)
 			text = message or "职位详情获取失败"
-			code, recoverable, recovery = _classify_action_error(code, text)
+			risk_commands = _risk_commands(context)
+			code, recoverable, recovery = _classify_action_error(
+				code,
+				text,
+				clean_command=risk_commands.get("clean_command"),
+				doctor_command=risk_commands.get("doctor_command"),
+			)
 			last_error = WorkflowActionError(code, text, recoverable=recoverable, recovery_action=recovery)
 
 	try:
@@ -461,7 +566,13 @@ def execute_candidate_detail(
 		raise last_error
 	code, message = platform.parse_error(raw_card)
 	text = message or "职位详情获取失败"
-	code, recoverable, recovery = _classify_action_error(code, text)
+	risk_commands = _risk_commands(context)
+	code, recoverable, recovery = _classify_action_error(
+		code,
+		text,
+		clean_command=risk_commands.get("clean_command"),
+		doctor_command=risk_commands.get("doctor_command"),
+	)
 	raise WorkflowActionError(code, text, recoverable=recoverable, recovery_action=recovery)
 
 
@@ -513,7 +624,12 @@ def _candidate_search(context: ActionContext, inputs: Mapping[str, Any], prior: 
 
 def _candidate_recommend(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	with context.candidate_platform() as platform:
-		data = _unwrap(platform, platform.recommend_jobs(page=_int_input(inputs, "page", 1, minimum=1)), "推荐职位获取失败")
+		data = _unwrap(
+			platform,
+			platform.recommend_jobs(page=_int_input(inputs, "page", 1, minimum=1)),
+			"推荐职位获取失败",
+			context=context,
+		)
 	items = _extract_list_items(data, ("recommendList", "jobList", "list", "items", "result"))
 	return StepResult(_with_items({"result": data}, items))
 
@@ -533,6 +649,7 @@ def _candidate_detail(context: ActionContext, inputs: Mapping[str, Any], prior: 
 				lid=lid,
 				data_dir=context.data_dir,
 				account=account_scope(context.auth()),
+				context=context,
 			)
 	return StepResult({"job": data, "result": data})
 
@@ -553,12 +670,19 @@ def _raise_local_state_write_failed(message: str, details: dict[str, Any]) -> No
 def _candidate_apply(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	security_id = str(_required(inputs, "security_id"))
 	job_id = str(_required(inputs, "job_id"))
+	lid = str(inputs.get("lid") or "")
 	account = account_scope(context.auth())
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		if cache.is_applied(security_id, job_id, account=account):
 			raise WorkflowActionError("ALREADY_APPLIED", "已对该职位发起过投递/立即沟通")
 		with context.candidate_platform() as platform:
-			data = _unwrap(platform, platform.apply(security_id, job_id, lid=str(inputs.get("lid") or "")), "投递失败")
+			data = _write_call(
+				context,
+				platform,
+				lambda: platform.apply(security_id, job_id, lid=lid),
+				"投递失败",
+				check_command="me --section deliver",
+			)
 		try:
 			cache.record_apply(security_id, job_id, account=account)
 		except Exception:
@@ -573,13 +697,17 @@ def _candidate_apply(context: ActionContext, inputs: Mapping[str, Any], prior: M
 def _candidate_greet(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	security_id = str(_required(inputs, "security_id"))
 	job_id = str(_required(inputs, "job_id"))
+	message = str(inputs.get("message") or "")
 	account = account_scope(context.auth())
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		if cache.is_greeted(security_id, job_id=job_id, account=account):
 			raise WorkflowActionError("ALREADY_GREETED", "已向该招聘者打过招呼")
 		with context.candidate_platform() as platform:
-			data = _unwrap(
-				platform, platform.greet(security_id, job_id, str(inputs.get("message") or "")), "打招呼失败"
+			data = _write_call(
+				context,
+				platform,
+				lambda: platform.greet(security_id, job_id, message),
+				"打招呼失败",
 			)
 		try:
 			cache.record_greet(security_id, job_id, account=account)
@@ -592,7 +720,7 @@ def _candidate_greet(context: ActionContext, inputs: Mapping[str, Any], prior: M
 	return StepResult({"security_id": security_id, "job_id": job_id, "result": data})
 
 
-def _candidate_friend(platform: Any, identifier: str) -> dict[str, Any]:
+def _candidate_friend(platform: Any, identifier: str, *, context: ActionContext | None = None) -> dict[str, Any]:
 	try:
 		friend, error_response = find_friend(platform, identifier)
 	except FriendLookupLimitExceeded as exc:
@@ -603,7 +731,7 @@ def _candidate_friend(platform: Any, identifier: str) -> dict[str, Any]:
 			recovery_action="缩小沟通列表范围后重试",
 		) from exc
 	if error_response is not None:
-		_unwrap(platform, error_response, "沟通列表获取失败")
+		_unwrap(platform, error_response, "沟通列表获取失败", context=context)
 	if friend is not None:
 		return friend
 	raise WorkflowActionError("CONTACT_NOT_FOUND", f"沟通列表中未找到联系人: {identifier}")
@@ -625,17 +753,14 @@ def _candidate_exchange(context: ActionContext, inputs: Mapping[str, Any], prior
 	identifier = str(_required(inputs, "security_id"))
 	exchange_type = _exchange_type(inputs)
 	with context.candidate_platform() as platform:
-		friend = _candidate_friend(platform, identifier)
+		friend = _candidate_friend(platform, identifier, context=context)
 		uid = str(friend.get("uid") or "")
 		security_id = _candidate_current_security_id(friend)
-		data = _unwrap(
+		name = str(friend.get("name") or "-")
+		data = _write_call(
+			context,
 			platform,
-			platform.exchange_contact(
-				security_id,
-				uid,
-				str(friend.get("name") or "-"),
-				exchange_type=exchange_type,
-			),
+			lambda: platform.exchange_contact(security_id, uid, name, exchange_type=exchange_type),
 			"联系方式交换失败",
 		)
 	return StepResult({"uid": uid, "security_id": security_id, "result": data})
@@ -653,16 +778,13 @@ def _candidate_mark(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 	if label_id is None:
 		raise WorkflowActionError("INVALID_PARAM", f"未知标签: {label}（可选: 新招呼、沟通中、已约面、已获取简历、不合适、收藏）")
 	with context.candidate_platform() as platform:
-		friend = _candidate_friend(platform, identifier)
+		friend = _candidate_friend(platform, identifier, context=context)
 		uid = str(friend.get("uid") or "")
-		data = _unwrap(
+		friend_source = int(friend.get("friendSource") or 0)
+		data = _write_call(
+			context,
 			platform,
-			platform.friend_label(
-				uid,
-				label_id,
-				int(friend.get("friendSource") or 0),
-				remove=remove,
-			),
+			lambda: platform.friend_label(uid, label_id, friend_source, remove=remove),
 			"联系人标签更新失败",
 		)
 	return StepResult({
@@ -675,14 +797,19 @@ def _candidate_mark(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 
 def _candidate_chat(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	with context.candidate_platform() as platform:
-		data = _unwrap(platform, platform.friend_list(page=_int_input(inputs, "page", 1, minimum=1)), "沟通列表获取失败")
+		data = _unwrap(
+			platform,
+			platform.friend_list(page=_int_input(inputs, "page", 1, minimum=1)),
+			"沟通列表获取失败",
+			context=context,
+		)
 	items = _extract_list_items(data, ("result", "friendList", "list", "items"))
 	return StepResult(_with_items({"result": data}, items))
 
 
 def _candidate_chat_history(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	with context.candidate_platform() as platform:
-		friend = _candidate_friend(platform, str(_required(inputs, "gid")))
+		friend = _candidate_friend(platform, str(_required(inputs, "gid")), context=context)
 		gid = str(friend.get("uid") or "")
 		security_id = _candidate_current_security_id(friend)
 		response = platform.chat_history(
@@ -691,7 +818,7 @@ def _candidate_chat_history(context: ActionContext, inputs: Mapping[str, Any], p
 			page=_int_input(inputs, "page", 1, minimum=1),
 			count=_int_input(inputs, "count", 20, minimum=1),
 		)
-		data = _unwrap(platform, response, "聊天记录获取失败")
+		data = _unwrap(platform, response, "聊天记录获取失败", context=context)
 	items = _extract_list_items(data, ("messageList", "messages", "list", "items", "result"))
 	return StepResult(
 		_with_items(
@@ -714,8 +841,8 @@ def _candidate_pipeline_data(
 		# 与顶层 `boss pipeline` / `boss digest` 的聚合结果不一致（Issue #881）。
 		chat_items, friend_error, pages_scanned, truncated = collect_friend_list_page(platform)
 		if friend_error is not None:
-			_unwrap(platform, friend_error, "沟通列表获取失败")
-		interview_data = _unwrap(platform, platform.interview_data(), "面试列表获取失败")
+			_unwrap(platform, friend_error, "沟通列表获取失败", context=context)
+		interview_data = _unwrap(platform, platform.interview_data(), "面试列表获取失败", context=context)
 	interview_items = interview_data.get("interviewList") or []
 	items = build_pipeline_items(
 		chat_items=chat_items,
@@ -777,7 +904,9 @@ def _ai_assist(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping
 			"AI_NOT_CONFIGURED",
 			"AI 服务未配置",
 			recoverable=True,
-			recovery_action="boss ai config --provider <provider> --model <model> --api-key <key>",
+			recovery_action=_hint_command(
+				context, "ai config --provider <provider> --model <model> --api-key <key>"
+			),
 		)
 	service = AIService(
 		str(base_url),
@@ -795,7 +924,15 @@ def _ai_assist(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping
 		)
 	except AIServiceError as exc:
 		raise WorkflowActionError(
-			"AI_API_ERROR", str(exc), recoverable=True, recovery_action=recovery_action_for(exc, "检查 AI 配置后重试")
+			"AI_API_ERROR",
+			str(exc),
+			recoverable=True,
+			recovery_action=recovery_action_for(
+				exc,
+				"检查 AI 配置后重试",
+				# 恢复建议里的 ai config 必须写回触发本次 workflow 的目录。
+				config_command=_hint_command(context, "ai config"),
+			),
 		) from exc
 	return StepResult({"resume": resume_name, "result": result})
 
@@ -876,7 +1013,10 @@ def _candidate_watch(context: ActionContext, inputs: Mapping[str, Any], prior: M
 				recoverable=True,
 				# watch 名来自 wizard 的 name 输入、是自由文本：带空格时不加引号，
 				# 照抄 `watch remove 我的 监控` 会把一个名字拆成两个参数。
-				recovery_action=f"boss watch remove {shell_argument(name)}；再用 boss watch add {shell_argument(name)} <关键词> 重建",
+				recovery_action=(
+					f"{_hint_command(context, f'watch remove {shell_argument(name)}')}；"
+					f"再用 {_hint_command(context, f'watch add {shell_argument(name)} <关键词>')} 重建"
+				),
 			) from exc
 		if record is None:
 			raise WorkflowActionError("SAVED_SEARCH_NOT_FOUND", f"未找到 watch: {name}")
@@ -963,7 +1103,12 @@ def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> Step
 	checkpoint = data.get("checkpoint") if isinstance(data, dict) else None
 	resume_command = checkpoint.get("resume_command") if isinstance(checkpoint, dict) else None
 	if not isinstance(resume_command, str) or not resume_command:
-		resume_command = f"boss crawl resume {shell_argument(outcome.run_id)}"
+		# 兜底只服务拿不到 checkpoint 的 outcome（如测试替身）：有 data_dir 时同样
+		# 保留目录，避免恢复命令落到默认目录的另一份采集记录。
+		resume_command = boss_command(
+			f"crawl resume {shell_argument(outcome.run_id)}",
+			data_dir=getattr(outcome, "data_dir", None),
+		)
 	if cache is not None:
 		data = _attach_wizard_jobs(data if isinstance(data, dict) else {}, cache, str(outcome.run_id))
 	if outcome.status == "timeout_stopped":
@@ -1021,6 +1166,18 @@ def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> Step
 	return StepResult(data, artifacts=tuple(outcome.output_paths.values()))
 
 
+def _crawl_busy_error(context: ActionContext, exc: CrawlBusyError) -> WorkflowActionError:
+	"""同一个 crawl run 正由别的进程执行：本次没有发出任何请求，稍后恢复是安全的。"""
+	status_command = _hint_command(context, f"crawl status {shell_argument(exc.run_id)}")
+	return WorkflowActionError(
+		"CRAWL_BUSY",
+		str(exc),
+		recoverable=True,
+		recovery_action=f"用 {status_command} 查看进度，等当前执行结束后再恢复；不要并发恢复同一个任务",
+		details={"run_id": exc.run_id},
+	)
+
+
 def _crawl_start(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	# 恢复 waiting_input 时若已有内部 crawl run_id，必须续跑而不是新建采集。
 	existing_run_id = _optional_str(inputs.get("run_id") or inputs.get("crawl_run_id"))
@@ -1049,7 +1206,10 @@ def _crawl_start(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 		raise WorkflowActionError(
 			"INVALID_PARAM",
 			f"向导采集不支持 hook_profile={hook_profile!r}：workflow 没有 hook-dir 输入，请显式运行 boss crawl run/start",
-			recovery_action="boss crawl run <query> --city <城市> --hook-profile screenshot-full --hook-dir <脚本目录>",
+			recovery_action=_hint_command(
+				context,
+				"crawl run <query> --city <城市> --hook-profile screenshot-full --hook-dir <脚本目录>",
+			),
 		)
 	raw_pages = inputs.get("pages")
 	pages = 5 if raw_pages is None else _positive_int(raw_pages, name="pages")
@@ -1076,10 +1236,13 @@ def _crawl_start(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 		raise WorkflowActionError(
 			"INVALID_PARAM",
 			f"crawl 配置无效: {exc}",
-			recovery_action="boss config reset crawl",
+			recovery_action=_hint_command(context, "config reset crawl"),
 		) from exc
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
-		outcome = _crawl_service(context, cache).create_and_run(settings)
+		try:
+			outcome = _crawl_service(context, cache).create_and_run(settings)
+		except CrawlBusyError as exc:
+			raise _crawl_busy_error(context, exc) from exc
 		return _crawl_outcome_result(outcome, cache)
 
 
@@ -1128,6 +1291,8 @@ def _crawl_resume(context: ActionContext, inputs: Mapping[str, Any], prior: Mapp
 			)
 		except KeyError as exc:
 			raise WorkflowActionError("CRAWL_RUN_NOT_FOUND", f"未找到 crawl run: {run_id}") from exc
+		except CrawlBusyError as exc:
+			raise _crawl_busy_error(context, exc) from exc
 		return _crawl_outcome_result(outcome, cache)
 
 
@@ -1145,9 +1310,14 @@ def _recruiter_call(
 	fallback: str,
 	*,
 	list_keys: tuple[str, ...] = (),
+	write: bool = False,
+	check_command: str | None = None,
 ) -> StepResult:
 	with context.recruiter_platform() as platform:
-		data = _unwrap(platform, call(platform), fallback)
+		if write:
+			data = _write_call(context, platform, lambda: call(platform), fallback, check_command=check_command)
+		else:
+			data = _unwrap(platform, call(platform), fallback, context=context, check_command=check_command)
 	payload: dict[str, Any] = {"result": data}
 	if list_keys:
 		items = _extract_list_items(data, list_keys)
@@ -1178,14 +1348,15 @@ def _recruiter_applications(context: ActionContext, inputs: Mapping[str, Any], p
 
 
 def _recruiter_resume(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
+	geek_id = str(_required(inputs, "geek_id"))
+	job_id = str(_required(inputs, "job_id"))
+	security_id = _optional_str(inputs.get("security_id"))
 	return _recruiter_call(
 		context,
-		lambda platform: platform.view_geek(
-			str(_required(inputs, "geek_id")),
-			str(_required(inputs, "job_id")),
-			_optional_str(inputs.get("security_id")),
-		),
+		lambda platform: platform.view_geek(geek_id, job_id, security_id),
 		"候选人简历获取失败",
+		# view_geek 声明 effect: unknown，无法证明没有副作用；未知结果不能自动重放。
+		write=True,
 	)
 
 
@@ -1203,6 +1374,7 @@ def _recruiter_last_messages(context: ActionContext, inputs: Mapping[str, Any], 
 				job_id=_optional_str(inputs.get("job_id")),
 			),
 			"沟通列表获取失败",
+			context=context,
 		)
 		friend_items = next(
 			(value for key in ("friendList", "result", "list") if isinstance((value := friend_data.get(key)), list)),
@@ -1225,7 +1397,7 @@ def _recruiter_last_messages(context: ActionContext, inputs: Mapping[str, Any], 
 				break
 		if not friend_ids:
 			return StepResult({"friend_ids": [], "messages": [], "items": [], "total": 0})
-		data = _unwrap(platform, platform.last_messages(friend_ids), "最近消息获取失败")
+		data = _unwrap(platform, platform.last_messages(friend_ids), "最近消息获取失败", context=context)
 	items = _extract_list_items(data, ("messages", "messageList", "list", "items", "result"))
 	if not items and isinstance(data, Mapping):
 		# Some APIs return {friendId: lastMsg} maps — flatten for TUI.
@@ -1243,7 +1415,11 @@ def _recruiter_reply(context: ActionContext, inputs: Mapping[str, Any], prior: M
 	friend_id = _required_int(inputs, "friend_id", minimum=1)
 	message = str(_required(inputs, "message"))
 	return _recruiter_call(
-		context, lambda platform: platform.send_message_by_friend(friend_id, message), "消息发送失败"
+		context,
+		lambda platform: platform.send_message_by_friend(friend_id, message),
+		"消息发送失败",
+		write=True,
+		check_command=f"hr chatmsg {friend_id}",
 	)
 
 
@@ -1269,6 +1445,8 @@ def _recruiter_request_resume(
 		context,
 		lambda platform: platform.exchange_request_by_friend(friend_id, exchange_type=4),
 		"附件简历请求失败",
+		write=True,
+		check_command=f"hr chatmsg {friend_id}",
 	)
 
 
@@ -1281,6 +1459,8 @@ def _recruiter_exchange_contact(
 		context,
 		lambda platform: platform.exchange_request_by_friend(friend_id, exchange_type=exchange_type),
 		"联系方式交换请求失败",
+		write=True,
+		check_command=f"hr chatmsg {friend_id}",
 	)
 
 
@@ -1300,12 +1480,16 @@ def _recruiter_jobs_detail(context: ActionContext, inputs: Mapping[str, Any], pr
 
 def _recruiter_jobs_online(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	job_id = str(_required(inputs, "job_id"))
-	return _recruiter_call(context, lambda platform: platform.job_online(job_id), "职位上线失败")
+	return _recruiter_call(
+		context, lambda platform: platform.job_online(job_id), "职位上线失败", write=True, check_command="hr jobs list"
+	)
 
 
 def _recruiter_jobs_offline(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	job_id = str(_required(inputs, "job_id"))
-	return _recruiter_call(context, lambda platform: platform.job_offline(job_id), "职位下线失败")
+	return _recruiter_call(
+		context, lambda platform: platform.job_offline(job_id), "职位下线失败", write=True, check_command="hr jobs list"
+	)
 
 
 DEFAULT_ACTIONS: dict[str, Action] = {

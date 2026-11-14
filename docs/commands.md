@@ -44,7 +44,7 @@ boss <命令> --help                      # 查看单个命令选项
 
 TTY 下只把 `operator_actions` 渲染到 stderr；`next_actions` 是纯 Agent 通道，不渲染。Agent 拿到 `operator_actions` 时应转述给操作者，而不是自己编措辞。
 
-**信封与退出码**：每条命令在 stdout 只输出一个七键 JSON 信封；默认 `exit 0` ⇔ `ok=true`、`exit 1` ⇔ `ok=false`。可选全局 `--exit-codes sysexits` 按错误类别返回语义化退出码（77 认证；75 限流/预算/超时；78 参数/配置；69 风控/平台不支持；70 内部错误；其余 1），供脚本按失败类型分支；信封内容不变。全局选项（`--json`、`--data-dir`、`--platform`、`--cdp-url` 等）必须写在子命令之前，例如 `boss --json search 关键词`；写在子命令后面会返回 `INVALID_PARAM`，并说明该选项是全局的。
+**信封与退出码**：每条命令在 stdout 只输出一个七键 JSON 信封；默认 `exit 0` ⇔ `ok=true`、`exit 1` ⇔ `ok=false`。可选全局 `--exit-codes sysexits` 按错误类别返回语义化退出码（77 认证；75 限流/预算/超时/workflow 占用；78 参数/配置；69 风控/平台不支持；70 内部错误；其余 1），供脚本按失败类型分支；信封内容不变。全局选项（`--json`、`--data-dir`、`--platform`、`--cdp-url` 等）必须写在子命令之前，例如 `boss --json search 关键词`；写在子命令后面会返回 `INVALID_PARAM`，并说明该选项是全局的。
 
 ## 基础操作
 
@@ -59,7 +59,7 @@ TTY 下只把 `operator_actions` 渲染到 stderr；`next_actions` 是纯 Agent 
 | `boss doctor` | 诊断环境、依赖、凭据完整性和网络；默认仅本地诊断，不读取浏览器 Cookie。`--probe-cookies` 才提取浏览器 Cookie，`--live-probe` 才执行低频只读探测。探测到求职者侧登录态时先标出身份，不继续请求招聘者接口 |
 | `boss me` | 我的信息（用户/简历/期望/投递记录） |
 
-登录恢复命令保留原数据目录：使用 `--data-dir` 时，认证错误的 `error.recovery_action`、`hints.next_actions` 和真人扫码指引会携带经过 shell 参数转义的绝对目录，换工作目录后仍可照提示登录。登录成功后的状态检查、搜索与推荐提示，以及 `status` 的后继操作，使用同一目录。向导等待登录时的登录与续跑指引、认证失败与超时 checkpoint、任务不存在或记录损坏时的恢复提示，以及 `status` / `doctor` 信封里的 `auth_health` 诊断字段（含检查项的恢复动作），也保留目录，避免被引导到默认目录下的其他会话。静态 `boss schema` 仍展示通用命令示例。
+登录恢复命令保留原数据目录：使用 `--data-dir` 时，认证错误的 `error.recovery_action`、`hints.next_actions` 和真人扫码指引会携带经过 shell 参数转义的绝对目录，换工作目录后仍可照提示登录。登录成功后的状态检查、搜索与推荐提示，以及 `status` 的后继操作，使用同一目录。向导等待登录时的登录与续跑指引、认证失败与超时 checkpoint、任务不存在或记录损坏时的恢复提示，以及 `status` / `doctor` 信封里的 `auth_health` 诊断字段（含检查项的恢复动作），也保留目录，避免被引导到默认目录下的其他会话。向导动作层返回的恢复命令同样保留目录与平台：AI 未配置或 API 报错时的 `ai config`、watch 参数损坏时的删除与重建命令、`config reset crawl`，以及不支持 `hook_profile` 时的 `crawl run` 指引，都定位到触发本次 workflow 的 `--data-dir`，不会把新密钥写进默认目录或去默认目录删改同名监控。静态 `boss schema` 仍展示通用命令示例。
 
 `boss me --section deliver --deliver-page 2` 单独查看投递记录时，信封 `pagination` 给出分页证据：`page` 优先使用平台返回的有效页码，否则回显请求页；`has_more` 仅在平台返回布尔 `hasMore` 时为 `true` / `false`，缺失或类型不明确时为 `null`，`has_more_source=unknown`。`total` 是本页 `list` 数组的条数（`total_kind=returned_page_count`）；列表字段缺失或类型不符时为 `null`，不代表全量投递数。仅 `has_more=true` 时附加下一页命令；未知时 `operator_actions` 说明不能凭本页数量判断。默认 `boss me` 汇总四段信息、或只查其他 section 时，顶层 `pagination` 保持 `null`。MCP 对应调用是 `boss_me(section="deliver", deliver_page=2)`。
 
@@ -67,9 +67,11 @@ TTY 下只把 `operator_actions` 渲染到 stderr；`next_actions` 是纯 Agent 
 
 BOSS 的 code `31`（IP/环境限制）/ `32`（账号限制）/ `35` / `36`、环境类或含糊的 code `37`、HTTP 403 和官方 `403.html` 访问受限页及 `verify.html` / `security.html` 安全页会停止请求并锁存本地状态。明确的凭据过期才能进入有限刷新；仅出现 `token` / `stoken` 或同时要求安全验证时不能刷新。风险锁沿用 `cdp_risk_lock.json` 文件名，覆盖候选人与招聘者的 httpx、CDP、headless、聊天页动作、登录、导入、刷新和同 `data_dir` 的独立 crawl；更换令牌或通道不会自动清除锁。`error.details.risk_lock` 保留原始风险原因、可用业务码与 `explicit_resume_required`；账号风险仍返回 `ACCOUNT_RISK`，历史环境锁继续返回 `ENVIRONMENT_RISK_LOCKED`。
 
-由用户在原会话的官方目标业务页确认恢复后，执行 `boss clean --risk-lock` 解除本地阻断，再显式恢复原任务。主页可访问不代表职位页或聊天页已恢复；该清理命令不解除服务器风险，也不验证线上恢复。`--dry-run` 仅预览；再次命中风险会立即重锁。Agent 不应自行执行清锁。
+由用户在原会话的官方目标业务页确认恢复后，执行 `boss clean --risk-lock` 解除本地阻断，再显式恢复原任务。主页可访问不代表职位页或聊天页已恢复；该清理命令不解除服务器风险，也不验证线上恢复。`--dry-run` 仅预览；再次命中风险会立即重锁。Agent 不应自行执行清锁。风控信封的 `error.recovery_action` 与 `hints.next_actions` 中出现的 `clean --risk-lock` 与 `doctor` 会携带触发该错误的数据目录与平台（`boss --data-dir <绝对路径> clean --risk-lock`）：锁文件位于 `<data_dir>/.cdp_risk_lock`，照抄裸命令只会在默认目录空转、返回 `local_lock_removed: false` 而不报错。`doctor` 的 `cdp_risk_lock` 检查项与风险锁解锁指引同样定位本次诊断目录；静态 `boss schema` 的 `error_codes` 仍展示通用示例。
 
 访问受限页展示的恢复时间只作平台提示，不触发定时刷新或自动清锁；移动端可用也不能证明网页端限制已解除。已有受限页时，`login --force` 在清除 Cookie 前同样停止。
+
+浏览器来源耗尽（`BROWSER_SESSION_NOT_FOUND` / `CDP_UNAVAILABLE` / `BROWSER_DISABLED`）的信封同样保留本次数据目录与平台：`error.recovery_action`、`hints.next_actions` 与 `hints.operator_actions` 里出现的 `doctor`、`status --live`、`login --cdp`、`clean --risk-lock` 都改写成 `boss --data-dir <绝对路径> ...`。`doctor` 检查的是该目录的登录态、缓存与风险锁；静态 `boss schema` 与来源策略表本身仍展示通用示例。
 
 ### 浏览器 Cookie 提取与 macOS 钥匙串
 
@@ -137,6 +139,10 @@ boss crawl stop <run_id>
 | `boss crawl stop <run_id>` | 请求运行中任务在下一个安全点停止并保留 checkpoint |
 | `boss crawl shortlist <run_id> (--all \| --selector <csel_...>)` | 将 crawl 结果导入原项目的本地候选池；不请求平台，保留内部职位关联和详情缓存供 `boss ai fit` 使用 |
 
+同一采集 `run_id` 同时只允许一个执行器。重叠的前台恢复返回 `CRAWL_BUSY`（`recoverable: true`，`--exit-codes sysexits` 下为 75），不发出请求、不修改断点或清除停止请求；`hints.next_actions` 只给原数据目录的 `crawl status <run_id>`，等当前执行结束后再恢复。新建采集、后台 worker 与向导采集步骤共用这项互斥；向导的失败信封与该失败任务的状态查询同样只建议查看内部采集状态。`--background` 仍立即返回供轮询，worker 取得执行权后才读取断点。`status` / `results` / `stop` 在执行期间照常可用；锁按 `run_id` 隔离，进程退出后由操作系统释放，不需手工删除锁文件。无法准备执行锁时返回 `LOCAL_IO_ERROR`，不发出请求。Python API 的 `CrawlService.resume()` 在任务被占用时抛出 `CrawlBusyError`，可在当前执行结束后再次恢复。
+
+采集在浏览器打开、抓页或补详情时收到 `SystemExit` / `KeyboardInterrupt` 等退出信号，会先保存 `stopped`、页游标、待补详情和已消耗预算，再向外传播原退出信号；不会把未完成任务标为 `completed`。显式执行 `crawl resume <run_id>` 后续跑未完成页面和详情，已提交页面不重抓。
+
 采集任务的状态、结果、停止、恢复及候选池后继命令，以及 `checkpoint.resume_command`，都显式携带原 `--data-dir` 的绝对路径；换一个工作目录执行提示时仍定位同一份本地任务。任务不存在或记录损坏时的核对提示同样保留目录。采集服务、向导采集动作与 `agent crawl` 返回的任务恢复指引也保留目录，避免误读或停止默认目录中的同名任务。风险停止仍须先完成人工恢复；人工解锁提示中的 `boss clean --risk-lock` 也携带原数据目录，解锁后显式执行恢复命令。
 
 `crawl results` 的后继导入命令还携带本次返回职位的全部 `--selector`，只导入所见结果；`--page` / `--detail-status` 的筛选范围因此保持不变。空结果改为提示查看同一 run 的 `crawl status`。路径、run_id 和 selector 按 shell 参数转义，终端与信封使用同一条命令。
@@ -152,7 +158,7 @@ boss crawl stop <run_id>
 | 命令 | 说明 |
 |------|------|
 | `boss greet <sid> <jid>` | 向指定招聘者打招呼；重复记录返回 `ALREADY_GREETED` |
-| `boss batch-greet <query>` | 搜索后按显式 `--count` 批量打招呼，支持 `--dry-run`；命中 `ACCOUNT_RISK` / `ENVIRONMENT_RISK` 立即停批并返回 `ok:false`，已成功项随 `error.details.greeted` 带回 |
+| `boss batch-greet <query>` | 搜索后按显式 `--count` 批量打招呼，支持 `--dry-run`；命中 `ACCOUNT_RISK` / `ENVIRONMENT_RISK` 立即停批并返回 `ok:false`，已成功项随 `error.details.greeted` 带回；单条招呼结果未确认（`ACTION_UNCONFIRMED`，请求已发出但响应中断）同样立即停批，返回 `ok:false` 且 `error.details` 带 `outcome_unknown: true` / `replay_safe: false`，不自动重发 |
 | `boss apply <sid> <jid>` | 发起投递或立即沟通；重复记录返回 `ALREADY_APPLIED` |
 | `boss exchange <uid-or-sid>` | 请求交换手机号或微信；优先使用 `boss chat` 输出的稳定 `uid` |
 
@@ -259,7 +265,7 @@ boss hr location 10001 --yes
 
 招聘自动化命令的后继与恢复提示显式携带原 `--data-dir` 与 `--role recruiter`：`agent run` / `train` / `stats` / `control` / `stop` 与 `agent review list|approve|reject`、`agent pending list` 的 `hints.next_actions`、终端 `next_steps`、`agent control` 返回的 `data.commands`，以及复核项缺失、`automation` 配置损坏时的 `recovery_action` 都指回同一份 `automation/` 状态。`agent` 组不在 `hr` 组下，重放招聘者命令必须显式带角色，否则会按候选人角色读取另一套本地状态。候选人侧的 `agent crawl` 后继命令只保留目录、不强制角色；AI 未配置时给出的 `ai config` 与 AI 匹配失败后的重试命令同样保留目录。
 
-在同一浏览器、同一账号完成官方验证并确认原先受阻页面正常后，由操作者明确恢复：`boss --role recruiter agent run --resume`。该选项解除本地停止状态并复用已确认动作与队列，不代表平台风险已经解除；普通 `agent run` 不解锁。MCP `boss_agent_run` 的 `resume` 默认 `false`，Agent 只有收到操作者明确恢复指令后才可设置为 `true`。wizard 和 crawl 的可恢复 run 继续使用各自的 `--resume <run_id>` / `crawl resume <run_id>`；已被 `wizard --stop` 置为 `stopped` 的 run 保持终止，应新建 workflow 或恢复其内部任务。结果未知的写动作（`ACTION_UNCONFIRMED`，或平台已成功但本地记账失败）会把 `replay_safe: false` 写入步骤错误；`--resume` 不会重跑该步骤，只返回原失败与核对指引，确认平台实际状态后应新建 workflow。
+在同一浏览器、同一账号完成官方验证并确认原先受阻页面正常后，由操作者明确恢复：`boss --role recruiter agent run --resume`。该选项解除本地停止状态并复用已确认动作与队列，不代表平台风险已经解除；普通 `agent run` 不解锁。MCP `boss_agent_run` 的 `resume` 默认 `false`，Agent 只有收到操作者明确恢复指令后才可设置为 `true`。wizard 和 crawl 的可恢复 run 继续使用各自的 `--resume <run_id>` / `crawl resume <run_id>`；已被 `wizard --stop` 置为 `stopped` 的 run 保持终止，应新建 workflow 或恢复其内部任务。结果未知的写动作（`ACTION_UNCONFIRMED`，或平台已成功但本地记账失败）会把 `replay_safe: false` 写入步骤错误；`--resume` 不会重跑该步骤，只返回原失败与核对指引，确认平台实际状态后应新建 workflow。写请求发出之前，该动作的「结果未知」与核对命令就已经落在执行中的步骤上：执行进程在结果确认前被终止（被 kill、终端关闭、断电）时，步骤会停在 `running` 但带有这条记录，`--resume` 同样不重放，而是把步骤与 run 记为失败并返回 `ACTION_UNCONFIRMED`；只读步骤与尚未走到写请求的中断照常重跑。执行期间查询 `--status` 看到 `running` 步骤带 `ACTION_UNCONFIRMED` 即表示该写请求在途。失败的 run 若待执行步骤的结果无法重放（`replay_safe: false`），`--status` / `--stop` 的 `hints.next_actions` 不再给 `--resume`，只给 `--status` 与新建 workflow；与 TTY「恢复已有任务」列表的筛选口径一致。
 
 MCP 的长运行使用异步子进程，运行期间仍能调用停止/状态工具。取消或超时会尝试中断并回收子进程；写操作被强制终止后可能有未知副作用，`error.details.outcome_unknown=true` 时不可自动重试；只读工具（如 search / show / status）返回 `outcome_unknown=false` 与 `replay_safe=true`，确认子进程已退出后可直接重试。`CLI_ERROR` 同样带这组字段：底层 `boss` 没能启动（不在 MCP server 的 `PATH` 中、`--boss-bin` 路径有误）时进程从未运行，返回 `outcome_unknown=false` 并提示修正安装或 `boss-mcp --boss-bin`；子进程运行后没有输出 JSON 信封时，写工具按结果未知处理（`outcome_unknown=true`），只读工具为 `outcome_unknown=false`。正常返回的 wizard 超时保留可恢复结果，MCP 等待覆盖其显式超时及保存进度的宽限期。
 

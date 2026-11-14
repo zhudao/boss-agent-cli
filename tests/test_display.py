@@ -167,6 +167,51 @@ class TestHandleAuthErrors:
 			POLICIES["existing-browser"].operator_actions
 		)
 
+	def test_browser_source_unavailable_carries_data_dir_and_platform(self, tmp_path):
+		"""自定义 --data-dir 下策略里的 doctor / status --live 必须指向同一目录（Issue #980）。
+
+		裸 ``boss doctor`` 诊断的是默认目录的登录态与风险锁，照抄的 Agent 拿到的是
+		另一份本地状态。
+		"""
+		from boss_agent_cli.api.browser_source import BrowserSourceUnavailable, POLICIES
+
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True, "data_dir": tmp_path, "platform": "zhipin"}
+
+		@handle_auth_errors("chat")
+		def impl(ctx):
+			raise BrowserSourceUnavailable(POLICIES["existing-browser"], ("cdp",))
+
+		with patch("boss_agent_cli.display.handle_error_output") as mock_err:
+			impl(ctx)
+
+		kwargs = mock_err.call_args.kwargs
+		doctor = f"boss --data-dir {shell_argument(str(tmp_path.resolve()))} doctor"
+		assert kwargs["recovery_action"] == doctor
+		assert kwargs["hints"]["next_actions"] == [doctor]
+
+	def test_httpx_only_policy_commands_are_rewritten_per_data_dir(self, tmp_path):
+		"""策略表文案里的 clean --risk-lock / login --cdp 也属于本地状态命令（Issue #980）。"""
+		from boss_agent_cli.api.browser_source import BrowserSourceUnavailable, POLICIES
+
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True, "data_dir": tmp_path, "platform": "zhipin"}
+
+		@handle_auth_errors("chat")
+		def impl(ctx):
+			raise BrowserSourceUnavailable(POLICIES["httpx-only"], ("httpx",))
+
+		with patch("boss_agent_cli.display.handle_error_output") as mock_err:
+			impl(ctx)
+
+		kwargs = mock_err.call_args.kwargs
+		prefix = f"boss --data-dir {shell_argument(str(tmp_path.resolve()))}"
+		assert kwargs["hints"]["next_actions"] == [f"{prefix} status --live"]
+		recovery = kwargs["hints"]["operator_actions"][-1]
+		assert f"{prefix} clean --risk-lock" in recovery
+		assert f"{prefix} login --cdp" in recovery
+		assert " boss clean --risk-lock" not in recovery
+
 	def test_browser_source_unsupported_uses_not_supported_contract(self):
 		"""BrowserSourceUnsupported → NOT_SUPPORTED：recoverable / recovery_action 来自真源契约，
 		不被硬编码覆盖；针对来源的建议放进 hints.operator_actions。"""
@@ -1224,3 +1269,76 @@ def test_shell_argument_quotes_shell_metacharacters():
 	assert shell_argument("a~b") == "a~b"
 	for value in ("its'fine", "全天*", "$HOME", "~", "a;b", "x|y"):
 		assert shlex.split(shell_argument(value)) == [value]
+
+
+# ── 浏览器内核缺失：不能报成可重试的 NETWORK_ERROR ──────────────────────
+# patchright 升级后仍需对应修订版的 Chromium；找不到可执行文件时
+# `sync_playwright().start()` / `chromium.launch()` 抛 Playwright 原生错误。
+# 装饰器此前把它兜成 NETWORK_ERROR +「重试」，可重试永远不会成功，
+# Agent 会拿同一条命令反复打平台。登录链路早已把这条错误识别为
+# BROWSER_KERNEL_MISSING，命令层也必须用同一份契约。
+
+_KERNEL_MISSING_MESSAGES = [
+	"BrowserType.launch: Executable doesn't exist at "
+	"/Users/u/Library/Caches/ms-playwright/chromium_headless_shell-1248/"
+	"chrome-headless-shell-mac-arm64/chrome-headless-shell",
+	"Looks like Playwright was just installed or updated. "
+	"Please run the following command to download new browsers:\n\n    playwright install",
+]
+
+
+@pytest.mark.parametrize("message", _KERNEL_MISSING_MESSAGES)
+def test_browser_kernel_missing_uses_install_contract(message):
+	"""命令层捕获到内核缺失时必须给 BROWSER_KERNEL_MISSING + 安装指引。"""
+	ctx = MagicMock()
+	ctx.obj = {"json_output": True}
+
+	@handle_auth_errors("search")
+	def impl(ctx):
+		raise RuntimeError(message)
+
+	with patch("boss_agent_cli.display.handle_error_output") as mock_err:
+		impl(ctx)
+
+	kwargs = mock_err.call_args.kwargs
+	assert kwargs["code"] == "BROWSER_KERNEL_MISSING"
+	assert kwargs["recoverable"] is True
+	assert kwargs["recovery_action"] == "patchright install chromium"
+	assert "patchright install chromium" in kwargs["hints"]["next_actions"]
+	assert not any("重试" == action for action in kwargs["hints"]["next_actions"])
+
+
+def test_browser_kernel_missing_hint_points_at_doctor_and_does_not_suggest_retry(tmp_path):
+	ctx = MagicMock()
+	ctx.obj = {"json_output": True, "data_dir": tmp_path, "platform": "zhipin"}
+
+	@handle_auth_errors("detail")
+	def impl(ctx):
+		raise RuntimeError("Executable doesn't exist at /nonexistent/chrome-headless-shell")
+
+	with patch("boss_agent_cli.display.handle_error_output") as mock_err:
+		impl(ctx)
+
+	kwargs = mock_err.call_args.kwargs
+	actions = kwargs["hints"]["next_actions"]
+	assert actions[0] == "patchright install chromium"
+	assert any("doctor" in action for action in actions)
+	assert kwargs["hints"]["operator_actions"]
+
+
+def test_unrelated_runtime_error_still_falls_back_to_network_error():
+	"""只有内核缺失这一种确定性失败改判；其余运行时错误保持原兜底。"""
+	ctx = MagicMock()
+	ctx.obj = {"json_output": True}
+
+	@handle_auth_errors("search")
+	def impl(ctx):
+		raise RuntimeError("upstream gateway returned 502")
+
+	with patch("boss_agent_cli.display.handle_error_output") as mock_err:
+		impl(ctx)
+
+	kwargs = mock_err.call_args.kwargs
+	assert kwargs["code"] == "NETWORK_ERROR"
+	assert kwargs["recoverable"] is True
+	assert kwargs["recovery_action"] == "重试"

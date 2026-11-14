@@ -18,16 +18,22 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"message": "同意附件简历请求的结果未确认，禁止自动重试",
 		"recoverable": False,
 		"recovery_action": "在官方页面核对请求状态，不要自动重试",
+		"replay_safe": False,
+		"outcome_unknown": True,
 	},
 	"ACTION_UNCONFIRMED": {
 		"message": "页面动作已执行，但未确认是否发送成功，禁止自动重试",
 		"recoverable": False,
 		"recovery_action": "动作可能已生效，请先 `boss hr chatmsg <friend_id>` 核实，勿直接重试",
+		"replay_safe": False,
+		"outcome_unknown": True,
 	},
 	"LOCAL_STATE_WRITE_FAILED": {
 		"message": "平台操作已完成，但本地状态保存失败，禁止自动重发",
 		"recoverable": False,
 		"recovery_action": "先在官方页面核对本次操作是否已生效；不要自动重发，确认磁盘空间与缓存目录权限后再继续",
+		# 平台结果已确认成功，只是本地记账失败：禁止重发，但不是「结果未知」。
+		"replay_safe": False,
 	},
 	"LOCAL_IO_ERROR": {
 		"message": "本地文件读写失败",
@@ -48,6 +54,8 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"message": "首次招呼状态未确认，禁止自动重发",
 		"recoverable": False,
 		"recovery_action": "先用 boss hr chat --job-id <id> 核对会话；保留本地预约，必要时在官方页面处理",
+		"replay_safe": False,
+		"outcome_unknown": True,
 	},
 	"LOCATION_ALREADY_SENT": {
 		"message": "该会话已发送过工作地点，禁止重复发送",
@@ -58,6 +66,8 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"message": "工作地点发送结果未确认，禁止自动重发",
 		"recoverable": False,
 		"recovery_action": "先用 boss hr chatmsg <friend_id> 核对地点卡是否已发出；保留本地预约，不要自动重发",
+		"replay_safe": False,
+		"outcome_unknown": True,
 	},
 	"AUTH_EXPIRED": {
 		"message": "登录态过期",
@@ -223,6 +233,10 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"message": "平台返回了未识别的错误",
 		"recoverable": False,
 		"recovery_action": "不要自动重试：先在 BOSS 官方页面核对本次操作是否生效，并用 boss doctor 检查登录态、浏览器通道与网络；确认后重新执行一次，仍失败请附上命令与 error.message 提交 issue",
+		# 未识别的响应无法证明写操作没有发生：写命令不得把它升级成可重试的
+		# NETWORK_ERROR，批量与 wizard 也不得重放（Issue #990）。声明后，单次
+		# 命令的 UNKNOWN 信封同样能从 error.details 读出该判定。
+		"replay_safe": False,
 	},
 	"CRAWL_UNAVAILABLE": {
 		"message": "DrissionPage crawl 运行环境或 Hook 注入不可用",
@@ -253,6 +267,16 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"message": "workflow 已按 stop 请求停止",
 		"recoverable": True,
 		"recovery_action": "创建新 workflow，或恢复其内部可恢复任务",
+	},
+	"WORKFLOW_BUSY": {
+		"message": "同一 workflow 正在由另一次调用执行，本次调用未执行任何步骤",
+		"recoverable": True,
+		"recovery_action": "boss wizard --status <run_id> 查看进度，等当前执行结束后再恢复；不要并发恢复同一个 run_id",
+	},
+	"CRAWL_BUSY": {
+		"message": "同一 crawl run 正在由另一次调用执行，本次调用未发出任何请求",
+		"recoverable": True,
+		"recovery_action": "boss crawl status <run_id> 查看进度，等当前执行结束后再恢复；不要并发恢复同一个 run_id",
 	},
 	"CRAWL_NOT_COMPLETED": {
 		"message": "crawl 尚未完成，Agent 不会导入不完整结果",

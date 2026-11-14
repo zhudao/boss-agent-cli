@@ -20,6 +20,7 @@ from rich.table import Table
 
 from boss_agent_cli.output import emit_success, is_local_io_error, redact_sensitive_text
 from boss_agent_cli.schema.error_codes import ERROR_CODES
+from boss_agent_cli.services.browser_runtime import is_browser_kernel_missing
 
 # Rich output goes to stderr so stdout stays clean for Agent JSON
 console = Console(stderr=True)
@@ -123,15 +124,23 @@ def error_contract_for_code(
 	)
 
 
-def platform_error_contract(code: str) -> tuple[bool, str | None, dict[str, Any] | None]:
+def platform_error_contract(
+	code: str,
+	*,
+	ctx: Any = None,
+	clean_command: str | None = None,
+	doctor_command: str | None = None,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
 	"""Return ``(recoverable, recovery_action, hints)`` for a platform error code.
 
 	风控码的恢复指引与 ``next_actions`` 一律以 ``RISK_ERROR_CONTRACTS`` 为准，
-	避免各命令手工拼装出互相矛盾的停止指令。
+	避免各命令手工拼装出互相矛盾的停止指令。有运行上下文的调用方传入 ``ctx``：
+	风险锁写在 ``<data_dir>/.cdp_risk_lock``，裸 ``boss clean --risk-lock`` 会去
+	默认目录解锁，自定义目录的锁原样保留且命令不报错（Issue #978）。
 	"""
 	recoverable, recovery_action = error_contract_for_code(code)
 	if code in RISK_ERROR_CONTRACTS:
-		recovery_action, hints = risk_error_contract(code)
+		recovery_action, hints = risk_error_contract(code, ctx=ctx, clean_command=clean_command, doctor_command=doctor_command)
 		return recoverable, recovery_action, hints
 	return recoverable, recovery_action, None
 
@@ -144,6 +153,38 @@ def risk_error_message(code: str) -> str:
 	"""
 	label = str(ERROR_CODES.get(code, {}).get("message") or "命中平台风控")
 	return f"{label}；停止自动化访问并在官方页面处理"
+
+
+def handle_browser_kernel_missing(ctx: Any, command: str, exc: Exception) -> None:
+	"""内核缺失的统一出口：BROWSER_KERNEL_MISSING + 可执行的安装指引。
+
+	Playwright 报 ``Executable doesn't exist`` / ``Playwright was just installed``
+	是确定性失败：patchright 已升级但对应修订版的 Chromium 还没装，重试同一条
+	命令（含 wizard 的自动重试）永远不会成功。此前命令层把它兜成
+	``NETWORK_ERROR`` +「重试」，Agent 会拿同一条命令反复打平台。登录链路
+	（``commands/_login_errors.py``）早已识别这条错误，命令层与 wizard 现在共用
+	同一份契约与文案。异常文本可能带本机路径，只作为 ``details.cause`` 保留
+	首行，不进 message。
+	"""
+	recoverable, recovery_action = error_contract_for_code("BROWSER_KERNEL_MISSING")
+	doctor = boss_command_for_ctx(ctx, "doctor", include_data_dir=True)
+	cause = (str(exc) or type(exc).__name__).splitlines()[0][:300]
+	handle_error_output(
+		ctx,
+		command,
+		code="BROWSER_KERNEL_MISSING",
+		message="patchright 浏览器内核缺失或与所需修订版不匹配",
+		recoverable=recoverable,
+		recovery_action=recovery_action,
+		details={"cause": cause},
+		hints={
+			"next_actions": ["patchright install chromium", doctor],
+			"operator_actions": [
+				"浏览器内核安装完成后重新执行原命令；缺的是 headless shell 时运行 patchright install chromium-headless-shell",
+				f"仍失败时先跑 {doctor} 核对所需修订版与本机已安装版本",
+			],
+		},
+	)
 
 
 def platform_error_message(code: str, message: str | None, fallback_message: str) -> str:
@@ -284,18 +325,18 @@ def handle_platform_error_output(
 	response: Any,
 	*,
 	fallback_message: str,
-	unknown_error_code: str | None = None,
 	extra_hints: dict[str, Any] | None = None,
 ) -> None:
 	"""Emit a schema-backed error envelope for an unsuccessful platform response.
 
 	``extra_hints`` 承载命令自身的诊断字段（如 status 的 ``auth_health``）；
 	风控码的 ``next_actions`` 由 ``RISK_ERROR_CONTRACTS`` 覆盖，调用方不能改写。
+	``UNKNOWN`` 沿用登记表的「先核对、勿自动重试」契约：写命令曾把它改写成
+	可重试的 ``NETWORK_ERROR``，批量与 wizard 因此重放可能已生效的写操作
+	（Issue #990）。
 	"""
 	code, message = platform.parse_error(response)
-	if code == "UNKNOWN" and unknown_error_code is not None:
-		code = unknown_error_code
-	recoverable, recovery_action, risk_hints = platform_error_contract(code)
+	recoverable, recovery_action, risk_hints = platform_error_contract(code, ctx=ctx)
 	hints = {**(extra_hints or {}), **(risk_hints or {})} or None
 	details = None
 	if isinstance(response, dict):
@@ -763,13 +804,87 @@ RISK_ERROR_CONTRACTS: dict[str, dict[str, Any]] = {
 }
 
 
-def risk_error_contract(code: str) -> tuple[str, dict[str, list[str]]]:
-	"""Return ``(recovery_action, hints)`` for a platform risk error code."""
+#: 契约文案里的注释性命令（默认示例）。有运行上下文时由调用方替换成带
+#: ``--data-dir`` 的真实命令：风险锁写在 ``<data_dir>/.cdp_risk_lock``。
+_RISK_CONTRACT_CLEAN = "boss clean --risk-lock"
+_RISK_CONTRACT_DOCTOR = "boss doctor"
+
+
+def _risk_contract_commands(
+	text: str,
+	clean_command: str | None,
+	doctor_command: str | None,
+) -> str:
+	"""把契约文本里的默认示例替换成调用方上下文中的命令（Issue #978）。"""
+	if clean_command:
+		text = text.replace(_RISK_CONTRACT_CLEAN, clean_command)
+	if doctor_command:
+		text = text.replace(_RISK_CONTRACT_DOCTOR, doctor_command)
+	return text
+
+
+def risk_error_contract(
+	code: str,
+	*,
+	ctx: Any = None,
+	clean_command: str | None = None,
+	doctor_command: str | None = None,
+) -> tuple[str, dict[str, list[str]]]:
+	"""Return ``(recovery_action, hints)`` for a platform risk error code.
+
+	有 ``ctx`` 的调用方得到带 ``--data-dir`` 与平台的 ``clean --risk-lock`` /
+	``doctor``；无上下文的纯函数调用与静态文档保持登记表的通用示例。
+	"""
 	spec = RISK_ERROR_CONTRACTS.get(code)
 	if spec is None:
 		_, recovery = error_contract_for_code(code, fallback_recovery_action="停止自动化访问")
 		return recovery or "停止自动化访问", {}
-	return str(spec["recovery_action"]), {"next_actions": list(spec["next_actions"])}
+	if ctx is not None:
+		if clean_command is None:
+			clean_command = boss_command_for_ctx(ctx, "clean --risk-lock", include_data_dir=True)
+		if doctor_command is None:
+			doctor_command = boss_command_for_ctx(ctx, "doctor", include_data_dir=True)
+	return (
+		_risk_contract_commands(str(spec["recovery_action"]), clean_command, doctor_command),
+		{
+			"next_actions": [
+				_risk_contract_commands(str(item), clean_command, doctor_command)
+				for item in spec["next_actions"]
+			]
+		},
+	)
+
+
+#: 浏览器来源策略表里的命令默认示例。有运行上下文时由调用方替换成带
+#: ``--data-dir`` 与平台的真实命令：``doctor`` 诊断的是本地登录态、缓存与风险锁。
+_BROWSER_POLICY_COMMANDS: dict[str, tuple[str, ...]] = {
+	"boss status --live": ("status --live",),
+	"boss doctor": ("doctor",),
+	"boss login --cdp": ("login --cdp",),
+	"boss clean --risk-lock": ("clean --risk-lock",),
+}
+
+
+def browser_policy_text(text: str, command_for: Callable[[str], str]) -> str:
+	"""把来源策略文案里的默认示例换成 ``command_for`` 构造的命令（Issue #980）。
+
+	``doctor`` / ``status --live`` / ``login --cdp`` / ``clean --risk-lock`` 读的是
+	``<data_dir>`` 里的登录态与风险锁；自定义 ``--data-dir`` 下照抄裸命令只会
+	诊断或清理默认目录。
+	"""
+	for literal, (command,) in _BROWSER_POLICY_COMMANDS.items():
+		if literal in text:
+			text = text.replace(literal, command_for(command))
+	return text
+
+
+def browser_policy_text_for_ctx(ctx: Any, text: str) -> str:
+	"""带数据目录与平台的来源策略文案；无上下文的纯函数调用保持原文。"""
+	if not text:
+		return text
+	return browser_policy_text(
+		text, lambda command: boss_command_for_ctx(ctx, command, include_data_dir=True)
+	)
 
 
 def httpx_only_fallback_hint(ctx: Any) -> list[str]:
@@ -841,18 +956,25 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					},
 				)
 			except BrowserSourceUnavailable as e:
+				# 策略表是来源耗尽时的唯一文案真源，但表本身没有运行上下文：
+				# 其中内嵌的 doctor / status --live / login --cdp / clean --risk-lock
+				# 读的是 <data_dir> 里的登录态与风险锁，这里补上本次目录与平台（Issue #980）。
 				hints: dict[str, list[str]] = {}
 				if e.policy.operator_actions:
-					hints["operator_actions"] = list(e.policy.operator_actions)
+					hints["operator_actions"] = [
+						browser_policy_text_for_ctx(ctx, action) for action in e.policy.operator_actions
+					]
 				if e.policy.next_actions:
-					hints["next_actions"] = list(e.policy.next_actions)
+					hints["next_actions"] = [
+						browser_policy_text_for_ctx(ctx, action) for action in e.policy.next_actions
+					]
 				handle_error_output(
 					ctx,
 					command_name,
 					code=e.code,
 					message=str(e),
 					recoverable=True,
-					recovery_action=e.policy.recovery_action,
+					recovery_action=browser_policy_text_for_ctx(ctx, e.policy.recovery_action),
 					hints=hints or None,
 				)
 			except BrowserChannelRequired as e:
@@ -908,7 +1030,7 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					hints=auth_required_hints(ctx),
 				)
 			except PlatformRiskError as e:
-				recovery_action, hints = risk_error_contract(e.code)
+				recovery_action, hints = risk_error_contract(e.code, ctx=ctx)
 				handle_error_output(
 					ctx,
 					command_name,
@@ -967,7 +1089,10 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					recovery_action=internal_recovery,
 				)
 			except OSError as e:
-				if is_local_io_error(e):
+				if is_browser_kernel_missing(str(e)):
+					# Playwright 以 OSError 子类抛「内核缺失」时同样不能被兜成可重试。
+					handle_browser_kernel_missing(ctx, command_name, e)
+				elif is_local_io_error(e):
 					# 路径不可写、目标被同名文件占用、磁盘满：重试同一条命令永远修不好，
 					# 落成可重试的 NETWORK_ERROR 只会让 Agent 无限重试。
 					handle_error_output(
@@ -992,6 +1117,11 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 				# 否则 Agent 会拿同一个非法值反复重试。
 				raise
 			except Exception as e:
+				# 内核缺失是确定性失败：符号名 / 路径未变时重试永远同一结果，不能
+				# 兜成 NETWORK_ERROR +「重试」让 Agent 反复打平台。
+				if is_browser_kernel_missing(str(e)):
+					handle_browser_kernel_missing(ctx, command_name, e)
+					return
 				handle_error_output(
 					ctx,
 					command_name,

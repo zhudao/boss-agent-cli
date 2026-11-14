@@ -614,6 +614,10 @@ def test_local_and_ai_actions_return_structured_recovery(tmp_path):
 		DEFAULT_ACTIONS["ai_assist"](context, {"resume": "default", "prompt": "优化"}, {})
 	assert exc_info.value.code == "AI_NOT_CONFIGURED"
 	assert exc_info.value.recoverable is True
+	# 照抄恢复提示必须把新密钥写回本次运行的数据目录（Issue #976）。
+	assert shlex.split(exc_info.value.recovery_action)[:4] == [
+		"boss", "--data-dir", str(tmp_path.resolve()), "ai",
+	]
 
 
 def test_candidate_watch_stores_string_params(tmp_path):
@@ -652,7 +656,10 @@ def test_candidate_watch_corrupt_params_reports_recovery(tmp_path):
 	with pytest.raises(WorkflowActionError) as exc_info:
 		DEFAULT_ACTIONS["candidate_watch"](context, {"action": "run", "name": "daily"}, {})
 	assert exc_info.value.code == "SAVED_SEARCH_INVALID"
-	assert "boss watch remove daily" in exc_info.value.recovery_action
+	# 动作层恢复命令保留触发本次 workflow 的数据目录（Issue #976）。
+	assert shlex.split(exc_info.value.recovery_action.split("；")[0]) == [
+		"boss", "--data-dir", str(tmp_path.resolve()), "watch", "remove", "daily",
+	]
 
 
 def test_candidate_watch_corrupt_params_quotes_name_with_spaces(tmp_path):
@@ -669,8 +676,13 @@ def test_candidate_watch_corrupt_params_quotes_name_with_spaces(tmp_path):
 	with pytest.raises(WorkflowActionError) as exc_info:
 		DEFAULT_ACTIONS["candidate_watch"](context, {"action": "run", "name": "我的 监控"}, {})
 	assert exc_info.value.code == "SAVED_SEARCH_INVALID"
-	assert "boss watch remove '我的 监控'" in exc_info.value.recovery_action
-	assert "boss watch add '我的 监控' <关键词>" in exc_info.value.recovery_action
+	remove_cmd, _, rebuild = exc_info.value.recovery_action.partition("；再用 ")
+	assert shlex.split(remove_cmd) == [
+		"boss", "--data-dir", str(tmp_path.resolve()), "watch", "remove", "我的 监控",
+	]
+	assert shlex.split(rebuild.removesuffix(" 重建")) == [
+		"boss", "--data-dir", str(tmp_path.resolve()), "watch", "add", "我的 监控", "<关键词>",
+	]
 
 
 def _crawl_outcome(run_id, status="completed"):
@@ -774,7 +786,9 @@ def test_crawl_action_rejects_invalid_config(tmp_path, monkeypatch, crawl_config
 		DEFAULT_ACTIONS["crawl_start"](context, {"query": "Python", "city": "北京"}, {})
 	assert excinfo.value.code == "INVALID_PARAM"
 	assert field in str(excinfo.value)
-	assert excinfo.value.recovery_action == "boss config reset crawl"
+	assert shlex.split(excinfo.value.recovery_action) == [
+		"boss", "--data-dir", str(tmp_path.resolve()), "config", "reset", "crawl",
+	]
 	assert service.created_settings is None
 
 
@@ -800,7 +814,13 @@ def test_crawl_action_rejects_unsupported_hook_profile(tmp_path, monkeypatch, ho
 		)
 	assert excinfo.value.code == "INVALID_PARAM"
 	assert "hook_profile" in str(excinfo.value)
-	assert "boss crawl run" in str(excinfo.value.recovery_action)
+	# 文本参数只用作说明；机器可执行的是 recovery_action 里的 crawl run 命令。
+	assert shlex.split(str(excinfo.value.recovery_action))[:4] == [
+		"boss", "--data-dir", str(tmp_path.resolve()), "crawl",
+	]
+	assert excinfo.value.recovery_action.endswith(
+		"crawl run <query> --city <城市> --hook-profile screenshot-full --hook-dir <脚本目录>"
+	)
 	assert service.created_settings is None
 
 
@@ -3137,6 +3157,86 @@ def test_wizard_status_and_stop_after_stop_report_only_terminals(tmp_path):
 	assert [shlex.split(action) for action in envelope["hints"]["next_actions"]] == expected
 
 
+_BLOCKED_STEP_ERRORS = {
+	"unconfirmed-write": {
+		"code": "ACTION_UNCONFIRMED",
+		"message": "发送结果未确认",
+		"recoverable": False,
+		"recovery_action": "操作可能已生效：先用 boss hr chatmsg 42 核对平台记录，不要自动重试",
+		"replay_safe": False,
+	},
+	"local-state-write-failed": {
+		"code": "LOCAL_STATE_WRITE_FAILED",
+		"message": "平台操作已完成，但本地状态保存失败",
+		"recoverable": False,
+		"recovery_action": "先在官方页面核对本次操作是否已生效；不要自动重发",
+		"replay_safe": False,
+	},
+}
+
+
+@pytest.mark.parametrize("error", _BLOCKED_STEP_ERRORS.values(), ids=_BLOCKED_STEP_ERRORS.keys())
+def test_wizard_status_on_blocked_failed_run_stops_suggesting_resume(tmp_path, error):
+	"""结果无法重放的失败给 `--resume` 只会原样失败：指引改为先核对（Issue #1021）。"""
+	plan = WorkflowPlan(
+		role="recruiter",
+		platform="zhipin",
+		goal="reply",
+		inputs={"friend_id": 42, "message": "offline fixture"},
+		requested_steps=("recruiter_reply",),
+		mode="headless",
+	)
+	with WorkflowStore(tmp_path) as store:
+		store.create("wrn_blocked", plan)
+		store.update_step("wrn_blocked", "recruiter_reply", status="failed", error=error)
+		store.update_run("wrn_blocked", status="failed", current_step="recruiter_reply", error=error)
+
+	status = CliRunner().invoke(cli, ["--json", "--data-dir", str(tmp_path), "wizard", "--status", "wrn_blocked"])
+	assert status.exit_code == 0
+	envelope = json.loads(status.stdout)
+	assert envelope["data"]["status"] == "failed"
+	assert [shlex.split(action) for action in envelope["hints"]["next_actions"]] == [
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard", "--status", "wrn_blocked"],
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard"],
+	]
+	# 步骤级的核对命令随状态返回，Agent 照它核对平台记录。
+	assert envelope["data"]["steps"][0]["error"]["recovery_action"] == error["recovery_action"]
+
+	# 照做 `--resume` 得到的确实是原失败：改变指引的前提成立。
+	resumed = CliRunner().invoke(cli, ["--json", "--data-dir", str(tmp_path), "wizard", "--resume", "wrn_blocked"])
+	assert resumed.exit_code == 1
+	assert json.loads(resumed.stdout)["error"]["code"] == error["code"]
+
+
+def test_wizard_status_on_replayable_failed_run_still_suggests_resume(tmp_path):
+	"""普通失败没有这条限制：恢复仍是唯一能接着往下跑的动作。"""
+	plan = WorkflowPlan(
+		role="recruiter",
+		platform="zhipin",
+		goal="reply",
+		inputs={"friend_id": 42, "message": "offline fixture"},
+		requested_steps=("recruiter_reply",),
+		mode="headless",
+	)
+	error = {
+		"code": "RATE_LIMITED",
+		"message": "请求过于频繁",
+		"recoverable": True,
+		"recovery_action": "稍后重试，或返回主菜单选择其他事项",
+	}
+	with WorkflowStore(tmp_path) as store:
+		store.create("wrn_retryable", plan)
+		store.update_step("wrn_retryable", "recruiter_reply", status="failed", error=error)
+		store.update_run("wrn_retryable", status="failed", current_step="recruiter_reply", error=error)
+
+	status = CliRunner().invoke(cli, ["--json", "--data-dir", str(tmp_path), "wizard", "--status", "wrn_retryable"])
+	assert status.exit_code == 0
+	assert [shlex.split(action) for action in json.loads(status.stdout)["hints"]["next_actions"]] == [
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard", "--resume", "wrn_retryable"],
+		["boss", "--data-dir", str(tmp_path.resolve()), "wizard", "--status", "wrn_retryable"],
+	]
+
+
 def test_wizard_stopped_run_offers_bound_crawl_resume(tmp_path):
 	"""绑定了内部 crawl 的 stopped run：先给恢复了数据目录的 crawl resume（Issue #870）。"""
 	plan = WorkflowPlan(
@@ -3968,6 +4068,31 @@ def test_runner_browser_source_unavailable_keeps_policy_error_code(tmp_path):
 	assert run["error"]["recovery_action"] == policy.recovery_action
 
 
+def test_runner_browser_source_recovery_targets_the_run_data_dir(tmp_path):
+	"""wizard 的来源耗尽恢复命令必须指向本次运行的数据目录（Issue #980）。
+
+	策略表的 ``boss doctor`` 读的是 ``<data_dir>`` 里的登录态与风险锁；runner
+	手上有 ``context.data_dir``，不补就退回默认目录。
+	"""
+	import shlex
+
+	from boss_agent_cli.api.browser_source import BrowserSourceUnavailable, resolve_policy
+
+	policy = resolve_policy("existing-browser")
+	data_dir = tmp_path / "state dir"
+
+	def no_channel(context, inputs, prior):
+		raise BrowserSourceUnavailable(policy, attempted=("cdp",))
+
+	with WorkflowStore(tmp_path) as store:
+		run = WorkflowRunner(store, {"no_channel": no_channel}).run(
+			_plan("no_channel"), SimpleNamespace(data_dir=data_dir), run_id="bs-dir-run"
+		)
+
+	recovery = run["error"]["recovery_action"]
+	assert shlex.split(recovery) == ["boss", "--data-dir", str(data_dir.resolve()), "doctor"]
+
+
 def test_runner_browser_navigation_timeout_is_not_generic_network_error(tmp_path):
 	from boss_agent_cli.api.browser_client import BrowserNavigationError
 
@@ -4138,6 +4263,8 @@ def test_ai_assist_truncation_recovery_points_to_max_tokens(tmp_path, monkeypatc
 	assert exc_info.value.code == "AI_API_ERROR"
 	assert "max_completion_tokens=4096" in str(exc_info.value)
 	assert "--max-tokens" in exc_info.value.recovery_action
+	# AI 报错的恢复建议同样指回本次运行的数据目录（Issue #976）。
+	assert str(tmp_path.resolve()) in exc_info.value.recovery_action
 
 
 def test_runner_reports_deterministic_action_bug_as_internal_error(tmp_path):
@@ -4151,6 +4278,48 @@ def test_runner_reports_deterministic_action_bug_as_internal_error(tmp_path):
 	assert run["error"]["code"] == "INTERNAL_ERROR"
 	assert run["error"]["recoverable"] is False
 	assert run["error"]["message"] == "KeyError: 'jobList'"
+
+
+def test_runner_reports_browser_kernel_missing_without_retry(tmp_path):
+	"""浏览器内核缺失是确定性失败：wizard 不能报成可重试的 NETWORK_ERROR。
+
+	patchright 升级后所需 Chromium 未安装，同一条命令（含 runner 的自动重试与
+	Agent 的 --resume）永远复现同一结果；恢复动作只能是安装内核。
+	"""
+
+	def broken(context, inputs, prior):
+		raise RuntimeError(
+			"BrowserType.launch: Executable doesn't exist at "
+			"/Users/u/Library/Caches/ms-playwright/chromium_headless_shell-1248/"
+			"chrome-headless-shell-mac-arm64/chrome-headless-shell"
+		)
+
+	with WorkflowStore(tmp_path) as store:
+		run = WorkflowRunner(store, {"broken": broken}).run(
+			_plan("broken"), SimpleNamespace(data_dir=tmp_path), run_id="kernel-run"
+		)
+	assert run["error"]["code"] == "BROWSER_KERNEL_MISSING"
+	assert run["error"]["recoverable"] is True
+	assert run["error"]["recovery_action"] == "patchright install chromium"
+	# doctor 指引必须指向本次运行的数据目录（同 Issue #978 的迁移）。
+	assert str((tmp_path / "doctor-marker")) not in run["error"]["details"]["doctor_command"]
+	assert run["error"]["details"]["doctor_command"] == f"boss --data-dir {tmp_path.resolve()} doctor"
+
+
+def test_runner_does_not_auto_retry_browser_kernel_missing(tmp_path):
+	"""内核缺失不能进入 runner 的自动重试循环：每次重试都会再起一个浏览器。"""
+	attempts = []
+
+	def broken(context, inputs, prior):
+		attempts.append(1)
+		raise RuntimeError("Executable doesn't exist at /nonexistent/chromium")
+
+	with WorkflowStore(tmp_path) as store:
+		run = WorkflowRunner(store, {"broken": broken}).run(
+			_plan("broken"), object(), run_id="kernel-retry-run", max_retries=3
+		)
+	assert len(attempts) == 1, attempts
+	assert run["error"]["code"] == "BROWSER_KERNEL_MISSING"
 
 
 def test_runner_reports_local_file_error_as_local_io_error(tmp_path):
@@ -4350,3 +4519,136 @@ def test_crawl_actions_reject_string_with_detail(tmp_path):
 		DEFAULT_ACTIONS["crawl_start"](context, {"query": "Python", "city": "北京", "with_detail": "false"}, {})
 	with pytest.raises(WorkflowInputError):
 		DEFAULT_ACTIONS["crawl_resume"](context, {"run_id": "run-1", "with_detail": "false"}, {})
+
+
+class _UnknownResponsePlatform(_FakeCandidatePlatform):
+	"""所有平台调用都返回无法解析的响应（Issue #990 的浏览器通道形态）。"""
+
+	def apply(self, security_id, job_id, lid=""):
+		self.calls.append(("apply", security_id, job_id, lid))
+		return {"code": -1, "message": "browser response is not JSON", "zpData": {}}
+
+	def greet(self, security_id, job_id, message=""):
+		self.calls.append(("greet", security_id, job_id, message))
+		return {"code": -1, "message": "browser response is not JSON", "zpData": {}}
+
+	def parse_error(self, response):
+		return "UNKNOWN", str(response.get("message") or "")
+
+
+def test_wizard_write_unknown_response_is_not_replayed(tmp_path):
+	"""写步骤遇到未识别的响应时禁止自动重试与 --resume 重跑（Issue #990）。
+
+	``_classify_action_error`` 原先把所有 ``UNKNOWN`` 映射成可重试的
+	``NETWORK_ERROR``，``_unwrap`` 又让 ``replay_safe`` 保持 True，runner 的
+	自动重试与 ``--resume`` 都会重放一次可能已生效的写操作。
+	"""
+	platform = _UnknownResponsePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	with pytest.raises(WorkflowActionError) as applied:
+		DEFAULT_ACTIONS["candidate_apply"](context, {"security_id": "sec-1", "job_id": "job-1"}, {})
+	assert applied.value.code == "UNKNOWN"
+	assert applied.value.recoverable is False
+	assert applied.value.replay_safe is False
+	assert "不要自动重试" in (applied.value.recovery_action or "")
+
+	with pytest.raises(WorkflowActionError) as greeted:
+		DEFAULT_ACTIONS["candidate_greet"](context, {"security_id": "sec-2", "job_id": "job-2", "message": "你好"}, {})
+	assert greeted.value.replay_safe is False
+
+
+def test_wizard_runner_does_not_resume_unknown_write_step(tmp_path):
+	calls = []
+
+	def unknown_write(context, inputs, prior):
+		calls.append("write")
+		raise WorkflowActionError(
+			"UNKNOWN",
+			"browser response is not JSON",
+			recoverable=False,
+			recovery_action=str(ERROR_CODES["UNKNOWN"]["recovery_action"]),
+			replay_safe=False,
+		)
+
+	with WorkflowStore(tmp_path) as store:
+		first = WorkflowRunner(store, {"write": unknown_write}).run(
+			_plan("write"), object(), run_id="run-unknown-write", max_retries=1
+		)
+		assert first["status"] == "failed"
+		assert first["steps"][0]["error"]["replay_safe"] is False
+		# 自动重试不得发生：一次未识别响应就是一次可能已发出的写。
+		assert calls == ["write"]
+		second = WorkflowRunner(store, {"write": unknown_write}).run(
+			_plan("write"), object(), run_id="run-unknown-write"
+		)
+
+	assert second["status"] == "failed"
+	assert second["error"]["code"] == "UNKNOWN"
+	assert calls == ["write"]
+
+
+@pytest.mark.parametrize("error_code", ["UNKNOWN", "ACTION_UNCONFIRMED"])
+@pytest.mark.parametrize(
+	"role,action,method,inputs,check_args",
+	[
+		("candidate", "candidate_apply", "apply", {"security_id": "synthetic-sid", "job_id": "synthetic-job"}, ["me", "--section", "deliver"]),
+		("candidate", "candidate_greet", "greet", {"security_id": "synthetic-sid", "job_id": "synthetic-job"}, ["chat"]),
+		("candidate", "candidate_exchange", "exchange_contact", {"security_id": "sid_current"}, ["chat"]),
+		("candidate", "candidate_mark", "friend_label", {"security_id": "sid_current", "label": "沟通中"}, ["chat"]),
+		("recruiter", "recruiter_reply", "send_message_by_friend", {"friend_id": 42, "message": "你好"}, ["hr", "chatmsg", "42"]),
+		("recruiter", "recruiter_request_resume", "exchange_request_by_friend", {"friend_id": 42}, ["hr", "chatmsg", "42"]),
+		("recruiter", "recruiter_exchange_contact", "exchange_request_by_friend", {"friend_id": 42}, ["hr", "chatmsg", "42"]),
+		("recruiter", "recruiter_jobs_online", "job_online", {"job_id": "synthetic-job"}, ["hr", "jobs", "list"]),
+		("recruiter", "recruiter_jobs_offline", "job_offline", {"job_id": "synthetic-job"}, ["hr", "jobs", "list"]),
+		("recruiter", "recruiter_resume", "view_geek", {"geek_id": "synthetic-geek", "job_id": "synthetic-job"}, ["hr", "chat"]),
+	],
+)
+def test_default_wizard_actions_never_replay_unknown_results(
+	tmp_path, error_code, role, action, method, inputs, check_args,
+):
+	"""真实适配器连接默认动作与 runner：有限重试、恢复都只能调用一次。"""
+	from boss_agent_cli.platforms.zhipin import BossPlatform
+	from boss_agent_cli.platforms.zhipin_recruiter import BossRecruiterPlatform
+
+	data_dir = tmp_path / "wizard profile"
+	client = MagicMock()
+	response = {"code": -1, "message": "unrecognized backend response", "zpData": {}}
+	if error_code == "ACTION_UNCONFIRMED":
+		response["__cli_error_code__"] = error_code
+		response["__cli_error_details__"] = {"outcome": "unknown", "replay_safe": False}
+	getattr(client, method).return_value = response
+	client.friend_list.return_value = {
+		"code": 0,
+		"zpData": {"result": [{"uid": 10001, "securityId": "sid_current", "name": "测试联系人", "friendSource": 0}], "hasMore": False},
+	}
+	platform = BossPlatform(client) if role == "candidate" else BossRecruiterPlatform(client)
+	context = _action_context(data_dir, role=role, candidate=platform, recruiter=platform)
+	plan = replace(_plan(action), role=role, inputs=inputs)
+	with WorkflowStore(data_dir) as store:
+		runner = WorkflowRunner(store, DEFAULT_ACTIONS)
+		first = runner.run(plan, context, run_id="unknown-action", max_retries=2)
+		assert first["status"] == "failed"
+		error = first["steps"][0]["error"]
+		assert error["code"] == error_code
+		assert error["recoverable"] is False
+		assert error["replay_safe"] is False
+		check_command = shlex.join(["boss", "--data-dir", str(data_dir.resolve()), *check_args])
+		assert check_command in error["recovery_action"]
+		assert "不要自动重试" in error["recovery_action"]
+		if role == "candidate":
+			assert "hr chatmsg" not in error["recovery_action"]
+		getattr(client, method).assert_called_once()
+		resumed = runner.run(plan, context, run_id="unknown-action", max_retries=2)
+		assert resumed["status"] == "failed"
+		getattr(client, method).assert_called_once()
+
+
+def test_wizard_read_unknown_response_stays_retryable():
+	"""读取的未识别响应没有副作用，仍按 NETWORK_ERROR 兜底（Issue #990）。"""
+	from boss_agent_cli.wizard.actions import _classify_action_error
+
+	code, recoverable, recovery = _classify_action_error("UNKNOWN", "browser response is not JSON")
+	assert code == "NETWORK_ERROR"
+	assert recoverable is True
+	assert "稍后重试" in recovery
