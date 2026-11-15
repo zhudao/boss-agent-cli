@@ -25,7 +25,15 @@ from boss_agent_cli.automation.storage import AutomationStateError, AutomationSt
 from boss_agent_cli.ai.service import AIServiceError
 from boss_agent_cli.cache.store import CacheStore
 from boss_agent_cli.commands.ai_cmd import _build_fit_prompt, _create_ai_service
-from boss_agent_cli.commands.crawl import _require_crawl_capabilities, _settings_from_context, _transport_factory
+from boss_agent_cli.commands.crawl import (
+	_LoginSeedUnavailable,
+	_report_crawl_runtime_missing,
+	_report_login_required,
+	_require_crawl_capabilities,
+	_seeded_transport_factory,
+	_settings_from_context,
+)
+from boss_agent_cli.crawler.controls import CrawlRuntimeUnavailable
 from boss_agent_cli.crawler.operations import crawl_status, import_crawl_shortlist
 from boss_agent_cli.crawler.service import CrawlBusyError, CrawlService
 from boss_agent_cli.display import (
@@ -40,6 +48,7 @@ from boss_agent_cli.display import (
 )
 from boss_agent_cli.resume.models import resume_to_text
 from boss_agent_cli.resume.store import ResumeStore
+from boss_agent_cli.services.install_extras import extras_requirement
 
 
 @click.group("agent")
@@ -156,10 +165,12 @@ def crawl_cmd(
 					chrome_path=None,
 					cdp_port=None,
 				)
+				# 与 crawl run / start 同一份登录种子：采集浏览器的配置目录是隔离的，
+				# 不注入就是登录页，会落成 risk_stopped 并写下风险锁（Issue #1044）。
 				outcome = CrawlService(
 					cache,
 					data_dir=data_dir,
-					transport_factory=_transport_factory,
+					transport_factory=_seeded_transport_factory(ctx),
 				).create_and_run(settings)
 				run_id = outcome.run_id
 			status = crawl_status(cache, run_id or "", data_dir=data_dir)
@@ -227,6 +238,12 @@ def crawl_cmd(
 			hints={"next_actions": [status_command]},
 		)
 		return
+	except _LoginSeedUnavailable as exc:
+		_report_login_required(ctx, "agent.crawl", str(exc))
+		return
+	except CrawlRuntimeUnavailable as exc:
+		_report_crawl_runtime_missing(ctx, "agent.crawl", str(exc))
+		return
 	except RuntimeError as exc:
 		configure_cmd = boss_command_for_ctx(ctx, "crawl configure", include_data_dir=True)
 		handle_error_output(
@@ -235,7 +252,7 @@ def crawl_cmd(
 			code="CRAWL_UNAVAILABLE",
 			message=str(exc),
 			recoverable=True,
-			recovery_action=f"安装 boss-agent-cli[crawl] 并执行 {configure_cmd}",
+			recovery_action=f"安装 {extras_requirement('crawl')} 并执行 {configure_cmd}",
 		)
 		return
 
@@ -350,10 +367,15 @@ def review_group() -> None:
 def review_list_cmd(ctx: click.Context) -> None:
 	"""列出旧版本遗留的待人工复核动作。"""
 	store = AutomationStore(ctx.obj["data_dir"])
+	try:
+		reviews = store.read_reviews()
+	except AutomationStateError as exc:
+		_emit_state_error(ctx, "agent.review.list", exc)
+		return
 	handle_output(
 		ctx,
 		"agent.review.list",
-		{"items": [asdict(item) for item in store.read_reviews()]},
+		{"items": [asdict(item) for item in reviews]},
 		render=lambda d: render_list_result(
 			d.get("items", []),
 			"reviews",
@@ -370,7 +392,11 @@ def review_list_cmd(ctx: click.Context) -> None:
 def review_approve_cmd(ctx: click.Context, review_id: str) -> None:
 	"""处理旧版本复核项并写入兼容 pending 队列。"""
 	store = AutomationStore(ctx.obj["data_dir"])
-	pending = store.approve_review(review_id, now_iso())
+	try:
+		pending = store.approve_review(review_id, now_iso())
+	except AutomationStateError as exc:
+		_emit_state_error(ctx, "agent.review.approve", exc)
+		return
 	if pending is None:
 		_emit_review_missing(ctx, "agent.review.approve", review_id)
 		return
@@ -390,7 +416,11 @@ def review_approve_cmd(ctx: click.Context, review_id: str) -> None:
 def review_reject_cmd(ctx: click.Context, review_id: str, reason: str) -> None:
 	"""拒绝一条旧版本人工复核动作，并记录跳过事件。"""
 	store = AutomationStore(ctx.obj["data_dir"])
-	rejected = store.reject_review(review_id, reason, now_iso())
+	try:
+		rejected = store.reject_review(review_id, reason, now_iso())
+	except AutomationStateError as exc:
+		_emit_state_error(ctx, "agent.review.reject", exc)
+		return
 	if rejected is None:
 		_emit_review_missing(ctx, "agent.review.reject", review_id)
 		return
@@ -422,10 +452,15 @@ def pending_group() -> None:
 def pending_list_cmd(ctx: click.Context) -> None:
 	"""列出旧版本遗留的待执行动作队列。"""
 	store = AutomationStore(ctx.obj["data_dir"])
+	try:
+		pending = store.read_pending()
+	except AutomationStateError as exc:
+		_emit_state_error(ctx, "agent.pending.list", exc)
+		return
 	handle_output(
 		ctx,
 		"agent.pending.list",
-		{"items": [asdict(item) for item in store.read_pending()]},
+		{"items": [asdict(item) for item in pending]},
 		render=lambda d: render_list_result(
 			d.get("items", []),
 			"pending",
@@ -521,6 +556,12 @@ def _emit_state_error(ctx: click.Context, command: str, exc: AutomationStateErro
 		command,
 		code="AUTOMATION_STATE_INVALID",
 		message=f"{exc.path} 无法解析：{exc.detail}",
+		# 登记表的指引只针对 state.json；队列文件损坏时指向实际出问题的文件。
+		recovery_action=(
+			None
+			if exc.path.name == "state.json"
+			else f"修正或移除 {exc.path} 中的问题记录后重试；建议先备份该文件"
+		),
 	)
 	ctx.exit(1)
 

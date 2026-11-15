@@ -47,7 +47,7 @@ boss-agent-cli 把职位发现、福利筛选、本地简历与 AI、投递沟�
 ```bash
 # 安装（uv 推荐；浏览器内核仅用于用户主动登录 / 本地导出）
 uv tool install boss-agent-cli
-patchright install chromium
+boss doctor   # 缺浏览器内核时会给出可直接执行的安装命令
 
 # 真人入口：直接进入角色、平台和目标向导
 boss
@@ -132,7 +132,7 @@ with BossClient(AuthManager(...)) as client:
 
 完整命令表、参数与福利筛选原理见 **[命令参考](docs/commands.md)**；能力真源是 `boss schema`（支持 `--format openai-tools` / `anthropic-tools` / `mcp-tools` 导出工具定义）。
 
-批量采集需要额外安装 `uv sync --extra crawl`。它使用独立的 `<data-dir>/crawl/chrome-profile`，不会接管日常 Chrome profile。默认不注入 Hook；如需使用本地脚本，必须同时显式提供 Hook 档位和包含 `SHA256SUMS` 的目录：
+批量采集需要额外安装 `pip install "boss-agent-cli[crawl]"`（或 `uv tool install "boss-agent-cli[crawl]"`；源码仓库内为 `uv sync --extra crawl`）。它使用独立的 `<data-dir>/crawl/chrome-profile`，不会接管日常 Chrome profile。默认不注入 Hook；如需使用本地脚本，必须同时显式提供 Hook 档位和包含 `SHA256SUMS` 的目录：
 
 ```powershell
 boss crawl configure --max-requests 20 --max-details 50 --max-seconds 600 --max-retries 1

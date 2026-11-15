@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Any, Mapping, NoReturn
+from typing import Any, Callable, Mapping, NoReturn
 
 import click
 
@@ -47,13 +47,24 @@ def _is_interactive(ctx: click.Context) -> bool:
 	)
 
 
+def _command_for_ctx(ctx: click.Context) -> Callable[[str], str]:
+	"""向导 TTY 恢复文案里的命令要定位本次运行的数据目录与平台（Issue #1090）。"""
+	return lambda command: boss_command_for_ctx(ctx, command, include_data_dir=True)
+
+
 def _interactive_error(
+	ctx: click.Context,
 	*,
 	code: str,
 	message: str | None = None,
 	recovery_action: str | None = None,
 ) -> NoReturn:
-	render_error(code=code, message=message, recovery_action=recovery_action)
+	render_error(
+		code=code,
+		message=message,
+		recovery_action=recovery_action,
+		command_for=_command_for_ctx(ctx),
+	)
 	raise SystemExit(1)
 
 
@@ -69,7 +80,7 @@ def _wizard_error(
 	hints: dict[str, Any] | None = None,
 ) -> None:
 	if interactive:
-		_interactive_error(code=code, message=message, recovery_action=recovery_action)
+		_interactive_error(ctx, code=code, message=message, recovery_action=recovery_action)
 	handle_error_output(
 		ctx,
 		"wizard",
@@ -80,6 +91,17 @@ def _wizard_error(
 		details=details,
 		hints=hints,
 	)
+
+
+def _run_after_stop(store: WorkflowStore, run_id: str) -> dict[str, Any]:
+	"""停止已落盘后取展示用的 run；内部 crawl 结果损坏时退回断点本身。
+
+	停止标记已经写入，不能因为叠加实时采集结果失败就把这次停止报成错误。
+	"""
+	try:
+		return store.get(run_id) or {}
+	except CacheRecordInvalid:
+		return store.get_checkpoint(run_id) or {}
 
 
 def _workflow_inner_run_id(run: Mapping[str, Any]) -> str:
@@ -360,7 +382,7 @@ def _emit_run(ctx: click.Context, run: Mapping[str, Any], *, interactive: bool) 
 	if run.get("status") == "failed":
 		error = run.get("error") or {}
 		if interactive:
-			render_run(run)
+			render_run(run, command_for=_command_for_ctx(ctx))
 			return
 		_wizard_error(
 			ctx,
@@ -379,7 +401,7 @@ def _emit_run(ctx: click.Context, run: Mapping[str, Any], *, interactive: bool) 
 		ctx,
 		"wizard",
 		run,
-		render=render_run,
+		render=lambda payload: render_run(payload, command_for=_command_for_ctx(ctx)),
 		hints={"next_actions": [boss_command_for_ctx(ctx, f"wizard --status {shell_argument(str(run['run_id']))}", include_data_dir=True)]},
 	)
 
@@ -421,7 +443,12 @@ def _run_interactive_session(
 			render_cancelled()
 			return
 		except WorkflowInputError as exc:
-			render_error(code="INVALID_PARAM", message=str(exc), recovery_action="请返回并重新输入")
+			render_error(
+				code="INVALID_PARAM",
+				message=str(exc),
+				recovery_action="请返回并重新输入",
+				command_for=_command_for_ctx(ctx),
+			)
 			if not ask_continue_session():
 				return
 			continue
@@ -435,7 +462,7 @@ def _run_interactive_session(
 				if selection.action == "status":
 					run = store.get(str(selection.run_id))
 					if run is None:
-						render_error(code="WORKFLOW_NOT_FOUND")
+						render_error(code="WORKFLOW_NOT_FOUND", command_for=_command_for_ctx(ctx))
 						if not ask_continue_session(clear_before=False):
 							return
 						continue
@@ -473,10 +500,10 @@ def _run_interactive_session(
 						continue
 				elif selection.action == "stop":
 					if not store.request_stop(str(selection.run_id)):
-						render_error(code="WORKFLOW_NOT_FOUND")
+						render_error(code="WORKFLOW_NOT_FOUND", command_for=_command_for_ctx(ctx))
 					else:
 						clear_wizard_screen()
-						render_run(store.get(str(selection.run_id)) or {})
+						render_run(_run_after_stop(store, str(selection.run_id)))
 					if not ask_continue_session(clear_before=False):
 						return
 					continue
@@ -486,7 +513,7 @@ def _run_interactive_session(
 						turn_retries = max(1, max_retries)
 					existing = store.get(str(resume_run_id))
 					if existing is None:
-						render_error(code="WORKFLOW_NOT_FOUND")
+						render_error(code="WORKFLOW_NOT_FOUND", command_for=_command_for_ctx(ctx))
 						if not ask_continue_session():
 							return
 						continue
@@ -495,14 +522,23 @@ def _run_interactive_session(
 				source_id = str(selection.inputs.get("source_run_id") or "")
 				browse_run = store.get(source_id) if source_id else None
 				if browse_run is None:
-					render_error(code="WORKFLOW_NOT_FOUND", message="找不到可浏览的采集结果")
+					render_error(
+						code="WORKFLOW_NOT_FOUND",
+						message="找不到可浏览的采集结果",
+						command_for=_command_for_ctx(ctx),
+					)
 					if not ask_continue_session():
 						return
 					continue
 			else:
 				plan = build_plan(selection)
 		except WorkflowInputError as exc:
-			render_error(code="INVALID_PARAM", message=str(exc), recovery_action="请返回并重新输入")
+			render_error(
+				code="INVALID_PARAM",
+				message=str(exc),
+				recovery_action="请返回并重新输入",
+				command_for=_command_for_ctx(ctx),
+			)
 			if not ask_continue_session():
 				return
 			continue
@@ -524,7 +560,12 @@ def _run_interactive_session(
 			except WizardReturnHome:
 				continue
 			except WorkflowActionError as exc:
-				render_error(code=exc.code, message=str(exc), recovery_action=exc.recovery_action)
+				render_error(
+					code=exc.code,
+					message=str(exc),
+					recovery_action=exc.recovery_action,
+					command_for=_command_for_ctx(ctx),
+				)
 			if not ask_continue_session(clear_before=False):
 				return
 			continue
@@ -550,7 +591,12 @@ def _run_interactive_session(
 			# 职位操作里选「返回主菜单」：直接回到主循环，不再多问一层。
 			continue
 		except WorkflowActionError as exc:
-			render_error(code=exc.code, message=str(exc), recovery_action=exc.recovery_action)
+			render_error(
+				code=exc.code,
+				message=str(exc),
+				recovery_action=exc.recovery_action,
+				command_for=_command_for_ctx(ctx),
+			)
 			if not ask_continue_session():
 				return
 			continue
@@ -588,7 +634,12 @@ def _run_interactive_session(
 				except WizardReturnHome:
 					continue
 				except WorkflowActionError as exc:
-					render_error(code=exc.code, message=str(exc), recovery_action=exc.recovery_action)
+					render_error(
+						code=exc.code,
+						message=str(exc),
+						recovery_action=exc.recovery_action,
+						command_for=_command_for_ctx(ctx),
+					)
 				if not ask_continue_session(clear_before=False):
 					return
 				continue
@@ -609,7 +660,12 @@ def _run_interactive_session(
 			except WizardReturnHome:
 				continue
 			except WorkflowActionError as exc:
-				render_error(code=exc.code, message=str(exc), recovery_action=exc.recovery_action)
+				render_error(
+					code=exc.code,
+					message=str(exc),
+					recovery_action=exc.recovery_action,
+					command_for=_command_for_ctx(ctx),
+				)
 				if not ask_continue_session(clear_before=False):
 					return
 				continue
@@ -738,7 +794,7 @@ def _run_wizard_command(
 					hints={"next_actions": [boss_command_for_ctx(ctx, "wizard", include_data_dir=True)]},
 				)
 				return
-			run = store.get(stop_run_id) or {}
+			run = _run_after_stop(store, stop_run_id)
 			handle_output(ctx, "wizard", run, render=render_run, hints={"next_actions": _workflow_next_actions(ctx, run)})
 			return
 
@@ -823,7 +879,7 @@ def _run_wizard_command(
 	if run.get("status") == "failed":
 		error = run.get("error") or {}
 		if interactive:
-			render_run(run)
+			render_run(run, command_for=_command_for_ctx(ctx))
 			raise SystemExit(1)
 		_wizard_error(
 			ctx,
@@ -840,7 +896,7 @@ def _run_wizard_command(
 		ctx,
 		"wizard",
 		run,
-		render=render_run,
+		render=lambda payload: render_run(payload, command_for=_command_for_ctx(ctx)),
 		hints={"next_actions": [boss_command_for_ctx(ctx, f"wizard --status {shell_argument(str(run['run_id']))}", include_data_dir=True)]},
 	)
 

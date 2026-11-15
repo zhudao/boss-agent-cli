@@ -145,7 +145,7 @@ def _add_live_probe_checks(ctx: click.Context, auth: AuthManager, checks: list[d
 					}
 				)
 				identity = interpret_recruiter_identity(_user_info_payload(platform, info))
-				checks.append(_recruiter_identity_check(identity))
+				checks.append(_recruiter_identity_check(identity, ctx=ctx))
 			else:
 				code, message = platform.parse_error(info)
 				if code in RISK_ERROR_CONTRACTS:
@@ -172,7 +172,9 @@ def _add_live_probe_checks(ctx: click.Context, auth: AuthManager, checks: list[d
 				"name": "candidate_live_user_info",
 				"status": "warn",
 				"detail": f"求职者只读 user_info 探测异常: {exc}",
-				"recovery_action": "先运行 boss status 检查本地登录态；命中风控时停止自动化访问",
+				"recovery_action": (
+					f"先运行 {_doctor_command(ctx, 'status')} 检查本地登录态；命中风控时停止自动化访问"
+				),
 			}
 		)
 
@@ -182,7 +184,9 @@ def _add_live_probe_checks(ctx: click.Context, auth: AuthManager, checks: list[d
 				"name": "recruiter_live_read",
 				"status": "warn",
 				"detail": "当前登录态在求职者侧，未请求招聘者接口",
-				"recovery_action": "在官方页面切换到「我要招聘」后执行 boss hr whoami；命中风控时停止自动化访问",
+				"recovery_action": (
+					f"在官方页面切换到「我要招聘」后执行 {_doctor_command(ctx, 'hr', 'whoami')}；命中风控时停止自动化访问"
+				),
 			}
 		)
 		return None
@@ -239,13 +243,15 @@ def _user_info_payload(platform: Any, info: Any) -> dict[str, Any]:
 	return {}
 
 
-def _recruiter_identity_check(identity: dict[str, Any]) -> dict[str, Any]:
+def _recruiter_identity_check(identity: dict[str, Any], *, ctx: Any = None) -> dict[str, Any]:
+	"""``hr whoami`` 恢复命令定位到本次诊断的数据目录（Issue #1095）。"""
 	if identity.get("ready") is True:
 		return {
 			"name": "recruiter_identity",
 			"status": "ok",
 			"detail": "当前登录态在招聘者侧（identity=1）",
 		}
+	whoami_command = _doctor_command(ctx, "hr", "whoami") if ctx is not None else "boss hr whoami"
 	if identity.get("side") == "candidate":
 		detail = "当前登录态在求职者侧（identity=0）"
 		if identity.get("double_identity") is True:
@@ -254,11 +260,11 @@ def _recruiter_identity_check(identity: dict[str, Any]) -> dict[str, Any]:
 			"name": "recruiter_identity",
 			"status": "warn",
 			"detail": detail,
-			"recovery_action": "在官方页面切换到「我要招聘」后执行 boss hr whoami",
+			"recovery_action": f"在官方页面切换到「我要招聘」后执行 {whoami_command}",
 		}
 	return {
 		"name": "recruiter_identity",
 		"status": "warn",
 		"detail": "getUserInfo 的 identity 不是 0 或 1，继续做招聘者只读探测",
-		"recovery_action": "执行 boss hr whoami 核对身份",
+		"recovery_action": f"执行 {whoami_command} 核对身份",
 	}

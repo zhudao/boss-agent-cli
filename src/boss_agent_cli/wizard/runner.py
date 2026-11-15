@@ -14,6 +14,7 @@ from boss_agent_cli.api.browser_source import BrowserSourceUnavailable, BrowserS
 from boss_agent_cli.api.client import PlatformRiskError
 from boss_agent_cli.api.request_budget import RequestBudgetExceeded, request_control
 from boss_agent_cli.auth.manager import AuthRequired, TokenRefreshFailed
+from boss_agent_cli.cache.store import CacheBusyError, is_cache_busy_error
 from boss_agent_cli.display import (
 	INTERNAL_ERROR_TYPES,
 	boss_command,
@@ -24,7 +25,7 @@ from boss_agent_cli.display import (
 	shell_argument,
 )
 from boss_agent_cli.output import is_local_io_error
-from boss_agent_cli.services.browser_runtime import is_browser_kernel_missing
+from boss_agent_cli.services.browser_runtime import is_browser_kernel_missing, patchright_install_command
 from boss_agent_cli.wizard.models import StepResult, WorkflowInputError, WorkflowPlan, WorkflowStatus
 from boss_agent_cli.wizard.store import WorkflowStore
 
@@ -79,14 +80,16 @@ def _browser_kernel_missing_error(
 	``doctor`` 诊断的是 ``<data_dir>`` 里的登录态与内核缓存，必须带上本次运行
 	的数据目录，否则自定义 --data-dir 下照抄提示会诊断另一份目录（同 Issue #978）。
 	"""
-	recoverable, recovery_action = error_contract_for_code("BROWSER_KERNEL_MISSING")
+	recoverable, _ = error_contract_for_code("BROWSER_KERNEL_MISSING")
 	doctor = boss_command("doctor", platform_name=plan.platform, data_dir=data_dir)
 	cause = (str(exc) or type(exc).__name__).splitlines()[0][:300]
 	return WorkflowActionError(
 		"BROWSER_KERNEL_MISSING",
 		"patchright 浏览器内核缺失或与所需修订版不匹配",
 		recoverable=recoverable,
-		recovery_action=recovery_action,
+		# 与命令层同一份可执行指引：裸 `patchright install chromium` 在
+		# `uv tool install` 环境下不在 PATH 上（Issue #1060）。
+		recovery_action=patchright_install_command(),
 		details={"cause": cause, "doctor_command": doctor},
 	)
 
@@ -125,7 +128,8 @@ class WorkflowControl:
 	resume_action: str | None = None
 
 	def poll(self) -> str | None:
-		run = self.store.get(self.run_id)
+		# 只看断点里的状态：叠加实时采集结果会让损坏的 crawl 记录挡住停止信号。
+		run = self.store.get_checkpoint(self.run_id)
 		if run is not None and run.get("status") == WorkflowStatus.STOPPED.value:
 			return "stop"
 		if self.deadline is not None and time.monotonic() >= self.deadline:
@@ -279,6 +283,18 @@ class WorkflowRunner:
 		pending_steps = [name for name in plan.requested_steps if name not in prior_results]
 		if pending_steps and pending_steps[0] in blocked_steps:
 			# 保持原失败状态与 recovery_action，让操作者先核对官方页面。
+			if stored_run["status"] not in {WorkflowStatus.FAILED.value, WorkflowStatus.STOPPED.value}:
+				# 步骤失败已落盘、run 状态还没写完执行器就消失了：run 仍是 running，
+				# 原样返回会把结果未知的写操作报成执行中（Issue #1129）。
+				blocked_step = pending_steps[0]
+				self._store.update_run(
+					run_id,
+					status=WorkflowStatus.FAILED.value,
+					current_step=blocked_step,
+					last_result=stored_run.get("last_result"),
+					error=blocked_steps[blocked_step],
+				)
+				return self._store.get(run_id) or stored_run
 			return stored_run
 
 		self._store.update_run(
@@ -487,9 +503,19 @@ class WorkflowRunner:
 						"NETWORK_ERROR", str(exc), recoverable=True, recovery_action="重试当前 run_id"
 					)
 			except Exception as exc:
+				# 本地缓存锁冲突不是网络问题（Issue #1118）：等锁释放后重试同一
+				# run_id 即可，不能兜成 NETWORK_ERROR。
+				if isinstance(exc, CacheBusyError) or is_cache_busy_error(exc):
+					busy_recoverable, busy_recovery = error_contract_for_code("CACHE_BUSY")
+					error = WorkflowActionError(
+						"CACHE_BUSY",
+						str(exc) if isinstance(exc, CacheBusyError) else f"本地缓存库正被其他进程写入（{exc}）",
+						recoverable=busy_recoverable,
+						recovery_action=busy_recovery,
+					)
 				# 内核缺失是确定性失败：同一条输入（含 --resume）永远复现，不能兜成
 				# NETWORK_ERROR +「重试当前 run_id」（Issue #1007）。
-				if is_browser_kernel_missing(str(exc)):
+				elif is_browser_kernel_missing(str(exc)):
 					error = _browser_kernel_missing_error(exc, plan, data_dir)
 				else:
 					error = WorkflowActionError(

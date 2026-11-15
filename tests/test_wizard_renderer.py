@@ -16,8 +16,10 @@ from boss_agent_cli.wizard.renderer import (
 	ERROR_LABELS,
 	RECOVERY_LABELS,
 	STEP_LABELS,
+	_RECOVERY_COMMANDS,
 	recovery_message,
 )
+from boss_agent_cli.services.install_extras import extras_requirement
 
 ROOT = Path(__file__).resolve().parents[1]
 WIZARD_SOURCE_ROOT = ROOT / "src" / "boss_agent_cli" / "wizard"
@@ -73,3 +75,154 @@ def test_expired_auth_and_stopped_workflow_do_not_fall_back_to_generic_retry():
 	stopped_recovery = recovery_message("WORKFLOW_STOPPED") or ""
 	assert "恢复已有任务" in stopped_recovery
 	assert stopped_recovery != "请返回主菜单后重试。"
+
+
+def test_missing_crawl_dependencies_do_not_fall_back_to_generic_retry():
+	"""依赖缺失时「请返回主菜单后重试」只会让真人反复撞同一个失败（Issue #1050）。"""
+	recovery = recovery_message("CRAWL_UNAVAILABLE") or ""
+	assert f'uv tool install "{extras_requirement("crawl")}"' in recovery
+	assert "重试不会有帮助" in recovery
+	assert recovery != "请返回主菜单后重试。"
+
+
+def test_browser_kernel_recovery_uses_the_running_interpreter():
+	"""内核安装指引必须能照抄执行（Issue #1060）。
+
+	`uv tool install` 只把 boss / boss-mcp 放进 PATH，裸 `patchright install
+	chromium` 会 command not found；向导展示的命令必须走运行本 CLI 的解释器，
+	并且优先使用错误里携带的动态命令（含本次运行的解释器路径）。
+	"""
+	import sys
+
+	from boss_agent_cli.services.browser_runtime import patchright_install_command
+
+	localized = recovery_message("BROWSER_KERNEL_MISSING") or ""
+	assert sys.executable in localized
+	assert "-m patchright install chromium" in localized
+
+	custom = "/custom/venv/bin/python -m patchright install chromium"
+	assert custom in (recovery_message("BROWSER_KERNEL_MISSING", custom) or "")
+	# 没有动态命令时回落到当前解释器。
+	fallback = recovery_message("BROWSER_KERNEL_MISSING", "检查网络后重试") or ""
+	assert patchright_install_command() in fallback
+
+
+def test_risk_recovery_uses_context_aware_clean_command():
+	"""runner 已算出带数据目录的解锁命令时，TTY 文案不能退回裸命令（Issue #1087）。"""
+	command = "boss --data-dir '/tmp/custom state' clean --risk-lock"
+	for code in ("ACCOUNT_RISK", "ENVIRONMENT_RISK", "ENVIRONMENT_RISK_LOCKED"):
+		recovery = recovery_message(code, f"由用户执行 {command} 并显式恢复任务") or ""
+		assert command in recovery, code
+		assert "由你本人执行" in recovery, code
+		assert "执行 boss clean --risk-lock" not in recovery, code
+
+
+def test_risk_recovery_without_context_keeps_the_generic_example():
+	recovery = recovery_message("ENVIRONMENT_RISK_LOCKED") or ""
+	assert "boss clean --risk-lock" in recovery
+
+
+def test_every_bare_boss_command_in_recovery_labels_can_be_rebound():
+	"""静态恢复文案里的每个 ``boss …`` 示例都必须有改写条目（Issue #1090）。
+
+	漏登记的家族会让真人在 TTY 里照抄一条指向默认数据目录的命令。
+	"""
+	import re
+
+	# 先剔除已登记的完整字面量，剩下的 ``boss …`` 就是漏网之鱼。正则直接匹配
+	# 会截断多词命令（``boss me --section deliver`` → ``boss me``）。
+	pattern = re.compile(r"boss [a-z][a-z0-9-]*")
+	missing: dict[str, list[str]] = {}
+	for code, text in RECOVERY_LABELS.items():
+		for literal in sorted(_RECOVERY_COMMANDS, key=len, reverse=True):
+			text = text.replace(literal, "")
+		uncovered = sorted(set(pattern.findall(text)))
+		if uncovered:
+			missing[code] = uncovered
+	assert missing == {}, f"这些命令没有改写条目，会指向默认数据目录：{missing}"
+
+
+def test_empty_state_panel_rebinds_its_import_hint(monkeypatch):
+	"""空简历面板的导入命令也要带上本次运行的数据目录（Issue #1090）。"""
+	import io
+
+	from rich.console import Console
+
+	from boss_agent_cli import display
+	from boss_agent_cli.wizard.renderer import render_run
+
+	def command_for(command: str) -> str:
+		return f"boss --data-dir '/tmp/custom state' {command}"
+
+	stream = io.StringIO()
+	monkeypatch.setattr(display, "console", Console(file=stream, force_terminal=False, width=200))
+	render_run(
+		{"status": "completed", "goal": "resumes", "last_result": {"data": {"items": []}}},
+		command_for=command_for,
+	)
+
+	output = stream.getvalue()
+	assert "boss --data-dir '/tmp/custom state' resume import <文件>" in output
+	assert "命令导入：boss resume import" not in output
+
+	"""静态恢复文案里的裸命令要能换成本次运行的数据目录（Issue #1090）。"""
+	def command_for(command: str) -> str:
+		return f"boss --data-dir '/tmp/custom state' {command}"
+	expected = {
+		"AI_NOT_CONFIGURED": "boss --data-dir '/tmp/custom state' ai config",
+		"SAVED_SEARCH_INVALID": "boss --data-dir '/tmp/custom state' watch remove",
+		"CONTACT_NOT_FOUND": "boss --data-dir '/tmp/custom state' chat",
+		"ALREADY_APPLIED": "boss --data-dir '/tmp/custom state' me --section deliver",
+		"EXCHANGE_NOT_AVAILABLE": "boss --data-dir '/tmp/custom state' hr reply",
+		"CRAWL_BUSY": "boss --data-dir '/tmp/custom state' crawl status",
+		"UNKNOWN": "boss --data-dir '/tmp/custom state' doctor",
+	}
+	for code, marker in expected.items():
+		recovery = recovery_message(code, command_for=command_for) or ""
+		assert marker in recovery, code
+		# 改写后不能残留裸命令。
+		assert " boss ai config" not in recovery.replace(marker, ""), code
+
+	# 无上下文保持通用示例。
+	assert "boss doctor" in (recovery_message("UNKNOWN") or "")
+
+
+def test_dynamic_recovery_sentence_wins_over_a_stale_static_label():
+	"""actions 已按本次数据目录改正命令家族时，静态标签不能覆盖它（Issue #1090）。"""
+	dynamic = "用 boss --data-dir '/tmp/custom state' watch remove demo 重建"
+	recovery = recovery_message("SAVED_SEARCH_INVALID", dynamic) or ""
+	assert recovery == dynamic
+
+	busy = "用 boss --data-dir '/tmp/custom state' crawl status run-1 查看进度"
+	assert recovery_message("CRAWL_BUSY", busy) == busy
+
+	# 没有上下文的动态句子不改变原有静态文案。
+	assert "boss preset remove" in (recovery_message("SAVED_SEARCH_INVALID", "请重新添加") or "")
+
+
+def test_failed_run_panel_prefers_context_aware_unlock_command(monkeypatch):
+	"""失败面板的「下一步」必须使用 run 里保存的上下文解锁命令（Issue #1087）。"""
+	import io
+
+	from rich.console import Console
+
+	from boss_agent_cli import display
+	from boss_agent_cli.wizard.renderer import render_run
+
+	command = "boss --data-dir '/tmp/custom state' clean --risk-lock"
+	stream = io.StringIO()
+	monkeypatch.setattr(display, "console", Console(file=stream, force_terminal=False, width=200))
+	render_run(
+		{
+			"status": "failed",
+			"error": {
+				"code": "ENVIRONMENT_RISK_LOCKED",
+				"message": "风控锁定",
+				"recovery_action": f"由用户执行 {command} 并显式恢复任务",
+			},
+		}
+	)
+
+	output = stream.getvalue()
+	assert command in output
+	assert "执行 boss clean --risk-lock" not in output

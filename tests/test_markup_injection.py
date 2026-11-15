@@ -18,10 +18,10 @@ _LINK = "[link=https://example.invalid/x]点我领奖[/link]"
 _PAYLOADS = (_CLOSING_TAG, _LINK)
 
 
-def _capture_terminal_console(monkeypatch):
+def _capture_terminal_console(monkeypatch, *, width: int = 120):
 	"""force_terminal 才会走到 OSC 8 超链接编码；force_terminal=False 掩盖注入。"""
 	stream = io.StringIO()
-	console = Console(file=stream, force_terminal=True, width=120, color_system="truecolor")
+	console = Console(file=stream, force_terminal=True, width=width, color_system="truecolor")
 	monkeypatch.setattr("boss_agent_cli.display.console", console)
 	return stream
 
@@ -108,8 +108,58 @@ class TestDisplayRenderers:
 
 		_assert_literal(stream, payload)
 
+	@pytest.mark.parametrize("command", [
+		"boss --data-dir '/tmp/[green]/data' login",
+		"boss --data-dir '/tmp/[link=https://example.invalid]x[/link]' login",
+	])
+	def test_status_login_hint_preserves_bracketed_data_dir(self, monkeypatch, command):
+		"""未登录提示里的数据目录必须按字面显示（Issue #1083）。"""
+		from boss_agent_cli.display import render_status
+
+		stream = _capture_terminal_console(monkeypatch)
+		render_status({"logged_in": False}, login_action=command)
+
+		_assert_literal(stream, command)
+
+	@pytest.mark.parametrize("command", [
+		"boss --data-dir '/tmp/[green]/data' clean --risk-lock",
+		"boss --data-dir '/tmp/[link=https://example.invalid]x[/link]' clean --risk-lock",
+	])
+	def test_status_risk_lock_hint_preserves_bracketed_data_dir(self, monkeypatch, command):
+		"""风控解锁提示里的数据目录同样必须按字面显示（Issue #1087）。"""
+		from boss_agent_cli.display import render_status
+
+		stream = _capture_terminal_console(monkeypatch, width=400)
+		render_status(
+			{
+				"logged_in": True,
+				"user_name": "tester",
+				"cdp_risk_lock": {
+					"locked": True,
+					"locked_at": "2026-11-15 10:00:00",
+					"reason": "ENVIRONMENT_RISK",
+				},
+			},
+			clean_action=command,
+		)
+
+		_assert_literal(stream, command)
+
 
 class TestWizardRenderers:
+	@pytest.mark.parametrize("command", [
+		"'/opt/[green]/bin/python' -m patchright install chromium",
+		r"& 'C:\Tools\[green]\python.exe' -m patchright install chromium",
+	])
+	def test_kernel_install_hint_preserves_bracketed_paths(self, monkeypatch, command):
+		"""内核安装命令中的目录名必须原样显示（Issue #1079）。"""
+		from boss_agent_cli.wizard.preflight import _render_kernel_blocked
+
+		stream = _capture_terminal_console(monkeypatch)
+		_render_kernel_blocked(f"缺少内核，请运行 {command}")
+
+		_assert_literal(stream, command)
+
 	@pytest.mark.parametrize("payload", _PAYLOADS)
 	def test_job_card(self, monkeypatch, payload):
 		from boss_agent_cli.wizard.renderer import render_job_card_zh

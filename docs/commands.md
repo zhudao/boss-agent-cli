@@ -59,7 +59,7 @@ TTY 下只把 `operator_actions` 渲染到 stderr；`next_actions` 是纯 Agent 
 | `boss doctor` | 诊断环境、依赖、凭据完整性和网络；默认仅本地诊断，不读取浏览器 Cookie。`--probe-cookies` 才提取浏览器 Cookie，`--live-probe` 才执行低频只读探测。探测到求职者侧登录态时先标出身份，不继续请求招聘者接口 |
 | `boss me` | 我的信息（用户/简历/期望/投递记录） |
 
-登录恢复命令保留原数据目录：使用 `--data-dir` 时，认证错误的 `error.recovery_action`、`hints.next_actions` 和真人扫码指引会携带经过 shell 参数转义的绝对目录，换工作目录后仍可照提示登录。登录成功后的状态检查、搜索与推荐提示，以及 `status` 的后继操作，使用同一目录。向导等待登录时的登录与续跑指引、认证失败与超时 checkpoint、任务不存在或记录损坏时的恢复提示，以及 `status` / `doctor` 信封里的 `auth_health` 诊断字段（含检查项的恢复动作），也保留目录，避免被引导到默认目录下的其他会话。向导动作层返回的恢复命令同样保留目录与平台：AI 未配置或 API 报错时的 `ai config`、watch 参数损坏时的删除与重建命令、`config reset crawl`，以及不支持 `hook_profile` 时的 `crawl run` 指引，都定位到触发本次 workflow 的 `--data-dir`，不会把新密钥写进默认目录或去默认目录删改同名监控。静态 `boss schema` 仍展示通用命令示例。
+登录恢复命令保留原数据目录：使用 `--data-dir` 时，认证错误的 `error.recovery_action`、`hints.next_actions` 和真人扫码指引会携带经过 shell 参数转义的绝对目录，换工作目录后仍可照提示登录。登录成功后的状态检查、搜索与推荐提示，以及 `status` 的后继操作，使用同一目录。向导等待登录时的登录与续跑指引、认证失败与超时 checkpoint、任务不存在或记录损坏时的恢复提示，以及 `status` / `doctor` 信封里的 `auth_health` 诊断字段（含检查项的恢复动作），也保留目录，避免被引导到默认目录下的其他会话。向导动作层返回的恢复命令同样保留目录与平台：AI 未配置或 API 报错时的 `ai config`、watch 参数损坏时的删除与重建命令、`config reset crawl`，以及不支持 `hook_profile` 时的 `crawl run` 指引，都定位到触发本次 workflow 的 `--data-dir`，不会把新密钥写进默认目录或去默认目录删改同名监控。静态 `boss schema` 仍展示通用命令示例。恢复文案只改写原文中的命令示例，不再扫描刚插入的命令；数据目录包含 `boss doctor` 等文字、或已有命令中的路径参数带引号时，路径均按字面保留；前文名称或路径中的词内撇号不会打乱后续命令的引用边界。
 
 `boss me --section deliver --deliver-page 2` 单独查看投递记录时，信封 `pagination` 给出分页证据：`page` 优先使用平台返回的有效页码，否则回显请求页；`has_more` 仅在平台返回布尔 `hasMore` 时为 `true` / `false`，缺失或类型不明确时为 `null`，`has_more_source=unknown`。`total` 是本页 `list` 数组的条数（`total_kind=returned_page_count`）；列表字段缺失或类型不符时为 `null`，不代表全量投递数。仅 `has_more=true` 时附加下一页命令；未知时 `operator_actions` 说明不能凭本页数量判断。默认 `boss me` 汇总四段信息、或只查其他 section 时，顶层 `pagination` 保持 `null`。MCP 对应调用是 `boss_me(section="deliver", deliver_page=2)`。
 
@@ -117,7 +117,7 @@ pbpaste | boss login --curl-file -
 
 ## 可恢复批量采集
 
-`crawl` 是用户显式触发的有界 Chrome 任务。首次使用需安装 `uv sync --extra crawl`；采集器只启动 `<data-dir>/crawl/chrome-profile` 这个独立 profile，不接管日常 Chrome。请求数、详情数、墙钟时间和重试由固定预算控制，每一步持久化 checkpoint，并可用 `stop` 停止。
+`crawl` 是用户显式触发的有界 Chrome 任务。默认安装不带采集依赖，首次使用需安装 `pip install "boss-agent-cli[crawl]"`（或 `uv tool install "boss-agent-cli[crawl]"`；源码仓库内为 `uv sync --extra crawl`）。`uv tool install` 每次按给定的依赖组重建工具环境，已经装过 `mcp` 时要一次列全：`uv tool install "boss-agent-cli[crawl,mcp]"`，信封里的恢复指引会按当前环境给出完整写法。未安装时 `crawl run` / `start` / `resume`、`agent crawl --query` 与向导采集步骤返回 `CRAWL_UNAVAILABLE`，不创建任务也不启动后台进程，`status` / `results` / `stop` / `shortlist` 不受影响。采集器只启动 `<data-dir>/crawl/chrome-profile` 这个独立 profile，不接管日常 Chrome。请求数、详情数、墙钟时间和重试由固定预算控制，每一步持久化 checkpoint，并可用 `stop` 停止。
 
 ```powershell
 boss crawl configure --max-requests 20 --max-details 50 --max-seconds 600 --max-retries 1
@@ -139,17 +139,19 @@ boss crawl stop <run_id>
 | `boss crawl stop <run_id>` | 请求运行中任务在下一个安全点停止并保留 checkpoint |
 | `boss crawl shortlist <run_id> (--all \| --selector <csel_...>)` | 将 crawl 结果导入原项目的本地候选池；不请求平台，保留内部职位关联和详情缓存供 `boss ai fit` 使用 |
 
-同一采集 `run_id` 同时只允许一个执行器。重叠的前台恢复返回 `CRAWL_BUSY`（`recoverable: true`，`--exit-codes sysexits` 下为 75），不发出请求、不修改断点或清除停止请求；`hints.next_actions` 只给原数据目录的 `crawl status <run_id>`，等当前执行结束后再恢复。新建采集、后台 worker 与向导采集步骤共用这项互斥；向导的失败信封与该失败任务的状态查询同样只建议查看内部采集状态。`--background` 仍立即返回供轮询，worker 取得执行权后才读取断点。`status` / `results` / `stop` 在执行期间照常可用；锁按 `run_id` 隔离，进程退出后由操作系统释放，不需手工删除锁文件。无法准备执行锁时返回 `LOCAL_IO_ERROR`，不发出请求。Python API 的 `CrawlService.resume()` 在任务被占用时抛出 `CrawlBusyError`，可在当前执行结束后再次恢复。
+同一采集 `run_id` 同时只允许一个执行器。重叠的前台恢复返回 `CRAWL_BUSY`（`recoverable: true`，`--exit-codes sysexits` 下为 75），不发出请求、不修改断点或清除停止请求；`hints.next_actions` 只给原数据目录的 `crawl status <run_id>`，等当前执行结束后再恢复。新建采集、后台 worker 与向导采集步骤共用这项互斥；向导的失败信封与该失败任务的状态查询同样只建议查看内部采集状态。`--background` 对有待恢复工作的非排队任务先探测执行锁，再立即返回供轮询：仍被占用时返回 `running`，不另起 worker，也不清除停止请求；原 worker 已退出、锁已释放但记录仍为 `running` 时，会启动恢复并返回 `queued`。父进程在启动前释放探测锁，worker 重新取得执行权后才读取最新断点，保留已提交页面和累计预算。刚进入 `queued` 的任务继续等待原 worker；排队超过 30 秒仍未被接手（后台进程被强制终止等）时，同样先探测执行锁——仍被占用返回 `running`，空闲则重新启动 worker，此时 `crawl status` 的 `hints.next_actions` 也会给出 `crawl resume <run_id> --background`。`status` / `results` / `stop` 在执行期间照常可用；锁按 `run_id` 隔离，进程退出后由操作系统释放，不需手工删除锁文件。无法准备执行锁时返回 `LOCAL_IO_ERROR`，不发出请求。Python API 的 `CrawlService.resume()` 在任务被占用时抛出 `CrawlBusyError`，可在当前执行结束后再次恢复。
+
+后台 worker 的输出不回传给调用方，所以登录态由父进程先查：`crawl start` 与需要启动 worker 的 `crawl resume --background` 在本地登录态缺失、没有 Cookie 或缺少 `wt2` 时直接返回 `AUTH_REQUIRED`，不创建任务、不解除停止请求、不启动进程；参数错误仍先于登录检查报出，已完成或仍在排队的任务不受影响。worker 若在接手之前退出（登录态在启动瞬间失效、风险锁等），而任务仍显示 `queued` 或 `running`，会把它落为 `stopped` 并在 `error` 写明「后台任务未能开始执行」与错误码，`crawl status` 可见，登录或解除阻断后用 `crawl resume` 重新启动；任务已处于终态（上一次执行的结果）或另一个执行器持有执行权时不改写，此时再次执行 `crawl resume --background` 会由父进程报出原因。
 
 采集在浏览器打开、抓页或补详情时收到 `SystemExit` / `KeyboardInterrupt` 等退出信号，会先保存 `stopped`、页游标、待补详情和已消耗预算，再向外传播原退出信号；不会把未完成任务标为 `completed`。显式执行 `crawl resume <run_id>` 后续跑未完成页面和详情，已提交页面不重抓。
 
-采集任务的状态、结果、停止、恢复及候选池后继命令，以及 `checkpoint.resume_command`，都显式携带原 `--data-dir` 的绝对路径；换一个工作目录执行提示时仍定位同一份本地任务。任务不存在或记录损坏时的核对提示同样保留目录。采集服务、向导采集动作与 `agent crawl` 返回的任务恢复指引也保留目录，避免误读或停止默认目录中的同名任务。风险停止仍须先完成人工恢复；人工解锁提示中的 `boss clean --risk-lock` 也携带原数据目录，解锁后显式执行恢复命令。
+采集任务的状态、结果、停止、恢复及候选池后继命令，以及 `checkpoint.resume_command`，都显式携带原 `--data-dir` 的绝对路径；换一个工作目录执行提示时仍定位同一份本地任务。任务不存在或记录损坏时的核对提示同样保留目录。采集服务、向导采集动作与 `agent crawl` 返回的任务恢复指引也保留目录，避免误读或停止默认目录中的同名任务。风险停止仍须先完成人工恢复；人工解锁提示中的 `boss clean --risk-lock` 也携带原数据目录，解锁后显式执行恢复命令。运行结果 `data.error` 与错误信封 `error.message` 里的同类命令（如「由用户执行 `boss clean --risk-lock`」）同样改写为原数据目录的完整命令。
 
 `crawl results` 的后继导入命令还携带本次返回职位的全部 `--selector`，只导入所见结果；`--page` / `--detail-status` 的筛选范围因此保持不变。空结果改为提示查看同一 run 的 `crawl status`。路径、run_id 和 selector 按 shell 参数转义，终端与信封使用同一条命令。
 
-默认 Hook 为 `none`。`screenshot-full` 仅在用户明确选择 `--hook-profile screenshot-full --hook-dir <目录>` 时启用；目录必须由用户拥有相应授权，并提供原始 7 个脚本及 `SHA256SUMS`。项目不再发布这些第三方脚本，运行前逐文件校验 SHA-256 并记录脚本标识与摘要；不记录 Cookie、请求头或完整请求体。
+默认 Hook 为 `none`。`screenshot-full` 仅在用户明确选择 `--hook-profile screenshot-full --hook-dir <目录>` 时启用；目录必须由用户拥有相应授权，并提供原始 7 个脚本及 `SHA256SUMS`。缺少 `--hook-dir` 时 `crawl run` / `crawl start` 在创建任务、打开浏览器之前返回 `INVALID_PARAM`。项目不再发布这些第三方脚本，运行前逐文件校验 SHA-256 并记录脚本标识与摘要；不记录 Cookie、请求头或完整请求体。
 
-候选人侧可用 `boss agent crawl --run-id <run_id> --resume <简历名>` 执行“完成的 crawl → shortlist → ai fit → 按匹配分排序”，不会启动浏览器；`boss agent crawl --query <关键词> --city <城市> --resume <简历名>` 会新建真实采集。已有同 `data_dir` 风险锁时，run/start/resume 和 agent 的新采集在浏览器构造、连接及后台拉起前阻断；resume 只恢复自身断点，不能清锁。新风险保持 `risk_stopped` outcome、已采集队列与 checkpoint，并在 `data.risk_lock` 保留结构化原因和可用业务码，未知业务码为 `null`；人工恢复步骤只放在 `hints.operator_actions`，不提供可自动执行的恢复动作。状态、结果、本地 shortlist 导入和读取已完成 run 仍可用。
+候选人侧可用 `boss agent crawl --run-id <run_id> --resume <简历名>` 执行“完成的 crawl → shortlist → ai fit → 按匹配分排序”，不会启动浏览器；`boss agent crawl --query <关键词> --city <城市> --resume <简历名>` 会新建真实采集，与 `crawl run` 一样把 `boss login` 的登录 Cookie 与 User-Agent 注入独立采集浏览器；本地登录态缺失、没有 Cookie 或缺少 `wt2` 时在打开浏览器之前返回 `AUTH_REQUIRED`，不创建任务。已有同 `data_dir` 风险锁时，run/start/resume 和 agent 的新采集在浏览器构造、连接及后台拉起前阻断；resume 只恢复自身断点，不能清锁。新风险保持 `risk_stopped` outcome、已采集队列与 checkpoint，并在 `data.risk_lock` 保留结构化原因和可用业务码，未知业务码为 `null`；人工恢复步骤只放在 `hints.operator_actions`，不提供可自动执行的恢复动作。状态、结果、本地 shortlist 导入和读取已完成 run 仍可用。
 
 每页完成后更新 `<data-dir>/crawl/runs/<run_id>/jobs.json`、`jobs.csv` 和带筛选/冻结首行的 `jobs.xlsx`。XLSX 保留完整值但所有数据行固定为单行和统一行高，长内容仅在表格中截断显示。JSON/CSV/XLSX 不包含 `security_id`、职位 ID、selector、招聘者姓名或职位；`crawl results` 同样不暴露平台标识与招聘者信息，但会返回供本地导入使用的 selector。真实平台标识保留在受限本地 SQLite 状态，`boss clean --privacy` 会删除 crawl 运行、预算和导出。风险码 `31` / `32` / `35` / `36` / `37`、code `38` 的身份资料流程、安全页、职位列表容器异常、预算耗尽或 stop 请求都会保存断点并停止；code `38` 不等同于验证码。stdout 始终只输出 JSON 信封和恢复命令。
 

@@ -86,16 +86,33 @@ boss logout && boss login
 
 ## Browser / patchright issues
 
-### `patchright install chromium` fails
+### Browser kernel install fails (`BROWSER_KERNEL_MISSING`)
+
+The kernel install command must use **the same interpreter that runs boss**.
+`uv tool install` / `pipx install` only put `boss` and `boss-mcp` on PATH and keep
+patchright inside the tool environment, so a bare `patchright install chromium`
+fails with `command not found` (Issue #1060). Both the envelope's
+`error.recovery_action` and `boss doctor` print a runnable command that includes the
+interpreter path — copy it as is:
 
 ```bash
+boss doctor                     # prints the runnable install command and the required revision
+# e.g. /path/to/python -m patchright install chromium
+
+# Extra troubleshooting when the install itself fails
 # macOS / Linux: ensure write access to ~/Library/Caches (macOS) or ~/.cache (Linux)
 # Windows: run as admin once
-pip install --upgrade patchright
-patchright install chromium --with-deps
-# If the global tool environment reports a missing headless shell:
-patchright install chromium-headless-shell
+<same interpreter> -m pip install --upgrade patchright
+<same interpreter> -m patchright install chromium --with-deps
+# If it reports a missing headless shell:
+<same interpreter> -m patchright install chromium-headless-shell
 ```
+
+On Windows, install guidance targets PowerShell. If the interpreter path contains spaces or special characters, the full command looks like `& 'C:\Program Files\Python\python.exe' -m patchright install chromium`; keep the leading `&`, which invokes the quoted path. If you are using cmd.exe, open PowerShell before running this form of command.
+
+When `PLAYWRIGHT_BROWSERS_PATH` is set, use the same environment setting for the kernel install, the CLI, `boss doctor`, and the wizard preflight; the preflight checks only that directory. Relative paths resolve against `INIT_CWD` (or the current directory when unset), and `0` selects `.local-browsers` inside the patchright driver package.
+
+The wizard's “Log in now” option uses the same authentication chain as `boss login`: it first tries to reuse an existing browser login and opens a QR browser only when needed. A missing patchright kernel does not block valid Cookie or existing CDP login; the wizard shows kernel installation guidance only after the QR fallback reports that the kernel is missing.
 
 ### `AUTH_REQUIRED` before live tests
 
@@ -103,14 +120,33 @@ patchright install chromium-headless-shell
 not a CLI failure. Validate local commands, schema, MCP, and doctor first; run
 `boss login` before live `search`, `detail`, or `status --live` checks.
 
+### `boss-mcp` reports a missing MCP SDK
+
+The default `boss-agent-cli` install does not include the optional MCP SDK. When the SDK is missing, `boss-mcp` writes installation guidance to stderr and exits with code 1, leaving stdout empty; a host may only report that the connection closed. Add the dependency using your original installation method, then restart MCP:
+
+```bash
+pip install "boss-agent-cli[mcp]"
+# For a uv tool installation
+uv tool install "boss-agent-cli[mcp]"
+# Inside a source checkout
+uv sync --extra mcp
+```
+
+`uv tool install` rebuilds the tool environment from the extras you name and does not keep earlier ones: when `crawl` is already installed, list both (`uv tool install "boss-agent-cli[crawl,mcp]"`), otherwise adding MCP removes the crawl dependencies. The `boss-mcp` startup message and the `CRAWL_UNAVAILABLE` recovery guidance spell out the full requirement for the current environment; `pip install` is incremental and unaffected.
+
+You can also use the README's `uvx --from "boss-agent-cli[mcp]" boss-mcp` configuration directly. Missing dependencies inside the SDK and other server failures keep their original errors so you can diagnose the actual cause.
+
 ### MCP tools return `CLI_ERROR`
 
 `CLI_ERROR` is a process-level failure between the MCP server and the underlying
 `boss` CLI, not a platform response:
 
 - **The CLI could not start** (`error.message` begins with `无法启动底层 boss CLI`):
-  `boss` is not on the MCP server process's `PATH`, the `--boss-bin` path is wrong,
-  or the file is not executable. No platform operation happened
+  `boss-mcp` defaults to the `boss` entry point from its own installation (next to
+  the interpreter running the server) and does not depend on the MCP host's `PATH`;
+  it falls back to a `PATH` lookup only when that entry point is missing. This error
+  means the sibling entry point is absent and `boss` is not on the MCP server
+  process's `PATH`, or the `--boss-bin` path is wrong or not executable. No platform operation happened
   (`error.details.outcome_unknown=false`). Install `boss` into the MCP server's
   environment or pass `boss-mcp --boss-bin /path/to/boss`; the README's
   `uvx --from boss-agent-cli[mcp] boss-mcp` puts that environment's `boss` on `PATH`.
@@ -352,10 +388,11 @@ Every error response contains `code`, `recoverable`, and `recovery_action`, so a
 | `LOCAL_STATE_WRITE_FAILED` | The platform action completed but local state could not be saved | Check the official page for the actual result first; never automatically resend, and confirm disk space and cache-directory permissions before continuing |
 | `LOCAL_IO_ERROR` | A local file could not be read or written (export path, `config.json`, cache) | Do not retry automatically: make sure the target path is a writable directory (not an existing file of the same name) with enough disk space, then run the command again |
 | `MODEL_REGISTRY_INVALID` | The local model registry `models/registry.json` is unreadable (interrupted write, broken manual edit) | Fix or delete the file and retry; deleting it only drops the registry entries — the model files stay on disk, and re-running `boss ai local import` rebuilds them |
-| `AUTOMATION_STATE_INVALID` | The recruiter automation state `automation/state.json` is unreadable, so `boss agent run` / `stats` cannot continue (a broken `stop.json` is treated as an open circuit breaker) | Fix or delete the file and retry; deleting it loses automation deduplication and progress history, so back it up first |
+| `AUTOMATION_STATE_INVALID` | The recruiter automation state `automation/state.json` is unreadable or has fields of the wrong type, or a record in the queue files `pending-actions.jsonl` / `human-review-queue.jsonl` has an unreadable `confidence` or `action`, so `boss agent run` / `stats` / `pending` / `review` cannot continue (a broken `stop.json` is treated as an open circuit breaker) | Fix the file and field named in `error.message` and retry; deleting `state.json` loses automation deduplication and progress history, so back it up first |
 | `SAVED_SEARCH_INVALID` | A local preset / watch has unreadable params (`saved_searches.params` is not a JSON object), so `boss search --preset` / `boss watch run` cannot continue | Run `boss preset remove <name>` (or `boss watch remove`) and add it again; the params live only in the local cache, so deleting them does not touch platform data |
 | `CACHE_RECORD_INVALID` | A local crawl / workflow record is unreadable (`crawl_runs`, `crawl_jobs`, `workflow_runs` or `workflow_steps` JSON columns cannot be parsed), so the checkpoint cannot be resumed | Re-create the task (`boss crawl start` for crawl, `boss wizard --input-json` for workflows); the record lives only in the local cache, already-exported files are left untouched, and the `boss wizard` task list skips broken records and names them |
 | `CACHE_DATABASE_INVALID` | The local cache database `cache/boss_agent.db` is corrupted or occupied by another file (`file is not a database`), so nearly every command that reads or writes local state fails | Back up the file, delete it and retry; a fresh empty database is created automatically. The shortlist, presets, watch history and task checkpoints in it are lost, while platform data is untouched. Retryable failures such as a concurrent lock never report this code |
+| `CACHE_BUSY` | The local cache database `cache/boss_agent.db` is being written by another connection (`database is locked`), so the SQLite write lock cannot be acquired within the busy timeout | Wait for the other boss command or program holding the cache to finish writing, then retry. The file itself is intact — do not delete it, and platform data is untouched. If it keeps happening, check for leftover background boss tasks |
 | `ALREADY_APPLIED` | Already applied | Skip; review applications with `boss me --section deliver`, or follow up with `boss chat` |
 | `GREET_LIMIT` | Daily greet quota hit | Pause until tomorrow |
 | `NETWORK_ERROR` | Connection failed | Retry with backoff |
@@ -366,7 +403,7 @@ Every error response contains `code`, `recoverable`, and `recovery_action`, so a
 | `AI_API_ERROR` | AI provider call failed | Retry / check key |
 | `AI_PARSE_ERROR` | AI response not JSON | Retry |
 | `PLATFORM_NOT_SUPPORTED` | The current platform does not support this role or subcommand | Switch to a supported platform (e.g. `boss --platform zhipin hr ...`) |
-| `BROWSER_KERNEL_MISSING` | patchright browser kernel missing or mismatched (including non-login commands that launch a browser: `search` / `detail` / `greet` / `chat` / `me` / `wizard`, and `resume export --format pdf`) | `patchright install chromium`; if the headless shell is missing, run `patchright install chromium-headless-shell`. This is a deterministic failure; retrying will not help |
+| `BROWSER_KERNEL_MISSING` | patchright browser kernel missing or mismatched (including non-login commands that launch a browser: `search` / `detail` / `greet` / `chat` / `me` / `wizard`, and `resume export --format pdf`) | `<interpreter running boss> -m patchright install chromium` (the envelope's `recovery_action` gives the full command); if the headless shell is missing, run `-m patchright install chromium-headless-shell` with the same interpreter. This is a deterministic failure; retrying will not help |
 
 ## Windows smoke checklist
 

@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import random
 import socket
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, ContextManager, Protocol
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from boss_agent_cli.api.zhipin_errors import normalize_risk_code, platform_risk_page_response
 from boss_agent_cli.api.request_budget import (
@@ -18,8 +19,10 @@ from boss_agent_cli.api.request_budget import (
 	is_request_stop,
 	retry_after_seconds,
 )
+from boss_agent_cli.crawler.controls import CrawlRuntimeUnavailable
 from boss_agent_cli.crawler.hooks import HookInjection, HookRegistrationError, inject_hook_profile
 from boss_agent_cli.display import risk_error_message
+from boss_agent_cli.services.install_extras import EXTRA_MODULES, extras_requirement, module_available
 
 # 兼容 search / pc 等变体；监听只作主路径，失败时退到页面内同源请求（不走 httpx）。
 JOBLIST_TARGET = r"wapi/zpgeek/[^?\s]*joblist\.json"
@@ -27,6 +30,32 @@ JOBLIST_URL = "https://www.zhipin.com/wapi/zpgeek/search/joblist.json"
 JOB_CARD_URL = "https://www.zhipin.com/wapi/zpgeek/job/card.json"
 JOBLIST_PATH = "/wapi/zpgeek/search/joblist.json"
 JOB_CARD_PATH = "/wapi/zpgeek/job/card.json"
+
+
+def packet_page_no(packet: Any) -> int | None:
+	"""从监听到的 joblist 请求 URL 读 `page` 参数；读不出页码返回 None。
+
+	DrissionPage 的 `DataPacket.url` 即请求 URL（POST 也一样带原查询串），
+	`Listener.start()` 会先清空队列。断点恢复先导航到第 1 页再滚动翻页，
+	队列里会依次出现 1..target 页的响应；只有按 URL 页码匹配才能拿到
+	本次请求的目标页（Issue #1114）。
+	"""
+	url = getattr(packet, "url", None)
+	if not isinstance(url, str) or not url:
+		url = getattr(getattr(packet, "request", None), "url", None)
+	if not isinstance(url, str) or not url:
+		return None
+	try:
+		values = parse_qs(urlsplit(url).query).get("page")
+	except ValueError:
+		return None
+	if not values:
+		return None
+	try:
+		page_no = int(values[0])
+	except (TypeError, ValueError):
+		return None
+	return page_no if page_no >= 1 else None
 
 _CRAWL_FETCH_SCRIPT = """
 async function (path, params, timeoutMs) {
@@ -89,6 +118,22 @@ class CrawlTransport(Protocol):
 	def close(self) -> None: ...
 
 
+# 采集浏览器与 XLSX 导出各自依赖的可选包，都在 `crawl` 依赖组里。
+_CRAWL_RUNTIME_MODULES = EXTRA_MODULES["crawl"]
+
+
+def ensure_crawl_runtime() -> None:
+	"""入口在创建任务、启动后台进程、打开浏览器之前确认 `crawl` 可选依赖已安装。
+
+	默认安装不带这组依赖。等到打开浏览器才发现时任务已经建好，执行器只能把它
+	记成 `stopped`，调用方拿到的是成功信封和恢复指引，照做只会重复同一个失败
+	（Issue #1050）。这里只探测模块是否可导入，不导入它们。
+	"""
+	missing = [name for name in _CRAWL_RUNTIME_MODULES if not module_available(name)]
+	if missing:
+		raise CrawlRuntimeUnavailable(f"crawl 需要 {'、'.join(missing)}；请安装 {extras_requirement('crawl')}")
+
+
 class DrissionCrawlerSession:
 	"""A single-tab, sequential browser listener and page-cookie detail client."""
 
@@ -145,7 +190,7 @@ class DrissionCrawlerSession:
 		try:
 			from DrissionPage import ChromiumOptions, ChromiumPage
 		except ImportError as exc:
-			raise RuntimeError("crawl 需要 DrissionPage；请安装 boss-agent-cli[crawl]") from exc
+			raise CrawlRuntimeUnavailable("crawl 需要 DrissionPage；请安装 boss-agent-cli[crawl]") from exc
 		options = ChromiumOptions()
 		self._profile_path = self._profile_path.resolve()
 		self._profile_path.mkdir(parents=True, exist_ok=True)
@@ -189,6 +234,50 @@ class DrissionCrawlerSession:
 			except Exception:
 				pass
 		listen.start(JOBLIST_TARGET, is_regex=True, method=("GET", "POST"))
+
+	def _joblist_packet_body(self, packet: Any) -> Any:
+		"""解析监听包，并在按页码筛选之前执行统一的风险检查。"""
+		response = getattr(packet, "response", None)
+		body = self._normalize_response_body(getattr(response, "body", None))
+		if isinstance(body, dict):
+			self._raise_if_risk_response(body)
+		response_url = getattr(response, "url", None) or getattr(packet, "url", "")
+		page_risk = platform_risk_page_response(
+			url=response_url if isinstance(response_url, str) else "",
+			body=body if isinstance(body, str) else "",
+		)
+		if page_risk is not None:
+			raise CrawlRiskError.from_response(page_risk)
+		if getattr(response, "status", None) == 403:
+			raise CrawlRiskError("职位监听请求 HTTP 403，已停止；请在官方目标业务页确认恢复")
+		return body
+
+	def _wait_for_joblist_packet(self, target_page: int) -> Any | None:
+		"""取与目标页匹配的 joblist 响应包，跳过导航/滚动带出的早期页（Issue #1114）。
+
+		`Listener.wait()` 返回队列头（最旧的包）。断点恢复从第 N 页开始时，
+		队列里依次是导航产生的第 1 页、滚动产生的 2..N 页响应；直接取队头
+		会把第 1 页的数据记成第 N 页并且断点照常前进。页码读不出的包只在
+		请求第 1 页时接受，其余情况继续等目标页或超时后走页面内兜底。
+		"""
+		if self._page is None:
+			return None
+		deadline = time.monotonic() + self._timeout
+		while True:
+			remaining = deadline - time.monotonic()
+			if remaining <= 0:
+				return None
+			packet = self._page.listen.wait(timeout=remaining, raise_err=False)
+			if not packet:
+				return None
+			# 早期页的风险响应也必须停止，限流响应也必须交给调用方处理。
+			body = self._joblist_packet_body(packet)
+			response = getattr(packet, "response", None)
+			if getattr(response, "status", None) == 429 or isinstance(body, dict) and body.get("code") in (9, "9"):
+				return packet
+			page_no = packet_page_no(packet)
+			if page_no == target_page or (page_no is None and target_page == 1):
+				return packet
 
 	@staticmethod
 	def _normalize_response_body(body: Any) -> Any:
@@ -238,21 +327,10 @@ class DrissionCrawlerSession:
 					raise
 				self._page_no = position
 				self._raise_if_security_page()
-				packet = self._page.listen.wait(timeout=self._timeout, raise_err=False)
+				packet = self._wait_for_joblist_packet(target_page)
 				if packet is not None:
 					response = getattr(packet, "response", None)
-					body = self._normalize_response_body(getattr(response, "body", None))
-					if isinstance(body, dict):
-						self._raise_if_risk_response(body)
-					response_url = getattr(response, "url", None) or getattr(packet, "url", "")
-					page_risk = platform_risk_page_response(
-						url=response_url if isinstance(response_url, str) else "",
-						body=body if isinstance(body, str) else "",
-					)
-					if page_risk is not None:
-						raise CrawlRiskError.from_response(page_risk)
-					if getattr(response, "status", None) == 403:
-						raise CrawlRiskError("职位监听请求 HTTP 403，已停止；请在官方目标业务页确认恢复")
+					body = self._joblist_packet_body(packet)
 					if (
 						getattr(response, "status", None) == 429
 						or isinstance(body, dict)

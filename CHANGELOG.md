@@ -2,9 +2,118 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
-## [Unreleased]
+## [3.4.22] - 2026-11-15
 
 ### Fixed
+- `boss wizard --stop` 不再被损坏的内部采集结果挡住（Issue #1128）：`WorkflowStore.request_stop` 此前先读取叠加了实时采集结果的 run，绑定的 crawl 任务里只要有一条 `crawl_jobs.payload` 解码失败，就在写入停止标记之前以 `CACHE_RECORD_INVALID` 退出，workflow 仍是 `running`、内部 crawl 也收不到停止请求。现在先落盘停止标记，再只读取 workflow 自己的步骤记录把停止传给内部 crawl；展示用的实时结果读不出来时退回断点本身，仍返回已停止的状态。workflow 自己的断点列损坏时停止标记同样会落盘，长动作轮询停止信号也不再读取实时采集结果。`--status` 对损坏记录的报告不变。
+- `boss wizard --resume` 不再把只落盘一半的写失败报成执行中（Issue #1129）：写步骤以 `ACTION_UNCONFIRMED` 失败时，步骤与 run 的失败状态分两次提交；执行器在两次提交之间消失后，断点停在 run=`running`、step=`failed`，恢复原样返回它，命令 exit 0、`ok=true`、`error=null`。现在恢复会把 run 归并为 `failed` 并带上该步骤的错误与核对指引，命令 exit 1；这次写操作仍然不会重放。
+- 招聘自动化的队列与状态文件类型漂移统一返回 `AUTOMATION_STATE_INVALID`（Issue #1130）：`pending-actions.jsonl` / `human-review-queue.jsonl` 里某条记录的 `confidence` 不是数字时，`boss agent pending list`、`agent review list / approve / reject` 此前 stdout 为空并以 `ValueError` traceback 退出；`state.json` 的 `conversations` / `autonomy` / `safety` 或 `autonomy.circuit_breaker` 不是 object 时，`agent stats` 与 `agent run` 被报成 `INTERNAL_ERROR` 并让用户升级或提 issue。现在两类情况都给出指明文件与字段的信封，队列损坏时 `recovery_action` 指向实际出问题的文件；校验失败不改写队列，也不执行其中的动作。同时覆盖 `conversations` 的条目不是 object、`safety.consecutive_errors` 不是整数，以及待执行或待复核记录的 `action` 不是已知动作（此前 `agent run` 报成可重试的 `NETWORK_ERROR`）。数字、数字字符串和缺省的 `confidence` 照常读取；布尔值、非有限数和超出浮点范围的整数按损坏处理。
+
+
+## [3.4.21] - 2026-11-15
+
+### Fixed
+- 后台采集恢复在启动 worker 前校验断点参数（Issue #1125）：`CrawlSettings.from_dict` 已能识别缺键与类型漂移，但后台父进程此前跳过它，以 `ok=true / queued` 回报、清除旧 stop 并启动随后立即失败的 worker。现在持有执行锁重读记录后，在修改 stop、刷新时间戳和探测依赖/登录态之前返回 `CACHE_RECORD_INVALID`；原记录保留，已有执行器与交接中的队列维持幂等处理。
+
+## [3.4.20] - 2026-11-15
+
+### Fixed
+- `crawl run` / `crawl start --hook-profile screenshot-full` 缺少 `--hook-dir` 时在创建任务之前返回 `INVALID_PARAM`（Issue #1116）：此前任务会先落盘，打开浏览器并导航到平台之后才在注入阶段失败，被记成 `status=stopped` 的成功信封；`crawl resume` 没有 `--hook-dir` 参数，重试只会重复同一错误并白开一次有头 Chrome。schema 与文档早已写明两者必须成对，现在入口按同一规则拒绝，不创建 run、不启动浏览器。
+- 缓存库写锁冲突不再以 traceback 退出或被报成 `NETWORK_ERROR`（Issue #1118）：SQLite 头正常时，`CacheStore` 初始化与写操作里的 `database is locked` 现在归一成新登记的 `CACHE_BUSY`。此前 `crawl stop` 没有异常处理，stdout 为 0 字节并带 traceback；`crawl resume` 被统一装饰器兜成可重试的 `NETWORK_ERROR`，`boss wizard` 的通用兜底同样如此。现在 `crawl stop` / `status` / `results` / `shortlist`、`crawl resume` 与 wizard 动作都返回单个可重试信封，恢复动作是「等待写入结束后重试」，不再提示删除缓存库或重试平台请求。
+- crawl 断点参数缺键或类型漂移按记录损坏返回 `CACHE_RECORD_INVALID`（Issue #1117）：`CrawlSettings.from_dict` 原来直接下标读取 `query` / `city_code` / `pages` / `with_detail`，缺键的 `KeyError` 被命令层报成「未找到 crawl run: <字段名>」并把调用方引向新建任务；`pages="abc"` 被报成 `INVALID_PARAM`（修正 crawl 配置），`pages=null` 落到 `INTERNAL_ERROR`。现在在读取边界校验必填字段与类型（`pages=true` 也按类型漂移拒绝），错误信息点名具体字段，恢复指引为重建任务；合法记录行为不变。
+- crawl 监听翻页按请求页码匹配响应包（Issue #1114）：DrissionPage 的 `Listener.wait()` 返回队列头，而断点恢复先导航到列表第 1 页、再滚动到断点页，队列里依次是 1..N 页的响应。此前直接取队头，会把第 1 页数据记成断点页、断点照常前进并以 `ok:true` 结束。现在按监听请求 URL 的 `page` 参数匹配目标页，跳过导航/滚动带出的早期页；所有响应在筛选页码前先检查风险码、安全页和 HTTP 403，早期页的限流响应也保留并交给冷却处理，避免跳过停止信号。页码读不出的包只在请求第 1 页时接受，超时仍走页面内同源请求兜底。
+- 后台恢复在预检之前清除旧 stop 标记（Issue #1115）：预检窗口（可选依赖探测、读取登录态）内到达的 `crawl stop` 会被随后的清理当成启动前残留一并清掉，worker 继续采集而停止请求丢失。现在旧 stop 先清、预检失败时以单条更新恢复旧标记和时间戳，保留期间新到的停止请求；成功时只刷新交接时间、不清新 stop，既保留 worker 的停止指令，也避免无旧 stop 的过期队列被重复拉起。
+
+### Added
+- 错误码 `CACHE_BUSY`（缓存库被其他连接写入，可重试）：登记在 `ERROR_CODES`，`docs/troubleshooting` 中英文补充说明。
+
+## [3.4.19] - 2026-11-15
+
+### Fixed
+- 发布验收的子进程失败保留 stderr 原因（Issue #1107）：`scripts/verify_release.py` 只报「uv 失败，退出码 1」，把 stderr 整个丢掉——刚发布后 PyPI 索引尚未传播与真实依赖冲突在报告里完全一样，维护者只能重跑碰运气（3.4.17 发布时 `--pypi-version` 首跑失败、数分钟后通过，原因没有留下任何证据）。现在失败时的 `steps[].error` 带上 stderr 的有界尾部（末尾 12 行、单行 300 字符）；凭据先抹成 `[REDACTED]` 再截断（URL userinfo、无 scheme 的 `user:pass@host`、`token=` / `password=` 等键值与 Bearer 令牌），避免 `@` 落在截断点之外时漏出前缀；超时与 `allow_failure` 探针路径不变，无输出时保持原来的一句话。
+- MCP 显式 `null` 参数与缺键等价（Issue #1108）：文档与 CHANGELOG 自 3.3.x 起承诺「传 `null` 与不传等价于省略」，映射层也为 `None` 留了判断，但入口的类型检查会先把 `null` 判成 `INVALID_PARAM`（如 `boss_wizard.action: null` 得不到文档承诺的默认 `run`，`sort` / `section` 等可选参数同样被拒）。现在 `call_tool` 在类型检查与参数映射之前剔除值为 `null` 的键；必填参数传 `null` 按缺参返回「缺少必填参数」，不会把 `str(None)` 拼成 `"None"` 发给 CLI。数组内部的 `null` 元素、未知参数与原有类型校验不变。
+
+## [3.4.18] - 2026-11-15
+
+### Fixed
+- MCP 数组参数按 `items.type` 逐元素校验（Issue #1105）：入口此前只检查参数的顶层 JSON 类型，`add_tags: [false, {"k": "v"}]` 会被映射层用 `str()` 拼成 `--add-tag False --add-tag "{'k': 'v'}"` 并写进本地标签，信封仍是 `ok:true`；`friend_ids` 里的错误元素要到 CLI 才得到一条不指明位置的参数错误，数字字符串则被隐式接受。现在 `boss_shortlist_annotate.add_tags` / `remove_tags`、`boss_crawl_shortlist.selectors`、`boss_wizard.requested_steps` 与 `boss_hr_last_messages.friend_ids` 的元素类型不符时，在进入参数映射和 CLI 之前返回 `INVALID_PARAM`，错误带下标（如 `add_tags[1] 应为 string，收到 bool`）；单个数组最多逐条列出 3 处，其余只报数量。合法数组与空数组的行为不变。
+
+## [3.4.17] - 2026-11-15
+
+### Fixed
+- MCP 位置参数保留以连字符开头的文本（Issue #1102）：搜索词、预设名、消息或标识符为 `-synthetic` / `--help` / `--` 时，原映射会让 Click 将其解析为选项，导致参数错误或意外输出帮助。现在把真实选项保留在前，并用 `--` 分隔位置参数；普通输入的参数顺序不变。按工具目录遍历全部位置参数和 action 分支，验证文本原值、附加选项及 CLI 成功 / 错误信封。
+
+## [3.4.16] - 2026-11-15
+
+### Fixed
+- 恢复命令不再重复改写路径或引号内的名称（Issue #1100）：数据目录含 `boss chat` / `boss doctor` 等文字时，逐项替换会再次改写刚插入的路径并破坏命令。错误信封、风控契约、浏览器来源提示与向导恢复文案统一只扫描原文一次，保留已有命令中的路径参数，前文名称或路径中的词内撇号也不会打乱引用边界；身份诊断省略可选上下文时继续返回通用 `boss hr whoami` 示例。
+- 采集结果与错误信封的 `message` / `data.error` 保留自定义 `--data-dir`（Issue #1097）：`CrawlRiskError` 在 `crawler/` 层构造，文案里嵌的 `boss clean --risk-lock` 是裸命令；`error.message` 之前只做脱敏不做改写。现在 `handle_error_output` 在出口统一按运行上下文改写 `message`，`crawl start` / `crawl resume` / `crawl status` 的 `data.error` 同样指向本次运行的命令；不含命令的文案与无上下文的纯函数调用保持原文。
+- `boss doctor` 检查项的恢复文案保留自定义 `--data-dir`（Issue #1095）：`checks[].hint` 与 `checks[].recovery_action` 仍写死裸 `boss doctor --probe-cookies` / `boss login` / `boss hr whoami`，而同一信封的 `hints.next_actions` 已按运行上下文改写。自定义 `--data-dir` 的用户照抄检查项里的命令，诊断或核对的仍是默认目录。现在这些检查项同样指向本次运行的 `boss [--platform ...] --data-dir <dir> ...`；无上下文时保持通用示例。
+- 命令层与信封的恢复文案保留自定义 `--data-dir`（Issue #1092）：错误码登记表里 42 个错误码的 `recovery_action` 写死裸 `boss resume list` / `boss crawl status` / `boss doctor` / `boss shortlist add` 等，而 `handle_error_output` 只对认证类与风控码按运行上下文改写，其余错误码直接透传登记表原文——自定义 `--data-dir` 的用户按提示操作时，命令会落到默认目录，看不到自己的简历、采集记录或 workflow，容易以为任务丢了而重建。现在登记表恢复文案在信封出口统一改写为本次运行的 `boss [--platform ...] --data-dir <dir> ...`（TTY 与 JSON 两条路径一致），认证类错误仍优先给登录命令；调用方显式传入的恢复文案、无上下文的 `boss schema` 文档与纯函数调用保持原文。新增守卫测试：登记表里出现的每条 `boss …` 命令都必须有改写条目。
+
+## [3.4.15] - 2026-11-15
+
+### Fixed
+- 向导 TTY 恢复文案的其余命令保留自定义 `--data-dir`（Issue #1090）：`AI_NOT_CONFIGURED`、`CONTACT_NOT_FOUND`、`ALREADY_APPLIED`、`EXCHANGE_NOT_AVAILABLE`、`SAVED_SEARCH_INVALID`、`CRAWL_BUSY`、`UNKNOWN`、`RESUME_NOT_FOUND` 等静态恢复文案仍写死裸 `boss ai config` / `boss chat` / `boss doctor` / `boss resume list` 等；actions 已算好带数据目录的恢复句子（如 watch 失败给 `watch remove`）时还会被静态标签覆盖。空简历面板与 AI 辅助的输入提示同样只给裸 `boss resume import`。现在向导失败面板与空态提示把命令改写为本次运行的 `boss [--platform ...] --data-dir <dir> ...`，动态指引优先采用，无上下文时保持通用示例；另有守卫测试要求静态文案里出现的每条 `boss …` 命令都有改写条目。
+
+## [3.4.14] - 2026-11-15
+
+### Fixed
+- TTY 风控恢复提示保留自定义数据目录（Issue #1087）：`boss status` 的本地风控锁定提示与向导交互式失败面板仍写死裸 `boss clean --risk-lock`，照抄时会在默认目录空转、本次 `--data-dir` 的锁仍在；runner 早已算好带 `--data-dir` 的恢复动作（Issue #978），却在向导静态文案里被覆盖。现在 `status` 传入当前上下文的解锁命令并按字面转义，向导文案把动态命令替换进面向真人的措辞。
+
+## [3.4.13] - 2026-11-15
+
+### Fixed
+- `boss status` 的未登录提示按字面显示登录命令（Issue #1083）：提示命令保留当前 `--data-dir`，数据目录含 `[green]` 等方括号目录名时会被 Rich 当作样式吞掉，终端显示的路径不完整。现在转义该命令文本，并覆盖终端渲染回归。
+
+## [3.4.12] - 2026-11-15
+
+### Fixed
+- 向导不再因扫码内核缺失而阻断 Cookie / CDP 登录（Issue #1075）：登录门此前在整条认证链之前检查 patchright 内核，最后一级扫码降级的前置条件也被套到浏览器 Cookie 提取与已有 CDP 登录上，直接 `boss login` 能成功的环境在向导中反而无法继续。现在先走既有认证链，仅在实际报告扫码内核缺失后读取内核诊断并展示安装指引；可复用登录态时无需扫描内核，风控错误仍立即停止。双语排障文档同步。
+- 向导的内核安装指引按字面显示解释器路径（Issue #1079）：路径含 `[green]` 等方括号目录名时，详情此前被当作 Rich 样式解析，终端显示的安装命令会丢失部分路径。现在转义详情文本，保留面板自身的样式；POSIX 与 Windows 命令均覆盖终端渲染回归。
+
+## [3.4.11] - 2026-11-15
+
+### Fixed
+- Windows 上的浏览器内核安装恢复命令可以直接执行（Issue #1072）：3.4.9 起该命令用运行 boss 的解释器路径拼出，但引用规则按 POSIX 处理，反斜杠不在安全字符集内，Windows 上任何路径都会被包上单引号——PowerShell 报 `Unexpected token '-m'`，cmd.exe 把整段当成文件名。现在 Windows 上路径不含需转义字符时原样输出（PowerShell 与 cmd 均可执行），含空格等字符时按 PowerShell 写成 `& '<路径>' -m patchright install chromium`；`BROWSER_KERNEL_MISSING` 信封、`boss doctor` 提示、向导文案与 PDF 导出失败的恢复文案同步生效，POSIX 行为不变。
+- 浏览器内核预检遵循 `PLAYWRIGHT_BROWSERS_PATH`（Issue #1073）：patchright 会按该环境变量安装和启动浏览器，`boss doctor` 与向导登录门此前却只扫描默认缓存，自定义目录已安装时误报缺失、默认缓存有旧安装时又可能误报正常。现在显式配置时只检测驱动实际使用的目录，支持相对路径的 `INIT_CWD` 解析与 `0` 指定的包内 `.local-browsers`；未配置时保持原有默认探测。双语排障文档同步。
+
+## [3.4.10] - 2026-11-14
+
+### Fixed
+- 补装一个可选依赖不再顶掉另一个（Issue #1068）：`uv tool install` 每次按给定的依赖组重建工具环境，而 `CRAWL_UNAVAILABLE` 的恢复指引只写 `boss-agent-cli[crawl]`、`boss-mcp` 缺 SDK 的启动提示只写 `boss-agent-cli[mcp]`——已装 `[mcp]` 的用户照前者执行后 MCP SDK 被移除，再照后者执行又把采集依赖移除，两条指引互相循环，通过 MCP 使用采集的用户正好落在其中。现在两处指引（含 `crawl` 各入口、`agent crawl --query`、向导采集步骤与向导终端文案）给出的安装要求都会带上当前解释器里已经可用的依赖组，例如 `boss-agent-cli[crawl,mcp]`；只装了某个组的一部分时不算已安装。双语命令参考与排障文档补充说明。
+- MCP 主机用绝对路径启动 `boss-mcp` 时工具调用不再全部 `CLI_ERROR`（Issue #1066）：底层 CLI 此前只按 MCP server 进程的 `PATH` 查找 `boss`，而桌面端主机通常不继承登录 shell 的 `PATH`，`uv tool install` / `pipx install` 的入口目录不在其中——`initialize` 与 `tools/list` 正常，每一次 `tools/call` 都返回「无法启动底层 boss CLI」；`PATH` 上若另有一份旧版 `boss`，还会被静默驱动。现在未传 `--boss-bin` 时优先使用与 `boss-mcp` 同一安装的 `boss` 入口（运行 server 的解释器旁边），该入口不存在时才回退到按 `PATH` 查找；显式 `--boss-bin` 行为不变。双语排障文档同步。
+- 便携包的内核安装改用运行 boss 的解释器（Issue #1064）：`install.sh` 此前用 `uv tool run patchright install chromium`，它会独立解析一个 patchright 版本，可能与 wheel 内的浏览器修订版不一致，装完仍报内核缺失。现在从 `boss` 入口脚本取工具环境解释器并调用 `-m patchright install`，手动重试命令同样打印完整可执行写法；便携包说明的 Windows 段改为指向 `boss doctor` 给出的命令。
+
+## [3.4.9] - 2026-11-14
+
+### Fixed
+- 工具式安装下浏览器内核安装指引不可执行（Issue #1060）：按推荐方式 `uv tool install` / `pipx install` 安装后，只有 `boss`、`boss-mcp` 进入 PATH，patchright 留在工具环境里，而信封的 `error.recovery_action`、`hints.next_actions`、向导文案与文档都让用户执行裸 `patchright install chromium`——实测直接 `command not found`（rc=127），Agent 照抄必然失败。现在所有内核安装指引改用运行本 CLI 的同一解释器（`<python> -m patchright install chromium`，缺 headless shell 时为对应变体），版本与启动浏览器时一致；`uv run` / 源码环境同样成立。
+- 向导登录门的内核预检从不拦截（Issue #1060）：`_browser_kernel_status()` 把缓存根目录传给按条目名精确匹配的判定函数，永远匹配不上，`status == "error"` 分支不可达，内核真缺失时仍会去开浏览器再失败；同时该函数此前只会返回 `ok` / `warn`，`boss doctor` 把内核缺失报成 `warn`、摘要停在 `degraded`。现在预检展开 `chromium-<修订版>` 条目再比对，缺内核判定为 `error`，`doctor` 的 `patchright` 检查也改为按解释器导入判断，不再因 `uv tool install` 未把 patchright 暴露到 PATH 而误报缺失。
+- 新命令贡献指南与当前工程结构对齐（Issue #1057）：中英文清单改为在 `mcp_tools.py` 定义工具、在 `mcp_args.py` 映射参数，说明兼容导出和协议工具目录核对；移除对本地忽略文件的必改要求，补齐新增模块 mypy 严格登记、能力计数与变更记录同步步骤。
+
+## [3.4.8] - 2026-11-14
+
+### Fixed
+- 默认安装未包含 MCP SDK 时，`boss-mcp` 不再只输出 `ModuleNotFoundError` 堆栈（Issue #1053）：安装后的命令改走轻量启动入口，只有顶层 `mcp` 包缺失时向 stderr 输出 `[mcp]` 的 pip / uv tool / 源码安装说明并以 1 退出，stdout 保持为空；SDK 可用时原样转发全部参数，SDK 内部其他依赖错误保留原始诊断。双语排障文档同步，stdio 回归逐名核对新旧入口的工具列表。
+
+## [3.4.7] - 2026-11-14
+
+### Fixed
+- 未安装 `crawl` 可选依赖时采集不再返回成功信封（Issue #1050）：默认安装不带 DrissionPage 与 openpyxl，依赖缺失此前要到打开浏览器才被发现，执行器把它当普通异常落成 `stopped`——`crawl run` 返回 `ok: true` 与 `crawl resume` 指引，照做得到同样的结果，可以无限重复，每次还新建一条执行不了的任务；`crawl start` 返回 `queued` 后由后台进程落成 `stopped`，`agent crawl --query` 先建任务再失败，向导采集步骤落成 `NETWORK_ERROR` 加「恢复当前任务」。登记表里为此准备的 `CRAWL_UNAVAILABLE` 在真实路径上到不了。现在 `crawl run` / `start` / `resume`、`agent crawl --query` 与向导采集步骤在创建任务、启动后台进程、读取登录态之前确认依赖可导入，缺失时返回 `CRAWL_UNAVAILABLE`（`exit 1`），恢复动作指向安装 `boss-agent-cli[crawl]`，不给出恢复命令；模块可定位但导入失败时，执行器保存断点后同样按 `CRAWL_UNAVAILABLE` 回报。`crawl status` / `results` / `stop` / `shortlist` 不受影响。文档补上 pip / uv tool 的安装方式。
+
+## [3.4.6] - 2026-11-14
+
+### Fixed
+- 排队任务的后台进程消失后可用后台恢复重新启动（Issue #1045）：`crawl resume <run_id> --background` 把 `queued` 一律视为原 worker 即将接手，不探测执行锁也不启动进程。worker 若不经过清理路径就消失（被强制终止、机器重启），任务永远停在没有错误的 `queued`，后台恢复每次都返回 `queued`，`crawl status` 的后继动作只有 `results` 与 `stop`。现在这个保护只在 30 秒启动窗口内生效；排队更久的任务与遗留的 `running` 一样先探测执行锁：仍被占用返回 `running`、不改动任务，空闲则做登录预检、解除旧停止请求并启动 worker。`crawl status` 对排队过久的任务额外给出 `crawl resume <run_id> --background`。执行锁仍保证同一任务只有一个执行器，后到者以 `CRAWL_BUSY` 退出且不改写任务。中英文命令参考同步。
+- `agent crawl --query` 向采集浏览器注入登录态（Issue #1044）：`crawl run` / `start` / `resume` 与向导采集步骤都会把 `boss login` 的 Cookie 与 User-Agent 注入独立采集浏览器，只有 `agent crawl --query` 直接用了不带登录种子的传输。采集浏览器的配置目录与日常 Chrome 隔离，没有可用会话时页面是登录页，采集按未登录落为 `risk_stopped` 并写下本地风险锁——已登录的用户也会被要求手动执行 `clean --risk-lock`。现在该入口与其他采集入口共用同一份登录种子；本地登录态缺失、没有 Cookie 或缺少 `wt2` 时在打开浏览器之前返回 `AUTH_REQUIRED` 与登录指引，不创建任务，参数错误仍先报出；`agent crawl --run-id` 只读本地结果，不受登录态影响。中英文命令参考同步。
+- 未登录时启动后台采集不再留下永久排队的任务（Issue #1042）：`crawl start` 只创建任务并拉起后台进程，登录态由 worker 检查；worker 的信封写进空设备，未登录时它以 `AUTH_REQUIRED` 退出却不改写任务，调用方拿到 `ok` 与 `queued`，之后 `crawl status` 一直是没有错误的 `queued`，`crawl resume --background` 又把 `queued` 视为原 worker 即将接手而不再启动。现在 `crawl start` 与需要启动 worker 的 `crawl resume --background` 先按采集实际使用的口径检查本地登录态，缺失、没有 Cookie 或缺少 `wt2` 时返回 `AUTH_REQUIRED` 与登录指引，不创建任务、不解除停止请求、不启动进程；参数错误仍先报出，已完成或排队中的任务不受影响。worker 在接手前退出而任务仍显示 `queued` 或 `running` 时，把它落为 `stopped` 并写明原因与错误码（风险锁只记错误码）；任务已处于终态、另一个执行器持有执行权或本次是被 `CRAWL_BUSY` 拒绝时不改写；前台恢复失败不改动任务。中英文命令参考同步。
+
+## [3.4.5] - 2026-11-14
+
+### Fixed
+- 采集进程突然退出后可从遗留的 `running` 状态后台恢复（Issue #1038）：此前 `crawl resume <run_id> --background` 只看持久化状态，worker 已退出、执行锁已释放时仍回报 `running` 而不启动恢复，任务持续空转。现在父进程用现有执行锁判断是否仍有执行器，空闲时重读断点并允许恢复遗留的 `running`；持锁任务不启动第二个 worker、不修改 checkpoint 或清除 stop。探测锁在启动前释放，worker 再自行取锁；锁不可用时返回 `LOCAL_IO_ERROR`。真实子进程突然退出的离线回归验证只续抓未提交页面、保留累计请求预算，中英文命令参考同步。
+- 已停止采集任务的显式后台恢复会解除旧停止请求（Issue #1036）：此前 `crawl resume <run_id> --background` 返回 `queued`，但子进程因 `--from-queue` 保留旧 `stop_requested`，刚开始执行便再次停止，无法续跑。现在父进程在启动 worker 前清除旧标记，worker 仍保留启动期间新收到的 stop；对已有 `queued` 任务及仍在执行的 `running` 任务，重复恢复不清除停止请求、不拉起新进程。离线回归执行真实队列入口，覆盖正常续跑与启动途中再次停止。
 - Agent 快速上手补上 `CRAWL_BUSY`（Issue #1033）：3.4.4 的采集执行互斥已写进命令参考与排障文档，但 Agent 快速上手的错误码清单只有同类的 `WORKFLOW_BUSY`，中英文都缺这一条——Agent 遇到并发恢复被拒时找不到处理说明，容易重试或 `--stop` 让位，正是该错误码要阻止的行为。现在两份快速上手的错误码清单与采集编排一节都写明「查 `crawl status <run_id>`、等当前执行结束再恢复，`status` / `results` / `stop` 不受影响」，并新增文档守卫要求两个并发码在中英两侧同时出现。
 - HTML / JSON 导出的通用失败不再提示安装浏览器内核（Issue #1031）：`resume export` 的失败分流在内核缺失与本地 IO 之外，第三条「渲染 / 模板错误」仍直接复用错误码登记表里拆分前的 `EXPORT_FAILED` 恢复文案「检查 patchright 安装」——HTML / JSON 导出只用本地模板与文件写入，从不启动浏览器，照做只会装一个没用到的内核。现在 PDF 保留内核提示（浏览器确实参与渲染），HTML / JSON 改为提示检查简历文件内容与导出选项，并说明该格式不使用浏览器内核；新增回归要求 HTML 渲染失败的信封里不出现 `patchright`，PDF 的通用失败仍保留原指引。
 - Node 回归脚本的子进程超时统一为 30 秒（Issue #1029）：`test_fetch_script_marks_non_json_body` 等四条用例的预算原为 5–15 秒，相对脚本实测的约 40 毫秒本有余量，但 CI 跑步机在四个矩阵任务与 lint 并发时会出现秒级冷启动卡顿，`Test (Python 3.14)` 因此把必需检查打成假红一次，重跑才恢复。现在四条用例与其余 Node 回归一样使用 30 秒预算；脚本真的挂起仍会在 30 秒内失败，断言与重试策略不变。

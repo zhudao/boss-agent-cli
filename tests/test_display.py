@@ -4,6 +4,7 @@ import io
 import re
 import shlex
 import sys
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 from urllib.parse import urlparse
 
@@ -23,6 +24,7 @@ from boss_agent_cli.display import (
 	risk_error_message,
 	shell_argument,
 )
+from boss_agent_cli.services.browser_runtime import patchright_install_command
 
 
 _HTTP_URL = re.compile(r"https?://[^\s<>\"']+")
@@ -42,9 +44,9 @@ def _has_official_zhipin_url(text: str) -> bool:
 	return False
 
 
-def _capture_display_console(monkeypatch):
+def _capture_display_console(monkeypatch, *, width: int = 100):
 	stream = io.StringIO()
-	console = Console(file=stream, force_terminal=False, width=100)
+	console = Console(file=stream, force_terminal=False, width=width)
 	monkeypatch.setattr("boss_agent_cli.display.console", console)
 	return stream
 
@@ -737,6 +739,28 @@ class TestRenderers:
 		assert "not logged in" in output
 		assert "boss --platform otherplat login" in output
 
+	def test_render_status_risk_lock_uses_custom_clean_action(self, monkeypatch):
+		from boss_agent_cli.display import render_status
+		stream = _capture_display_console(monkeypatch, width=400)
+
+		render_status(
+			{
+				"logged_in": True,
+				"user_name": "张三",
+				"cdp_risk_lock": {
+					"locked": True,
+					"locked_at": "2026-11-15 10:00:00",
+					"reason": "ENVIRONMENT_RISK",
+				},
+			},
+			clean_action="boss --data-dir '/tmp/custom state' clean --risk-lock",
+		)
+
+		output = stream.getvalue()
+		assert "风控锁定中" in output
+		assert "boss --data-dir '/tmp/custom state' clean --risk-lock" in output
+		assert "执行 boss clean --risk-lock" not in output
+
 	def test_render_simple_list_empty(self, monkeypatch):
 		from boss_agent_cli.display import render_simple_list
 		stream = _capture_display_console(monkeypatch)
@@ -1301,10 +1325,15 @@ def test_browser_kernel_missing_uses_install_contract(message):
 		impl(ctx)
 
 	kwargs = mock_err.call_args.kwargs
+	install = patchright_install_command()
 	assert kwargs["code"] == "BROWSER_KERNEL_MISSING"
 	assert kwargs["recoverable"] is True
-	assert kwargs["recovery_action"] == "patchright install chromium"
-	assert "patchright install chromium" in kwargs["hints"]["next_actions"]
+	# 安装命令必须带运行本 CLI 的解释器：`uv tool install` 后裸 patchright 不在 PATH
+	# 上，照抄会 command not found（Issue #1060）。
+	assert kwargs["recovery_action"] == install
+	assert sys.executable in install
+	assert "-m patchright install chromium" in install
+	assert install in kwargs["hints"]["next_actions"]
 	assert not any("重试" == action for action in kwargs["hints"]["next_actions"])
 
 
@@ -1321,7 +1350,7 @@ def test_browser_kernel_missing_hint_points_at_doctor_and_does_not_suggest_retry
 
 	kwargs = mock_err.call_args.kwargs
 	actions = kwargs["hints"]["next_actions"]
-	assert actions[0] == "patchright install chromium"
+	assert actions[0] == patchright_install_command()
 	assert any("doctor" in action for action in actions)
 	assert kwargs["hints"]["operator_actions"]
 
@@ -1342,3 +1371,145 @@ def test_unrelated_runtime_error_still_falls_back_to_network_error():
 	assert kwargs["code"] == "NETWORK_ERROR"
 	assert kwargs["recoverable"] is True
 	assert kwargs["recovery_action"] == "重试"
+
+
+# ── 登记表恢复文案按运行上下文改写（Issue #1092）─────────────
+
+
+class TestRegistryRecoveryCommands:
+	def test_bare_commands_gain_the_run_data_dir(self, tmp_path):
+		from boss_agent_cli.display import registry_recovery_for_ctx
+
+		ctx = MagicMock()
+		ctx.obj = {"platform": "zhipin", "data_dir": tmp_path / "custom state"}
+		text = registry_recovery_for_ctx(ctx, "boss resume list")
+		assert text == f"boss --data-dir '{tmp_path.resolve()}/custom state' resume list"
+
+	def test_longer_command_wins_over_its_prefix(self, tmp_path):
+		"""``boss hr chat`` 是 ``boss hr chatmsg`` 的前缀，替换顺序不能切坏命令。"""
+		from boss_agent_cli.display import registry_recovery_for_ctx
+
+		ctx = MagicMock()
+		ctx.obj = {"platform": "zhipin", "data_dir": tmp_path}
+		text = registry_recovery_for_ctx(ctx, "先用 boss hr chatmsg <friend_id> 核实")
+		assert "hr chatmsg <friend_id>" in text
+		assert "hr chat msg <friend_id>" not in text
+		assert f"boss --data-dir {tmp_path.resolve()} hr chatmsg" in text
+
+		text = registry_recovery_for_ctx(ctx, "先用 boss hr chat --job-id <id> 核对会话")
+		assert f"boss --data-dir {tmp_path.resolve()} hr chat --job-id <id>" in text
+
+	def test_multiple_commands_in_one_sentence(self, tmp_path):
+		from boss_agent_cli.display import registry_recovery_for_ctx
+
+		ctx = MagicMock()
+		ctx.obj = {"platform": "zhipin", "data_dir": tmp_path}
+		text = registry_recovery_for_ctx(
+			ctx, "该职位已投递过：用 boss me --section deliver 查看投递记录，或用 boss chat 跟进"
+		)
+		prefix = f"boss --data-dir {tmp_path.resolve()}"
+		assert f"{prefix} me --section deliver" in text
+		assert f"{prefix} chat" in text
+
+	def test_platform_prefix_is_kept(self, tmp_path):
+		from boss_agent_cli.display import registry_recovery_for_ctx
+
+		ctx = MagicMock()
+		ctx.obj = {"platform": "otherplat", "data_dir": tmp_path}
+		text = registry_recovery_for_ctx(ctx, "boss doctor")
+		assert text == f"boss --platform otherplat --data-dir {tmp_path.resolve()} doctor"
+
+	def test_without_context_the_example_stays_generic(self):
+		from boss_agent_cli.display import registry_recovery_for_ctx
+
+		assert registry_recovery_for_ctx(None, "boss doctor") == "boss doctor"
+
+	def test_every_registered_recovery_command_can_be_rewritten(self):
+		"""登记表里出现的每条 ``boss …`` 都必须有改写条目（Issue #1092）。
+
+		漏登记会让真人与 Agent 照抄一条指向默认数据目录的命令。
+		"""
+		from boss_agent_cli.display import _REGISTRY_COMMANDS
+		from boss_agent_cli.schema.error_codes import ERROR_CODES
+
+		bare = re.compile(r"boss [a-z][a-z0-9-]*")
+		missing: dict[str, list[str]] = {}
+		for code, spec in ERROR_CODES.items():
+			text = str(spec.get("recovery_action") or "")
+			for literal in sorted(_REGISTRY_COMMANDS, key=len, reverse=True):
+				text = text.replace(literal, "")
+			uncovered = sorted(set(bare.findall(text)))
+			if uncovered:
+				missing[code] = uncovered
+		assert missing == {}, f"这些命令没有改写条目：{missing}"
+
+	def test_tty_envelope_rewrites_registry_recovery(self, monkeypatch, tmp_path):
+		ctx = MagicMock()
+		ctx.obj = {"json_output": False, "platform": "zhipin", "data_dir": tmp_path}
+		stream = _capture_display_console(monkeypatch, width=400)
+		with patch.object(sys, "stdout") as mock_out:
+			mock_out.isatty.return_value = True
+			with pytest.raises(SystemExit):
+				handle_error_output(ctx, "resume show", code="RESUME_NOT_FOUND", message="简历不存在")
+
+		output = stream.getvalue()
+		assert f"boss --data-dir {tmp_path.resolve()} resume list" in output
+		assert "recovery: boss resume list" not in output
+
+	def test_json_envelope_rewrites_registry_recovery(self, monkeypatch, tmp_path):
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True, "platform": "zhipin", "data_dir": tmp_path}
+		captured = {}
+		monkeypatch.setattr("boss_agent_cli.output.emit_error", lambda *args, **kwargs: captured.update(kwargs))
+		handle_error_output(ctx, "crawl", code="CRAWL_RUN_NOT_FOUND", message="未找到任务")
+
+		action = captured["recovery_action"]
+		prefix = f"boss --data-dir {tmp_path.resolve()}"
+		assert f"{prefix} crawl start" in action
+		assert f"{prefix} crawl status" in action
+
+	def test_explicit_caller_contract_is_not_rewritten(self, monkeypatch):
+		"""调用方自己算好的恢复文案（可能带别的状态）不能被再次改写。"""
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True, "platform": "zhipin", "data_dir": Path("/tmp/custom state")}
+		captured = {}
+		monkeypatch.setattr("boss_agent_cli.output.emit_error", lambda *args, **kwargs: captured.update(kwargs))
+		handle_error_output(
+			ctx,
+			"fixture",
+			code="RESUME_NOT_FOUND",
+			message="fixture",
+			recovery_action="在官方页面核对后再决定下一步",
+		)
+
+		assert captured["recovery_action"] == "在官方页面核对后再决定下一步"
+
+	def test_error_message_rewrites_embedded_bare_commands(self, monkeypatch, tmp_path):
+		"""``error.message`` 里的裸命令同样要指向本次运行的数据目录（Issue #1097）。
+
+		采集层与招聘者层在 ``api/`` / ``crawler/`` 构造文案时没有 ctx，只能在
+		信封出口改写。
+		"""
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True, "platform": "zhipin", "data_dir": tmp_path}
+		captured = {}
+		monkeypatch.setattr("boss_agent_cli.output.emit_error", lambda *args, **kwargs: captured.update(kwargs))
+		handle_error_output(
+			ctx,
+			"crawl",
+			code="ACCOUNT_RISK",
+			message="采集浏览器当前未登录，已停止；由用户执行 boss clean --risk-lock 再显式恢复。",
+		)
+
+		message = captured["message"]
+		assert f"boss --data-dir {tmp_path.resolve()} clean --risk-lock" in message
+		assert "boss clean --risk-lock" not in message
+
+	def test_error_message_without_commands_is_unchanged(self, monkeypatch):
+		ctx = MagicMock()
+		ctx.obj = {"json_output": True, "platform": "zhipin", "data_dir": Path("/tmp/plain")}
+		captured = {}
+		monkeypatch.setattr("boss_agent_cli.output.emit_error", lambda *args, **kwargs: captured.update(kwargs))
+		handle_error_output(ctx, "fixture", code="INVALID_PARAM", message="缺少必填参数 query")
+
+		assert captured["message"] == "缺少必填参数 query"

@@ -94,16 +94,32 @@ boss logout && boss login
 
 ## 浏览器 / patchright 问题
 
-### `patchright install chromium` 失败
+### 浏览器内核安装失败（`BROWSER_KERNEL_MISSING`）
+
+内核安装命令必须使用**运行 boss 的同一个解释器**。`uv tool install` / `pipx install`
+只把 `boss`、`boss-mcp` 放进 PATH，patchright 留在工具环境里，裸
+`patchright install chromium` 会报 `command not found`（Issue #1060）。信封的
+`error.recovery_action` 与 `boss doctor` 给出的都是带解释器路径的可执行命令，
+直接照抄即可：
 
 ```bash
+boss doctor                     # 输出可执行的安装命令与所需修订版
+# 形如：/path/to/python -m patchright install chromium
+
+# 安装失败时的补充排查
 # macOS / Linux：确认对 ~/Library/Caches（macOS）或 ~/.cache（Linux）有写权限
 # Windows：以管理员身份运行一次
-pip install --upgrade patchright
-patchright install chromium --with-deps
-# 全局 tool 环境提示缺 headless shell 时再执行
-patchright install chromium-headless-shell
+<同上的解释器> -m pip install --upgrade patchright
+<同上的解释器> -m patchright install chromium --with-deps
+# 提示缺 headless shell 时再执行
+<同上的解释器> -m patchright install chromium-headless-shell
 ```
+
+Windows 下的安装指引面向 PowerShell。解释器路径含空格或特殊字符时，完整命令形如 `& 'C:\Program Files\Python\python.exe' -m patchright install chromium`；开头的 `&` 是执行该路径所需的调用运算符，照抄时请保留。正在使用 cmd.exe 时，先打开 PowerShell 再执行这类命令。
+
+设置 `PLAYWRIGHT_BROWSERS_PATH` 后，内核安装、运行 CLI、`boss doctor` 与向导预检需要使用同一环境设置；预检只检查这个指定目录。相对路径以 `INIT_CWD`（未设置时为当前目录）为基准，值为 `0` 时使用 patchright 驱动包内的 `.local-browsers`。
+
+向导的「现在登录」与 `boss login` 使用同一认证链：先尝试复用浏览器登录态，必要时再打开扫码浏览器。缺少 patchright 内核时，仍可通过有效的 Cookie 或已有 CDP 登录；只有实际进入扫码降级并报告内核缺失后，向导才展示内核安装指引。
 
 ### 真实平台验证前就报 `AUTH_REQUIRED`
 
@@ -111,11 +127,27 @@ patchright install chromium-headless-shell
 `search`、`detail`、`status --live` 验证必须先执行 `boss login`；登录前只验证 CLI
 本地命令、schema、MCP 和 doctor。
 
+### `boss-mcp` 提示缺少 MCP SDK
+
+默认安装 `boss-agent-cli` 不包含可选的 MCP SDK。`boss-mcp` 在 SDK 缺失时会把安装说明写到 stderr 并以 1 退出；stdout 保持为空，宿主可能只显示连接已关闭。用原安装方式补上依赖后重启 MCP：
+
+```bash
+pip install "boss-agent-cli[mcp]"
+# 使用 uv tool 安装时
+uv tool install "boss-agent-cli[mcp]"
+# 源码仓库内
+uv sync --extra mcp
+```
+
+`uv tool install` 每次按给定的依赖组重建工具环境，不保留之前选过的组：已经装过 `crawl` 时要一次列全（`uv tool install "boss-agent-cli[crawl,mcp]"`），否则补上 MCP 的同时采集依赖会被移除。`boss-mcp` 的启动提示和 `CRAWL_UNAVAILABLE` 的恢复指引会按当前环境给出完整写法；`pip install` 是增量安装，不受影响。
+
+也可直接使用 README 的 `uvx --from "boss-agent-cli[mcp]" boss-mcp` 配置。SDK 内部其他依赖缺失或服务器自身异常仍显示其原始错误，请按具体报错排查。
+
 ### MCP 工具返回 `CLI_ERROR`
 
 `CLI_ERROR` 是 MCP server 与底层 `boss` CLI 之间的进程层失败，不是平台响应：
 
-- **底层 CLI 没能启动**（`error.message` 以「无法启动底层 boss CLI」开头）：`boss` 不在 MCP server 进程的 `PATH` 中、`--boss-bin` 路径有误或文件不可执行。此时没有产生任何平台操作（`error.details.outcome_unknown=false`）。把 `boss` 装进 MCP server 所在环境，或用 `boss-mcp --boss-bin /path/to/boss` 指定路径；README 推荐的 `uvx --from boss-agent-cli[mcp] boss-mcp` 会把同一环境的 `boss` 放进 `PATH`。
+- **底层 CLI 没能启动**（`error.message` 以「无法启动底层 boss CLI」开头）：`boss-mcp` 默认使用与自己同一安装的 `boss` 入口（运行 server 的解释器旁边），不依赖 MCP 主机的 `PATH`；只有该入口不存在时才按 `PATH` 查找。出现这条错误说明同安装入口缺失且 `boss` 不在 MCP server 进程的 `PATH` 中，或 `--boss-bin` 路径有误、文件不可执行。此时没有产生任何平台操作（`error.details.outcome_unknown=false`）。把 `boss` 装进 MCP server 所在环境，或用 `boss-mcp --boss-bin /path/to/boss` 指定路径；README 推荐的 `uvx --from boss-agent-cli[mcp] boss-mcp` 会把同一环境的 `boss` 放进 `PATH`。
 - **子进程运行后没有输出 JSON 信封**：只读工具没有平台写入（`outcome_unknown=false`），按 `error.message` 排查，升级到最新版本后重新调用；写工具结果未知（`outcome_unknown=true`），先核对平台实际状态，不要直接重试。
 
 `boss-mcp` 常用启动参数：`--data-dir`、`--platform`、`--role`、`--browser-source`、`--boss-bin`、`--transport stdio|sse|http`；完整默认值见 `boss-mcp --help`。
@@ -337,10 +369,11 @@ httpx 带着从 Chrome 拷出来的 Cookie，把 `__zp_stoken__` 当查询参数
 | `LOCAL_STATE_WRITE_FAILED` | 平台操作已完成，但本地状态保存失败 | 先在官方页面核对本次操作是否已生效；不要自动重发，确认磁盘空间与缓存目录权限后再继续 |
 | `LOCAL_IO_ERROR` | 本地文件读写失败（导出路径、`config.json`、缓存等） | 不要自动重试：确认目标路径是可写目录（而不是同名的已有文件）、权限与磁盘空间正常后再执行 |
 | `MODEL_REGISTRY_INVALID` | 本地模型登记表 `models/registry.json` 损坏（写一半被中断、手工编辑写坏） | 修正或删除该文件后重试；删除只会丢失已导入模型的登记，模型文件仍在磁盘上，重新执行 `boss ai local import` 即可重建 |
-| `AUTOMATION_STATE_INVALID` | 招聘自动化状态 `automation/state.json` 损坏，`boss agent run` / `stats` 无法读取（`stop.json` 损坏时按已熔断处理） | 修正或删除该文件后重试；删除会丢失自动化去重与历史进度，建议先备份 |
+| `AUTOMATION_STATE_INVALID` | 招聘自动化状态 `automation/state.json` 损坏或字段类型不对，或队列文件 `pending-actions.jsonl` / `human-review-queue.jsonl` 里有记录的 `confidence`、`action` 读不出来，`boss agent run` / `stats` / `pending` / `review` 无法继续（`stop.json` 损坏时按已熔断处理） | 按 `error.message` 指出的文件与字段修正后重试；删除 `state.json` 会丢失自动化去重与历史进度，建议先备份 |
 | `SAVED_SEARCH_INVALID` | 本地预设 / watch 的参数损坏（`saved_searches.params` 不是 JSON 对象），`boss search --preset`、`boss watch run` 无法执行 | 执行 `boss preset remove <名称>`（watch 用 `boss watch remove`）后重新添加；参数只存在本地缓存，删除不影响平台数据 |
 | `CACHE_RECORD_INVALID` | 本地 crawl / workflow 任务记录损坏（`crawl_runs`、`crawl_jobs`、`workflow_runs`、`workflow_steps` 的 JSON 列读不出来），断点无法恢复 | 重新创建任务（crawl 用 `boss crawl start`，workflow 用 `boss wizard --input-json`）；记录只存在本地缓存，已导出的文件不会自动删除，`boss wizard` 的任务列表会跳过坏记录并点名 |
 | `CACHE_DATABASE_INVALID` | 本地缓存库 `cache/boss_agent.db` 损坏或被别的文件占位（`file is not a database`），几乎所有读写本地状态的命令都受影响 | 先备份该文件，再删除后重试，命令会自动重建空库；库里的候选池、预设、watch 历史与任务断点会一起作废，平台数据不受影响。并发锁等可重试错误不会报这个码 |
+| `CACHE_BUSY` | 本地缓存库 `cache/boss_agent.db` 正被其他连接写入（`database is locked`），SQLite busy timeout 内拿不到写锁 | 等待占用缓存的 boss 命令或程序结束写入后重试；库文件本身完好，不需要删除，平台数据不受影响。持续出现时检查是否有残留的 boss 后台任务 |
 | `ALREADY_APPLIED` | 已发起过投递 / 立即沟通 | 跳过；用 `boss me --section deliver` 查看投递记录，或用 `boss chat` 跟进 |
 | `GREET_LIMIT` | 今日次数用完 | 告知用户 |
 | `NETWORK_ERROR` | 网络错误 | 重试 |
@@ -350,7 +383,7 @@ httpx 带着从 Chrome 拷出来的 Cookie，把 `__zp_stoken__` 当查询参数
 | `AI_API_ERROR` | AI 服务调用失败 | 检查网络连接和密钥配置，重试 |
 | `AI_PARSE_ERROR` | AI 返回结果解析失败 | 重试（模型输出不稳定时可能发生） |
 | `PLATFORM_NOT_SUPPORTED` | 当前平台不支持该角色或子命令 | 切换到支持的平台 |
-| `BROWSER_KERNEL_MISSING` | patchright 浏览器内核缺失或版本不匹配（含非登录命令：`search` / `detail` / `greet` / `chat` / `me` / `wizard` 等启动浏览器时，以及 `resume export --format pdf`） | `patchright install chromium`；缺 headless shell 时运行 `patchright install chromium-headless-shell`。这是确定性失败，重试不会成功 |
+| `BROWSER_KERNEL_MISSING` | patchright 浏览器内核缺失或版本不匹配（含非登录命令：`search` / `detail` / `greet` / `chat` / `me` / `wizard` 等启动浏览器时，以及 `resume export --format pdf`） | `<运行 boss 的解释器> -m patchright install chromium`（信封 `recovery_action` 给出完整命令）；缺 headless shell 时运行同一解释器的 `-m patchright install chromium-headless-shell`。这是确定性失败，重试不会成功 |
 
 ## Windows smoke checklist
 

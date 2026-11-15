@@ -138,13 +138,55 @@ def test_python_version_satisfies(tmp_path):
 # ── 3. 依赖缺失 ─────────────────────────────────────────────────────
 
 
-@patch("boss_agent_cli.commands.doctor.shutil.which", return_value=None)
-def test_patchright_missing(mock_which, tmp_path):
-	"""patchright 可执行文件不在 PATH 中时应为 warn。"""
+@patch("boss_agent_cli.commands.doctor.patchright_importable", return_value=False)
+def test_patchright_missing(mock_importable, tmp_path):
+	"""patchright 无法导入时应为 warn；判定以解释器导入为准，不看 PATH。"""
 	code, parsed = _invoke_doctor(tmp_path)
 	pr_check = _find_check(parsed["data"]["checks"], "patchright")
 	assert pr_check["status"] == "warn"
-	assert "未找到" in pr_check["detail"]
+	assert "无法导入" in pr_check["detail"]
+
+
+def test_patchright_check_does_not_depend_on_path(tmp_path, monkeypatch):
+	"""回归（Issue #1060）：`uv tool install` 只暴露 boss / boss-mcp，patchright
+	不在 PATH 上，但它就在运行 CLI 的解释器里，doctor 不能误报缺失。"""
+	import boss_agent_cli.commands.doctor as doctor_module
+
+	monkeypatch.setattr(doctor_module.shutil, "which", lambda name: None)
+	_code, parsed = _invoke_doctor(tmp_path)
+	pr_check = _find_check(parsed["data"]["checks"], "patchright")
+	assert pr_check["status"] == "ok"
+
+
+def test_doctor_kernel_install_hint_is_executable_in_this_installation(tmp_path):
+	"""内核安装提示必须用运行 CLI 的解释器，而不是 PATH 上的裸 patchright。
+
+	`uv tool install boss-agent-cli` 之后 `patchright` 不在 PATH，裸命令 rc=127；
+	提示里的解释器必须存在，且 `-m patchright` 可以导入。
+	"""
+	import re as re_module
+	import shlex
+	import subprocess
+	import sys
+	from pathlib import Path
+
+	_code, parsed = _invoke_doctor(tmp_path)
+	pr_check = _find_check(parsed["data"]["checks"], "patchright_chromium")
+	command = next(
+		token
+		for token in re_module.findall(r"(\S+ -m patchright install [^\s；]+)", pr_check["detail"])
+	)
+	argv = shlex.split(command)
+	assert argv[0] == sys.executable
+	assert Path(argv[0]).exists()
+	probe = subprocess.run(
+		[argv[0], "-m", "patchright", "--version"],
+		capture_output=True,
+		text=True,
+		timeout=120,
+		check=False,
+	)
+	assert probe.returncode == 0, probe.stderr
 
 
 # ── 4. 网络不通 ──────────────────────────────────────────────────────
@@ -910,6 +952,7 @@ def test_windows_playwright_cache_dir_uses_localappdata(tmp_path, monkeypatch):
 	"""Windows 默认 ms-playwright 缓存应纳入 doctor 检测。"""
 	from boss_agent_cli.services.browser_runtime import patchright_browser_cache_dirs
 
+	monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
 	local_app_data = tmp_path / "AppData" / "Local"
 	monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
 
@@ -944,7 +987,9 @@ def test_evaluate_patchright_chromium_requires_exact_revision(tmp_path):
 		tmp_path / "chromium_headless_shell-1217",
 	]
 	status, detail = evaluate_patchright_chromium("1208", installed)
-	assert status == "warn"
+	# 内核缺失是确定性失败：doctor 用 error 让 summary 变成 broken，而不是
+	# 让用户以为只是「有点小问题」（Issue #1060）。
+	assert status == "error"
 	assert "chromium-1208" in detail
 	assert "boss login" in detail
 
@@ -959,9 +1004,9 @@ def test_evaluate_patchright_chromium_reports_missing_headless_shell(tmp_path):
 
 	status, detail = evaluate_patchright_chromium("1223", [tmp_path / "chromium-1223"])
 
-	assert status == "warn"
+	assert status == "error"
 	assert "chromium_headless_shell-1223" in detail
-	assert "patchright install chromium-headless-shell" in detail
+	assert "-m patchright install chromium-headless-shell" in detail
 
 
 def test_evaluate_patchright_chromium_falls_back_without_manifest(tmp_path):
@@ -991,3 +1036,60 @@ def test_doctor_no_longer_probes_zhaopin(tmp_path):
 	checks = parsed["data"]["checks"]
 	assert _find_check(checks, "network_zhilian") is None
 	assert not any("zhaopin" in json.dumps(check, ensure_ascii=False) for check in checks)
+
+
+def test_doctor_live_probe_recovery_keeps_the_data_dir(tmp_path):
+	"""探测异常的恢复命令要指向本次诊断的数据目录（Issue #1092）。
+
+	裸 `boss status` / `boss hr whoami` 读默认目录的登录态，`--data-dir` 用户
+	照抄后会被引到另一份缓存，看起来仍然「未登录」。
+	"""
+	parsed, _, _, _ = _run_live_probe(
+		tmp_path,
+		platform_side_effect=RuntimeError("fixture probe failure"),
+	)
+	checks = {check["name"]: check for check in parsed["data"]["checks"]}
+	recovery = checks["candidate_live_user_info"]["recovery_action"]
+	assert f"--data-dir {tmp_path.resolve()}" in recovery
+	assert "boss --data-dir" in recovery
+	assert "运行 boss status" not in recovery
+
+
+def test_doctor_recruiter_side_hint_keeps_the_data_dir(tmp_path):
+	parsed, _, _, _ = _run_live_probe(
+		tmp_path,
+		platform_user_info={"zpData": {"identity": 0, "doubleIdentity": True, "recruit": False}},
+	)
+	checks = {check["name"]: check for check in parsed["data"]["checks"]}
+	recovery = checks["recruiter_live_read"]["recovery_action"]
+	assert f"--data-dir {tmp_path.resolve()}" in recovery
+	assert "hr whoami" in recovery
+	assert "执行 boss hr whoami" not in recovery
+
+
+# ── 11. 检查项恢复文案保留 --data-dir ─────────────────────────────────
+
+
+def test_doctor_cookie_hint_keeps_the_data_dir(tmp_path):
+	"""默认诊断的 cookie_extract 提示要指向本次诊断的数据目录（Issue #1095）。"""
+	_code, parsed = _invoke_doctor(tmp_path)
+	ce = _find_check(parsed["data"]["checks"], "cookie_extract")
+	expected_dir = tmp_path.resolve()
+	assert f"boss --data-dir {expected_dir}" in ce["hint"]
+	assert "--probe-cookies" in ce["hint"]
+	assert "boss --data-dir " in ce["hint"].split("，或 ")[-1]
+
+
+def test_doctor_recruiter_identity_hint_keeps_the_data_dir(tmp_path):
+	"""双身份停在求职者侧时，核对命令必须指回本次诊断的数据目录（Issue #1095）。"""
+	parsed, _platform, recruiter, _output = _run_live_probe(
+		tmp_path, platform_user_info={"zpData": {"identity": 0, "doubleIdentity": True, "recruit": False}}
+	)
+	identity = _find_check(parsed["data"]["checks"], "recruiter_identity")
+	read = _find_check(parsed["data"]["checks"], "recruiter_live_read")
+	expected_prefix = f"boss --data-dir {tmp_path.resolve()} "
+	for check in (identity, read):
+		action = check["recovery_action"]
+		assert expected_prefix in action
+		assert " hr whoami" in action
+	recruiter.list_jobs.assert_not_called()

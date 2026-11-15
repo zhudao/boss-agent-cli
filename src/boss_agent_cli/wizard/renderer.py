@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping
@@ -74,6 +75,8 @@ ERROR_LABELS = {
 	"WORKFLOW_STOPPED": "任务已停止",
 	"WORKFLOW_BUSY": "该任务正在另一个窗口或进程中执行",
 	"CRAWL_BUSY": "该采集任务正在另一个窗口或进程中执行",
+	"CACHE_BUSY": "本地缓存正被另一个进程写入",
+	"CRAWL_UNAVAILABLE": "采集所需的可选依赖没有安装",
 	"WORKFLOW_PLAN_MISMATCH": "任务信息与已有记录不一致",
 	"INVALID_PARAM": "请求参数无效",
 	"AUTH_EXPIRED": "登录状态已过期",
@@ -98,7 +101,7 @@ RECOVERY_LABELS = {
 	"NETWORK_ERROR": "请检查网络后重试，或返回主菜单选择其他事项。",
 	"INTERNAL_ERROR": "这不是网络问题，重试不会有帮助。请升级到最新版本，仍出现时把这次的命令和报错反馈给维护者。",
 	"BROWSER_NAV_TIMEOUT": "请用已登录的 Chrome 调试端口重试，或先重新登录后再恢复任务。",
-	"BROWSER_KERNEL_MISSING": "这不是网络问题，重试不会有帮助。请退出向导，运行 patchright install chromium 安装浏览器内核后重新执行命令。",
+	"BROWSER_KERNEL_MISSING": "这不是网络问题，重试不会有帮助。请退出向导，运行 python -m patchright install chromium（使用运行 boss 的同一个解释器）安装浏览器内核后重新执行命令。",
 	"RATE_LIMITED": "请稍后再试。",
 	"ACCOUNT_RISK": "请停止自动操作并在平台内检查账号状态；确认风险解除后，由你本人执行 boss clean --risk-lock，再重新启动向导恢复任务。",
 	"ENVIRONMENT_RISK": "请停止自动操作，保留当前浏览器 profile，在平台官方页面确认风险解除后，由你本人执行 boss clean --risk-lock，再重新启动向导恢复任务。",
@@ -128,8 +131,50 @@ RECOVERY_LABELS = {
 	"WIZARD_INPUT_REQUIRED": "headless 模式请通过 --input-json 提供完整输入，或用 run_id 恢复。",
 	"WORKFLOW_STOPPED": "任务已停止；如需继续，请选择“恢复已有任务”。",
 	"WORKFLOW_BUSY": "请等它结束，或选择“查看任务状态”确认进度后再恢复。",
+	# 具体安装命令由 recovery_message 按当前已有的依赖组动态拼出（Issue #1068）。
+	"CRAWL_UNAVAILABLE": "这不是网络问题，重试不会有帮助。请退出向导，补上 crawl 可选依赖后重新执行。",
 	"CRAWL_BUSY": "请等它结束；需要确认进度时执行 boss crawl status <run_id>，不要并发恢复同一个任务。",
+	"CACHE_BUSY": "请等正在运行的 boss 命令结束后选择“恢复已有任务”继续；库文件本身完好，不需要删除。",
 }
+
+#: 风控恢复动作里由 runner / actions 注入的真实解锁命令（Issue #978 / #976）。
+_RISK_CLEAN_COMMAND = re.compile(
+	r"""boss(?: --platform \S+)? --data-dir (?:'[^']*'|"[^"]*"|\S+) clean --risk-lock"""
+)
+_RISK_CODES = frozenset({"ACCOUNT_RISK", "ENVIRONMENT_RISK", "ENVIRONMENT_RISK_LOCKED"})
+
+#: 动作层已经给出带数据目录的完整恢复句子的错误码（Issue #1090）。静态文案的
+#: 命令家族可能不同（例如 watch 失败却提示 preset remove），此时动态版本更准确。
+_DYNAMIC_RECOVERY_CODES = frozenset({"ACTION_UNCONFIRMED", "SAVED_SEARCH_INVALID", "CRAWL_BUSY"})
+_CONTEXT_AWARE_COMMAND = re.compile(r"""boss(?: --platform \S+)? --data-dir """)
+
+#: 静态恢复文案里的默认命令示例；有运行上下文时由调用方替换成带 ``--data-dir``
+#: 的命令（Issue #1090）。
+_RECOVERY_COMMANDS: dict[str, tuple[str, ...]] = {
+	"boss ai config": ("ai config",),
+	"boss me --section deliver": ("me --section deliver",),
+	"boss chat": ("chat",),
+	"boss preset remove": ("preset remove",),
+	"boss preset list": ("preset list",),
+	"boss resume list": ("resume list",),
+	"boss resume import": ("resume import",),
+	"boss watch remove": ("watch remove",),
+	"boss watch list": ("watch list",),
+	"boss crawl status": ("crawl status",),
+	"boss hr chatmsg": ("hr chatmsg",),
+	"boss hr reply": ("hr reply",),
+	"boss doctor": ("doctor",),
+	"boss clean --risk-lock": ("clean --risk-lock",),
+}
+
+
+def _rewrite_recovery_commands(text: str, command_for: Callable[[str], str] | None) -> str:
+	"""把静态恢复文案里的裸命令换成调用方上下文的命令（Issue #1090）。"""
+	if command_for is None:
+		return text
+	return display.rewrite_command_examples(
+		text, {literal: command for literal, (command,) in _RECOVERY_COMMANDS.items()}, command_for
+	)
 
 # 这些步骤对真人噪声大，TTY 进度里默认静默。
 _SILENT_STEPS = {"auth_status"}
@@ -163,10 +208,46 @@ def error_message(code: str, message: str | None = None) -> str:
 	return ERROR_LABELS.get(code) or (str(message).strip() if message else "任务执行时遇到问题")
 
 
-def recovery_message(code: str, recovery_action: str | None = None) -> str | None:
+def recovery_message(
+	code: str,
+	recovery_action: str | None = None,
+	*,
+	command_for: Callable[[str], str] | None = None,
+) -> str | None:
 	localized = RECOVERY_LABELS.get(code)
+	if localized and code in _DYNAMIC_RECOVERY_CODES and recovery_action:
+		# actions 层已给出带数据目录的完整指引，直接采用；静态文案的命令家族
+		# 可能与实际失败对象不同（Issue #1090）。
+		action_text = str(recovery_action)
+		if _CONTEXT_AWARE_COMMAND.search(action_text):
+			return action_text
+	if localized and code in _RISK_CODES and recovery_action:
+		# runner / actions 已把解锁命令换成带 --data-dir 的真实命令；静态文案
+		# 保留面向真人的措辞，命令部分必须用动态版本，否则自定义数据目录下
+		# 照抄提示会去默认目录空转（Issue #1087）。
+		match = _RISK_CLEAN_COMMAND.search(str(recovery_action))
+		if match:
+			return localized.replace("boss clean --risk-lock", match.group(0))
+	if code == "BROWSER_KERNEL_MISSING":
+		# 安装命令依赖运行本 CLI 的解释器（`uv tool install` 不把 patchright
+		# 放进 PATH，Issue #1060）：有动态命令时用它替换静态说法。
+		from boss_agent_cli.services.browser_runtime import patchright_install_command
+
+		command = str(recovery_action) if recovery_action and "patchright" in str(recovery_action) else None
+		return (
+			"这不是网络问题，重试不会有帮助。请退出向导，运行 "
+			f"{command or patchright_install_command()} 安装浏览器内核后重新执行命令。"
+		)
+	if code == "CRAWL_UNAVAILABLE":
+		# 安装命令要带上已经可用的依赖组：uv tool install 会重建环境（Issue #1068）。
+		from boss_agent_cli.services.install_extras import extras_install_hint
+
+		return (
+			"这不是网络问题，重试不会有帮助。请退出向导，用 "
+			f"{extras_install_hint('crawl')} 补上采集依赖后重新执行。"
+		)
 	if localized:
-		return localized
+		return _rewrite_recovery_commands(localized, command_for)
 	if recovery_action and any("\u4e00" <= char <= "\u9fff" for char in str(recovery_action)):
 		return str(recovery_action)
 	return "请返回主菜单后重试。" if recovery_action else None
@@ -246,10 +327,16 @@ def busy_status(message: str) -> Iterator[None]:
 		yield
 
 
-def render_error(*, code: str, message: str | None = None, recovery_action: str | None = None) -> None:
+def render_error(
+	*,
+	code: str,
+	message: str | None = None,
+	recovery_action: str | None = None,
+	command_for: Callable[[str], str] | None = None,
+) -> None:
 	message_text = display.escape_markup(error_message(code, message))
 	display.console.print(Panel(message_text, title="操作未完成", border_style="red"))
-	recovery = recovery_message(code, recovery_action)
+	recovery = recovery_message(code, recovery_action, command_for=command_for)
 	if recovery:
 		display.console.print(f"[bold]下一步：[/bold]{display.escape_markup(recovery)}")
 
@@ -431,11 +518,17 @@ def render_crawl_job_brief(job: Mapping[str, Any], *, with_description: bool = F
 	display.console.print(Panel("\n".join(lines), title="采集职位（本地）", border_style="green"))
 
 
-def render_run(run: Mapping[str, Any], *, with_preview: bool = True) -> None:
+def render_run(
+	run: Mapping[str, Any],
+	*,
+	with_preview: bool = True,
+	command_for: Callable[[str], str] | None = None,
+) -> None:
 	"""Single, human-first summary: content card or one error panel — not a debug dump.
 
 	``with_preview=False`` 用于结果列表上方：那里下方已有可选职位菜单，
-	框里再列一遍职位既冗余、页码也跟菜单对不上。
+	框里再列一遍职位既冗余、页码也跟菜单对不上。``command_for`` 让失败面板
+	的恢复命令带上本次运行的数据目录（Issue #1090）。
 	"""
 	status = str(run.get("status") or "")
 	if status == "failed":
@@ -444,6 +537,7 @@ def render_run(run: Mapping[str, Any], *, with_preview: bool = True) -> None:
 			code=str(error.get("code") or "NETWORK_ERROR"),
 			message=str(error.get("message") or ""),
 			recovery_action=error.get("recovery_action"),
+			command_for=command_for,
 		)
 		return
 
@@ -509,7 +603,7 @@ def render_run(run: Mapping[str, Any], *, with_preview: bool = True) -> None:
 		return
 
 	# Management / digest / AI / empty-list friendly summaries.
-	if _render_management_result(run):
+	if _render_management_result(run, command_for=command_for):
 		return
 
 	job = _extract_job_payload(run.get("last_result"))
@@ -521,7 +615,7 @@ def render_run(run: Mapping[str, Any], *, with_preview: bool = True) -> None:
 	goal = goal_label(run.get("role"), run.get("goal"))
 	if count is not None:
 		if count == 0:
-			_render_empty_result(run)
+			_render_empty_result(run, command_for=command_for)
 			return
 		display.console.print(f"[green]已完成[/green] {goal}，共 [bold]{count}[/bold] 条结果可继续选择。")
 		# Compact markdown preview so list goals are not “只有数字”。
@@ -567,11 +661,15 @@ def render_run(run: Mapping[str, Any], *, with_preview: bool = True) -> None:
 	display.console.print(Panel(table, title="任务状态", border_style="cyan"))
 
 
-def _render_empty_result(run: Mapping[str, Any]) -> None:
+def _render_empty_result(
+	run: Mapping[str, Any],
+	*,
+	command_for: Callable[[str], str] | None = None,
+) -> None:
 	"""Friendly empty-state panel for management goals with zero items."""
 	goal = str(run.get("goal") or "")
 	title = goal_label(run.get("role"), goal)
-	hints = {
+	hints: dict[str, str] = {
 		"resumes": "当前还没有本地简历。可用命令导入：boss resume import <文件>",
 		"shortlist": "候选池为空。可在职位列表里收藏，或从采集结果导入。",
 		"pipeline": "暂无沟通/面试进度。先去「投递与沟通」打个招呼吧。",
@@ -586,7 +684,7 @@ def _render_empty_result(run: Mapping[str, Any]) -> None:
 		"last_messages": "暂无最近消息。",
 		"jobs_list": "暂无已发布职位。",
 	}
-	message = hints.get(goal, "没有可展示的结果。")
+	message = _rewrite_recovery_commands(hints.get(goal, "没有可展示的结果。"), command_for)
 	display.console.print(
 		Panel(
 			f"[bold]{title}[/bold]\n\n[dim]{message}[/dim]",
@@ -764,7 +862,11 @@ def _render_list_preview_if_any(run: Mapping[str, Any], *, limit: int = 8) -> No
 	display.console.print(Group(table, footer))
 
 
-def _render_management_result(run: Mapping[str, Any]) -> bool:
+def _render_management_result(
+	run: Mapping[str, Any],
+	*,
+	command_for: Callable[[str], str] | None = None,
+) -> bool:
 	"""Rich panels for digest / AI / structured management outcomes."""
 	from rich.console import Group
 	from rich.text import Text
@@ -828,7 +930,7 @@ def _render_management_result(run: Mapping[str, Any]) -> bool:
 		if isinstance(data.get("items"), list):
 			count = len(data["items"])
 			if count == 0:
-				_render_empty_result(run)
+				_render_empty_result(run, command_for=command_for)
 				return True
 			display.console.print(
 				f"[green]已完成[/green] {goal_label(run.get('role'), goal)}，共 [bold]{count}[/bold] 条监控。"
@@ -884,7 +986,7 @@ def _render_management_result(run: Mapping[str, Any]) -> bool:
 			return True
 		count = len(items)
 		if count == 0:
-			_render_empty_result(run)
+			_render_empty_result(run, command_for=command_for)
 			return True
 		display.console.print(
 			f"[green]已完成[/green] {goal_label(run.get('role'), goal)}，共 [bold]{count}[/bold] 条结果。"

@@ -9,9 +9,12 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import signal
 import subprocess
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from mcp.server import Server
@@ -95,6 +98,28 @@ _BOSS_GLOBAL_ARGS: list[str] = []
 _CLI_TIMEOUT_SECONDS = 120.0
 _CHECKPOINT_GRACE_SECONDS = 5.0
 _TERMINATE_GRACE_SECONDS = 1.0
+
+
+def _default_boss_bin(*, executable: str | None = None, windows: bool | None = None) -> str:
+	"""未显式传 ``--boss-bin`` 时使用的底层 CLI。
+
+	``boss`` 与 ``boss-mcp`` 是同一次安装的两个入口，都在运行本 server 的解释器
+	旁边。MCP 主机常用绝对路径启动 ``boss-mcp`` 且不继承登录 shell 的 PATH
+	（``uv tool install`` / ``pipx install`` 的入口目录不在其中），只按 PATH 找
+	``boss`` 会让全部工具调用失败；PATH 上若另有一份旧版 ``boss``，还会被静默
+	驱动（Issue #1066）。同目录入口不存在时才回退到按 PATH 查找。
+	"""
+	interpreter = sys.executable if executable is None else executable
+	if not interpreter:
+		# 嵌入式运行时 sys.executable 可能为空；不能据此落到当前目录下的同名文件。
+		return DEFAULT_BOSS_BIN
+	bin_dir = Path(interpreter).parent
+	on_windows = os.name == "nt" if windows is None else windows
+	for name in (("boss.exe", "boss") if on_windows else ("boss",)):
+		candidate = bin_dir / name
+		if candidate.is_file():
+			return str(candidate)
+	return DEFAULT_BOSS_BIN
 
 
 def _configure_boss_invocation(
@@ -454,6 +479,14 @@ _JSON_TYPE_CHECKS: dict[str, tuple[type, ...]] = {
 	"object": (dict,),
 }
 
+#: 单个数组最多逐条列出的元素错误数，其余只报数量：错误信封不随输入规模膨胀。
+_MAX_ELEMENT_TYPE_ERRORS = 3
+
+
+def _matches_json_type(value: Any, expected: str) -> bool:
+	# Python 里 bool 是 int 子类；JSON 里 true/false 不是数字，反向也一样。
+	return isinstance(value, _JSON_TYPE_CHECKS[expected]) and (expected == "boolean" or not isinstance(value, bool))
+
 
 def _argument_type_errors(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 	"""按 inputSchema 校验参数类型，返回人类可读的错误列表。
@@ -461,6 +494,10 @@ def _argument_type_errors(tool_name: str, arguments: dict[str, Any]) -> list[str
 	`_build_args` 用 `is True` / truthiness 判断布尔参数：客户端把 `dry_run` /
 	`yes` 传成字符串时，标志位会被静默丢弃或反向生效（`"false"` 是 truthy），
 	写命令的预览 / 确认语义随之改变。类型错误必须在进入 CLI 之前拒绝。
+
+	数组还要按 `items.type` 逐元素校验（Issue #1105）：`_build_args` 用 `str()`
+	拼装元素，布尔值或对象会变成 `False`、`{'k': 'v'}` 这样的文本写进本地标签，
+	整数数组里的错误元素则要到 CLI 才得到一条不指明位置的参数错误。
 	"""
 	tool = next((item for item in TOOLS if item.name == tool_name), None)
 	if tool is None:
@@ -474,11 +511,20 @@ def _argument_type_errors(tool_name: str, arguments: dict[str, Any]) -> list[str
 		expected = prop.get("type")
 		if not isinstance(expected, str) or expected not in _JSON_TYPE_CHECKS:
 			continue
-		allowed = _JSON_TYPE_CHECKS[expected]
-		# Python 里 bool 是 int 子类；JSON 里 true/false 不是数字，反向也一样。
-		valid = isinstance(value, allowed) and (expected in {"boolean"} or not isinstance(value, bool))
-		if not valid:
+		if not _matches_json_type(value, expected):
 			errors.append(f"{key} 应为 {expected}，收到 {type(value).__name__}")
+			continue
+		items = prop.get("items")
+		item_type = items.get("type") if isinstance(items, dict) else None
+		if expected != "array" or not isinstance(item_type, str) or item_type not in _JSON_TYPE_CHECKS:
+			continue
+		invalid = [index for index, item in enumerate(value) if not _matches_json_type(item, item_type)]
+		errors.extend(
+			f"{key}[{index}] 应为 {item_type}，收到 {type(value[index]).__name__}"
+			for index in invalid[:_MAX_ELEMENT_TYPE_ERRORS]
+		)
+		if len(invalid) > _MAX_ELEMENT_TYPE_ERRORS:
+			errors.append(f"{key} 另有 {len(invalid) - _MAX_ELEMENT_TYPE_ERRORS} 个元素类型错误")
 	return errors
 
 
@@ -500,6 +546,12 @@ async def call_tool(ctx: Any, params: CallToolRequestParams) -> CallToolResult:
 			params.name,
 			f"未知参数：{', '.join(unknown)}；请按 tools/list 的 inputSchema 传参",
 		)
+	# 显式 ``null`` 与缺键等价于省略（Issue #958 / #982 / #1002 的契约）：映射层所有
+	# 可选参数判断都为 ``None`` 留了位置，文档也承诺 ``null`` 落回默认值，但类型检查
+	# 会先把 ``null`` 判成类型错误，导致 `boss_wizard.action: null` 到不了默认的 run。
+	# 在类型检查与映射之前剔除；必填参数传 null 因此走缺参分支，而不是把
+	# ``str(None)`` 拼成 "None" 发给 CLI（Issue #1108）。
+	arguments = {key: value for key, value in arguments.items() if value is not None}
 	type_errors = _argument_type_errors(params.name, arguments)
 	if type_errors:
 		# 类型错误同样不能交给 `_build_args` 的 truthiness 判断：`"false"` 是 truthy，
@@ -637,7 +689,11 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
 	parser.add_argument("--path", default=DEFAULT_HTTP_PATH, help="HTTP streaming 路径")
 	parser.add_argument("--sse-path", default=DEFAULT_SSE_PATH, help="SSE 建链路径")
 	parser.add_argument("--message-path", default=DEFAULT_MESSAGE_PATH, help="SSE 消息回传路径")
-	parser.add_argument("--boss-bin", default=DEFAULT_BOSS_BIN, help="底层 boss CLI 可执行文件路径")
+	parser.add_argument(
+		"--boss-bin",
+		default=None,
+		help="底层 boss CLI 可执行文件路径（默认使用与 boss-mcp 同一安装的 boss 入口，找不到时按 PATH 查找）",
+	)
 	parser.add_argument("--data-dir", default=None, help="传给 boss CLI 的数据目录，用于项目级状态隔离")
 	parser.add_argument("--platform", default=None, help="传给 boss CLI 的默认平台，如 zhipin")
 	parser.add_argument("--role", choices=("candidate", "recruiter"), default=None, help="传给 boss CLI 的默认角色")
@@ -654,7 +710,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
 def run(argv: list[str] | None = None) -> None:
 	args = _parse_cli_args(argv)
 	_configure_boss_invocation(
-		boss_bin=args.boss_bin,
+		boss_bin=args.boss_bin or _default_boss_bin(),
 		data_dir=args.data_dir,
 		platform=args.platform,
 		role=args.role,

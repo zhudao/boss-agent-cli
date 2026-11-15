@@ -28,7 +28,7 @@ from boss_agent_cli.wizard.catalog import GOALS, build_plan, catalog_data
 from boss_agent_cli.wizard.actions import ActionContext, DEFAULT_ACTIONS, execute_candidate_search
 from boss_agent_cli.output import Logger
 from boss_agent_cli.main import cli
-from boss_agent_cli.wizard.runner import WorkflowActionError, WorkflowRunner
+from boss_agent_cli.wizard.runner import WorkflowActionError, WorkflowControl, WorkflowRunner
 from boss_agent_cli.wizard.store import WorkflowStore
 from boss_agent_cli.wizard.prompts import (
 	ClickMenu,
@@ -39,12 +39,14 @@ from boss_agent_cli.wizard.prompts import (
 	WizardControl,
 	WizardReturnHome,
 	_collect_control,
+	_collect_inputs,
 	_main_menu_options,
 	ask_continue_session,
 	collect_entity_follow_up,
 	collect_result_follow_up,
 	collect_wizard_input,
 )
+from boss_agent_cli.services.install_extras import extras_requirement
 
 # PTY 用例要真起一个 CLI 进程并等 prompt_toolkit 渲染完首屏，耗时随机器负载浮动：
 # 本机约 1s，而 CI 的 P0 baseline job 在同一个 job 里串跑 ruff / pytest / mypy，
@@ -59,6 +61,7 @@ class _ScriptedMenu:
 		self.selections = iter(selections)
 		self.texts = iter(texts)
 		self.menus = []
+		self.text_labels: list[str] = []
 		self.last_kwargs = {}
 		self.kwargs_log = []
 
@@ -77,6 +80,7 @@ class _ScriptedMenu:
 		return value
 
 	def text(self, label, *, default="", required=True):
+		self.text_labels.append(label)
 		return next(self.texts, default)
 
 
@@ -1464,6 +1468,96 @@ def test_workflow_stop_forwards_to_bound_crawl_run(tmp_path):
 	assert inner["stop_requested"] is True
 
 
+def test_wizard_stop_persists_when_bound_crawl_results_are_corrupt(tmp_path):
+	"""停止只依赖 workflow 断点：内部 crawl 结果读不出来也要落下停止标记（Issue #1128）。"""
+	plan = WorkflowPlan(
+		role="candidate",
+		platform="zhipin",
+		goal="crawl_resume",
+		inputs={"run_id": "inner-corrupt"},
+		requested_steps=("crawl_resume",),
+		mode="headless",
+	)
+	with WorkflowStore(tmp_path) as store:
+		store.create("run-corrupt-crawl", plan)
+		store.update_run("run-corrupt-crawl", status="running", current_step="crawl_resume")
+		store.update_step(
+			"run-corrupt-crawl",
+			"crawl_resume",
+			status="running",
+			result={"inner_run_id": "inner-corrupt"},
+		)
+		store._cache.create_crawl_run(
+			"inner-corrupt",
+			{"run_id": "inner-corrupt"},
+			str(tmp_path / "crawl" / "runs" / "inner-corrupt"),
+		)
+		store._cache._conn.execute(
+			"INSERT INTO crawl_jobs (run_id, job_key, selector, page_no, payload, detail_done, updated_at) "
+			"VALUES (?, ?, ?, ?, ?, ?, ?)",
+			("inner-corrupt", "job-1", "selector-1", 1, "{not json", 0, 0.0),
+		)
+		store._cache._conn.commit()
+
+	stop = CliRunner().invoke(
+		cli,
+		["--json", "--data-dir", str(tmp_path), "wizard", "--stop", "run-corrupt-crawl"],
+	)
+
+	assert stop.exit_code == 0, stop.output
+	envelope = json.loads(stop.stdout)
+	assert envelope["ok"] is True
+	assert envelope["data"]["run_id"] == "run-corrupt-crawl"
+	assert envelope["data"]["status"] == "stopped"
+	with WorkflowStore(tmp_path) as store:
+		assert store.get_checkpoint("run-corrupt-crawl")["status"] == "stopped"
+		assert store._cache.get_crawl_run("inner-corrupt")["stop_requested"] is True
+		control = WorkflowControl("run-corrupt-crawl", "crawl_resume", store)
+		# 长动作轮询停止信号时同样不能被损坏的采集结果挡住。
+		assert control.poll() == "stop"
+	# 状态查询仍按记录损坏报告，停止不改变这条契约。
+	status = CliRunner().invoke(
+		cli,
+		["--json", "--data-dir", str(tmp_path), "wizard", "--status", "run-corrupt-crawl"],
+	)
+	assert status.exit_code == 1
+	assert json.loads(status.stdout)["error"]["code"] == "CACHE_RECORD_INVALID"
+
+
+@pytest.mark.parametrize(
+	("table", "column", "where"),
+	[
+		("workflow_steps", "result", "run_id = 'run-corrupt-self'"),
+		("workflow_steps", "error", "run_id = 'run-corrupt-self'"),
+		("workflow_runs", "last_result", "run_id = 'run-corrupt-self'"),
+	],
+)
+def test_wizard_stop_persists_when_its_own_checkpoint_is_corrupt(tmp_path, table, column, where):
+	"""workflow 自己的断点列损坏时，停止标记仍要先落盘（Issue #1128）。"""
+	plan = WorkflowPlan(
+		role="candidate",
+		platform="zhipin",
+		goal="crawl_start",
+		inputs={"query": "Python", "city": "北京"},
+		requested_steps=("crawl_start",),
+		mode="headless",
+	)
+	with WorkflowStore(tmp_path) as store:
+		store.create("run-corrupt-self", plan)
+		store.update_run("run-corrupt-self", status="running", current_step="crawl_start")
+		store._cache._conn.execute(f"UPDATE {table} SET {column} = '{{bad' WHERE {where}")
+		store._cache._conn.commit()
+
+		assert store.request_stop("run-corrupt-self") is True
+		status = store._cache._conn.execute(
+			"SELECT status FROM workflow_runs WHERE run_id = 'run-corrupt-self'"
+		).fetchone()[0]
+		# 已停止的任务再次停止与此前一致：没有可停止的任务。
+		assert store.request_stop("run-corrupt-self") is False
+
+	assert status == "stopped"
+
+
 def test_resume_after_timeout_forwards_bound_inner_checkpoint_to_action(tmp_path):
 	"""超时后恢复：failed 步骤的 inner_run_id 必须传给 action，且不能被重跑清空（Issue #882）。"""
 	priors = []
@@ -2542,6 +2636,35 @@ def test_error_message_prefers_platform_chinese_text():
 	assert "换一条" in (recovery_message("INVALID_PARAM") or "")
 
 
+def test_interactive_error_panel_uses_the_run_data_dir(tmp_path, monkeypatch):
+	"""TTY 失败面板的恢复命令必须指向本次 --data-dir（Issue #1090）。
+
+	`_interactive_error` 拿到的是 click ctx；改写后照抄面板里的命令就能修好
+	同一份目录，而不是默认目录。
+	"""
+	import io
+
+	from rich.console import Console
+
+	from boss_agent_cli import display
+	from boss_agent_cli.commands import wizard as wizard_mod
+	from boss_agent_cli.wizard.renderer import _RECOVERY_COMMANDS  # noqa: F401  (确保改写表已加载)
+
+	stream = io.StringIO()
+	monkeypatch.setattr(display, "console", Console(file=stream, force_terminal=False, width=400))
+	state_dir = tmp_path / "state dir"
+	ctx = SimpleNamespace()
+	ctx.obj = {"data_dir": state_dir, "platform": "zhipin"}
+
+	with pytest.raises(SystemExit):
+		wizard_mod._interactive_error(ctx, code="AI_NOT_CONFIGURED")
+
+	output = stream.getvalue()
+	assert "boss --data-dir" in output
+	assert str(state_dir) in output
+	assert "执行 boss ai config" not in output
+
+
 def test_wizard_risk_recovery_requires_explicit_unlock_command():
 	"""风控锁不会自动解除：向导恢复文案必须给出本人执行的显式解锁命令。
 
@@ -3516,7 +3639,7 @@ def test_gate_is_silent_and_free_when_logged_in(tmp_path, monkeypatch, capsys):
 
 
 def test_gate_offers_login_before_any_goal_selection(tmp_path, monkeypatch):
-	"""A14/A15：未登录时先给三选菜单；选「现在登录」直接开浏览器。"""
+	"""A14/A15：未登录时先给三选菜单；选「现在登录」执行认证链。"""
 	from boss_agent_cli.wizard import preflight
 
 	monkeypatch.setattr("boss_agent_cli.auth.manager.AuthManager.check_status", lambda self: None)
@@ -3535,35 +3658,63 @@ def test_gate_offers_login_before_any_goal_selection(tmp_path, monkeypatch):
 	assert [option.value for option in options] == ["login", "local", "exit"]
 
 
-def test_gate_blocks_on_missing_browser_kernel_without_opening_browser(tmp_path, monkeypatch):
-	"""A16：内核缺失时给安装指引，绝不尝试开浏览器。"""
+def test_gate_reports_missing_browser_kernel_when_qr_login_is_needed(tmp_path, monkeypatch, capsys):
+	"""A16：认证链确实需要扫码且内核缺失时，给安装指引并回到菜单。"""
 	from boss_agent_cli.wizard import preflight
 
 	monkeypatch.setattr("boss_agent_cli.auth.manager.AuthManager.check_status", lambda self: None)
 	monkeypatch.setattr(
 		preflight,
 		"_browser_kernel_status",
-		lambda: ("error", "patchright 需要 chromium-1234，请运行 patchright install chromium"),
+		lambda: ("error", "patchright 需要 chromium-1234，请运行 python -m patchright install chromium"),
 	)
 	login_calls = []
-	monkeypatch.setattr(
-		"boss_agent_cli.auth.manager.AuthManager.login",
-		lambda self, **kw: login_calls.append(kw),
-	)
 
-	# 第一次选登录 → 被内核拦住回到菜单；第二次选退出。
+	def missing_kernel(self, **kw):
+		login_calls.append(kw)
+		raise RuntimeError("Executable doesn't exist at /missing/chromium")
+
+	monkeypatch.setattr("boss_agent_cli.auth.manager.AuthManager.login", missing_kernel)
+
+	# 第一次选登录 → 扫码路径报告缺内核；第二次选退出。
 	menu = _ScriptedMenu(["login", "exit"])
 	assert preflight.ensure_login(_gate_ctx(tmp_path), menu=menu) == preflight.GATE_EXIT
-	assert login_calls == [], "内核缺失时不得尝试打开浏览器"
+	assert len(login_calls) == 1, "先尝试认证链，不能提前阻断不需要扫码的登录方式"
+	captured = capsys.readouterr()
+	assert captured.out == ""
+	assert "环境不支持自动扫码" in captured.err
+	assert "python -m patchright install chromium" in captured.err
 
 
-def test_gate_login_risk_stops_without_offering_retry(tmp_path, monkeypatch):
-	"""风控是硬边界：登录门展示停止指引后退出，不再回到「重试登录」菜单。"""
+def test_gate_kernel_status_compares_real_cache_entries(tmp_path, monkeypatch):
+	"""回归（Issue #1060）：预检必须展开缓存条目再按修订版比对。
+
+	此前直接把缓存根目录传给 ``evaluate_patchright_chromium``，按条目名精确匹配
+	永远失败，于是返回 warn，无法识别真正缺失的内核并展示安装指引。
+	"""
+	from boss_agent_cli.services import browser_runtime
+	from boss_agent_cli.wizard import preflight
+
+	monkeypatch.setattr(browser_runtime, "patchright_chromium_revision", lambda: "1234")
+	monkeypatch.setattr(browser_runtime, "patchright_browser_cache_dirs", lambda: [tmp_path])
+
+	# 缓存根目录存在但没有所需修订版：必须判定为 error。
+	assert preflight._browser_kernel_status()[0] == "error"
+
+	# 装上所需修订版后必须判定为 ok。
+	(tmp_path / "chromium-1234").mkdir()
+	(tmp_path / "chromium_headless_shell-1234").mkdir()
+	assert preflight._browser_kernel_status()[0] == "ok"
+
+
+@pytest.mark.parametrize("kernel_status", ["ok", "error"])
+def test_gate_login_risk_stops_without_offering_retry(tmp_path, monkeypatch, kernel_status):
+	"""风控是硬边界：登录门展示停止指引后退出，缺扫码内核也不能遮蔽风险。"""
 	from boss_agent_cli.api.client import AccountRiskError
 	from boss_agent_cli.wizard import preflight
 
 	monkeypatch.setattr("boss_agent_cli.auth.manager.AuthManager.check_status", lambda self: None)
-	monkeypatch.setattr(preflight, "_browser_kernel_status", lambda: ("ok", ""))
+	monkeypatch.setattr(preflight, "_browser_kernel_status", lambda: (kernel_status, "fixture kernel detail"))
 
 	def _boom(self, **kw):
 		raise AccountRiskError("fixture risk", is_cdp=True)
@@ -4298,9 +4449,12 @@ def test_runner_reports_browser_kernel_missing_without_retry(tmp_path):
 		run = WorkflowRunner(store, {"broken": broken}).run(
 			_plan("broken"), SimpleNamespace(data_dir=tmp_path), run_id="kernel-run"
 		)
+	from boss_agent_cli.services.browser_runtime import patchright_install_command
+
 	assert run["error"]["code"] == "BROWSER_KERNEL_MISSING"
 	assert run["error"]["recoverable"] is True
-	assert run["error"]["recovery_action"] == "patchright install chromium"
+	# 与命令层同一份可执行指引：解释器 + 模块入口，不依赖 PATH（Issue #1060）。
+	assert run["error"]["recovery_action"] == patchright_install_command()
 	# doctor 指引必须指向本次运行的数据目录（同 Issue #978 的迁移）。
 	assert str((tmp_path / "doctor-marker")) not in run["error"]["details"]["doctor_command"]
 	assert run["error"]["details"]["doctor_command"] == f"boss --data-dir {tmp_path.resolve()} doctor"
@@ -4652,3 +4806,56 @@ def test_wizard_read_unknown_response_stays_retryable():
 	assert code == "NETWORK_ERROR"
 	assert recoverable is True
 	assert "稍后重试" in recovery
+
+
+def test_crawl_start_without_crawl_dependencies_reports_unavailable_and_creates_no_run(tmp_path, monkeypatch):
+	"""依赖缺失不是网络抖动：不能落成 NETWORK_ERROR 加「恢复当前任务」（Issue #1050）。"""
+	monkeypatch.setitem(sys.modules, "DrissionPage", None)
+	with pytest.raises(WorkflowActionError) as caught:
+		DEFAULT_ACTIONS["crawl_start"](_action_context(tmp_path), {"query": "Python", "city": "北京"}, {})
+	error = caught.value
+	assert error.code == "CRAWL_UNAVAILABLE"
+	assert error.recoverable is ERROR_CODES["CRAWL_UNAVAILABLE"]["recoverable"]
+	assert extras_requirement("crawl") in error.recovery_action
+	assert f"boss --data-dir {tmp_path.resolve()} crawl configure" in error.recovery_action
+	with sqlite3.connect(tmp_path / "cache" / "boss_agent.db") as conn:
+		assert conn.execute("SELECT COUNT(*) FROM crawl_runs").fetchone()[0] == 0
+
+
+def test_crawl_resume_without_crawl_dependencies_leaves_the_run_untouched(tmp_path, monkeypatch):
+	with CacheStore(tmp_path / "cache" / "boss_agent.db") as cache:
+		cache.create_crawl_run(
+			"crawl-existing",
+			{"query": "Python", "city_code": "101010100"},
+			str(tmp_path / "crawl" / "runs" / "crawl-existing"),
+			status="stopped",
+		)
+		cache.request_crawl_stop("crawl-existing")
+	monkeypatch.setitem(sys.modules, "openpyxl", None)
+	with pytest.raises(WorkflowActionError) as caught:
+		DEFAULT_ACTIONS["crawl_resume"](_action_context(tmp_path), {"run_id": "crawl-existing"}, {})
+	assert caught.value.code == "CRAWL_UNAVAILABLE"
+	with CacheStore(tmp_path / "cache" / "boss_agent.db") as cache:
+		run = cache.get_crawl_run("crawl-existing")
+	assert run["status"] == "stopped"
+	assert run["stop_requested"] is True
+
+
+def test_empty_resume_prompt_points_at_the_run_data_dir(tmp_path):
+	"""AI 辅助缺简历时，提示里的导入命令要落在本次数据目录（Issue #1090）。"""
+	menu = _ScriptedMenu([], ["项目经历优化", "优化"])
+	inputs = _collect_inputs(menu, "candidate", "ai_assist", data_dir=tmp_path)
+
+	labels = menu.text_labels
+	assert inputs["prompt"] == "优化"
+	assert f"boss --data-dir {tmp_path.resolve()} resume import <文件>" in labels[0]
+	assert "可先用 boss resume 导入" not in labels[0]
+
+
+def test_empty_resume_prompt_keeps_the_bare_command_without_a_data_dir():
+	"""没有数据目录上下文时保持通用示例。"""
+	menu = _ScriptedMenu([], ["写一段自我介绍", "优化"])
+	_collect_inputs(menu, "candidate", "ai_assist")
+	labels = menu.text_labels
+	assert "可先用 boss resume import <文件> 导入" in labels[0]
+	assert "--data-dir" not in labels[0]

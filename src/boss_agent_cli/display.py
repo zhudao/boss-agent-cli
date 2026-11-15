@@ -6,9 +6,10 @@ Pipe mode (Agent): JSON envelope to stdout.
 """
 
 import datetime
+import re
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,9 +19,14 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
+from boss_agent_cli.cache.store import CacheBusyError, is_cache_busy_error
 from boss_agent_cli.output import emit_success, is_local_io_error, redact_sensitive_text
 from boss_agent_cli.schema.error_codes import ERROR_CODES
-from boss_agent_cli.services.browser_runtime import is_browser_kernel_missing
+from boss_agent_cli.services.browser_runtime import (
+	is_browser_kernel_missing,
+	patchright_headless_shell_command,
+	patchright_install_command,
+)
 
 # Rich output goes to stderr so stdout stays clean for Agent JSON
 console = Console(stderr=True)
@@ -110,6 +116,89 @@ def auth_required_hints(ctx: Any) -> dict[str, list[str]]:
 	}
 
 
+#: 错误码登记表恢复文案里的示例命令；有运行上下文时改写成带 ``--data-dir``
+#: 的真实命令（Issue #1092）。登记表是纯数据、被 `boss schema` 与文档引用，
+#: 不能写死某个用户的数据目录；改写只发生在错误信封出口。
+#:
+#: 键必须按长度倒序匹配：``boss hr chat`` 是 ``boss hr chatmsg`` 的前缀，
+#: ``boss wizard`` 是 ``boss wizard --status`` 的前缀，先短后长会切坏命令。
+_REGISTRY_COMMANDS: dict[str, str] = {
+	"boss agent pending list": "agent pending list",
+	"boss agent review list": "agent review list",
+	"boss agent run": "agent run",
+	"boss agent stats": "agent stats",
+	"boss ai config": "ai config",
+	"boss chat": "chat",
+	"boss clean --risk-lock": "clean --risk-lock",
+	"boss crawl configure": "crawl configure",
+	"boss crawl resume": "crawl resume",
+	"boss crawl start": "crawl start",
+	"boss crawl status": "crawl status",
+	"boss doctor": "doctor",
+	"boss hr chat": "hr chat",
+	"boss hr chatmsg": "hr chatmsg",
+	"boss hr reply": "hr reply",
+	"boss hr request-resume": "hr request-resume",
+	"boss login": "login",
+	"boss logout": "logout",
+	"boss me --section deliver": "me --section deliver",
+	"boss preset list": "preset list",
+	"boss preset remove": "preset remove",
+	"boss recommend": "recommend",
+	"boss resume delete": "resume delete",
+	"boss resume list": "resume list",
+	"boss search": "search",
+	"boss shortlist add": "shortlist add",
+	"boss shortlist list": "shortlist list",
+	"boss watch list": "watch list",
+	"boss watch remove": "watch remove",
+	"boss wizard --input-json": "wizard --input-json",
+	"boss wizard --resume": "wizard --resume",
+	"boss wizard --status": "wizard --status",
+	"boss wizard": "wizard",
+	"boss --json wizard": "--json wizard",
+}
+
+def rewrite_command_examples(
+	text: str,
+	commands: Mapping[str, str],
+	command_for: Callable[[str], str],
+) -> str:
+	"""一次扫描替换原文命令，保留引号内的路径和名称（Issue #1100）。
+
+	不能逐项 ``str.replace``：插入的目录可能含另一条命令的字面量，下一轮
+	替换会切坏路径。已构造的命令里的带引号参数也必须原样保留；Markdown
+	反引号包裹的命令示例仍需改写。词内的撇号不作为引号边界，否则前文
+	的 ``it's`` 或 ``'sample'unit'`` 会打乱后续路径的引号配对。
+	"""
+	if not commands:
+		return text
+	literals = "|".join(re.escape(literal) for literal in sorted(commands, key=len, reverse=True))
+	single_quoted = r"(?<![A-Za-z0-9])'(?:[^']|(?<=[A-Za-z0-9])'(?=[A-Za-z0-9]))*'"
+	pattern = re.compile(r"""\\.|""" + single_quoted + r"""|"(?:\\.|[^"\\])*"|(?P<command>""" + literals + ")")
+	return pattern.sub(
+		lambda match: command_for(commands[match["command"]]) if match["command"] else match[0],
+		text,
+	)
+
+
+def registry_recovery_for_ctx(ctx: Any, text: str) -> str:
+	"""把登记表恢复文案里的示例命令换成本次运行的命令（Issue #1092）。
+
+	``boss doctor`` / ``boss resume list`` / ``boss crawl status`` 等读的都是
+	``<data_dir>`` 里的登录态与本地记录；自定义 ``--data-dir`` 下照抄裸命令会
+	诊断或查询默认目录，让真人与 Agent 以为任务丢了。无运行上下文（纯函数
+	调用、``boss schema`` 文档）时原样返回。
+	"""
+	if ctx is None:
+		return text
+
+	def command_for(command: str) -> str:
+		return boss_command_for_ctx(ctx, command, include_data_dir=True)
+
+	return rewrite_command_examples(text, _REGISTRY_COMMANDS, command_for)
+
+
 def error_contract_for_code(
 	code: str,
 	*,
@@ -142,6 +231,10 @@ def platform_error_contract(
 	if code in RISK_ERROR_CONTRACTS:
 		recovery_action, hints = risk_error_contract(code, ctx=ctx, clean_command=clean_command, doctor_command=doctor_command)
 		return recoverable, recovery_action, hints
+	if recovery_action:
+		# 登记表是通用示例；诊断类命令（doctor / crawl status / resume list）读的
+		# 是本次运行的数据目录（Issue #1092）。
+		recovery_action = registry_recovery_for_ctx(ctx, recovery_action)
 	return recoverable, recovery_action, None
 
 
@@ -166,7 +259,9 @@ def handle_browser_kernel_missing(ctx: Any, command: str, exc: Exception) -> Non
 	同一份契约与文案。异常文本可能带本机路径，只作为 ``details.cause`` 保留
 	首行，不进 message。
 	"""
-	recoverable, recovery_action = error_contract_for_code("BROWSER_KERNEL_MISSING")
+	recoverable, _ = error_contract_for_code("BROWSER_KERNEL_MISSING")
+	install_command = patchright_install_command()
+	headless_command = patchright_headless_shell_command()
 	doctor = boss_command_for_ctx(ctx, "doctor", include_data_dir=True)
 	cause = (str(exc) or type(exc).__name__).splitlines()[0][:300]
 	handle_error_output(
@@ -175,12 +270,16 @@ def handle_browser_kernel_missing(ctx: Any, command: str, exc: Exception) -> Non
 		code="BROWSER_KERNEL_MISSING",
 		message="patchright 浏览器内核缺失或与所需修订版不匹配",
 		recoverable=recoverable,
-		recovery_action=recovery_action,
+		# 恢复动作必须是**当前安装形态下可执行**的命令：`uv tool install` 只把
+		# boss / boss-mcp 放进 PATH，裸 `patchright install chromium` 会 command
+		# not found（Issue #1060）。用运行本 CLI 的解释器调模块入口，版本也必然
+		# 与启动浏览器时一致。
+		recovery_action=install_command,
 		details={"cause": cause},
 		hints={
-			"next_actions": ["patchright install chromium", doctor],
+			"next_actions": [install_command, doctor],
 			"operator_actions": [
-				"浏览器内核安装完成后重新执行原命令；缺的是 headless shell 时运行 patchright install chromium-headless-shell",
+				f"浏览器内核安装完成后重新执行原命令；缺的是 headless shell 时运行 {headless_command}",
 				f"仍失败时先跑 {doctor} 核对所需修订版与本机已安装版本",
 			],
 		},
@@ -272,14 +371,27 @@ def handle_error_output(
 		recoverable = registered_recoverable
 	if recovery_action is None:
 		recovery_action = registered_recovery_action
+	# 调用方可能已经通过 platform_error_contract 之类把登记表原文改写成本次目录；
+	# 两种形态都算「仍是登记表契约」，认证分支不能因此丢掉扫码提示。
+	registered_variants = {registered_recovery_action}
+	if registered_recovery_action:
+		registered_variants.add(registry_recovery_for_ctx(ctx, registered_recovery_action))
 	if (
 		code in {"AUTH_REQUIRED", "AUTH_EXPIRED", "TOKEN_REFRESH_FAILED"}
 		and recoverable
-		and recovery_action == registered_recovery_action
+		and recovery_action in registered_variants
 	):
 		# 登记表是无运行上下文的示例；只补齐通用登录动作，不覆盖写操作的人工核对要求。
 		recovery_action = login_action_for_ctx(ctx)
 		hints = {**auth_required_hints(ctx), **(hints or {})}
+	elif recovery_action and recovery_action == registered_recovery_action:
+		# 仍是登记表原文：doctor / resume list / crawl status 读的是本次运行的数据
+		# 目录，透传出参会让真人与 Agent 去默认目录找（Issue #1092）。
+		recovery_action = registry_recovery_for_ctx(ctx, recovery_action)
+	# error.message 里也可能嵌着采集层 / 招聘者层构造的裸命令（「由用户执行
+	# boss clean --risk-lock」「请先 boss hr chatmsg <id> 核实」）。这些文案在
+	# api/ 与 crawler/ 层没有 ctx，只能在出口按本次运行改写（Issue #1097）。
+	message = registry_recovery_for_ctx(ctx, message)
 
 	if is_json_mode(ctx):
 		emit_error(
@@ -476,20 +588,31 @@ def render_job_detail(data: dict[str, Any], *, greet_command: str | None = None)
 		console.print(f"  [dim]next: {escape(greet_command)}[/dim]")
 
 
-def render_status(data: dict[str, Any], *, login_action: str = "boss login") -> None:
-	"""Render login status."""
+def render_status(
+	data: dict[str, Any],
+	*,
+	login_action: str = "boss login",
+	clean_action: str = "boss clean --risk-lock",
+) -> None:
+	"""Render login status.
+
+	``clean_action`` 由命令层传入带 ``--data-dir`` / ``--platform`` 的真实解锁
+	命令：风险锁写在 ``<data_dir>/.cdp_risk_lock``，裸命令会去默认目录空转
+	（Issue #1087）。
+	"""
 	if data.get("logged_in"):
 		name = escape_markup(data.get("user_name", "unknown"))
 		console.print(f"[green]logged in[/green] as [bold]{name}[/bold]")
 	else:
-		console.print(f"[yellow]not logged in[/yellow] - run: {login_action}")
+		# 登录命令可能带自定义 --data-dir：方括号目录名不能被当作样式吞掉。
+		console.print(f"[yellow]not logged in[/yellow] - run: {escape_markup(login_action)}")
 	lock = data.get("cdp_risk_lock")
 	if isinstance(lock, dict) and lock.get("locked"):
 		since = escape_markup(lock.get("locked_at") or "unknown")
 		reason = escape_markup(lock.get("reason") or "ENVIRONMENT_RISK")
 		console.print(
 			f"[yellow]BOSS 本地风控锁定中[/yellow]（{since} 起，{reason}）：确认官方目标业务页已恢复后，"
-			"由用户执行 boss clean --risk-lock 再显式恢复任务；令牌变化不会自动解锁"
+			f"由用户执行 {escape_markup(clean_action)} 再显式恢复任务；令牌变化不会自动解锁"
 		)
 
 
@@ -816,11 +939,15 @@ def _risk_contract_commands(
 	doctor_command: str | None,
 ) -> str:
 	"""把契约文本里的默认示例替换成调用方上下文中的命令（Issue #978）。"""
-	if clean_command:
-		text = text.replace(_RISK_CONTRACT_CLEAN, clean_command)
-	if doctor_command:
-		text = text.replace(_RISK_CONTRACT_DOCTOR, doctor_command)
-	return text
+	replacements = {
+		literal: command
+		for literal, command in (
+			(_RISK_CONTRACT_CLEAN, clean_command),
+			(_RISK_CONTRACT_DOCTOR, doctor_command),
+		)
+		if command
+	}
+	return rewrite_command_examples(text, replacements, lambda command: command)
 
 
 def risk_error_contract(
@@ -872,10 +999,9 @@ def browser_policy_text(text: str, command_for: Callable[[str], str]) -> str:
 	``<data_dir>`` 里的登录态与风险锁；自定义 ``--data-dir`` 下照抄裸命令只会
 	诊断或清理默认目录。
 	"""
-	for literal, (command,) in _BROWSER_POLICY_COMMANDS.items():
-		if literal in text:
-			text = text.replace(literal, command_for(command))
-	return text
+	return rewrite_command_examples(
+		text, {literal: command for literal, (command,) in _BROWSER_POLICY_COMMANDS.items()}, command_for
+	)
 
 
 def browser_policy_text_for_ctx(ctx: Any, text: str) -> str:
@@ -914,6 +1040,19 @@ def _with_httpx_only_hint(ctx: Any, hints: dict[str, list[str]] | None) -> dict[
 # 解析平台数据或 CLI 自身的缺陷：同样的输入必然得到同样的结果。归为 NETWORK_ERROR
 # 并建议「重试」会让 Agent 反复重试，重试的若是平台请求，还会白白消耗请求预算。
 INTERNAL_ERROR_TYPES: tuple[type[Exception], ...] = (TypeError, AttributeError, KeyError, IndexError, OverflowError)
+
+
+def _handle_cache_busy_error(ctx: Any, command_name: str, message: str) -> None:
+	"""锁冲突的统一出口：等待写锁释放后重试，而不是删除缓存或重试平台请求。"""
+	recoverable, recovery_action = error_contract_for_code("CACHE_BUSY")
+	handle_error_output(
+		ctx,
+		command_name,
+		code="CACHE_BUSY",
+		message=message,
+		recoverable=recoverable,
+		recovery_action=recovery_action,
+	)
 
 
 def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -1117,6 +1256,12 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 				# 否则 Agent 会拿同一个非法值反复重试。
 				raise
 			except Exception as e:
+				# 本地缓存锁冲突必须在 NETWORK_ERROR「重试」之前收口（Issue #1118）：
+				# 等锁释放即可，不是平台网络问题，也不需要重建缓存库。
+				if isinstance(e, CacheBusyError) or is_cache_busy_error(e):
+					message = str(e) if isinstance(e, CacheBusyError) else f"本地缓存库正被其他进程写入（{e}）"
+					_handle_cache_busy_error(ctx, command_name, message)
+					return
 				# 内核缺失是确定性失败：符号名 / 路径未变时重试永远同一结果，不能
 				# 兜成 NETWORK_ERROR +「重试」让 Agent 反复打平台。
 				if is_browser_kernel_missing(str(e)):
