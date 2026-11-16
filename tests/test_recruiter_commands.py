@@ -481,6 +481,23 @@ def test_recruiter_resume_exchange_supports_data_envelope(mock_auth_cls, mock_pl
 	mock_platform.exchange_request_by_friend.assert_called_once_with(1, exchange_type=1)
 
 
+@pytest.mark.parametrize("envelope", ["zpData", "data"])
+@pytest.mark.parametrize("payload", [None, "oops", ["oops"], 7])
+@patch("boss_agent_cli.commands.recruiter.resume.get_recruiter_platform_instance")
+@patch("boss_agent_cli.commands.recruiter.resume.AuthManager")
+def test_recruiter_resume_exchange_preserves_confirmed_success(mock_auth_cls, mock_platform_cls, envelope, payload):
+	mock_platform = _ctx_mock(mock_platform_cls)
+	mock_platform.exchange_request_by_friend.return_value = {"code": 0, envelope: payload}
+
+	result = _invoke("hr", "resume", "--exchange", "--friend-id", "1")
+
+	assert result.exit_code == 0, result.output
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"] == {"message": "联系方式交换请求已发送"}
+	mock_platform.exchange_request_by_friend.assert_called_once_with(1, exchange_type=1)
+
+
 @patch("boss_agent_cli.commands.recruiter.resume.get_recruiter_platform_instance")
 @patch("boss_agent_cli.commands.recruiter.resume.AuthManager")
 def test_recruiter_resume_exchange_wechat_maps_to_type_2(mock_auth_cls, mock_platform_cls):
@@ -567,6 +584,30 @@ def test_recruiter_resume_parse_supports_data_envelope(mock_auth_cls, mock_platf
 	assert parsed["data"]["basic"]["name"] == "张三"
 	assert parsed["data"]["expectation"]["position"] == "后端工程师"
 	assert parsed["hints"]["next_actions"][0] == _hint("hr applications")
+
+
+@pytest.mark.parametrize("envelope", ["zpData", "data"])
+@pytest.mark.parametrize("expectation", [None, "oops", ["oops"], 7])
+@patch("boss_agent_cli.commands.recruiter.resume.get_recruiter_platform_instance")
+@patch("boss_agent_cli.commands.recruiter.resume.AuthManager")
+def test_recruiter_resume_keeps_other_sections_with_drifted_expectation(mock_auth_cls, mock_platform_cls, envelope, expectation):
+	mock_platform = _ctx_mock(mock_platform_cls)
+	mock_platform.view_geek.return_value = {
+		"code": 0,
+		envelope: {"geekDetailInfo": {
+			"showExpectPosition": expectation,
+			"geekWorkExpList": [{"positionName": "测试工程师"}],
+		}},
+	}
+
+	result = _invoke("hr", "resume", "geek-1", "--job-id", "job-1", "--security-id", "sec-1")
+
+	assert result.exit_code == 0, result.output
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["expectation"] == {"position": "", "salary": "", "city": ""}
+	assert parsed["data"]["work_experience"][0]["position"] == "测试工程师"
+	mock_platform.view_geek.assert_called_once_with("geek-1", "job-1", security_id="sec-1")
 
 
 @patch("boss_agent_cli.commands.recruiter.resume.get_recruiter_platform_instance")
@@ -659,6 +700,29 @@ def test_parse_resume_accepts_data_envelope():
 	)
 	assert result["basic"]["name"] == "李四"
 	assert result["expectation"]["position"] == "Python 工程师"
+
+
+@pytest.mark.parametrize(
+	"detail",
+	[
+		None,
+		{"geekBaseInfo": None},
+		{"geekWorkExpList": None},
+		{"geekProjExpList": None},
+		{"geekEduExpList": None},
+		{"geekCertificationList": None},
+		{"jobCompetitive": None},
+		{"geekWorkExpList": [None, 123], "geekEduExpList": [None], "geekCertificationList": [None, {"certName": "PMP"}]},
+	],
+)
+def test_parse_resume_tolerates_null_and_drifted_sections(detail):
+	"""平台把简历字段返回成 null 或列表元素漂移时按空 section 处理（Issue #1140）。"""
+	result = parse_resume({"zpData": {"geekDetailInfo": detail}})
+
+	assert result["work_experience"] == [] or all(isinstance(item, dict) for item in result["work_experience"])
+	assert result["project_experience"] == []
+	assert result["education"] == []
+	assert isinstance(result["certifications"], list)
 
 
 def test_parse_resume_accepts_unwrapped_payload():

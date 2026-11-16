@@ -4,6 +4,22 @@
 
 ## 已发布
 
+- ✅ v3.4.38（2026-11-16）：本地记录与配置的数值/类型漂移继续收敛。`crawl_runs` 数值列被写成文本时 `crawl status` 不再 stdout 为空 + traceback，改为带列名的 `CACHE_RECORD_INVALID`，并与 `crawl resume` 共用 `params` 判定、回显有效预算；上一份聊天快照的 `unread` 类型漂移不再打断 `chat --export`（按 0 比较）；`ai_max_tokens` 被手改成数组/字符串时 `ai local smoke` 返回 `INVALID_PARAM`、招聘者自动回复退回模板话术，不再中止整轮自动化。
+- ✅ v3.4.37（2026-11-16）：简历 JSON 字段类型漂移的读取判定统一。`name` 写成对象、`personal_info` 写成字符串、`rows` 元素写成字符串等坏文件不再出现「list 当正常条目、show 返回错误类型、export 把 `'str' object has no attribute 'get'` 兜成 `EXPORT_FAILED`」；模型读取边界按字段校验类型，list 与按名读取共用判定，show/export 返回 `RESUME_FILE_INVALID` 并指出字段，import 仍是字段级 `INVALID_PARAM`。
+- ✅ v3.4.36（2026-11-16）：`wizard --stop` 在断点写坏（如 `params` 不是合法 JSON）时不再把已生效的停止报成 `CACHE_RECORD_INVALID`。停止标记先落盘，展示读取两级回退都失败时返回最小可用记录（`run_id` + `status: stopped`）；`--status` 仍按展示契约报告损坏。
+- ✅ v3.4.35（2026-11-16）：`wizard --status` 与交互式恢复选择不再把可恢复任务标成断点损坏。此前「读步骤 + 校验重放标记」和「叠加实时采集」共用一个 `try`，绑定的 crawl 记录写坏时整条任务被丢进损坏名单并提示重建；现在叠加数据损坏只影响 jobs / live_status 展示，断点或重放标记损坏仍按损坏跳过。
+- ✅ v3.4.34（2026-11-16）：MCP 的 `boss_preset_add` / `boss_watch_add` / `boss_batch_greet` 收到显式空串筛选（`industry` / `scale` / `stage` / `job_type`）时不再当成「没传」并返回 `ok=true`，而是原样下发给 CLI 返回取值诊断；`None` 与缺键仍等价于未传。
+- ✅ v3.4.33（2026-11-16）：`wizard --resume` 在任务断点完好、但绑定的内部 crawl 记录损坏时不再被判成 `CACHE_RECORD_INVALID`；恢复与执行器的控制读取只读断点本身，执行结果优先带实时采集叠加、叠加损坏时退回断点，`--status` 仍按展示契约报告损坏。
+- ✅ v3.4.32（2026-11-16）：缓存表结构漂移（旧版本建的库缺列、迁移中断）时，`shortlist list` / `shortlist add` 等走 `CacheStore` 的命令不再直接 traceback，改为返回 `CACHE_DATABASE_INVALID` 信封与备份重建指引；锁冲突仍是可重试的 `CACHE_BUSY`，代码写错的 `ProgrammingError` 保持原样上抛。
+- ✅ v3.4.31（2026-11-16）：`digest`、`stats`、`chat` 与 `resume export` 的 `-o` 导出统一改为原子写入，写入中途失败时保留上一次的完整导出，不再留下半截文件；失败仍返回 `LOCAL_IO_ERROR` 信封。
+- ✅ v3.4.30（2026-11-16）：`config.json` 的 `role` / `platform` / `browser_source` / `cdp_url`（类型）坏值不再挡住修复入口 `boss config reset`，其余命令仍按参数错误拒绝，显式命令行覆盖保持严格校验。
+- ✅ v3.4.29（2026-11-15）：`history` 与 wizard 候选人详情在非对象平台载荷上不再崩溃；`history` 按空页返回并保持分页未知，向导详情改走职位卡片，两个通道都读不出职位时返回 `JOB_NOT_FOUND`。
+- ✅ v3.4.28（2026-11-15）：断点里的重放标记 `error.replay_safe` 类型漂移时，`wizard --resume` 不再重放结果未知的写步骤；`--resume` / `--status` 与任务列表按 `CACHE_RECORD_INVALID` 拒绝且不改写断点，布尔值与缺省标记行为不变，`--stop` 不受影响。
+- ✅ v3.4.27（2026-11-15）：`wizard --stop` 支持幂等重试，外层已停止但内部采集停止尚未写完时可补齐传播；重复停止返回成功，不会恢复或重跑业务步骤，不存在和已完成任务的拒绝行为保持不变。
+- ✅ v3.4.26（2026-11-15）：职位卡片、个人信息、推荐列表与评分期望的非对象容器统一容错，合法字段保留原有类型；招聘者简历期望漂移按空处理，联系方式交换已确认成功时不再因响应格式漂移误报失败。
+- ✅ v3.4.25（2026-11-15）：沟通 / 面试 / 聊天消息列表的元素与容器漂移统一按跳过坏元素或空处理，`chat`、`pipeline`、`digest`、`chatmsg`、`chat-summary` 与 wizard 对应步骤不再报 `INTERNAL_ERROR`；`friend_detail` 的 `zpData` 漂移按未找到候选人拒绝执行聊天动作。
+- ✅ v3.4.24（2026-11-15）：`boss clean` 在搜索缓存表缺列时返回 `CACHE_DATABASE_INVALID` 信封，`--dry-run` 一致；简历解析对平台返回的 `null` 与漂移 section 按空处理，其余字段照常输出；历史、面试、推荐、开聊、导出与联系人去重里的非对象列表元素被跳过，不再让整条命令报 `INTERNAL_ERROR`。
+- ✅ v3.4.23（2026-11-15）：`export -o` 先写临时文件再原子替换，失败不再截断已有导出；采集导出的 json / csv / xlsx 一起更新或都不更新，XLSX 清洗控制字符、标签容错，导出失败以 `LOCAL_IO_ERROR` 回报；搜索缓存 `pagination` 形状漂移按未命中处理。
 - ✅ v3.4.22（2026-11-15）：`boss wizard --stop` 先落盘停止标记再传给内部采集任务，workflow 自身断点或采集结果损坏都不再挡住停止；`--resume` 把只落盘一半的写失败归并为 `failed` 并 exit 1；招聘自动化队列的 `confidence` / `action` 与 `state.json` 嵌套字段类型漂移统一返回 `AUTOMATION_STATE_INVALID`。
 - ✅ v3.4.21（2026-11-15）：后台采集恢复在父进程持锁重读后校验断点参数，缺键和类型漂移在修改 stop、刷新交接时间或探测登录态前返回 `CACHE_RECORD_INVALID`；校验失败保留原任务且不启动 worker。
 - ✅ v3.4.20（2026-11-15）：采集断点恢复按请求页码匹配监听响应，保留旧页风险和限流信号；后台预检不再丢失停止请求，并维持排队交接窗口；损坏的断点参数返回 `CACHE_RECORD_INVALID`，缓存写锁冲突返回 `CACHE_BUSY`；Hook 目录缺失在创建任务前拒绝。

@@ -5,7 +5,7 @@ import sqlite3
 import time
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 
 from boss_agent_cli.services.job_identity import deduplicate_job_result
 
@@ -113,6 +113,26 @@ def _decode_optional_record(
 	return None if not raw else _decode_record(kind, record_id, column, raw, expected=expected)
 
 
+def _decode_int_column(kind: str, record_id: str, column: str, raw: Any) -> int:
+	"""整数列的类型漂移在读取边界拦下并带上列名。
+
+	SQLite 是动态类型：INTEGER 列里被写进文本（手工改库、早期版本写入）时，
+	命令层的裸 ``int()`` 会抛 ``ValueError``——``BossCliGroup`` 只兜
+	``TypeError / AttributeError / KeyError`` 一类，结果 stdout 为空、只剩
+	traceback，连 JSON 信封都没有（Issue #1192）。
+	"""
+	if isinstance(raw, int) and not isinstance(raw, bool):
+		return raw
+	raise CacheRecordInvalid(kind, record_id, column, f"期望整数，实际是 {type(raw).__name__}")
+
+
+def _decode_bool_column(kind: str, record_id: str, column: str, raw: Any) -> bool:
+	"""0/1 整数列；文本 ``"false"`` 被 ``bool()`` 当成 True 同样是类型漂移。"""
+	if isinstance(raw, int) and not isinstance(raw, bool) and raw in (0, 1):
+		return bool(raw)
+	raise CacheRecordInvalid(kind, record_id, column, f"期望 0 或 1，实际是 {type(raw).__name__}")
+
+
 def _validate_workflow_params(run_id: str, params: dict[str, Any]) -> dict[str, Any]:
 	"""workflow_runs.params 的嵌套结构同样要在读取边界校验。
 
@@ -136,13 +156,14 @@ _SQLITE_HEADER = b"SQLite format 3\x00"
 class CacheDatabaseInvalid(Exception):
 	"""`cache/boss_agent.db` 不是可用的 SQLite 库（磁盘损坏、被别的文件占位）。
 
-	缓存库只保存本地数据：打不开时命令应输出信封并提示备份后重建，而不是把
+	也用于打开成功后执行查询时发现的结构漂移（旧版本建的库缺后加的列、迁移
+	中断）。缓存库只保存本地数据：命令应输出信封并提示备份后重建，而不是把
 	`sqlite3.DatabaseError` traceback 甩给 Agent。用独立基类（不是 ValueError /
 	RuntimeError）是为了不被命令层的兜底分类误吞。
 	"""
 
 	def __init__(self, path: Path, detail: str) -> None:
-		super().__init__(f"本地缓存库 {path} 无法打开（{detail}）")
+		super().__init__(f"本地缓存库 {path} 无法使用（{detail}）")
 		self.path = path
 		self.detail = detail
 
@@ -179,13 +200,95 @@ def _has_sqlite_header(path: Path) -> bool:
 		return False
 
 
+class _GuardedConnection(sqlite3.Connection):
+	"""把执行期的 SQLite 数据库错误转成缓存层异常。
+
+	`CacheStore.__init__` 只包住打开与建表阶段；此后的查询出错——旧版本建的库
+	缺少后加的列、B 树损坏、库被挂成只读——会以裸 `sqlite3.OperationalError`
+	抛到命令层，没有统一装饰器的命令（`shortlist list` / `shortlist add`）
+	stdout 为空并带 traceback（Issue #1174）。`clean` / `stats` 自己开的连接
+	早已按 `CacheDatabaseInvalid` 归一（Issue #1139），这里把 CacheStore 的
+	连接也收进同一口径。
+
+	两种错误保持原样上抛：busy 锁冲突由 `CacheBusyError` 单独表示（等锁重试，
+	不是数据损坏）；`ProgrammingError` 是代码把 SQL 或绑定参数写错了，不能被
+	包装成「本地数据损坏」让用户删库。连接级 `with` 的提交/回滚由 C 实现直接
+	调用，不走 Python 覆盖的方法，所以 `__exit__` 也要包一层。
+	"""
+
+	db_path: Path
+
+	def __init__(self, database: str, *args: Any, **kwargs: Any) -> None:
+		super().__init__(database, *args, **kwargs)
+		self.db_path = Path(database)
+
+	def _translate(self, exc: sqlite3.DatabaseError) -> Exception | None:
+		if isinstance(exc, sqlite3.ProgrammingError):
+			return None
+		if is_cache_busy_error(exc):
+			return CacheBusyError(self.db_path, str(exc))
+		return CacheDatabaseInvalid(self.db_path, str(exc))
+
+	def _raise_translated(self, exc: sqlite3.DatabaseError) -> NoReturn:
+		translated = self._translate(exc)
+		if translated is None:
+			raise exc
+		raise translated from exc
+
+	def execute(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+		try:
+			return super().execute(*args, **kwargs)
+		except sqlite3.DatabaseError as exc:
+			self._raise_translated(exc)
+
+	def executemany(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+		try:
+			return super().executemany(*args, **kwargs)
+		except sqlite3.DatabaseError as exc:
+			self._raise_translated(exc)
+
+	def executescript(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+		try:
+			return super().executescript(*args, **kwargs)
+		except sqlite3.DatabaseError as exc:
+			self._raise_translated(exc)
+
+	def commit(self) -> None:
+		try:
+			super().commit()
+		except sqlite3.DatabaseError as exc:
+			self._raise_translated(exc)
+
+	def rollback(self) -> None:
+		try:
+			super().rollback()
+		except sqlite3.DatabaseError as exc:
+			self._raise_translated(exc)
+
+	def __exit__(
+		self,
+		exc_type: type[BaseException] | None,
+		exc_value: BaseException | None,
+		traceback: TracebackType | None,
+		/,
+	) -> Literal[False]:
+		try:
+			return super().__exit__(exc_type, exc_value, traceback)
+		except sqlite3.DatabaseError as exc:
+			self._raise_translated(exc)
+
+
 class CacheStore:
 	def __init__(self, db_path: Path, *, search_ttl_seconds: int = _SEARCH_TTL) -> None:
 		self._db_path = db_path
 		self._search_ttl = search_ttl_seconds
 		db_path.parent.mkdir(parents=True, exist_ok=True)
 		try:
-			self._conn = sqlite3.connect(str(db_path), timeout=_BUSY_TIMEOUT_SECONDS)
+			self._conn = sqlite3.connect(
+				str(db_path),
+				timeout=_BUSY_TIMEOUT_SECONDS,
+				factory=_GuardedConnection,
+			)
 			self._conn.execute("PRAGMA journal_mode=WAL")
 			self._init_tables()
 		except sqlite3.OperationalError as exc:
@@ -497,9 +600,13 @@ class CacheStore:
 			"run_id": row[0],
 			"params": _decode_record("crawl_run", run_id, "params", row[1], expected=dict),
 			"status": row[2],
-			"stop_requested": bool(row[3]),
-			"requests_attempted": int(row[4]), "detail_requests_attempted": int(row[5]), "elapsed_seconds": int(row[6]),
-			"next_page": row[7], "list_finished": bool(row[8]), "output_dir": row[9], "error": row[10],
+			"stop_requested": _decode_bool_column("crawl_run", run_id, "stop_requested", row[3]),
+			"requests_attempted": _decode_int_column("crawl_run", run_id, "requests_attempted", row[4]),
+			"detail_requests_attempted": _decode_int_column("crawl_run", run_id, "detail_requests_attempted", row[5]),
+			"elapsed_seconds": _decode_int_column("crawl_run", run_id, "elapsed_seconds", row[6]),
+			"next_page": _decode_int_column("crawl_run", run_id, "next_page", row[7]),
+			"list_finished": _decode_bool_column("crawl_run", run_id, "list_finished", row[8]),
+			"output_dir": row[9], "error": row[10],
 			"hook_results": _decode_record("crawl_run", run_id, "hook_results", row[11], expected=list),
 			"created_at": row[12], "updated_at": row[13],
 		}
@@ -831,10 +938,11 @@ class CacheStore:
 		return cursor.rowcount > 0
 
 	def request_workflow_stop(self, run_id: str) -> bool:
+		"""幂等记录停止请求，让重试能补齐尚未完成的内部停止传播。"""
 		cursor = self._conn.execute(
 			"UPDATE workflow_runs SET status = ?, updated_at = ? WHERE run_id = ? "
-			"AND status NOT IN (?, ?)",
-			("stopped", time.time(), run_id, "completed", "stopped"),
+			"AND status != ?",
+			("stopped", time.time(), run_id, "completed"),
 		)
 		self._conn.commit()
 		return cursor.rowcount > 0

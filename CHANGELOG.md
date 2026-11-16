@@ -2,6 +2,96 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.38] - 2026-11-16
+
+### Fixed
+- crawl 记录的数值列与 `params` 类型漂移不再让 `crawl status` 破坏信封契约（Issue #1192）：`crawl_runs` 的 `next_page` / `requests_attempted` / `elapsed_seconds` / `stop_requested` 等列被写成文本时，此前 stdout 为空、stderr 只剩 `ValueError` traceback（`BossCliGroup` 兜底不含 `ValueError`）。现在缓存读取边界逐列校验并抛 `CacheRecordInvalid`（消息带列名），命令层返回 `CACHE_RECORD_INVALID` 信封；`crawl status` 复用 `CrawlSettings.from_dict` 校验 `params`，同一份损坏记录与 `crawl resume` 判定一致，`limits` 回显归一后的有效预算而不是原始坏值；任务列表排序与后台排队探测对坏时间戳按降级值处理，不再 traceback。
+- 上一份聊天快照里的 `unread` 类型漂移不再打断 `chat --export`（Issue #1194）：快照对比用 `curr_unread > prev_unread` 直接比较，上一份快照被手工改过或来自旧格式（如 `"unread": "3"`）时 `str` 与 `int` 比较抛 `TypeError`，整次导出落成 `INTERNAL_ERROR`。现在快照对比只认真正的整数，其余值（字符串、`bool`、`None` 等）按 0 参与比较——与「快照不可用按首次快照处理」的既有降级一致；`bool` 与 `int_code` 同口径排除。
+- `ai_max_tokens` 配置类型漂移不再崩成 `INTERNAL_ERROR`（Issue #1196）：`ai/config.py` 的 `load_config` 只合并默认值、不校验类型，`ai local smoke` 与招聘者自动回复里的裸 `int(config.get("ai_max_tokens") or 512)` 在配置被手改成数组 / 字符串时抛 `TypeError`——健康检查落成 `INTERNAL_ERROR` 且提示「不要重试」，自动回复则让整轮 `hr automation` 中止。现在两处共用 `ai_int_setting`：非整数（含 `bool`）与小于 1 的值给出明确配置错误；smoke 返回 `INVALID_PARAM` 并把 recovery 指向 `boss ai config --max-tokens`，自动回复按既有 `AIServiceError` 路径退回模板话术（不中止自动化）。`ai local configure` 写入的合法值行为不变。
+
+## [3.4.37] - 2026-11-16
+
+### Fixed
+- 简历 JSON 字段类型漂移的读取判定统一（Issue #1189）：`name` 写成对象、`personal_info` 写成字符串、`rows` 元素写成字符串等坏文件，此前 `resume list` 当正常条目、`resume show` 原样返回错误类型、`resume export --format html` 把 `'str' object has no attribute 'get'` 兜成 `EXPORT_FAILED`。现在模型读取边界按字段校验类型（消息给字段路径与期望类型），list 与按名读取共用同一判定：坏文件进 `hints.corrupt`，show/export 返回 `RESUME_FILE_INVALID` 并指出字段，`resume import` 仍是 `INVALID_PARAM` 字段级提示；合法旧格式不变。
+
+## [3.4.36] - 2026-11-16
+
+### Fixed
+- `wizard --stop` 不再把已生效的停止报成失败（Issue #1186）：停止标记先落盘、展示读取随后解析断点 JSON 列，断点写坏（如 `params` 不是合法 JSON）时整次停止返回 `ok=false` + `CACHE_RECORD_INVALID`，并引导「重新创建任务」。现在两级回退都失败时返回最小可用记录（`run_id` + `status: "stopped"`），确认停止生效；`--status` 仍按展示契约报告损坏。
+
+## [3.4.35] - 2026-11-16
+
+### Fixed
+- wizard 任务列表不再把可恢复任务标成断点损坏（Issue #1181）：`wizard --status` 与交互式恢复选择此前把「读步骤 + 校验重放标记」和「叠加实时采集」放在同一个 `try`，绑定的 crawl 记录写坏时整条任务被丢进 `corrupt_run_ids`，明明能恢复却被提示重建。现在两层读取分开：断点或重放标记损坏仍按损坏跳过，只是叠加数据坏掉时保留任务（少显示 jobs / live_status，不影响恢复）。
+
+## [3.4.34] - 2026-11-16
+
+### Fixed
+- MCP 枚举筛选的显式空串不再被静默吞掉（Issue #1180）：`boss_preset_add` / `boss_watch_add` / `boss_batch_greet` 的 `industry` / `scale` / `stage` / `job_type` 在 CLI 层是 Choice 校验的枚举，映射层此前用真值判断，`industry=""` 被化装成「没传」并返回 `ok=true`。现在这些键登记进 `_ENUM_KEYS` 并原样下发，由 CLI 返回 `INVALID_PARAM` 与可选值；`None` / 缺键仍等价于未传。
+
+## [3.4.33] - 2026-11-16
+
+### Fixed
+- `wizard --resume` 不再被损坏的内部采集记录挡住（Issue #1177）：断点与步骤完好、但绑定的 crawl 记录写坏时，`--resume` 此前经 `WorkflowStore.get()` 的展示用实时采集叠加读取，直接返回 `CACHE_RECORD_INVALID` 并提示重新创建任务。现在恢复与执行器内的控制读取只读断点本身；执行结果优先带实时采集叠加，叠加数据损坏时退回断点。`--status` 仍按展示契约报告损坏。
+
+## [3.4.32] - 2026-11-16
+
+### Fixed
+- 缓存表结构漂移时不再直接 traceback（Issue #1174）：`shortlist_records` 缺列（旧版本建的库、迁移中断）时，`shortlist list` / `shortlist add` 等走 `CacheStore` 的命令此前把 `sqlite3.OperationalError` 抛到顶层，stdout 为空并带 traceback。现在 `CacheStore` 的连接把执行期数据/结构错误归一为 `CACHE_DATABASE_INVALID` 信封（备份后删除重建的恢复动作），锁冲突仍是可重试的 `CACHE_BUSY`，代码写错的 `ProgrammingError` 保持原样上抛。
+
+## [3.4.31] - 2026-11-16
+
+### Fixed
+- `digest --format md -o`、`stats --format html -o`、`chat --export -o` 与 `resume export -o` 改为原子写入（Issue #1171）：`Path.write_text` / `open("w")` / Chromium 直写目标路径会先截断或留下半截文件，写入中途被中断（Ctrl-C、进程被杀、磁盘写满）就毁掉上一次的完整导出。现在与 `export`（#1137）共用 `write_text_atomic`，PDF 也先写临时文件再替换：失败时保留旧文件、不残留临时文件，写入失败仍返回 `LOCAL_IO_ERROR` 信封。
+
+## [3.4.30] - 2026-11-16
+
+### Fixed
+- `config.json` 的 `role` / `platform` / `browser_source` / `cdp_url`（类型）坏值不再把 `boss config reset` 也挡在启动期（Issue #1168）：此前这些键被手改成非法取值后，所有命令（含修复入口 `config reset <键>`）都在启动阶段返回 `INVALID_PARAM`，只能手工编辑文件。现在 `config` 子命令把坏值归一成默认值后放行，其余命令仍按参数错误拒绝；显式 `--role` / `--platform` / `--browser-source` / `--cdp-url` 覆盖保持严格校验。
+
+## [3.4.29] - 2026-11-15
+
+### Fixed
+- 历史列表与向导职位详情在非对象平台载荷上不再崩溃（Issue #1162）：`history` 的 `zpData` 漂移成字符串 / 数组 / 数字时，此前在 `hasMore` 读取处抛 `AttributeError` 并报成 `INTERNAL_ERROR`，现在按空页返回且分页证据保持「未知」；wizard 候选人详情在 `zpData` 或 `jobInfo` 不是对象时，此前抛未捕获的 `AttributeError`，现在与 `detail` / `show` 同口径改走职位卡片，两个通道都读不出职位时返回 `JOB_NOT_FOUND` 而不是 `NETWORK_ERROR`。合法响应行为不变。
+
+## [3.4.28] - 2026-11-15
+
+### Fixed
+- 断点里的重放标记类型漂移时不再重放结果未知的写步骤（Issue #1159）：`error.replay_safe` 被写成 `0`、`"false"`、`null` 等非布尔值时，`wizard --resume` 此前按可重放处理并再次执行该步骤。现在 `--resume` / `--status` 与任务列表在读取边界返回 `CACHE_RECORD_INVALID`，不执行动作、不改写断点，并提示先核对平台实际状态；布尔值与缺省标记的行为不变，`--stop` 仍照常落盘并传播停止。
+
+## [3.4.27] - 2026-11-15
+
+### Fixed
+- 工作流停止改为幂等操作（Issue #1156）：外层停止已经落盘、向内部采集传播停止时中断或遇到临时写锁后，再次 `wizard --stop` 会补齐内部停止标记，不再误报 `WORKFLOW_NOT_FOUND`；断点损坏时仍先保存外层停止，不存在和已完成任务的拒绝契约保持不变。
+
+## [3.4.26] - 2026-11-15
+
+### Fixed
+- `show` / `me` / `status` 的平台数据形状漂移不再报 `INTERNAL_ERROR`（Issue #1148）：`jobCard` 或 `zpData` 不是对象时，`show` 按 `JOB_NOT_FOUND` 返回（与 `jobCard: null` 一致），`me --section user` 输出空字段，`status --live` 的 `user_name` 回退为「未知用户」；合法响应的字段值与类型保持原样。
+- 招聘者简历的求职期望与联系方式交换响应形状漂移不再报 `INTERNAL_ERROR`（Issue #1150）：`showExpectPosition` 不是对象时按空期望处理，其余简历信息继续返回；交换动作已获平台成功响应时，可选 `zpData` 容器漂移不再把已成功动作误报为失败，合法对象字段继续保留。
+- 推荐列表与评分期望的非对象成功响应不再让 `recommend` 报 `INTERNAL_ERROR`（Issue #1152）：推荐载荷漂移时按空列表返回并保留未知分页标记；`--with-score` 的期望载荷漂移时按空偏好评分，合法职位继续返回。
+
+## [3.4.25] - 2026-11-15
+
+### Fixed
+- 沟通 / 面试列表的元素与容器漂移不再让 `chat` / `pipeline` / `digest` 报 `INTERNAL_ERROR`（Issue #1143）：`result` / `friendList` / `interviewList` 混入 `null`、数字、字符串时跳过坏元素，容器漂移成字符串或对象时按空处理，其余条目照常返回；wizard 的 pipeline / digest 步骤与联系人查找共用同一口径。
+- `friend_detail` 的 `zpData` 形状漂移按「未找到唯一匹配候选人」拒绝执行聊天动作（Issue #1144）：此前非对象真值会让 `.get` 抛 `AttributeError` 并以 `INTERNAL_ERROR` 中断，回复 / 交换联系方式等动作都不会执行；合法响应行为不变。
+- 聊天消息数组的元素与字段漂移不再让 `chatmsg` / `chat-summary` 报 `INTERNAL_ERROR`（Issue #1145）：`messages` / `historyMsgList` 里的非对象元素被跳过，`from` / `body` 漂移按空处理，`text` 统一转文本；招聘者聊天历史的游标分页共用同一入口。
+
+## [3.4.24] - 2026-11-15
+
+### Fixed
+- `boss clean` 在搜索缓存表结构漂移时返回 `CACHE_DATABASE_INVALID` 信封（Issue #1139）：本地 SQLite 的 `search_cache` 表缺列（例如旧版本建库）时，清理逻辑直接执行 `SELECT ... response`，sqlite 抛出的 `no such column` 此前穿透到通用兜底，stdout 为空并以 traceback 退出，`--dry-run` 同样如此。现在这类 `sqlite3.DatabaseError` 归一成指明缓存库路径的信封，恢复指引为重建缓存库。
+- 简历解析对平台返回的 `null` 与漂移 section 按空处理（Issue #1140）：`hr resume` 在 `geekDetailInfo`、`geekBaseInfo`、`geekWorkExpList`、`geekCertificationList` 等字段为 `null` 或元素混入非对象时，此前抛 `TypeError` / `AttributeError` 并报成 `INTERNAL_ERROR`。现在按空 section 解析并照常输出其余字段；`workEmphasis` 等标量字段也走宽松读取。
+- 平台列表接口里的非对象元素被跳过而不是让整个命令失败（Issue #1141）：`history`、`interviews`、`recommend`、`greet`、`export` 与联系人去重此前对 `jobList` / `interviewList` 里的 `null`、数字、字符串元素直接读键，抛出异常并让整次调用失败。现在这些元素被跳过，其余条目照常返回；新增 `api.models.dict_items` 作为统一入口。
+
+## [3.4.23] - 2026-11-15
+
+### Fixed
+- `export -o` 不再在失败时破坏已有文件（Issue #1134）：序列化 / 写入此前直接以 `"w"` 打开目标文件，平台字段里的列表混入非字符串元素时 `join` 抛错，用户上一次的导出已被截断。现在整份内容先在内存组装并写同目录临时文件，成功后才原子替换；`skills` / `welfare` 列表元素按文本拼接；写入失败返回 `LOCAL_IO_ERROR`，不再报 `INTERNAL_ERROR`。
+- 采集导出的三份输出要么一起更新要么都不更新（Issue #1135）：`jobs.json` / `jobs.csv` / `jobs.xlsx` 此前顺序非原子写入，XLSX 因控制字符序列化失败时其余文件已被覆盖；同一失败还被兜成可重试的 `NETWORK_ERROR`，或让运行以 `ok=true` 停在必然失败的断点上。现在各写临时文件、全部成功后替换；XLSX 写入前去掉 openpyxl 不接受的控制字符（JSON 保留原文）；标签 / 福利的非字符串元素按文本拼接；导出失败以 `LOCAL_IO_ERROR`（不可重试）回报并保存断点。
+- 搜索缓存的 `pagination` 形状漂移按未命中处理（Issue #1136）：缓存条目的 `pagination` 不是对象或 `null` 时，`boss search` 此前原样把它放进成功信封，下游按对象读取会出错。现在这类缓存视为未命中并重新请求平台。
+
 ## [3.4.22] - 2026-11-15
 
 ### Fixed

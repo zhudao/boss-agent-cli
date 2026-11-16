@@ -12,6 +12,29 @@ from boss_agent_cli.services.file_lock import exclusive_file_lock, run_lock_path
 from boss_agent_cli.wizard.models import WorkflowPlan
 
 
+def _validate_replay_markers(run: dict[str, Any]) -> dict[str, Any]:
+	"""``error.replay_safe`` 只能是布尔值或缺省。
+
+	恢复逻辑按 ``is False`` 判断「动作可能已生效、不得重放」。标记漂移成 ``0`` /
+	``"false"`` / ``null`` 时这条判断不成立，结果未知的写步骤会被再执行一次；
+	与其猜测原值，不如在读取边界按记录损坏拒绝，且不改写断点。
+	"""
+	run_id = str(run.get("run_id") or "")
+	records = [("workflow_run", run_id, run.get("error"))]
+	records.extend(
+		("workflow_step", f"{run_id}/{step.get('step_name')}", step.get("error")) for step in run.get("steps") or []
+	)
+	for kind, record_id, error in records:
+		if isinstance(error, dict) and "replay_safe" in error and not isinstance(error["replay_safe"], bool):
+			raise CacheRecordInvalid(
+				kind,
+				record_id,
+				"error.replay_safe",
+				"必须是布尔值；该步骤的写操作可能已经生效，重建任务前先核对平台实际状态",
+			)
+	return run
+
+
 class WorkflowStore:
 	def __init__(self, data_dir: Path) -> None:
 		self._cache = CacheStore(data_dir / "cache" / "boss_agent.db")
@@ -38,15 +61,18 @@ class WorkflowStore:
 			steps=plan.requested_steps,
 		)
 
-	def get_checkpoint(self, run_id: str) -> dict[str, Any] | None:
+	def get_checkpoint(self, run_id: str, *, validate_replay_markers: bool = True) -> dict[str, Any] | None:
 		"""只读 workflow 自己的断点（run + steps），不叠加内部 crawl 的实时结果。
 
 		停止这类控制操作只依赖断点本身：绑定的 crawl 结果读不出来时，
-		也必须能落下停止标记（Issue #1128）。
+		也必须能落下停止标记（Issue #1128）。``validate_replay_markers=False``
+		只供停止后的展示使用：停止已经落盘，不因重放标记漂移把它报成失败。
 		"""
 		run = self._cache.get_workflow_run(run_id)
 		if run is not None:
 			run["steps"] = self._cache.list_workflow_steps(run_id)
+			if validate_replay_markers:
+				_validate_replay_markers(run)
 		return run
 
 	def get(self, run_id: str) -> dict[str, Any] | None:
@@ -57,6 +83,18 @@ class WorkflowStore:
 			# Full browseable job page for status / follow-up (still paginated in TUI).
 			run = enrich_run_with_live_crawl(run, self._cache, job_limit=BROWSE_JOB_LIMIT)
 		return run
+
+	def get_for_result(self, run_id: str) -> dict[str, Any] | None:
+		"""执行结果读取：优先带实时采集叠加，叠加数据损坏时退回断点本身。
+
+		执行结束后返回给命令层的是展示用的完整任务；内部 crawl 记录损坏只影响
+		jobs / live_status 这些叠加字段，不能把已经执行完的任务报成
+		`CACHE_RECORD_INVALID`。断点自身损坏仍按原状抛出（与 #1128 同族）。
+		"""
+		try:
+			return self.get(run_id)
+		except CacheRecordInvalid:
+			return self.get_checkpoint(run_id)
 
 	def list_recent(self, *, limit: int = 20) -> list[dict[str, Any]]:
 		from boss_agent_cli.wizard.live_crawl import (
@@ -71,16 +109,22 @@ class WorkflowStore:
 			run_id = str(run["run_id"])
 			try:
 				run["steps"] = self._cache.list_workflow_steps(run_id)
-				# 绑定的 crawl 记录写坏时同样读不出状态，与 run 本体损坏同等对待。
-				enriched.append(enrich_run_with_live_crawl(run, self._cache, job_limit=LIST_ENRICH_JOB_LIMIT))
+				_validate_replay_markers(run)
 			except CacheRecordInvalid:
 				corrupt.append(run_id)
+				continue
+			try:
+				enriched.append(enrich_run_with_live_crawl(run, self._cache, job_limit=LIST_ENRICH_JOB_LIMIT))
+			except CacheRecordInvalid:
+				# 叠加的实时采集读不出来只影响展示字段（jobs / live_status），
+				# 断点与步骤完好就仍可恢复；不能把任务丢进 corrupt 名单（Issue #1181）。
+				enriched.append(run)
 		self._corrupt_run_ids = corrupt
 		return sort_runs_for_status_picker(enriched)
 
 	@property
 	def corrupt_run_ids(self) -> list[str]:
-		"""上一次 list_recent 跳过的损坏 run_id（读不出断点，只能重建）。"""
+		"""上一次 list_recent 跳过的损坏 run_id（断点读不出，只能重建）。"""
 		return list(self._corrupt_run_ids)
 
 	@property
