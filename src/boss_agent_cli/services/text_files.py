@@ -14,6 +14,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from boss_agent_cli.services.output_path import refuse_symlink_target
+
 
 def write_text_atomic(
 	path: str | os.PathLike[str],
@@ -24,15 +26,29 @@ def write_text_atomic(
 ) -> Path:
 	"""原子替换写入文本文件；失败时保留原文件，不留下临时文件。"""
 	target = Path(path)
+	# os.replace 替换符号链接本身而不是写穿目标；入口直接拒绝，避免静默破坏链接。
+	refuse_symlink_target(target)
 	target.parent.mkdir(parents=True, exist_ok=True)
-	fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
-	temporary = Path(temporary_name)
+	temporary: Path | None = None
 	try:
-		with os.fdopen(fd, "w", encoding=encoding, newline=newline) as handle:
+		fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+		temporary = Path(temporary_name)
+		# 与 json_files 同口径：孤立代理字符无法按 UTF-8 编码，严格模式会让
+		# 导出在写盘时抛 UnicodeEncodeError、命令丢掉信封（Issue #1294）。
+		# backslashreplace 写出 ``\udcff`` 字面转义，导出文件仍可正常打开。
+		with os.fdopen(fd, "w", encoding=encoding, newline=newline, errors="backslashreplace") as handle:
 			handle.write(body)
 			handle.flush()
 			os.fsync(handle.fileno())
 		os.replace(temporary, target)
+	except OSError as error:
+		# fd 级写入（write / flush / fsync）失败的异常没有 filename：补上目标路径，
+		# 调用方才会把它归成本地文件错误，而不是一次值得重试的网络异常
+		# （与 file_lock._acquire 同口径，Issue #1400）。
+		if error.filename is None:
+			error.filename = str(target)
+		raise
 	finally:
-		temporary.unlink(missing_ok=True)
+		if temporary is not None:
+			temporary.unlink(missing_ok=True)
 	return target

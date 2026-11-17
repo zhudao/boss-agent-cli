@@ -4,6 +4,50 @@
 
 ## 已发布
 
+- ✅ v3.4.82（2026-11-17）：招聘自动化的队列与扫描路径共享 `state.json` 在途标记，成功先落盘再推进队列，未通知的熔断标记下一轮重开（Issue #1514–#1517）；错误码契约审计——只读命令的未识别响应归一为可重试的 `NETWORK_ERROR`、`agent run` 熔断改报 `CIRCUIT_BREAKER_OPEN`、wizard 缺失联系人不再自动重试（Issue #1519–#1521）；风控 hint 按 Agent 命令与真人指引分通道输出，MCP 只读白名单补齐，agent 恢复命令保留角色（Issue #1522–#1524）。
+- ✅ v3.4.81（2026-11-17）：清理与体检的文件系统边界收紧——`clean` 跳过目录符号链接并在失败时带回部分结果、`doctor` 写探针改用独占临时文件（Issue #1497 #1498）；AI / 聊天 / 导出拒绝显式空值与不安全文件名，新增 `--clear-api-key`（Issue #1499–#1507）；SQLite 写入与旧库迁移并发安全，`watch` 命中写入幂等（Issue #1509 #1510）；求职者 greet/apply 发送前原子预约、automation 派发前落盘在途标记，未知结果不再重发（Issue #1508 #1511）。
+- ✅ v3.4.80（2026-11-17）：`batch-greet` 拒绝空查询并收紧数量上限（Issue #1490 #1494）；MCP 子进程超时按 argv 估算，批打招呼中断输出已完成的部分结果（Issue #1491 #1492）；MCP action 条件参数按允许键矩阵校验，不再静默丢弃（Issue #1493）。
+- ✅ v3.4.79（2026-11-17）：auth 登录态落盘的本地 IO 错误不再伪装成刷新或 CDP 失败（Issue #1479–#1480）；wizard 中断保留未确认写标记、空步骤断点拒绝（Issue #1478 #1483）；crawler 缓存忙、输出目录、配置路径与 Hook 状态校验（Issue #1477 #1481 #1482 #1484）；风险锁写盘编码与无 host 代理拒绝（Issue #1487 #1486）；招聘者聊天保留平台错误码（Issue #1485）。
+- ✅ v3.4.78（2026-11-17）：本地状态错误分类、删除顺序、候选池批量导入主键冲突与 favorites 形状漂移（Issue #1464–#1468）；automation 发送前异常还原 pending、风控闩锁写入不覆盖原始异常（Issue #1469–#1470）；MCP 空 `--data-dir`、`friend_ids` 下限、登录提示与深层信封（Issue #1471–#1474）。
+- ✅ v3.4.77（2026-11-17）：扫码空凭证、登录态本地保存失败、CDP 不可达、只读导航超时与聊天页 code 37 按真实结果分类（Issue #1454–#1458）；`--dry-run` 不再落熔断闩锁（Issue #1459）；`crawl resume` 坏 Hook 目录按本地状态失败上报（Issue #1460）；fixture 评测允许在 Agent 会话内运行，发布节奏改为批量。
+- ✅ v3.4.76（2026-11-17）：横杠位置参数 argv 改写三类错位（Issue #1447–#1449）；坏 `operating_mode` 启动崩溃与采集浏览器 UA 注入（Issue #1450、#1413）；联系人分页上限提示与恢复指引同口径（Issue #1451）。
+- ✅ v3.4.75（2026-11-17）：CDP 探测与连接失败清理（Issue #1421、#1425）；预算时间戳自愈与代理端口 / 聊天页签兜底（Issue #1422–#1424）；AI 配置字符串项与 base_url 校验（Issue #1428、#1431）；简历模板与导出边界（Issue #1429、#1434、#1435）；招聘者错误码兜底与匹配字段归一（Issue #1430、#1432）；模型登记表保留名（Issue #1433）；mark / wizard 超长数字输入、friendSource 漂移、resume init 模板与跨平台打开提示（Issue #1437–#1442）。
+- ✅ v3.4.74（2026-11-17）：采集 Cookie 注入失败不再误写风险锁、resume 的 Hook / 登录前置检查和导出目录边界（Issue #1405、#1408、#1409、#1412）；automation 队列与状态 fail-closed、agent crawl 先校验简历与风险锁优先级、TTY 列键（Issue #1406、#1407、#1410、#1411、#1419）。
+- ✅ v3.4.73（2026-11-17）：wizard 状态校验、平台错误码保留、福利条件归一与超时 / 状态面板边界（Issue #1382–#1386）；登录风控信封与 doctor 登录态脱敏（Issue #1390、#1393）；严格 JSON 出口、MCP 数值边界与 Rich 标题转义（Issue #1391、#1392、#1399）；本地写分类、CSV 行尾、联系人回退与薪资日志（Issue #1400–#1402、#1394）。
+- ✅ v3.4.72（2026-11-17）：wizard 缓存库损坏语义（Issue #1362）；简历行漂移与 agent / ai 错误语义（Issue #1366、#1369、#1370）；AI 与平台 / 认证响应深嵌套递归错误（Issue #1365、#1368、#1378）；组预算配置校验（Issue #1367）；MCP 响应代理字符与空标签 / 空路径边界（Issue #1375–#1377）。
+- ✅ v3.4.71（2026-11-17）：crawl 翻页 / 导出 / profile 路径与 hook 预检边界（Issue #1345–#1349）；缓存游标坏页统一为 `CACHE_DATABASE_INVALID`（Issue #1350）；联系人身份与查找上限语义（Issue #1351–#1353）；HTML 导出空值、符号链接输出与快照并发（Issue #1354–#1356）。
+- ✅ v3.4.70（2026-11-17）：搜索预筛容忍字段类型漂移（Issue #1335）；请求预算库损坏按本地 IO 错误上报（Issue #1336）；automation 队列坏状态与非 UTF-8 字节不再静默变空（Issue #1337）；watch / wizard 运行存量搜索参数时重新校验（Issue #1338）。
+- ✅ v3.4.69（2026-11-17）：welfare 筛选跳过 `welfareList` 坏元素（Issue #1329）；wizard 输入 / 配置 / 导出路径边界前置校验（Issue #1330）；wizard 简历损坏与联系人查找上限的错误语义（Issue #1331）。
+- ✅ v3.4.68（2026-11-17）：MCP 显式空串原样下发（Issue #1324）；crawl 断点读取补齐范围、枚举与文本校验（Issue #1325）；辅助工作流不再依赖 `pull_request_target`（Issue #1322）。
+- ✅ v3.4.67（2026-11-17）：chat 家族三处字段漂移按缺失处理（Issue #1317）；搜索缓存元素与 `browsers.json` 形状漂移按不可用处理（Issue #1318）。
+- ✅ v3.4.66（2026-11-17）：向导 `friendSource` 字段漂移按缺失处理（Issue #1314）；ROADMAP 已发布列表按版本独立成行（Issue #1312）。
+- ✅ v3.4.65（2026-11-17）：自动化锁损坏按状态错误上报与零派发冲突语义（Issue #1304、#1307）；空 stoken 刷新失败（Issue #1305）；非 ASCII 数字串判定（Issue #1306）。
+- ✅ v3.4.64（2026-11-17）：孤立代理字符收口（Issue #1294）；越界时间戳、pipeline 混合类型排序与 `--now-ts-ms 0`（Issue #1295、#1297、#1298）；HTML 导出非字符串字段（Issue #1296）。
+- ✅ v3.4.63（2026-11-16）：向导采集动作对损坏记录 / 导出失败 / 配置目录路径不可用按确定性错误上报（Issue #1286、#1287、#1290）；`OverflowError` 边界收口（Issue #1288）；`CRAWL_PROFILE_BUSY` 提示命令补 `<run_id>` 占位（Issue #1289）。
+- ✅ v3.4.62（2026-11-16）：`CRAWL_PROFILE_BUSY` 在 `agent crawl` / 向导路径不再被吞成 `stopped`（Issue #1274）；安全页检查识别 DrissionPage 的 `NoneElement`（Issue #1276）；断点恢复校验 `chrome_path` 类型（Issue #1278）；采集风险停止时提示风险锁未写盘（Issue #1281）；采集清理步骤各自兜底不再互相阻断（Issue #1277）；风险锁增加 cache 后备位置，主文件不可写时新进程仍能读到阻断（Issue #1270）。
+- ✅ v3.4.61（2026-11-16）：并发 crawl 共用配置目录时返回 `CRAWL_PROFILE_BUSY` 且不再删除运行中 Chrome 的 `SingletonLock`（Issue #1266）；风险锁写盘失败时风控信封明确「新进程不再受保护」（Issue #1270）。
+- ✅ v3.4.60（2026-11-16）：`agent run` / `agent train` 执行周期内控制锁冲突改为 `LOCAL_STATE_WRITE_FAILED`（动作可能已发出、禁止自动重发），dry-run 与 `--resume` 入口保持 `AUTOMATION_BUSY`（Issue #1267）。
+- ✅ v3.4.59（2026-11-16）：`agent run` / `agent train` 被 Ctrl+C 中断时输出 `CIRCUIT_BREAKER_OPEN` 信封而不是空 stdout，恢复指引为核对后 `--resume`（Issue #1262）。
+- ✅ v3.4.58（2026-11-16）：`agent run --dry-run` 遇到遗留的 `executing` 行只报告真实运行会转 `verification-required`，不再打开熔断或改写队列（Issue #1257）；`agent crawl` 对损坏的本地 run 记录返回 `CACHE_RECORD_INVALID` 并指向重建任务（Issue #1259）。
+- ✅ v3.4.57（2026-11-16）：automation 执行周期持有跨进程执行锁，第二个 executor 在发出任何请求前返回 `AUTOMATION_RUN_BUSY`，队列在途标记不再被并发回写覆盖（Issue #1253）。
+- ✅ v3.4.56（2026-11-16）：automation 控制锁冲突返回新登记的 `AUTOMATION_BUSY` 并指向真正的锁文件，不再误报 `CACHE_BUSY`（Issue #1251）。
+- ✅ v3.4.55（2026-11-16）：复核批准改为先入队再标记复核项。入队失败可重试，两步之间失败按 `approved_review_id` 去重，已批准动作不再丢失（Issue #1248）。
+- ✅ v3.4.54（2026-11-16）：automation 待执行动作先落盘 `executing` 再派发。中断后不再被 `--resume` 重发，下一轮转 `verification-required` 并打开熔断；`request_sent=false` 的预算停止仍可恢复 `pending`（Issue #1245）。
+- ✅ v3.4.53（2026-11-16）：熔断 `open` 字段只接受布尔。非布尔值在 `stop.json` 中 fail-closed、在 `state.json` 中报状态损坏，`SafetyGuard` 与 `hr location` 的读取口径一致（Issue #1242）。
+- ✅ v3.4.52（2026-11-16）：收口 crawl 停止与导出的状态机。ambient 控制信号按错误码落成 `workflow_stopped` / `timeout_stopped`，最后一页导出先于 `completed` 落库，导出失败映射 `LOCAL_IO_ERROR`，stop / 预算用尽只指引只读的 `crawl status`（Issue #1238）。
+- ✅ v3.4.51（2026-11-16）：收口 wizard `requested_steps` 空数组语义与 MCP argv 文本边界。空数组不再折叠为全量步骤，NUL / 孤立代理项在派生 CLI 前以 `INVALID_PARAM` 拒绝（Issue #1236）。
+- ✅ v3.4.50（2026-11-16）：收口平台载荷的容器漂移。`zpData` 为非对象真值时，wizard `last_messages` 按空页继续、`hr download-resume` 不再在附件落盘后崩溃、`hr jobs detail` 归一为空对象、`favorites list` 返回可重试的 `NETWORK_ERROR`（Issue #1233）。
+- ✅ v3.4.49（2026-11-16）：本地数值转换的溢出边界一次收口。合法大整数 / `1e400` 不再让搜索缓存、启动期配置校验、automation / crawl / AI 配置与本地模型输出落成 `INTERNAL_ERROR` 或可重试的 `NETWORK_ERROR`（Issue #1230）。
+- ✅ v3.4.48（2026-11-16）：本地 JSON 读取补齐超长整数与深嵌套两类确定性解析异常；熔断 latch 读不出来时 fail-closed，`agent stats` / `resume show` 返回契约错误码而不是 traceback（Issue #1227）。
+- ✅ v3.4.47（2026-11-16）：索引缓存读路径的解析、自洽与展示边界收口。超长整数 / 深嵌套按「没有缓存」返回 `INVALID_PARAM`；`count` 始终等于 `len(jobs)`；孤立代理字符的 `source` 按空串归一；`page` / `saved_at` 加合理区间（Issue #1224）。
+- ✅ v3.4.46（2026-11-16）：索引缓存元信息的类型漂移不再原样进入 `index_snapshot` 信封。非字符串 `source` 按空串、非法 `page` 按 `None`、非法 `count` 回退 `len(jobs)`、非有限 `saved_at` 按 0，`jobs` 可用时不整体丢弃缓存（Issue #1221）。
+- ✅ v3.4.45（2026-11-16）：`boss_hr_last_messages` 的显式空 `friend_ids` 不再退化为抓取当前页候选人。schema 声明 `minItems: 1`，MCP 入口按 schema 校验并返回 `INVALID_PARAM`；缺省仍走 page 模式，合法非空数组行为不变（Issue #1218）。
+- ✅ v3.4.44（2026-11-16）：缓存 TTL、风险锁时间戳与刷新前的登录态读取收口。`search_cache` / `job_desc_cache` 的坏 `created_at` 按过期删除；风险锁 `locked_at` 的超大整数 / `inf` 按时间未知展示且锁仍有效，`raise_if_locked` 保持风控契约；刷新 stoken 前先校验 `cookies` 结构（Issue #1214）。
+- ✅ v3.4.43（2026-11-16）：预算表、`crawl_jobs`、向导展示与风控锁四处本地记录漂移收口。调度时间戳按无历史 / 0 容错并清理 `typeof` 漂移行，坏冷却不再吞掉服务器 429 反馈；`page_no` / `detail_done` 在读取边界校验，`CACHE_RECORD_INVALID` 取代 `ok:true` 的 stopped；历史 `jobs_seen` / `jobs` 漂移降级展示；登录态 `cookies` 结构漂移不再掩盖风控信封（Issue #1212）。
+- ✅ v3.4.42（2026-11-16）：`boss ai` 各命令、`boss agent crawl` 与向导 AI 步骤在构造 `AIService` 前校验 `ai_temperature` / `ai_max_tokens`。坏值（字符串、数组、`bool`、负数、`inf`/`nan`）此前会原样进入请求 payload，由服务商返回 400、只看到泛化的 `AI_API_ERROR`；现在返回 `INVALID_PARAM` 并给出 `boss ai config` 修复命令，向导步骤抛同码错误，`null` 与缺键继续按默认值（Issue #1209）。
+- ✅ v3.4.41（2026-11-16）：`crawl resume --background` 在断点 `updated_at` 列被写成非数字文本时不再返回可重试的 `NETWORK_ERROR`。时间戳与状态排序、排队探测共用同一容错读数，漂移按 0 降级，后台恢复照常排队/启动，预检失败还原时写回归一后的 0.0（Issue #1206）。
+- ✅ v3.4.40（2026-11-16）：MCP 补齐两个 CLI 已有参数。`boss_greet` 新增可选 `message`（自定义打招呼语，缺省使用平台默认招呼），`boss_apply` 新增可选 `lid`（与 `security_id` 同一列表项的访问上下文，取自 search 结果）；两者缺省 / `null` 不下发，自由文本空串按未传处理（与 `boss_detail` 的 `lid` 同口径）。
+- ✅ v3.4.39（2026-11-16）：MCP 参数面两处修正。`boss_hr_chatmsg` 的显式 `max_msg_id=0` 不再被真值判断吞掉（键存在即下发，由 CLI 拒绝并返回 `INVALID_PARAM`）；`boss_exchange` 的 schema 暴露 `type`（phone|wechat），微信交换可达，缺省 / `phone` 不带选项、空串交给 CLI 枚举诊断。
 - ✅ v3.4.38（2026-11-16）：本地记录与配置的数值/类型漂移继续收敛。`crawl_runs` 数值列被写成文本时 `crawl status` 不再 stdout 为空 + traceback，改为带列名的 `CACHE_RECORD_INVALID`，并与 `crawl resume` 共用 `params` 判定、回显有效预算；上一份聊天快照的 `unread` 类型漂移不再打断 `chat --export`（按 0 比较）；`ai_max_tokens` 被手改成数组/字符串时 `ai local smoke` 返回 `INVALID_PARAM`、招聘者自动回复退回模板话术，不再中止整轮自动化。
 - ✅ v3.4.37（2026-11-16）：简历 JSON 字段类型漂移的读取判定统一。`name` 写成对象、`personal_info` 写成字符串、`rows` 元素写成字符串等坏文件不再出现「list 当正常条目、show 返回错误类型、export 把 `'str' object has no attribute 'get'` 兜成 `EXPORT_FAILED`」；模型读取边界按字段校验类型，list 与按名读取共用判定，show/export 返回 `RESUME_FILE_INVALID` 并指出字段，import 仍是字段级 `INVALID_PARAM`。
 - ✅ v3.4.36（2026-11-16）：`wizard --stop` 在断点写坏（如 `params` 不是合法 JSON）时不再把已生效的停止报成 `CACHE_RECORD_INVALID`。停止标记先落盘，展示读取两级回退都失败时返回最小可用记录（`run_id` + `status: stopped`）；`--status` 仍按展示契约报告损坏。

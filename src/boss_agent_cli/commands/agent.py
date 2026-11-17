@@ -21,19 +21,33 @@ from boss_agent_cli.automation.models import (
 	RunReport,
 )
 from boss_agent_cli.automation.runner import run_automation_cycle
-from boss_agent_cli.automation.storage import AutomationStateError, AutomationStore
+from boss_agent_cli.automation.storage import (
+	AutomationControlBusy,
+	AutomationControlBusyDispatched,
+	AutomationRunBusy,
+	AutomationStateError,
+	AutomationStore,
+)
 from boss_agent_cli.ai.service import AIServiceError
-from boss_agent_cli.cache.store import CacheStore
+from boss_agent_cli.cache.store import CacheRecordInvalid, CacheStore
 from boss_agent_cli.commands.ai_cmd import _build_fit_prompt, _create_ai_service
 from boss_agent_cli.commands.crawl import (
 	_LoginSeedUnavailable,
+	_report_corrupt_run,
 	_report_crawl_runtime_missing,
 	_report_login_required,
 	_require_crawl_capabilities,
 	_seeded_transport_factory,
 	_settings_from_context,
 )
-from boss_agent_cli.crawler.controls import CrawlRuntimeUnavailable
+from boss_agent_cli.crawler.controls import (
+	CrawlExportError,
+	CrawlProfileBusy,
+	CrawlProfilePathInvalid,
+	CrawlRuntimeUnavailable,
+	CrawlSessionAuthError,
+)
+from boss_agent_cli.crawler.hooks import HookRegistrationError
 from boss_agent_cli.crawler.operations import crawl_status, import_crawl_shortlist
 from boss_agent_cli.crawler.service import CrawlBusyError, CrawlService
 from boss_agent_cli.display import (
@@ -54,6 +68,21 @@ from boss_agent_cli.services.install_extras import extras_requirement
 @click.group("agent")
 def agent_group() -> None:
 	"""招聘自动化入口。"""
+
+
+# 复核 / 待执行队列的 TTY 展示列。键名必须是数据模型字段
+# （ReviewItem.id / confidence、PendingAction.id），否则 Rich 表格恒显示 “-”
+# （Issue #1411）。
+_REVIEW_LIST_COLUMNS: list[tuple[str, str, str]] = [
+	("ID", "id", "bold cyan"),
+	("动作", "action", "green"),
+	("分数", "confidence", "yellow"),
+]
+_PENDING_LIST_COLUMNS: list[tuple[str, str, str]] = [
+	("ID", "id", "bold cyan"),
+	("动作", "action", "green"),
+	("状态", "status", "yellow"),
+]
 
 
 def _hint_command(ctx: click.Context, command: str) -> str:
@@ -121,6 +150,19 @@ def crawl_cmd(
 	limit: int,
 ) -> None:
 	"""新建或读取 crawl 结果，导入候选池并执行 ai fit。"""
+	# 空简历名是合法 argv，但先跑完采集再报「简历 '' 不存在」既浪费请求也看不出
+	# 是漏填了名字；与 resume 命令组同口径，在入口按 INVALID_PARAM 拒绝（Issue #1369）。
+	if not resume_name.strip():
+		list_cmd = _crawl_hint_command(ctx, "resume list")
+		handle_error_output(
+			ctx,
+			"agent.crawl",
+			code="INVALID_PARAM",
+			message="简历名称不能为空",
+			recovery_action=f"补上简历名称后重试；用 {list_cmd} 查看已有简历",
+			hints={"next_actions": [list_cmd]},
+		)
+		return
 	crawl_by_run = _crawl_hint_command(ctx, "agent crawl --run-id <run_id> --resume <简历>")
 	crawl_by_query = _crawl_hint_command(ctx, "agent crawl --query <关键词> --city <城市> --resume <简历>")
 	if bool(run_id) == bool(query):
@@ -148,8 +190,33 @@ def crawl_cmd(
 		return
 
 	data_dir = ctx.obj["data_dir"]
+	# 风控锁是硬边界：仅对会发起平台采集的 --query 路径，先于简历校验报告，
+	# 避免已记录风险锁时被 RESUME_NOT_FOUND 引导去补简历后继续触发风控；
+	# --run-id 只读本地结果与短名单，不受锁影响（Issue #1407 回归）。
 	if query:
 		raise_if_locked(data_dir)
+	# 简历必须在任何平台调用、run 创建与短名单导入之前校验：非空但不存在的
+	# 名字先采集一轮再报 RESUME_NOT_FOUND，既发出真实请求又留下本地写入
+	# （Issue #1407）。损坏与缺失沿用 Issue #1369 的错误码区分。
+	resume_text, load_error = _resume_text(data_dir, resume_name)
+	if resume_text is None:
+		if load_error is not None:
+			# 文件存在但读不出来：不能报成「简历不存在」，提示修正或删除坏文件（Issue #1369）。
+			delete_cmd = _crawl_hint_command(ctx, f"resume delete {shell_argument(resume_name)}")
+			handle_error_output(
+				ctx,
+				"agent.crawl",
+				code="RESUME_FILE_INVALID",
+				message=f"简历文件 '{resume_name}.json' 损坏：{load_error}",
+				recovery_action=(
+					f"修正 resumes/{resume_name}.json 的 JSON 内容后重试，"
+					f"或执行 {delete_cmd} 后重新创建；该文件只存在本机"
+				),
+				hints={"next_actions": [delete_cmd, _crawl_hint_command(ctx, "resume list")]},
+			)
+			return
+		handle_error_output(ctx, "agent.crawl", code="RESUME_NOT_FOUND", message=f"简历 '{resume_name}' 不存在")
+		return
 	try:
 		with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
 			if query:
@@ -213,6 +280,11 @@ def crawl_cmd(
 			]},
 		)
 		return
+	except CacheRecordInvalid as exc:
+		# 本地 run 记录损坏不是参数错误：调整关键词或配置永远修不好（Issue #1259）。
+		# 与 crawl status / crawl resume 共用「断点读不出来，重新创建任务」的指引。
+		_report_corrupt_run(ctx, "agent.crawl", run_id or "", exc)
+		return
 	except ValueError as exc:
 		configure_cmd = boss_command_for_ctx(ctx, "crawl configure --help", include_data_dir=True)
 		handle_error_output(
@@ -241,6 +313,63 @@ def crawl_cmd(
 	except _LoginSeedUnavailable as exc:
 		_report_login_required(ctx, "agent.crawl", str(exc))
 		return
+	except CrawlSessionAuthError as exc:
+		# 本地 Cookie 注入失败不是平台风控；按认证前置条件回报，不提示 clean
+		# --risk-lock（Issue #1405）。
+		_report_login_required(ctx, "agent.crawl", str(exc))
+		return
+	except HookRegistrationError as exc:
+		# Hook 注入失败是确定性本地失败：不能被下面的 RuntimeError 兜成可重试的
+		# CRAWL_UNAVAILABLE（Issue #1408）。
+		hook_dir = f" {exc.hook_dir}" if exc.hook_dir is not None else ""
+		handle_error_output(
+			ctx,
+			"agent.crawl",
+			code="LOCAL_IO_ERROR",
+			message=str(exc),
+			recoverable=False,
+			recovery_action=f"停止自动重试：核对 Hook 目录{hook_dir} 中的脚本与 SHA256SUMS，修复后重新执行 agent crawl",
+		)
+		return
+	except CrawlProfileBusy as exc:
+		# 同一数据目录的采集配置目录被另一个运行中的 Chrome 占用：本次没有发出
+		# 请求，也不能让下面的 RuntimeError 兜成「安装 crawl 依赖」（Issue #1266）。
+		status_command = boss_command_for_ctx(ctx, "crawl status", include_data_dir=True)
+		handle_error_output(
+			ctx,
+			"agent.crawl",
+			code="CRAWL_PROFILE_BUSY",
+			message=str(exc),
+			hints={"next_actions": [status_command]},
+		)
+		return
+	except CrawlExportError as exc:
+		# 导出失败是本地目录 / 权限问题：CrawlExportError 是 RuntimeError 子类，
+		# 不单独捕获会被兜成 CRAWL_UNAVAILABLE 并让人去安装 crawl 依赖（与 crawl run 同口径）。
+		handle_error_output(
+			ctx,
+			"agent.crawl",
+			code="LOCAL_IO_ERROR",
+			message=str(exc),
+			recoverable=False,
+			recovery_action="确认输出目录可写（不是同名的已有文件）、目录权限与磁盘空间正常，修正后重新执行 agent crawl",
+		)
+		return
+	except CrawlProfilePathInvalid as exc:
+		# 配置目录被同名文件占用或不可写：确定性本地路径失败，重试或 resume 只会
+		# 复现同一个错误，不能兜成「安装 crawl 依赖」（Issue #1290 同口径）。
+		handle_error_output(
+			ctx,
+			"agent.crawl",
+			code="LOCAL_IO_ERROR",
+			message=str(exc),
+			recoverable=False,
+			recovery_action=(
+				"检查数据目录下的 crawl/chrome-profile 是否被同名文件占用、"
+				"目录权限与磁盘空间是否正常，修正后重新执行"
+			),
+		)
+		return
 	except CrawlRuntimeUnavailable as exc:
 		_report_crawl_runtime_missing(ctx, "agent.crawl", str(exc))
 		return
@@ -256,10 +385,6 @@ def crawl_cmd(
 		)
 		return
 
-	resume_text = _resume_text(data_dir, resume_name)
-	if resume_text is None:
-		handle_error_output(ctx, "agent.crawl", code="RESUME_NOT_FOUND", message=f"简历 '{resume_name}' 不存在")
-		return
 	if not jobs:
 		resume_command = boss_command_for_ctx(ctx, f"crawl resume {shell_argument(run_id or '')} --with-detail", include_data_dir=True)
 		handle_output(
@@ -278,7 +403,21 @@ def crawl_cmd(
 		)
 		return
 
-	svc = _create_ai_service(ctx)
+	try:
+		svc = _create_ai_service(ctx)
+	except ValueError as exc:
+		# 本地配置坏值重试必然复现：给 INVALID_PARAM 与修复命令（Issue #1209）。
+		# 字符串项自带更贴题的修复子命令（Issue #1428、#1431）。
+		hint = getattr(exc, "recovery_hint", None) or "ai config --max-tokens 4096 --temperature 0.7"
+		handle_error_output(
+			ctx,
+			"agent.crawl",
+			code="INVALID_PARAM",
+			message=f"本地 AI 配置损坏：{exc}",
+			recoverable=True,
+			recovery_action=_crawl_hint_command(ctx, hint),
+		)
+		return
 	if svc is None:
 		handle_error_output(
 			ctx,
@@ -379,7 +518,7 @@ def review_list_cmd(ctx: click.Context) -> None:
 		render=lambda d: render_list_result(
 			d.get("items", []),
 			"reviews",
-			[("ID", "review_id", "bold cyan"), ("动作", "action", "green"), ("分数", "score", "yellow")],
+			_REVIEW_LIST_COLUMNS,
 			next_steps=[_hint_command(ctx, "agent review approve <id>"), _hint_command(ctx, "agent review reject <id>")],
 		),
 		hints=_agent_hints(ctx),
@@ -394,6 +533,9 @@ def review_approve_cmd(ctx: click.Context, review_id: str) -> None:
 	store = AutomationStore(ctx.obj["data_dir"])
 	try:
 		pending = store.approve_review(review_id, now_iso())
+	except AutomationRunBusy as exc:
+		_emit_run_busy(ctx, "agent.review.approve", exc)
+		return
 	except AutomationStateError as exc:
 		_emit_state_error(ctx, "agent.review.approve", exc)
 		return
@@ -418,6 +560,9 @@ def review_reject_cmd(ctx: click.Context, review_id: str, reason: str) -> None:
 	store = AutomationStore(ctx.obj["data_dir"])
 	try:
 		rejected = store.reject_review(review_id, reason, now_iso())
+	except AutomationRunBusy as exc:
+		_emit_run_busy(ctx, "agent.review.reject", exc)
+		return
 	except AutomationStateError as exc:
 		_emit_state_error(ctx, "agent.review.reject", exc)
 		return
@@ -464,7 +609,7 @@ def pending_list_cmd(ctx: click.Context) -> None:
 		render=lambda d: render_list_result(
 			d.get("items", []),
 			"pending",
-			[("ID", "review_id", "bold cyan"), ("动作", "action", "green"), ("状态", "status", "yellow")],
+			_PENDING_LIST_COLUMNS,
 			next_steps=[_hint_command(ctx, "agent stats")],
 		),
 		hints=_agent_hints(ctx),
@@ -521,7 +666,14 @@ def control_cmd(ctx: click.Context) -> None:
 def stop_cmd(ctx: click.Context, reason: str) -> None:
 	"""打开招聘自动化熔断。"""
 	store = AutomationStore(ctx.obj["data_dir"])
-	store.request_stop(reason)
+	try:
+		store.request_stop(reason)
+	except AutomationControlBusy as exc:
+		_emit_control_busy(ctx, "agent.stop", exc)
+	except AutomationStateError as exc:
+		# 锁文件损坏 / 不可打开：确定性本地状态问题，不能把 traceback 甩给 Agent
+		# （Issue #1304）。
+		_emit_state_error(ctx, "agent.stop", exc)
 	handle_output(
 		ctx,
 		"agent.stop",
@@ -549,6 +701,49 @@ def _emit_review_missing(ctx: click.Context, command: str, review_id: str) -> No
 	ctx.exit(1)
 
 
+def _emit_control_busy(ctx: click.Context, command: str, exc: AutomationControlBusy) -> NoReturn:
+	"""控制锁冲突：本次控制更新没有生效，指引指向真正的锁文件（Issue #1251）。"""
+	handle_error_output(
+		ctx,
+		command,
+		code="AUTOMATION_BUSY",
+		message=str(exc),
+		hints={"next_actions": [_hint_command(ctx, "agent stats")]},
+	)
+	ctx.exit(1)
+
+
+def _emit_control_busy_after_dispatch(
+	ctx: click.Context, command: str, exc: AutomationControlBusyDispatched
+) -> NoReturn:
+	"""周期内控制锁冲突：平台动作可能已发出，禁止按「没有生效」重试（Issue #1267）。
+
+	动作已派发，但业务状态 / checkpoint 撞锁没落盘，队列行保持 executing。
+	重新运行会把该行按结果未知转成 verification-required，不会重发；但熔断状态
+	可能落后，所以按 `LOCAL_STATE_WRITE_FAILED` 上报：先核对官方页面，不自动重发。
+	"""
+	handle_error_output(
+		ctx,
+		command,
+		code="LOCAL_STATE_WRITE_FAILED",
+		message=f"招聘自动化执行中断：平台动作可能已发出，但自动化状态保存失败（{exc}）",
+		hints={"next_actions": [_hint_command(ctx, "agent stats")]},
+	)
+	ctx.exit(1)
+
+
+def _emit_run_busy(ctx: click.Context, command: str, exc: AutomationRunBusy) -> NoReturn:
+	"""执行锁冲突：另一个 agent run 正在执行，本次调用没有发出任何请求（Issue #1253）。"""
+	handle_error_output(
+		ctx,
+		command,
+		code="AUTOMATION_RUN_BUSY",
+		message=str(exc),
+		hints={"next_actions": [_hint_command(ctx, "agent stats")]},
+	)
+	ctx.exit(1)
+
+
 def _emit_state_error(ctx: click.Context, command: str, exc: AutomationStateError) -> NoReturn:
 	"""状态文件损坏时输出信封：自动化不能带着未知状态继续发送。"""
 	handle_error_output(
@@ -556,11 +751,14 @@ def _emit_state_error(ctx: click.Context, command: str, exc: AutomationStateErro
 		command,
 		code="AUTOMATION_STATE_INVALID",
 		message=f"{exc.path} 无法解析：{exc.detail}",
-		# 登记表的指引只针对 state.json；队列文件损坏时指向实际出问题的文件。
+		# 登记表的指引只针对 state.json；队列文件损坏或读不出来时指向实际出问题的文件。
 		recovery_action=(
 			None
 			if exc.path.name == "state.json"
-			else f"修正或移除 {exc.path} 中的问题记录后重试；建议先备份该文件"
+			else (
+				f"确认 {exc.path} 可读（权限正常、路径不是目录），"
+				"修正或移除其中的问题记录后重试；建议先备份该文件"
+			)
 		),
 	)
 	ctx.exit(1)
@@ -607,8 +805,6 @@ def _run_agent(
 	platform = ctx.obj.get("platform") or "zhipin"
 	store = AutomationStore(ctx.obj["data_dir"])
 	try:
-		if resume:
-			store.resume()
 		adapter = build_automation_adapter(
 			platform,
 			data_dir=ctx.obj["data_dir"],
@@ -623,14 +819,38 @@ def _run_agent(
 			platform=platform,
 			dry_run=dry_run,
 			limit=limit,
+			resume=resume,
 		)
+	except AutomationRunBusy as exc:
+		_emit_run_busy(ctx, command, exc)
+	except AutomationControlBusyDispatched as exc:
+		_emit_control_busy_after_dispatch(ctx, command, exc)
+	except AutomationControlBusy as exc:
+		_emit_control_busy(ctx, command, exc)
 	except AutomationStateError as exc:
 		_emit_state_error(ctx, command, exc)
+	except KeyboardInterrupt:
+		# runner 已打开熔断并保留 checkpoint；stdout 仍必须有一个信封：Click 的
+		# Abort 会让 MCP 拿到空输出，把这次写调用只当成结果未知（Issue #1262）。
+		handle_error_output(
+			ctx,
+			command,
+			code="CIRCUIT_BREAKER_OPEN",
+			message="招聘自动化执行被中断，已打开熔断并保留 checkpoint",
+		)
+		ctx.exit(1)
 
 
-def _resume_text(data_dir: Path, resume_name: str) -> str | None:
-	resume = ResumeStore(data_dir / "resumes").get(resume_name)
-	return resume_to_text(resume) if resume is not None else None
+def _resume_text(data_dir: Path, resume_name: str) -> tuple[str | None, str | None]:
+	"""读取简历纯文本；同时返回读不出来的原因，交给调用方区分损坏与缺失。
+
+	``(None, None)`` 表示文件不存在；``(None, 原因)`` 表示文件存在但损坏，
+	命令层据此报 ``RESUME_FILE_INVALID``（Issue #1369）。
+	"""
+	resume, load_error = ResumeStore(data_dir / "resumes").get_with_error(resume_name)
+	if resume is None:
+		return None, load_error
+	return resume_to_text(resume), None
 
 
 def _crawl_fit_jobs(cache: CacheStore, crawl_jobs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -696,7 +916,8 @@ def _fit_crawl_jobs(svc: Any, resume_text: str, jobs: list[dict[str, Any]]) -> d
 		text = "\n".join(line for line in text.splitlines() if not line.startswith("```")).strip()
 	try:
 		payload = json.loads(text)
-	except json.JSONDecodeError as exc:
+	# 超长整数（3.11+）与深嵌套同样是模型输出不可用，按解析失败报错。
+	except (ValueError, RecursionError) as exc:
 		raise ValueError("AI 返回结果不是 JSON") from exc
 	if not isinstance(payload, dict):
 		raise ValueError("AI 返回结果不是对象")
@@ -708,7 +929,8 @@ def _fit_score(item: Any) -> int:
 		return 0
 	try:
 		return int(item.get("match_score", 0))
-	except (TypeError, ValueError):
+	# OverflowError：模型输出 1e400 解析成 inf，按 0 分处理并继续返回结果。
+	except (TypeError, ValueError, OverflowError):
 		return 0
 
 

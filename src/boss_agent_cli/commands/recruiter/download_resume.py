@@ -5,6 +5,7 @@ from pathlib import Path
 import click
 
 from boss_agent_cli.api.client import PlatformRiskError
+from boss_agent_cli.api.models import platform_data_dict
 from boss_agent_cli.api.request_budget import is_request_stop
 from boss_agent_cli.api.recruiter_client import RecruiterAuthError
 from boss_agent_cli.api.recruiter_resume import ResumeValidationError
@@ -78,12 +79,17 @@ def download_resume_cmd(ctx: click.Context, friend_id: int, message_id: int, out
 			handle_error_output(ctx, command, code="PLATFORM_NOT_SUPPORTED", message="当前平台不支持下载附件简历")
 			return
 		except OSError:
+			# 目标路径已通过预检，此时的 OSError 是本地写盘失败（磁盘满、只读
+			# 目录、权限不足等），不是参数错误：重试同样的参数不会改变结果，
+			# 按不可重试的 LOCAL_IO_ERROR 上报（Issue #1503）。
+			recoverable, recovery_action = error_contract_for_code("LOCAL_IO_ERROR")
 			handle_error_output(
 				ctx,
 				command,
-				code="INVALID_PARAM",
-				message="无法保存文件，请检查目标目录与写入权限",
-				recovery_action="确认 --output 的父目录存在且可写后重试",
+				code="LOCAL_IO_ERROR",
+				message="无法保存文件，请检查磁盘空间与目标目录的写入权限",
+				recoverable=recoverable,
+				recovery_action=recovery_action,
 			)
 			return
 		except (AuthRequired, RecruiterAuthError):
@@ -158,7 +164,7 @@ def download_resume_cmd(ctx: click.Context, friend_id: int, message_id: int, out
 		handle_output(
 			ctx,
 			command,
-			{"friend_id": friend_id, "message_id": message_id, "downloaded": True, **platform.unwrap_data(result)},
+			{"friend_id": friend_id, "message_id": message_id, "downloaded": True, **platform_data_dict(platform.unwrap_data(result))},
 			# 附件落盘后没有下一步：Agent 只能自己猜文件在哪、也不会回到会话继续沟通。
 			hints={
 				"next_actions": [hint_command(ctx, f"hr chatmsg {friend_id}")],

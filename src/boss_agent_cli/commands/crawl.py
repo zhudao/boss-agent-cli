@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 import time
@@ -28,7 +29,15 @@ from boss_agent_cli.crawler.service import (
 	crawl_int_setting,
 	unused_local_port,
 )
-from boss_agent_cli.crawler.controls import CrawlRuntimeUnavailable
+from boss_agent_cli.crawler.controls import (
+	CrawlExportError,
+	CrawlHookDirInvalid,
+	CrawlProfileBusy,
+	CrawlProfilePathInvalid,
+	CrawlRuntimeUnavailable,
+	CrawlSessionAuthError,
+)
+from boss_agent_cli.crawler.hooks import HookRegistrationError, verify_hook_profile
 from boss_agent_cli.crawler.transport import DrissionCrawlerSession, ensure_crawl_runtime
 from boss_agent_cli.services.install_extras import extras_install_hint, extras_requirement
 from boss_agent_cli.services.json_files import write_json_atomic
@@ -41,6 +50,7 @@ from boss_agent_cli.display import (
 	login_action_for_ctx,
 	registry_recovery_for_ctx,
 	render_action_result,
+	risk_lock_persistence_actions,
 	shell_argument,
 	render_record_result,
 )
@@ -110,7 +120,8 @@ def _save_crawl_config(data_dir: Path, updates: dict[str, Any]) -> dict[str, Any
 			loaded = json.loads(config_path.read_text(encoding="utf-8"))
 			if isinstance(loaded, dict):
 				user_cfg = loaded
-		except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+		# 超长整数（3.11+）与深嵌套同样按配置损坏降级，不能挡住 crawl 配置写入。
+		except (ValueError, OSError, RecursionError):
 			pass
 	crawl_cfg = user_cfg.get("crawl", {})
 	if not isinstance(crawl_cfg, dict):
@@ -125,7 +136,7 @@ def _save_crawl_config(data_dir: Path, updates: dict[str, Any]) -> dict[str, Any
 def _city_code(city: str) -> str:
 	if city in CITY_CODES:
 		return CITY_CODES[city]
-	if city.isdigit():
+	if city.isascii() and city.isdigit():
 		return city
 	raise ValueError("city 必须是支持的城市名称或数字城市代码")
 
@@ -158,7 +169,10 @@ def _settings_from_context(
 		raise ValueError("搜索关键词不能为空")
 	cfg = _crawl_config(ctx)
 	data_dir = Path(ctx.obj["data_dir"])
-	resolved_profile = str(data_dir / "crawl" / "chrome-profile")
+	# 断点里存的是绝对路径：`--data-dir` 允许相对路径（如 `state`），若把
+	# `state/crawl/chrome-profile` 原样落盘，之后在不同 cwd 下 resume 会指向
+	# 另一个目录，而 from_dict 的绝对路径校验也会把刚建的任务判成记录损坏。
+	resolved_profile = str((data_dir / "crawl" / "chrome-profile").resolve())
 	resolved_hook = hook_profile or "none"
 	if resolved_hook not in _HOOK_CHOICES:
 		raise ValueError(f"unknown hook profile: {resolved_hook}")
@@ -172,7 +186,9 @@ def _settings_from_context(
 	resolved_hook_dir: Path | None = None
 	if hook_dir:
 		try:
-			resolved_hook_dir = Path(hook_dir).expanduser()
+			# expanduser 只展开 ~；断点里存的是绝对路径，换 cwd 后恢复仍要指向
+			# 同一目录（Issue #1408）。
+			resolved_hook_dir = Path(hook_dir).expanduser().resolve()
 		except RuntimeError as exc:
 			raise ValueError(
 				f"无法展开 --hook-dir 的家目录写法：{hook_dir!r}（{exc}）；请改用绝对路径或 ~/ 开头的当前用户路径"
@@ -182,6 +198,10 @@ def _settings_from_context(
 	# --hook-dir 参数，重试只会重复同一错误。参数问题必须在创建任务之前拒绝。
 	if resolved_hook == "screenshot-full" and resolved_hook_dir is None:
 		raise ValueError("--hook-profile screenshot-full 需要同时提供 --hook-dir（用户授权的原始 Hook 脚本目录）")
+	# 目录内容同样必须在创建任务与打开浏览器之前校验（Issue #1348）：缺清单、
+	# 空目录或脚本被改时，运行期注入失败只会把任务记成 stopped 并提示 resume，
+	# 而 resume 没有 --hook-dir 参数可以修复。这里只读本地文件，不触碰浏览器。
+	verify_hook_profile(resolved_hook, resolved_hook_dir)
 	return CrawlSettings(
 		query=query,
 		city_code=_city_code(city),
@@ -260,6 +280,31 @@ def _seeded_transport_factory(ctx: click.Context) -> Callable[[CrawlSettings], D
 	return lambda settings: _transport_factory(settings, seed_cookies=seed_cookies, user_agent=user_agent)
 
 
+class _LazySeededTransportFactory:
+	"""按需读取登录态的传输工厂：没有恢复工作的 run 不触发登录前置条件（Issue #1412）。
+
+	``crawl resume`` 原先把登录 / transport 预检放在调用 service 之前，已完成
+	的 run 也会先被要求登录。现在预检只在 ``CrawlService`` 确认 ``has_resume_work``
+	之后（``preflight``）或真正构造运输层时执行；完成路径直接返回既有结果。
+	"""
+
+	def __init__(self, ctx: click.Context) -> None:
+		self._ctx = ctx
+		self._factory: Callable[[CrawlSettings], DrissionCrawlerSession] | None = None
+
+	def _ensure(self) -> Callable[[CrawlSettings], DrissionCrawlerSession]:
+		if self._factory is None:
+			self._factory = _seeded_transport_factory(self._ctx)
+		return self._factory
+
+	def preflight(self) -> None:
+		"""确认本地登录态可注入；失败抛 ``_LoginSeedUnavailable``。"""
+		self._ensure()
+
+	def __call__(self, settings: CrawlSettings) -> DrissionCrawlerSession:
+		return self._ensure()(settings)
+
+
 def _report_corrupt_run(ctx: click.Context, command: str, run_id: str, exc: CacheRecordInvalid) -> None:
 	"""本地 run 记录写坏：断点读不出来，给「重新创建任务」指引而不是 traceback。"""
 	handle_error_output(
@@ -307,7 +352,13 @@ def _report_crawl_runtime_missing(ctx: click.Context, command: str, message: str
 	)
 
 
-def _run_service(ctx: click.Context, service_call: Any, *, on_error: Callable[[str, str], None] | None = None) -> None:
+def _run_service(
+	ctx: click.Context,
+	service_call: Any,
+	*,
+	on_error: Callable[[str, str], None] | None = None,
+	defer_transport_preflight: bool = False,
+) -> None:
 	def note(code: str, message: str) -> None:
 		# 错误出口会直接结束进程：后台 worker 要在那之前留下原因（Issue #1042）。
 		if on_error is not None:
@@ -315,12 +366,18 @@ def _run_service(ctx: click.Context, service_call: Any, *, on_error: Callable[[s
 
 	try:
 		raise_if_locked(Path(ctx.obj["data_dir"]))
-		transport_factory = _seeded_transport_factory(ctx)
+		transports = _LazySeededTransportFactory(ctx)
+		if not defer_transport_preflight:
+			# 新建任务的路径必须在落库 / 打开浏览器之前确认登录态可注入；resume
+			# 则交给 CrawlService 在确认还有恢复工作之后调用 preflight
+			# （Issue #1412）。
+			transports.preflight()
 		with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 			service = CrawlService(
 				cache,
 				data_dir=Path(ctx.obj["data_dir"]),
-				transport_factory=transport_factory,
+				transport_factory=transports,
+				preflight=transports.preflight,
 			)
 			outcome = service_call(service)
 	except KeyError as exc:
@@ -344,6 +401,23 @@ def _run_service(ctx: click.Context, service_call: Any, *, on_error: Callable[[s
 			hints={"next_actions": [status_command]},
 		)
 		return
+	except CrawlHookDirInvalid as exc:
+		# 断点里的 Hook 目录坏了：resume 没有 --hook-dir 可改，crawl configure
+		# 也修不了已存任务。按确定性本地失败收口（Issue #1460）。
+		note("LOCAL_IO_ERROR", str(exc))
+		hook_dir = f" {exc.hook_dir}" if exc.hook_dir is not None else ""
+		handle_error_output(
+			ctx,
+			"crawl",
+			code="LOCAL_IO_ERROR",
+			message=str(exc),
+			recoverable=False,
+			recovery_action=(
+				f"停止自动重试：核对 Hook 目录{hook_dir} 中的 7 个脚本与 SHA256SUMS，"
+				"修复后重新执行 crawl resume；目录已迁移时用新的 --hook-dir 重新创建任务"
+			),
+		)
+		return
 	except ValueError as exc:
 		note("INVALID_PARAM", str(exc))
 		configure_cmd = boss_command_for_ctx(ctx, "crawl configure --help", include_data_dir=True)
@@ -354,6 +428,73 @@ def _run_service(ctx: click.Context, service_call: Any, *, on_error: Callable[[s
 			message=str(exc),
 			recovery_action=f"按提示修正 crawl 配置后重试；可用 {configure_cmd} 查看可配置项",
 			hints={"next_actions": [configure_cmd]},
+		)
+		return
+	except CrawlExportError as exc:
+		# 导出失败是本地目录 / 权限问题：CrawlExportError 是 RuntimeError 子类，
+		# 不单独捕获会被兜成 CRAWL_UNAVAILABLE 并让人去安装 crawl 依赖（Issue #1238）。
+		note("LOCAL_IO_ERROR", str(exc))
+		handle_error_output(
+			ctx,
+			"crawl",
+			code="LOCAL_IO_ERROR",
+			message=str(exc),
+			recoverable=False,
+			recovery_action="确认输出目录可写（不是同名的已有文件）、目录权限与磁盘空间正常，修正后重新执行 crawl resume",
+		)
+		return
+	except CrawlProfileBusy as exc:
+		# 同一数据目录的采集共用一个 Chrome 配置目录：另一个 run 的 Chrome 正在
+		# 使用时，本次调用既没有发出请求，也不该删锁或起第二个实例（Issue #1266）。
+		note("CRAWL_PROFILE_BUSY", str(exc))
+		# `crawl status` 的 run_id 是必填参数：不带值的命令照抄后必然 INVALID_PARAM
+		# （Issue #1289）。占位符与项目其他 hint 一致。
+		status_command = boss_command_for_ctx(ctx, "crawl status <run_id>", include_data_dir=True)
+		handle_error_output(
+			ctx,
+			"crawl",
+			code="CRAWL_PROFILE_BUSY",
+			message=str(exc),
+			hints={"next_actions": [status_command]},
+		)
+		return
+	except CrawlProfilePathInvalid as exc:
+		# 配置目录被同名文件占用或不可写：确定性本地路径失败，重试或 resume 只会
+		# 复现同一个错误，不能给 ok=true 的 stopped 与恢复指引（Issue #1290）。
+		note("LOCAL_IO_ERROR", str(exc))
+		handle_error_output(
+			ctx,
+			"crawl",
+			code="LOCAL_IO_ERROR",
+			message=str(exc),
+			recoverable=False,
+			recovery_action=(
+				"检查数据目录下的 crawl/chrome-profile 是否被同名文件占用、"
+				"目录权限与磁盘空间是否正常，修正后重新执行"
+			),
+		)
+		return
+	except CrawlSessionAuthError as exc:
+		# 本地 Cookie 注入失败不是平台风控：不能写风险锁，也不能提示 clean
+		# --risk-lock；按认证前置条件让用户重新登录后重试（Issue #1405）。
+		note("AUTH_REQUIRED", str(exc))
+		_report_login_required(ctx, "crawl", str(exc))
+		return
+	except HookRegistrationError as exc:
+		# Hook 注入失败是确定性本地失败：resume 没有 --hook-dir 可以修复坏目录，
+		# 给 ok:true 的 stopped 与 resume 指引只会无限重复（Issue #1408）。
+		note("LOCAL_IO_ERROR", str(exc))
+		hook_dir = f" {exc.hook_dir}" if exc.hook_dir is not None else ""
+		handle_error_output(
+			ctx,
+			"crawl",
+			code="LOCAL_IO_ERROR",
+			message=str(exc),
+			recoverable=False,
+			recovery_action=(
+				f"停止自动重试：核对 Hook 目录{hook_dir} 中的 7 个脚本与 SHA256SUMS，"
+				"修复后重新执行 crawl resume；目录已迁移时用新的 --hook-dir 重新创建任务"
+			),
 		)
 		return
 	except RuntimeError as exc:
@@ -377,11 +518,31 @@ def _run_service(ctx: click.Context, service_call: Any, *, on_error: Callable[[s
 		)
 		return
 	resume_command = boss_command_for_ctx(ctx, f"crawl resume {shell_argument(outcome.run_id)}", include_data_dir=True)
+	status_command = boss_command_for_ctx(ctx, f"crawl status {shell_argument(outcome.run_id)}", include_data_dir=True)
 	if outcome.status == "risk_stopped":
 		hints = {"operator_actions": [
 			*unlock_operator_actions(boss_command_for_ctx(ctx, "clean --risk-lock", include_data_dir=True)),
 			f"完成人工恢复后，显式执行 {resume_command} 从原断点继续",
+			# 风险锁没写盘时保护只在本进程内存里：不提示会让操作者以为新进程
+			# 也被拦住（Issue #1281，文案与认证错误路径同一真源）。helper 接收
+			# 异常 details 结构，锁本身包成 {"risk_lock": ...}。
+			*risk_lock_persistence_actions({"risk_lock": outcome.risk_lock}),
 		]}
+	elif outcome.status == "budget_stopped":
+		# 预算计数与 settings 都持久化，resume 不会推进（Issue #1238）：只给只读状态。
+		hints = {
+			"next_actions": [status_command],
+			"operator_actions": [
+				"该任务的预算已用完，继续采集需要新建任务（或调高 max_requests 后重新 crawl start）",
+			],
+		}
+	elif outcome.status == "workflow_stopped":
+		hints = {
+			"next_actions": [status_command],
+			"operator_actions": [
+				"任务已按停止请求结束，未继续采集；如需继续，显式执行 crawl resume（它会清除停止标记）",
+			],
+		}
 	elif outcome.status != "completed":
 		hints = {"next_actions": [resume_command]}
 	else:
@@ -405,16 +566,29 @@ def _run_service(ctx: click.Context, service_call: Any, *, on_error: Callable[[s
 _QUEUE_HANDOFF_GRACE_SECONDS = 30.0
 
 
+def _tolerated_timestamp(value: Any) -> float:
+	"""本地记录时间戳的容错读取：漂移值按 0 参与调度（与 Issue #1192 同口径）。
+
+	`get_crawl_run` 故意不校验 `created_at` / `updated_at`，消费方必须自行降级；
+	纯本地元数据问题不能拦停恢复，更不能被兜成可重试的 NETWORK_ERROR（Issue #1206）。
+	`inf` / `nan` 同样按 0：`time.time() - inf` 是 `-inf`，小于交接窗口，会让
+	queued 任务被永远当成「刚排队」，后台恢复返回成功却不启动 worker（Issue #1349）；
+	超大整数在 `float()` 抛 `OverflowError`，也不能逃成 INTERNAL_ERROR。
+	"""
+	try:
+		parsed = float(value or 0.0)
+	except (TypeError, ValueError, OverflowError):
+		return 0.0
+	return parsed if math.isfinite(parsed) else 0.0
+
+
 def _awaiting_queued_worker(run: dict[str, Any]) -> bool:
 	"""任务刚排队：原 worker 可能正要取锁，父进程不探测、不抢占。"""
 	if run["status"] != "queued":
 		return False
 	# 时钟回拨得到负值时按仍在窗口内处理，宁可多等也不抢；时间戳类型漂移
 	# 无法判断新鲜度，按「排队已久」去探测锁，不能让父进程 traceback（Issue #1192）。
-	try:
-		updated = float(run["updated_at"])
-	except (TypeError, ValueError):
-		return False
+	updated = _tolerated_timestamp(run["updated_at"])
 	return time.time() - updated < _QUEUE_HANDOFF_GRACE_SECONDS
 
 
@@ -459,7 +633,8 @@ def _prepare_background_resume(
 			# （Issue #1115）。预检失败时还原旧 stop 与时间戳，保持「失败的调用
 			# 不改动任务」的既有约定（Issue #1042）；失败且无旧 stop 时不写库。
 			previous_stop = bool(run.get("stop_requested"))
-			previous_updated_at = float(run.get("updated_at") or 0.0)
+			# 仅用于预检失败时还原；类型漂移按 0 降级，不能让恢复本身中断（Issue #1206）。
+			previous_updated_at = _tolerated_timestamp(run.get("updated_at"))
 			if clear_stop and previous_stop:
 				cache.clear_crawl_stop_request(run_id)
 			try:
@@ -909,6 +1084,9 @@ def _resume(
 			clear_stop=not from_queue,
 		),
 		on_error=on_error,
+		# 登录 / transport 预检延后到 CrawlService 确认 has_resume_work 之后：
+		# 已完成且无待补详情的 run 直接返回既有结果（Issue #1412）。
+		defer_transport_preflight=True,
 	)
 
 

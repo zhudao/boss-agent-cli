@@ -292,8 +292,16 @@ def probe_cdp(cdp_url: str | None = None) -> str | None:
 	base = cdp_url or DEFAULT_CDP_URL
 	try:
 		resp = httpx.get(f"{base}/json/version", timeout=_CDP_PROBE_TIMEOUT)
-		return cast("str | None", resp.json().get("webSocketDebuggerUrl"))
-	except (httpx.HTTPError, ValueError, KeyError):
+		payload = resp.json()
+		# 非对象 JSON（[] / null / 标量）没有 webSocketDebuggerUrl 可读。直接 .get 会抛
+		# AttributeError 并中断登录降级链，故与 _fetch_ws_url 同口径：视为探测不可用。
+		# 与解析失败一样按「拿不到调试端口」处理（Issue #1421）。
+		if not isinstance(payload, dict):
+			return None
+		return cast("str | None", payload.get("webSocketDebuggerUrl"))
+	# ValueError 覆盖 JSON 语法错误；深嵌套响应在 3.11–3.13 抛 RecursionError。
+	# 与解析失败一样按「响应无法解析」处理：拿不到调试端口即视为探测不可用（Issue #1378）。
+	except (httpx.HTTPError, ValueError, KeyError, RecursionError):
 		return None
 
 
@@ -324,13 +332,19 @@ def login_via_cdp(
 	success_cookie = config["success_cookie"]
 	ws_url = probe_cdp(cdp_url)
 	if not ws_url:
-		raise ConnectionError("CDP 不可用，请先运行 boss-chrome 启动带调试端口的 Chrome")
+		raise ConnectionError(
+			"CDP 不可用：请先以 --remote-debugging-port=9222 启动带调试端口的 Chrome，"
+			"再用 --cdp-url 指向该端口重试"
+		)
 
 	pw = sync_playwright().start()
-	browser = pw.chromium.connect_over_cdp(ws_url)
-	# 跨所有 browser context 搜索已有登录态：命中则复用该 context，不导航登录页
-	all_contexts = list(browser.contexts)
 	try:
+		# 连接与 contexts 读取也在 try 内：握手失败时若泄漏 Playwright driver，
+		# 自动登录还会继续启动 patchright 扫码（Issue #1425）。成功路径不在这里
+		# stop，只由末尾的 finally 统一收尾，避免重复 stop。
+		browser = pw.chromium.connect_over_cdp(ws_url)
+		# 跨所有 browser context 搜索已有登录态：命中则复用该 context，不导航登录页
+		all_contexts = list(browser.contexts)
 		for existing_context in all_contexts:
 			for existing_page in existing_context.pages:
 				try:
@@ -670,6 +684,11 @@ def login_via_browser(*, timeout: int = 120, platform: str = "zhipin") -> dict[s
 			cookies = {
 				c["name"]: c["value"] for c in cookies_list if _is_cookie_domain(c.get("domain", ""), cookie_domain)
 			}
+			# 与 CDP 路径同口径（Issue #1454）：响应 URL 命中登录接口只说明流程走到了
+			# 确认页，不保证主 cookie 已写入。最终读取拿不到 success_cookie 时直接失败，
+			# 否则空凭证会被保存并在 CLI 里报「登录成功（扫码登录）」。
+			if not cookies.get(success_cookie):
+				raise RuntimeError(f"登录态校验失败：最终读取未拿到主 cookie（{success_cookie}），凭证不落盘")
 			if platform == "zhipin":
 				# 首页成功加载才对其 evaluate 提取 stoken；否则回退到 cookie jar，
 				# 避免页面卡在导航中导致 page.evaluate 永久挂起
@@ -753,6 +772,10 @@ def refresh_stoken(cookies: dict[str, Any], user_agent: str) -> str:
 			with suppress(Exception):
 				browser.close()
 
+	if not stoken:
+		# 与 CDP 路径同口径：首页迟迟不产出 stoken 是刷新失败，不能把空串当
+		# 成功返回、让调用方覆盖掉本地旧 stoken（Issue #1305）。
+		raise RuntimeError("headless 刷新 stoken 失败：页面未生成 stoken")
 	return stoken
 
 

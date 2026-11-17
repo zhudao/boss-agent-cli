@@ -351,6 +351,7 @@ httpx 带着从 Chrome 拷出来的 Cookie，把 `__zp_stoken__` 当查询参数
 | `WORKFLOW_BUSY` | 同一 `run_id` 正在由另一次调用执行（另一个终端、Agent 或 MCP 调用）；本次调用没有执行任何步骤，也没有改动 checkpoint | 用 `boss wizard --status <run_id>` 查看进度，等当前执行结束后再 `--resume`；不要并发恢复同一个 `run_id` |
 | `WORKFLOW_NOT_FOUND` | 本地 workflow 任务不存在或 `run_id` 有误（`boss wizard --status` / `--stop` / `--resume`） | 执行 `boss wizard` 新建任务，或先用 `boss wizard --status <run_id>` 核对 ID |
 | `CRAWL_BUSY` | 同一采集任务正由另一次调用执行；本次调用未发出请求，也未修改采集断点 | 用返回的同一数据目录的 `boss crawl status <run_id>` 查看进度，等当前执行结束后再恢复；不要并发恢复同一任务；`status` / `results` / `stop` 仍可用 |
+| `CRAWL_PROFILE_BUSY` | 同一数据目录的采集配置目录正被另一个运行中的采集 Chrome 使用（`SingletonLock` 里的 pid 仍存活）；本次调用未发出请求，也没有删除锁文件 | 用 `boss crawl status <run_id>` 查看正在运行的采集，等它结束后再启动或恢复；不要并发使用同一数据目录的采集浏览器，也不要删除 `SingletonLock` |
 | `CRAWL_RUN_NOT_FOUND` | 本地采集任务不存在或 `run_id` 有误（`boss crawl status` / `resume` / `results` 等） | 执行 `boss crawl start <query>` 新建任务，或用真实 `run_id` 执行 `boss crawl status <run_id>` 核对 |
 | `CONTACT_NOT_FOUND` | 沟通列表里没有这个联系人：`security_id` 可能已轮换，或对方已不在列表 | 先 `boss chat` 查看会话；已知 uid 时改用 uid 重试 |
 | `SAVED_SEARCH_NOT_FOUND` | 本地预设或 watch 不存在：`boss search --preset` / `boss watch run` 引用了没保存过的名字 | `boss preset list` / `boss watch list` 查看已有条目，需要时用 `boss preset add` / `boss watch add` 重建 |
@@ -369,6 +370,8 @@ httpx 带着从 Chrome 拷出来的 Cookie，把 `__zp_stoken__` 当查询参数
 | `LOCAL_STATE_WRITE_FAILED` | 平台操作已完成，但本地状态保存失败 | 先在官方页面核对本次操作是否已生效；不要自动重发，确认磁盘空间与缓存目录权限后再继续 |
 | `LOCAL_IO_ERROR` | 本地文件读写失败（导出路径、`config.json`、缓存等） | 不要自动重试：确认目标路径是可写目录（而不是同名的已有文件）、权限与磁盘空间正常后再执行 |
 | `MODEL_REGISTRY_INVALID` | 本地模型登记表 `models/registry.json` 损坏（写一半被中断、手工编辑写坏） | 修正或删除该文件后重试；删除只会丢失已导入模型的登记，模型文件仍在磁盘上，重新执行 `boss ai local import` 即可重建 |
+| `AUTOMATION_BUSY` | 招聘自动化控制锁 `automation/.control-lock.sqlite3` 正被另一条 boss 命令占用（熔断、恢复或写状态时 `database is locked`），本次控制更新没有生效 | 等待占用锁的 boss 命令结束后重试；锁文件本身完好，不需要删除。`agent stats` 可先查看当前状态。这不是缓存库 `cache/boss_agent.db` 的问题 |
+| `AUTOMATION_RUN_BUSY` | 招聘自动化正在同一数据目录中由另一进程执行（`automation/.run-lock.sqlite3` 被执行周期持有），本次调用没有发出任何请求 | 等待另一个 `boss agent run` 结束后重试；`agent stats` 可先查看当前状态。不要并发运行同一数据目录 |
 | `AUTOMATION_STATE_INVALID` | 招聘自动化状态 `automation/state.json` 损坏或字段类型不对，或队列文件 `pending-actions.jsonl` / `human-review-queue.jsonl` 里有记录的 `confidence`、`action` 读不出来，`boss agent run` / `stats` / `pending` / `review` 无法继续（`stop.json` 损坏时按已熔断处理） | 按 `error.message` 指出的文件与字段修正后重试；删除 `state.json` 会丢失自动化去重与历史进度，建议先备份 |
 | `SAVED_SEARCH_INVALID` | 本地预设 / watch 的参数损坏（`saved_searches.params` 不是 JSON 对象），`boss search --preset`、`boss watch run` 无法执行 | 执行 `boss preset remove <名称>`（watch 用 `boss watch remove`）后重新添加；参数只存在本地缓存，删除不影响平台数据 |
 | `CACHE_RECORD_INVALID` | 本地 crawl / workflow 任务记录损坏（`crawl_runs`、`crawl_jobs`、`workflow_runs`、`workflow_steps` 的 JSON 列读不出来），断点无法恢复 | 重新创建任务（crawl 用 `boss crawl start`，workflow 用 `boss wizard --input-json`）；记录只存在本地缓存，已导出的文件不会自动删除，`boss wizard` 的任务列表会跳过坏记录并点名 |

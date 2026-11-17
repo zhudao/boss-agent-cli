@@ -264,6 +264,23 @@ def test_roadmap_lists_the_current_release():
 		assert f"v{__version__}" in section, f"{path} 的已发布列表缺少 v{__version__}"
 
 
+def test_roadmap_release_entries_are_separate_list_items():
+	"""已发布列表的每条版本必须是独立的 `- ✅` 列表项。
+
+	发版脚本曾把新条目直接拼在上一版条目后面，v3.4.54–v3.4.65 挤成一整行
+	3000+ 字符，渲染后看不出分段（Issue #1312）。这里断言已发布区里每个
+	带「✅ v」的行都独立成列表项且一行只有一个版本标记。
+	"""
+	for path, heading in (("ROADMAP.md", "## 已发布"), ("ROADMAP.en.md", "## Released")):
+		content = _read(path)
+		section = content.split(heading, 1)[1].split("\n## ", 1)[0]
+		for line in section.splitlines():
+			if "✅ v" not in line:
+				continue
+			assert line.startswith("- ✅ v"), f"{path} 的发布条目未独立成行: {line[:40]}…"
+			assert line.count("✅ v") == 1, f"{path} 的发布条目粘连: {line[:40]}…"
+
+
 def test_troubleshooting_documents_action_unconfirmed_evidence():
 	"""ACTION_UNCONFIRMED 的 details 字段要写进排障表，用户才看得懂失败信封。"""
 	for path in ("docs/troubleshooting.md", "docs/troubleshooting.en.md"):
@@ -334,7 +351,7 @@ def test_site_copy_matches_current_version_and_counts():
 
 
 def test_contributing_documents_offline_mcp_evals():
-	"""离线评测必须能被贡献者发现：双语 CONTRIBUTING 说明场景、命令与独立终端要求。"""
+	"""离线评测必须能被贡献者发现：双语 CONTRIBUTING 说明场景、命令与运行方式。"""
 	zh = _read("CONTRIBUTING.md")
 	en = _read("CONTRIBUTING.en.md")
 
@@ -344,9 +361,11 @@ def test_contributing_documents_offline_mcp_evals():
 		assert "4/4 passed" in content
 
 	assert "## 离线 MCP 评测" in zh
-	assert "不要嵌套" in zh
+	assert "Agent 会话内" in zh
+	assert "--mode external" in zh
 	assert "## Offline MCP evals" in en
-	assert "do not nest" in en.lower()
+	assert "agent session" in en.lower()
+	assert "--mode external" in en
 
 
 def test_readme_links_offline_evals():

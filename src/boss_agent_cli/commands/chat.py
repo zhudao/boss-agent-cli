@@ -4,18 +4,18 @@ from typing import Any
 
 import click
 
-from boss_agent_cli.api.models import dict_items
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._platform import get_platform_instance
 from boss_agent_cli.commands._output_path import validate_output_path_or_emit
 from boss_agent_cli.services.chat_export import render_export
+from boss_agent_cli.services.friend_list_pages import friend_list_page_items
 from boss_agent_cli.services.output_path import prepare_output_path
 from boss_agent_cli.services.text_files import write_text_atomic
 from boss_agent_cli.services.chat_snapshot import save_snapshot_and_diff, load_snapshot
 from boss_agent_cli.services.chat_utils import (
 	RELATION_LABELS, FROM_FILTER, MSG_STATUS_LABELS,
-	contact_identity, int_code, sanitize_csv_cell, escape_md_cell,
+	contact_identity, int_code, safe_local_time, sanitize_csv_cell, escape_md_cell,
 )
 from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_error_output, handle_not_supported, handle_output, handle_platform_error_output, render_simple_list
 
@@ -37,7 +37,7 @@ _escape_md_cell = escape_md_cell
 	type=click.Choice(["html", "md", "csv", "json"]),
 	help="导出格式：html=HTML / md=Markdown / csv=CSV / json=JSON")
 @click.option("-o", "--output", "output_path", default=None,
-	help="输出文件路径（不指定则自动保存到配置的 export_dir）")
+	help="输出文件路径，仅在 --export 时生效（只给 -o 会返回 INVALID_PARAM，显式空串无效）；省略时保存到配置的 export_dir，未配置时使用 <data-dir>/chat-export")
 @click.pass_context
 @handle_auth_errors("chat")
 def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | None, export_fmt: str | None, output_path: str | None) -> None:
@@ -45,9 +45,39 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 	if not require_compliance_allowed(ctx, "chat"):
 		ctx.exit(1)
 
+	# `-o` 只在导出分支里生效：没配 `--export` 时路径被静默忽略却仍返回
+	# ok:true，调用方以为文件已经写出（Issue #1502）。入口直接拒绝。
+	if output_path is not None and export_fmt is None:
+		list_cmd = boss_command_for_ctx(ctx, "chat", include_data_dir=True)
+		handle_error_output(
+			ctx,
+			"chat",
+			code="INVALID_PARAM",
+			message="-o / --output 需要配合 --export 使用；不导出时请省略 -o",
+			recovery_action=(
+				f"加上 --export md（或 html/csv/json）后再指定 -o，例如 {list_cmd} --export md -o <文件路径>；"
+				"只想查看沟通列表时省略 -o"
+			),
+			hints={"next_actions": [list_cmd]},
+		)
+		return
+
 	# 只在真要导出时校验：`-o` 指向目录这类参数错误必须在第一次平台请求之前暴露，
 	# 而不是抓完沟通列表、写完快照之后再报一个与真正原因无关的信封。
-	if export_fmt and output_path:
+	if export_fmt and output_path is not None:
+		# 显式空串不是「用默认路径」的写法：旧的真值判断把它化装成「没传」，
+		# 于是 `--export md -o ""` 静默写出了默认导出文件（Issue #1501）。
+		if not output_path.strip():
+			chat_export_cmd = boss_command_for_ctx(ctx, f"chat --export {export_fmt}", include_data_dir=True)
+			handle_error_output(
+				ctx,
+				"chat",
+				code="INVALID_PARAM",
+				message="-o / --output 不能为空；省略 -o 才会自动保存到默认导出目录",
+				recovery_action=f"给出完整文件路径后重试，例如 {chat_export_cmd} -o <文件路径>",
+				hints={"next_actions": [chat_export_cmd]},
+			)
+			return
 		validated = validate_output_path_or_emit(ctx, "chat", output_path)
 		if validated is None:
 			return
@@ -69,8 +99,9 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 		platform_data = platform.unwrap_data(resp)
 		if not isinstance(platform_data, dict):
 			platform_data = {}
-		# 与 services/friend_list_pages 同一口径：元素级漂移只跳过坏元素（Issue #1141）。
-		items = dict_items(platform_data.get("result") or platform_data.get("friendList"))
+		# 与 services/friend_list_pages 同一口径：元素级漂移只跳过坏元素（Issue #1141），
+		# result 是真值非列表时回退 friendList（Issue #1351）。
+		items = friend_list_page_items(platform_data)
 
 		# 时间筛选阈值
 		cutoff_ts = None
@@ -91,7 +122,12 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 				last_time_str = _format_ts(last_ts)
 			else:
 				last_time_str = item.get("lastTime", "-")
-			last_message_info = item.get("lastMessageInfo") or {}
+			# lastMessageInfo 是对象；平台字段漂移成非空字符串 / 数组 / 数字时
+			# `.get` 会抛 AttributeError，状态的缺失语义本就是「未知」，按缺失处理
+			# （Issue #1317）。
+			last_message_info = item.get("lastMessageInfo")
+			if not isinstance(last_message_info, dict):
+				last_message_info = {}
 			message_status = last_message_info.get("status")
 			msg_status_label = _MSG_STATUS_LABELS.get(int_code(message_status), "未知")
 			return {
@@ -116,8 +152,14 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 		all_friends = [_friend_record(item) for item in items]
 
 		def _matches_filter(friend: dict[str, Any]) -> bool:
+			# 快照里的 last_ts 只认真正的整数：旧格式 / 手工改过的快照可能是
+			# 字符串，与 float 比较会抛 TypeError 打断整次导出（Issue #1317）。
+			# 与 chat_snapshot._unread_count 的 unread 同口径，漂移值按 0（未知）处理。
+			last_ts = friend.get("last_ts")
+			if type(last_ts) is not int:
+				last_ts = 0
 			return (
-				(not cutoff_ts or not friend.get("last_ts") or friend["last_ts"] >= cutoff_ts)
+				(not cutoff_ts or not last_ts or last_ts >= cutoff_ts)
 				and (relation_label is None or friend.get("initiated_by", "未知") == relation_label)
 			)
 
@@ -155,7 +197,7 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 			content = render_export(friends, export_fmt, from_who, days, diff_result)
 
 			# 未指定 -o 时，自动生成默认路径（日期命名，同天覆盖）
-			if not output_path:
+			if output_path is None:
 				today = datetime.date.today().isoformat()
 				# 优先读 config 中的 export_dir，否则 fallback 到 data_dir/chat-export
 				export_dir = ctx.obj.get("config", {}).get("export_dir")
@@ -269,7 +311,12 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 
 def _format_ts(ts_ms: int) -> str:
 	"""将毫秒时间戳格式化为可读日期（使用本地时区）"""
-	dt = datetime.datetime.fromtimestamp(ts_ms / 1000, tz=datetime.timezone.utc).astimezone()
+	dt = safe_local_time(ts_ms, tz=datetime.timezone.utc)
+	if dt is None:
+		# 越界 / 非有限时间戳只是展示信息：按「无时间」输出，不让整条命令
+		# 落成可重试的 NETWORK_ERROR（Issue #1295）。
+		return "-"
+	dt = dt.astimezone()
 	now = datetime.datetime.now(tz=datetime.timezone.utc).astimezone()
 	if dt.date() == now.date():
 		return dt.strftime("今天 %H:%M")

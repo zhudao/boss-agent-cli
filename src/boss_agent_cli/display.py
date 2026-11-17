@@ -7,6 +7,7 @@ Pipe mode (Agent): JSON envelope to stdout.
 
 import datetime
 import re
+import sqlite3
 import sys
 import threading
 from collections.abc import Mapping, Sequence
@@ -15,11 +16,13 @@ from typing import Any, Callable
 
 import click
 from rich.console import Console
+from rich.errors import MarkupError
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
-from boss_agent_cli.cache.store import CacheBusyError, is_cache_busy_error
+from boss_agent_cli.api._base_client import PlatformResponseInvalid
+from boss_agent_cli.cache.store import CacheBusyError, CacheDatabaseInvalid, is_cache_busy_error
 from boss_agent_cli.output import emit_success, is_local_io_error, redact_sensitive_text
 from boss_agent_cli.schema.error_codes import ERROR_CODES
 from boss_agent_cli.services.browser_runtime import (
@@ -44,6 +47,21 @@ def escape_markup(value: Any) -> str:
 
 
 _SHELL_METACHARACTERS = frozenset("'\"`$\\!*?[]{}()<>|&;#")
+
+
+def open_file_command(path: str) -> str:
+	"""返回按当前平台打开本地文件的命令（Issue #1441）。
+
+	``hints.next_actions`` 是给 Agent 直接执行的通道；``open`` 只在 macOS 存在，
+	Windows / Linux 上会 command not found。Windows 用 ``cmd /c start``（cmd 与
+	PowerShell 都能调用），其余 Unix 用 ``xdg-open``。
+	"""
+	quoted = shell_argument(path)
+	if sys.platform == "darwin":
+		return f"open {quoted}"
+	if sys.platform.startswith("win"):
+		return f'cmd /c start "" {quoted}'
+	return f"xdg-open {quoted}"
 
 
 def shell_argument(value: str) -> str:
@@ -105,6 +123,12 @@ def show_command_for_ctx(ctx: Any, *, index_saved: bool) -> str | None:
 def login_action_for_ctx(ctx: Any) -> str:
 	"""登录恢复使用原平台与数据目录，避免登录后原命令仍无会话。"""
 	return boss_command_for_ctx(ctx, "login", include_data_dir=True)
+
+
+def contact_refresh_command_for_ctx(ctx: Any) -> str:
+	"""CONTACT_NOT_FOUND 的后继命令：招聘者刷新 hr chat，求职者刷新 chat。"""
+	command = "hr chat" if ctx and getattr(ctx, "obj", None) and ctx.obj.get("role") == "recruiter" else "chat"
+	return boss_command_for_ctx(ctx, command, include_data_dir=True)
 
 
 def auth_required_hints(ctx: Any) -> dict[str, list[str]]:
@@ -194,7 +218,10 @@ def registry_recovery_for_ctx(ctx: Any, text: str) -> str:
 		return text
 
 	def command_for(command: str) -> str:
-		return boss_command_for_ctx(ctx, command, include_data_dir=True)
+		# agent 命令不在 hr 组下：恢复命令必须显式带角色，否则会读另一套本地
+		# 状态，与同信封的 next_actions 也不一致（Issue #1524）。
+		role = "recruiter" if command.startswith("agent ") else None
+		return boss_command_for_ctx(ctx, command, include_data_dir=True, role=role)
 
 	return rewrite_command_examples(text, _REGISTRY_COMMANDS, command_for)
 
@@ -219,18 +246,33 @@ def platform_error_contract(
 	ctx: Any = None,
 	clean_command: str | None = None,
 	doctor_command: str | None = None,
+	read_only: bool = False,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
 	"""Return ``(recoverable, recovery_action, hints)`` for a platform error code.
+
+	``read_only`` 标记产生该响应的平台调用不产生写入：未识别的响应只说明
+	读取失败，按 ``NETWORK_ERROR`` 让 Agent 安全重试，而不是沿用写操作的
+	「先核对官方页面、勿重试」契约（Issue #1519）。未知命令默认按写处理。
 
 	风控码的恢复指引与 ``next_actions`` 一律以 ``RISK_ERROR_CONTRACTS`` 为准，
 	避免各命令手工拼装出互相矛盾的停止指令。有运行上下文的调用方传入 ``ctx``：
 	风险锁写在 ``<data_dir>/.cdp_risk_lock``，裸 ``boss clean --risk-lock`` 会去
 	默认目录解锁，自定义目录的锁原样保留且命令不报错（Issue #978）。
+
+	CONTACT_NOT_FOUND 是确定性结果：``next_actions`` 指向同一数据目录刷新沟通
+	列表（招聘者 ``hr chat`` / 求职者 ``chat``），不重放原命令（Issue #1485）。
 	"""
+	if code == "UNKNOWN" and read_only:
+		code = "NETWORK_ERROR"
 	recoverable, recovery_action = error_contract_for_code(code)
 	if code in RISK_ERROR_CONTRACTS:
 		recovery_action, hints = risk_error_contract(code, ctx=ctx, clean_command=clean_command, doctor_command=doctor_command)
 		return recoverable, recovery_action, hints
+	if code == "CONTACT_NOT_FOUND":
+		# friend_id 写错或联系人已变化是确定性结果：给出去同一数据目录刷新沟通
+		# 列表的下一步，而不是让 Agent 重放同一条命令或让用户提 issue（#1485）。
+		chat_command = contact_refresh_command_for_ctx(ctx)
+		return recoverable, f"用 {chat_command} 核对联系人标识后重试", {"next_actions": [chat_command]}
 	if recovery_action:
 		# 登记表是通用示例；诊断类命令（doctor / crawl status / resume list）读的
 		# 是本次运行的数据目录（Issue #1092）。
@@ -361,8 +403,13 @@ def handle_error_output(
 	recovery_action: str | None = None,
 	details: dict[str, Any] | None = None,
 	hints: dict[str, Any] | None = None,
+	data: Any = None,
 ) -> None:
-	"""Smart error output: TTY -> rich error, pipe -> JSON error envelope."""
+	"""Smart error output: TTY -> rich error, pipe -> JSON error envelope.
+
+	``data`` 只用于「部分完成」的失败：批量删除等操作需要把已完成项和失败项
+	带回给调用方，而不是只留 ``data=null``（Issue #1497）。默认仍是 None。
+	"""
 	from boss_agent_cli.output import emit_error
 
 	# 调用方未显式声明时按登记表补齐，TTY 与 JSON 两条路径看到同一份恢复契约。
@@ -402,6 +449,7 @@ def handle_error_output(
 			recovery_action=recovery_action,
 			details=details,
 			hints=hints,
+			data=data,
 		)
 	else:
 		# JSON 路径由 output.py 脱敏；TTY 分支同样不能把异常文本里的凭据
@@ -430,6 +478,49 @@ def handle_not_supported(ctx: Any, command: str, exc: Exception, *, fallback_mes
 	)
 
 
+#: 不产生平台写入的命令（``handle_platform_error_output`` 的 ``command`` 取值）。
+#: 只用于区分未识别响应的恢复语义：在集合内按 ``NETWORK_ERROR`` 允许重试；
+#: 不在集合内（包括未来新增命令）一律按写处理，绝不告诉 Agent 重放可能已生效的写操作。
+_READ_ONLY_COMMANDS = frozenset({
+	"chat",
+	"chat-summary",
+	"chatmsg",
+	"digest",
+	"export",
+	"favorites-list",
+	"follow-up",
+	"history",
+	"interviews",
+	"me",
+	"pipeline",
+	"recommend",
+	"recruiter-applications",
+	"recruiter-candidates",
+	"recruiter-chat",
+	"recruiter-chatmsg",
+	"recruiter-jobs-detail",
+	"recruiter-jobs-list",
+	"recruiter-last-messages",
+	"recruiter-recommendations",
+	"recruiter-resume",
+	"recruiter-whoami",
+	"search",
+	"show",
+	"status",
+	"watch",
+})
+
+
+def read_only_platform_code(command: str, code: str) -> str:
+	"""只读命令的未识别响应按 ``NETWORK_ERROR`` 归一（Issue #1519）。
+
+	写命令与未知命令保持 ``UNKNOWN``：响应无法证明动作没有生效，重试就是重放。
+	"""
+	if code == "UNKNOWN" and command in _READ_ONLY_COMMANDS:
+		return "NETWORK_ERROR"
+	return code
+
+
 def handle_platform_error_output(
 	ctx: Any,
 	command: str,
@@ -448,7 +539,9 @@ def handle_platform_error_output(
 	（Issue #990）。
 	"""
 	code, message = platform.parse_error(response)
-	recoverable, recovery_action, risk_hints = platform_error_contract(code, ctx=ctx)
+	read_only = command in _READ_ONLY_COMMANDS
+	code = read_only_platform_code(command, code)
+	recoverable, recovery_action, risk_hints = platform_error_contract(code, ctx=ctx, read_only=read_only)
 	hints = {**(extra_hints or {}), **(risk_hints or {})} or None
 	details = None
 	if isinstance(response, dict):
@@ -494,7 +587,8 @@ def render_job_table(
 		console.print("[yellow]no results[/yellow]")
 		return
 
-	table = Table(title=f"{title} ({len(items)} results)", show_lines=True)
+	# title 可能含外部输入（搜索词等）：整个标题按字面渲染，后缀是代码自己的文本。
+	table = Table(title=f"{escape_markup(title)} ({len(items)} results)", show_lines=True)
 	table.add_column("#", style="dim", width=3)
 	table.add_column("title", style="bold cyan", max_width=30)
 	table.add_column("company", style="green", max_width=20)
@@ -626,10 +720,11 @@ def render_simple_list(
 	columns: list of (header, dict_key, style)
 	"""
 	if not items:
-		console.print(f"[yellow]no {title}[/yellow]")
+		console.print(f"[yellow]no {escape_markup(title)}[/yellow]")
 		return
 
-	table = Table(title=f"{title} ({len(items)})", show_lines=True)
+	# title 可能含外部输入（联系人名、配置路径等）：整个标题按字面渲染。
+	table = Table(title=f"{escape_markup(title)} ({len(items)})", show_lines=True)
 	table.add_column("#", style="dim", width=3)
 	for header, _, style in columns:
 		table.add_column(header, style=style, max_width=25)
@@ -698,10 +793,11 @@ def render_sectioned_record(data: dict[str, Any], *, title: str = "info") -> Non
 def render_string_grid(items: list[str], title: str, *, columns: int = 4) -> None:
 	"""Render a list of strings as a multi-column grid."""
 	if not items:
-		console.print(f"[yellow]no {title}[/yellow]")
+		console.print(f"[yellow]no {escape_markup(title)}[/yellow]")
 		return
 
-	table = Table(title=f"{title} ({len(items)})", show_header=False)
+	# title 可能含外部输入：整个标题按字面渲染。
+	table = Table(title=f"{escape_markup(title)} ({len(items)})", show_header=False)
 	for _ in range(columns):
 		table.add_column(max_width=20)
 
@@ -904,24 +1000,28 @@ class SearchProgress:
 RISK_ERROR_CONTRACTS: dict[str, dict[str, Any]] = {
 	"ACCOUNT_RISK": {
 		"recovery_action": ERROR_CODES["ACCOUNT_RISK"]["recovery_action"],
-		"next_actions": [
+		# next_actions 只放可执行命令；真人说明放 operator_actions，TTY 只渲染后者
+		# （Issue #1522）。
+		"next_actions": ["boss doctor"],
+		"operator_actions": [
 			"不要通过 CDP、patchright 或其他通道重试该操作",
 			"锁未解除时只使用本地辅助和离线状态命令；官方目标业务页恢复后由用户显式清除本地锁",
 		],
 	},
 	"ENVIRONMENT_RISK": {
 		"recovery_action": ERROR_CODES["ENVIRONMENT_RISK"]["recovery_action"],
-		"next_actions": [
+		"next_actions": ["boss doctor"],
+		"operator_actions": [
 			"不要刷新 Token、重新登录或自动重试该请求",
 			"由用户在原会话确认官方目标业务页恢复后，显式清除本地锁并恢复任务",
 		],
 	},
 	"ENVIRONMENT_RISK_LOCKED": {
 		"recovery_action": ERROR_CODES["ENVIRONMENT_RISK_LOCKED"]["recovery_action"],
-		"next_actions": [
+		"next_actions": ["boss doctor"],
+		"operator_actions": [
 			"不要刷新 Token、重新登录或换通道重试；本次请求未发出",
 			"由用户在原会话确认官方目标业务页恢复后，执行 boss clean --risk-lock 并显式恢复任务；令牌变化不放行",
-			"boss doctor",
 		],
 	},
 }
@@ -977,9 +1077,31 @@ def risk_error_contract(
 			"next_actions": [
 				_risk_contract_commands(str(item), clean_command, doctor_command)
 				for item in spec["next_actions"]
-			]
+			],
+			"operator_actions": [
+				_risk_contract_commands(str(item), clean_command, doctor_command)
+				for item in spec["operator_actions"]
+			],
 		},
 	)
+
+
+def risk_lock_persistence_actions(details: dict[str, Any] | None) -> list[str]:
+	"""风险锁未能写盘时，补充「只在当前进程生效」的操作者提示（Issue #1270）。
+
+	主锁与 group 目录的锁都写失败时，同进程后续请求仍被内存里的锁拦住，但进程
+	退出后新进程读不到任何锁，会以为没有风控阻断。信封必须在 `persisted: false`
+	时把这件事讲清楚，而不是只给普通的风控恢复指引。
+	"""
+	if not isinstance(details, dict):
+		return []
+	lock = details.get("risk_lock")
+	if not isinstance(lock, dict) or lock.get("persisted") is not False:
+		return []
+	return [
+		"本地风险锁未能写入磁盘：当前进程退出后，新的 boss 进程不会再被这把锁阻止；"
+		"先修复数据目录的写权限与磁盘空间，在确认平台已恢复前不要启动新的 boss 进程",
+	]
 
 
 #: 浏览器来源策略表里的命令默认示例。有运行上下文时由调用方替换成带
@@ -1039,7 +1161,19 @@ def _with_httpx_only_hint(ctx: Any, hints: dict[str, list[str]] | None) -> dict[
 
 # 解析平台数据或 CLI 自身的缺陷：同样的输入必然得到同样的结果。归为 NETWORK_ERROR
 # 并建议「重试」会让 Agent 反复重试，重试的若是平台请求，还会白白消耗请求预算。
-INTERNAL_ERROR_TYPES: tuple[type[Exception], ...] = (TypeError, AttributeError, KeyError, IndexError, OverflowError)
+# PlatformResponseInvalid：平台响应不是 JSON 对象，或深嵌套让 resp.json() 抛
+# RecursionError；同一响应重试必然复现，按 INTERNAL_ERROR（不可恢复）上报（Issue #1368）。
+# MarkupError：Rich 标记解析失败（漏转义的外部字符串进了渲染器）。同一输入必然
+# 复现，且这是 CLI 自身的转义缺陷，不能兜成可重试的网络错误（Issue #1399）。
+INTERNAL_ERROR_TYPES: tuple[type[Exception], ...] = (
+	TypeError,
+	AttributeError,
+	KeyError,
+	IndexError,
+	OverflowError,
+	PlatformResponseInvalid,
+	MarkupError,
+)
 
 
 def _handle_cache_busy_error(ctx: Any, command_name: str, message: str) -> None:
@@ -1068,10 +1202,15 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 	def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
 		@wraps(func)
 		def wrapper(ctx: Any, *args: Any, **kwargs: Any) -> Any:
-			from boss_agent_cli.api.browser_client import BrowserNavigationError, RecruiterChatTabRequired
+			from boss_agent_cli.api.browser_client import (
+				BrowserNavigationError,
+				ChatTabCdpUnreachable,
+				RecruiterChatTabRequired,
+			)
 			from boss_agent_cli.api._base_client import BrowserChannelRequired
 			from boss_agent_cli.api.browser_source import BrowserSourceUnavailable, BrowserSourceUnsupported
 			from boss_agent_cli.api.client import PlatformRiskError
+			from boss_agent_cli.api.proxy import ProxyConfigurationError
 			from boss_agent_cli.api.request_budget import RequestBudgetExceeded
 			from boss_agent_cli.auth.manager import AuthRequired, TokenRefreshFailed
 
@@ -1131,6 +1270,24 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 						]
 					},
 				)
+			except ChatTabCdpUnreachable as e:
+				# CDP HTTP 端点在脚本发送前就不可达：动作未派发，可安全重试。
+				# 不能落成 ACTION_UNCONFIRMED（Issue #1455）。
+				cdp_recoverable, cdp_recovery = error_contract_for_code("CDP_UNAVAILABLE")
+				handle_error_output(
+					ctx,
+					command_name,
+					code="CDP_UNAVAILABLE",
+					message=f"CDP 调试端点不可达，聊天页动作尚未发送: {e}",
+					recoverable=cdp_recoverable,
+					recovery_action=cdp_recovery,
+					hints={
+						"operator_actions": [
+							"确认 Chrome 仍以调试端口运行，且 --cdp-url 指向的地址可访问后重试",
+							"本次操作没有发送，重新执行是安全的",
+						]
+					},
+				)
 			except RecruiterChatTabRequired as e:
 				handle_error_output(
 					ctx,
@@ -1169,7 +1326,18 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					hints=auth_required_hints(ctx),
 				)
 			except PlatformRiskError as e:
-				recovery_action, hints = risk_error_contract(e.code, ctx=ctx)
+				recovery_action, contract_hints = risk_error_contract(e.code, ctx=ctx)
+				# _with_httpx_only_hint 可能返回 None：显式声明可空，避免覆盖既有变量类型。
+				risk_hints: dict[str, list[str]] | None = _with_httpx_only_hint(ctx, contract_hints)
+				persistence_actions = risk_lock_persistence_actions(e.details)
+				if persistence_actions:
+					risk_hints = {
+						**(risk_hints or {}),
+						"operator_actions": [
+							*((risk_hints or {}).get("operator_actions") or []),
+							*persistence_actions,
+						],
+					}
 				handle_error_output(
 					ctx,
 					command_name,
@@ -1179,10 +1347,50 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					recoverable=False,
 					recovery_action=recovery_action,
 					details=e.details or None,
-					hints=_with_httpx_only_hint(ctx, hints),
+					hints=risk_hints,
+				)
+			except ProxyConfigurationError as e:
+				# 代理环境变量非法是确定性配置错误：重试只会复现，且不能静默回退
+				# 直连（出口泄露）。按 INVALID_PARAM 收口，不动网络重试语义
+				# （Issue #1423）。文案由 typed error 提供，不含代理凭据。
+				invalid_recoverable, invalid_recovery = error_contract_for_code(
+					"INVALID_PARAM",
+					fallback_recovery_action="修正或清除 HTTPS_PROXY/ALL_PROXY 等代理环境变量后重试",
+				)
+				handle_error_output(
+					ctx,
+					command_name,
+					code="INVALID_PARAM",
+					message=str(e),
+					recoverable=invalid_recoverable,
+					recovery_action=invalid_recovery,
+					hints={
+						"operator_actions": [
+							"确认 HTTPS_PROXY / ALL_PROXY 形如 scheme://host:port，端口为 1-65535 的整数",
+							"不使用代理时请清除对应环境变量；CLI 不会回退为直连",
+						]
+					},
 				)
 			except RequestBudgetExceeded as e:
 				budget_recoverable, budget_recovery = error_contract_for_code(e.code)
+				if e.code == "CIRCUIT_BREAKER_OPEN":
+					# 熔断不是预算冷却：恢复指引指向 agent stats / --resume（Issue #1520）。
+					stats_command = boss_command_for_ctx(
+						ctx, "agent stats", include_data_dir=True, role="recruiter"
+					)
+					resume_command = boss_command_for_ctx(
+						ctx, "agent run --resume", include_data_dir=True, role="recruiter"
+					)
+					budget_hints: dict[str, Any] | None = {
+						"next_actions": [stats_command],
+						"operator_actions": [
+							f"先到官方页面核实未确认动作；确认后执行 {resume_command} 显式恢复",
+						],
+					}
+				else:
+					budget_hints = _with_httpx_only_hint(
+						ctx, {"operator_actions": ["等待冷却并检查并发任务；确认后显式恢复，不自动清理风险锁"]}
+					)
 				handle_error_output(
 					ctx,
 					command_name,
@@ -1191,9 +1399,7 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					recoverable=budget_recoverable,
 					recovery_action=budget_recovery,
 					details=e.details,
-					hints=_with_httpx_only_hint(
-						ctx, {"operator_actions": ["等待冷却并检查并发任务；确认后显式恢复，不自动清理风险锁"]}
-					),
+					hints=budget_hints,
 				)
 			except BrowserNavigationError as e:
 				nav_recoverable, nav_recovery = error_contract_for_code(e.code)
@@ -1215,6 +1421,21 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 							"首页在自动化下偶发加载卡住，CLI 已跳到空白页并重试。仍失败时，用带调试端口的 Chrome 打开官网并确认首页能加载，再执行 boss --cdp-url http://127.0.0.1:9222 <命令>",
 							"若 boss status 显示登录态 degraded 或 stoken 很久未更新，先执行 boss login",
 						],
+					},
+				)
+			except CacheDatabaseInvalid as e:
+				# 缓存库损坏（含取数阶段才暴露的坏页）是确定性本地失败：给登记表的
+				# 「备份后删库」指引，不能兜成 NETWORK_ERROR +「重试」让 Agent 在
+				# 坏库上无限 resume（Issue #1350）。
+				handle_error_output(
+					ctx,
+					command_name,
+					code="CACHE_DATABASE_INVALID",
+					message=str(e),
+					hints={
+						"operator_actions": [
+							f"备份后删除 {e.path}；候选池、预设、watch 历史与任务断点都随旧库一起作废",
+						]
 					},
 				)
 			except INTERNAL_ERROR_TYPES as e:
@@ -1277,10 +1498,43 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					message = str(e) if isinstance(e, CacheBusyError) else f"本地缓存库正被其他进程写入（{e}）"
 					_handle_cache_busy_error(ctx, command_name, message)
 					return
+				# 本地 SQLite 文件损坏 / 被同名目录占位是确定性失败：非装饰器命令
+				# 已由 BossCliGroup 报 LOCAL_IO_ERROR（Issue #1304），装饰器命令不能
+				# 兜成 NETWORK_ERROR +「重试」（Issue #1336）。请求预算库只保存节流
+				# 元数据，可删除重建；缓存库给出登记表里的通用本地 IO 指引。
+				if isinstance(e, sqlite3.DatabaseError):
+					io_recoverable, io_recovery = error_contract_for_code("LOCAL_IO_ERROR")
+					db_recovery_action = (
+						"备份后删除 request-budget.sqlite3 再重试；该文件只保存请求节流元数据，会自动重建"
+						if "request-budget.sqlite3" in str(e)
+						else io_recovery
+					)
+					handle_error_output(
+						ctx,
+						command_name,
+						code="LOCAL_IO_ERROR",
+						message=f"{command_name} 本地数据库文件无法打开: {e}",
+						recoverable=io_recoverable,
+						recovery_action=db_recovery_action,
+					)
+					return
 				# 内核缺失是确定性失败：符号名 / 路径未变时重试永远同一结果，不能
 				# 兜成 NETWORK_ERROR +「重试」让 Agent 反复打平台。
 				if is_browser_kernel_missing(str(e)):
 					handle_browser_kernel_missing(ctx, command_name, e)
+					return
+				# 孤立代理字符等不可编码 / 不可解码的本地文本是确定性失败：
+				# 重试只会复现，不能兜成 NETWORK_ERROR +「重试」（Issue #1294）。
+				if isinstance(e, UnicodeError):
+					encode_recoverable, encode_recovery = error_contract_for_code("LOCAL_IO_ERROR")
+					handle_error_output(
+						ctx,
+						command_name,
+						code="LOCAL_IO_ERROR",
+						message=f"{command_name} 处理本地文本失败: {e}",
+						recoverable=encode_recoverable,
+						recovery_action=encode_recovery,
+					)
 					return
 				handle_error_output(
 					ctx,

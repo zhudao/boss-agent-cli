@@ -27,7 +27,7 @@ from boss_agent_cli.api.browser_source import (
 	BrowserSourceUnavailable,
 	resolve_policy,
 )
-from boss_agent_cli.api.proxy import WEBRTC_LEAK_GUARD_ARGS, resolve_proxy
+from boss_agent_cli.api.proxy import WEBRTC_LEAK_GUARD_ARGS, ProxyConfigurationError, resolve_proxy
 from boss_agent_cli.api.browser_urls import DEFAULT_CDP_URL, is_zhipin_url
 from boss_agent_cli.api.endpoints_loader import EndpointSpec, endpoint_for_request
 from boss_agent_cli.api.httpx_helpers import new_trace_id
@@ -88,6 +88,14 @@ class BrowserNavigationError(RuntimeError):
 		if cause_text:
 			payload["cause"] = cause_text
 		return payload
+
+
+class ChatTabCdpUnreachable(RuntimeError):
+	"""CDP HTTP 端点不可达，聊天页脚本尚未发送。
+
+	与「动作已发出、结果未知」严格区分：此时回复 / 交换联系方式没有产生任何
+	平台写入，可以安全重试，不能报 ACTION_UNCONFIRMED（Issue #1455）。
+	"""
 
 
 class RecruiterChatTabRequired(RuntimeError):
@@ -621,7 +629,10 @@ class BrowserSession:
 			return True
 		except Exception as error:
 			self._close_browser_quietly()
-			if is_request_stop(error):
+			# 代理环境变量非法是确定性配置错误：换下一个 CDP 候选或降级通道
+			# 只会用同一份坏配置再失败一次，还可能让操作者以为「CDP 不可用」。
+			# 原样上抛，由命令层统一映射 INVALID_PARAM（Issue #1423）。
+			if is_request_stop(error) or isinstance(error, ProxyConfigurationError):
 				raise
 			return False
 
@@ -649,7 +660,8 @@ class BrowserSession:
 			if not isinstance(payload, dict):
 				return None
 			return cast("str | None", payload.get("webSocketDebuggerUrl"))
-		except (httpx.HTTPError, ValueError, KeyError):
+		# RecursionError：极深嵌套的探测响应与无效 JSON 一样按「拿不到 WS 地址」处理。
+		except (httpx.HTTPError, ValueError, KeyError, RecursionError):
 			return None
 
 	@staticmethod
@@ -797,11 +809,9 @@ class BrowserSession:
 			try:
 				self._page.wait_for_load_state("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
 			except Exception:
-				return {
-					"code": -1,
-					"message": "页面在请求期间发生导航且未在超时内就绪，无法发起请求；请稍后重试",
-					"zpData": {},
-				}
+				# 读取没有副作用，且本次请求尚未发出：按可安全重放的中断收口，
+				# 不能返回裸 code -1 让信封落到 UNKNOWN +「勿重试」（Issue #1458）。
+				return self._interrupted_request_response(endpoint)
 			self._page_ready = True
 			self._raise_if_security_page()
 			result = self._send_fetch(payload, endpoint)
@@ -1034,13 +1044,21 @@ def _pick_chat_target_ws(cdp_http_url: str) -> str:
 		with urllib.request.urlopen(list_url, timeout=3) as resp:
 			tabs = _json.load(resp)
 	except Exception as exc:
-		raise RuntimeError(f"cannot reach CDP at {list_url}: {exc}") from exc
+		raise ChatTabCdpUnreachable(f"cannot reach CDP at {list_url}: {exc}") from exc
 
-	for t in tabs:
-		if t.get("type") == "page" and is_zhipin_url(t.get("url", "")) and "/web/chat/index" in t.get("url", ""):
+	# /json 的容器漂移（对象而非数组、数组混入非对象元素）必须在打开
+	# WebSocket 之前收口：AttributeError 会被聊天动作执行器的宽泛捕获当成
+	# 「动作已发出、结果未知」，而实际上脚本还没开始执行（Issue #1424）。
+	for t in tabs if isinstance(tabs, list) else ():
+		if not isinstance(t, dict):
+			continue
+		url = t.get("url")
+		if t.get("type") != "page" or not isinstance(url, str):
+			continue
+		if is_zhipin_url(url) and "/web/chat/index" in url:
 			target_ws = t.get("webSocketDebuggerUrl")
-			if target_ws:
-				return cast("str", target_ws)
+			if isinstance(target_ws, str) and target_ws:
+				return target_ws
 	raise RecruiterChatTabRequired()
 
 
@@ -1220,7 +1238,9 @@ class _PageRiskResponseTracker:
 					return None
 			try:
 				data = json.loads(body)
-			except ValueError:
+			# RecursionError：平台响应正文深嵌套时同样无法解析，按非 JSON 正文
+			# 处理，不能让观测线程整个崩掉（Issue #1368）。
+			except (ValueError, RecursionError):
 				# JSON 内的普通说明即使包含 HTML 验证标题，也不是安全页。
 				page_risk = platform_risk_page_response(content_type="text/html", body=body)
 				if page_risk is not None:

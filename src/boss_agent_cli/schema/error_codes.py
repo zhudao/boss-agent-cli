@@ -40,6 +40,16 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"recoverable": False,
 		"recovery_action": "不要自动重试：确认目标路径是可写目录（而不是同名的已有文件）、目录权限与磁盘空间正常，修正后再执行",
 	},
+	"AUTOMATION_BUSY": {
+		"message": "招聘自动化控制锁正被其他进程占用",
+		"recoverable": True,
+		"recovery_action": "本次操作没有生效：等待占用 automation/.control-lock.sqlite3 的其他 boss 命令结束后重试；可先用 boss agent stats 查看当前状态。锁文件本身完好，不需要删除",
+	},
+	"AUTOMATION_RUN_BUSY": {
+		"message": "招聘自动化正在由另一进程执行，本次调用未发出任何请求",
+		"recoverable": True,
+		"recovery_action": "等待另一个 boss agent run 结束后重试；可先用 boss agent stats 查看当前状态。不要并发运行同一数据目录",
+	},
 	"AUTOMATION_STATE_INVALID": {
 		"message": "招聘自动化状态文件损坏",
 		"recoverable": True,
@@ -281,6 +291,11 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"message": "同一 crawl run 正在由另一次调用执行，本次调用未发出任何请求",
 		"recoverable": True,
 		"recovery_action": "boss crawl status <run_id> 查看进度，等当前执行结束后再恢复；不要并发恢复同一个 run_id",
+	},
+	"CRAWL_PROFILE_BUSY": {
+		"message": "采集配置目录正被另一个运行中的采集 Chrome 使用，本次调用未发出任何请求",
+		"recoverable": True,
+		"recovery_action": "boss crawl status <run_id> 查看正在运行的采集，等它结束后再启动或恢复；不要并发使用同一数据目录的采集浏览器，也不要删除 SingletonLock",
 	},
 	"CRAWL_NOT_COMPLETED": {
 		"message": "crawl 尚未完成，Agent 不会导入不完整结果",

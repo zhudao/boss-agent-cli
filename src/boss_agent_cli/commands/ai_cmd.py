@@ -9,7 +9,16 @@ from typing import Any, cast
 
 import click
 
-from boss_agent_cli.ai.config import AIConfigStore, PROVIDER_BASE_URLS, provider_endpoint
+from boss_agent_cli.ai.config import (
+	AIConfigStore,
+	AIConfigValueError,
+	PROVIDER_BASE_URLS,
+	ai_float_setting,
+	ai_int_setting,
+	ai_text_setting,
+	normalize_base_url,
+	provider_endpoint,
+)
 from boss_agent_cli.ai.prompts import (
 	CHAT_COACH_PROMPT,
 	CHAT_REPLY_PROMPT,
@@ -50,27 +59,62 @@ def _hint_command(ctx: click.Context, command: str) -> str:
 
 
 def _create_ai_service(ctx: click.Context) -> AIService | None:
-	"""从配置创建 AIService 实例，未配置时返回 None。"""
+	"""从配置创建 AIService 实例，未配置时返回 None。
+
+	数值项在构造前统一校验：``ai_temperature`` / ``ai_max_tokens`` 被写成
+	字符串或数组时，坏值会被原样塞进请求 payload、由服务商返回 400，调用方
+	只看到泛化的平台错误（Issue #1209）。``ValueError`` 由调用方映射成
+	``INVALID_PARAM`` 与修复命令，不能兜成可重试的网络错误。
+	"""
 	store = _get_ai_config_store(ctx)
 	if not store.is_configured():
 		return None
 	config = store.load_config()
 	api_key = store.get_api_key()
-	base_url = store.get_base_url()
+	# 字符串项同样要在构造前校验（Issue #1428、#1431）：``ai_model`` 漂移成数组 /
+	# 数字会让服务层 ``rsplit`` 崩溃，``ai_base_url`` 写成空白串或非 URL 会让
+	# httpx 抛 UnsupportedProtocol，两者都被兜成与真实原因无关的错误。
+	model = ai_text_setting(config, "ai_model") or ""
+	if not model.strip():
+		raise AIConfigValueError(
+			"AI 配置项 ai_model 未设置或为空",
+			recovery_hint="ai config --model <model>",
+		)
+	provider = ai_text_setting(config, "ai_provider")
+	raw_base_url = ai_text_setting(config, "ai_base_url")
+	base_url = normalize_base_url(raw_base_url) if raw_base_url is not None else None
+	base_url = provider_endpoint(provider, base_url)
 	if not api_key or not base_url:
 		return None
+	temperature = ai_float_setting(config, "ai_temperature", 0.7)
+	max_tokens = ai_int_setting(config, "ai_max_tokens", 4096)
 	return AIService(
 		base_url=base_url,
 		api_key=api_key,
-		model=config["ai_model"],
-		temperature=config.get("ai_temperature", 0.7),
-		max_tokens=config.get("ai_max_tokens", 4096),
+		model=model,
+		temperature=temperature,
+		max_tokens=max_tokens,
 	)
 
 
 def _require_ai_service(ctx: click.Context) -> AIService | None:
 	"""获取 AIService，未配置时输出错误信封并返回 None。"""
-	svc = _create_ai_service(ctx)
+	try:
+		svc = _create_ai_service(ctx)
+	except ValueError as exc:
+		# 本地配置坏值：重试同一条命令必然复现，给 INVALID_PARAM 与修复命令，
+		# 不能落成可重试的 NETWORK_ERROR（Issue #1209）。字符串项自带更贴题的
+		# 修复子命令（Issue #1428、#1431），数值项沿用冒烟提示。
+		hint = getattr(exc, "recovery_hint", None) or "ai config --max-tokens 4096 --temperature 0.7"
+		handle_error_output(
+			ctx, "ai",
+			code="INVALID_PARAM",
+			message=f"本地 AI 配置损坏：{exc}",
+			recoverable=True,
+			recovery_action=_hint_command(ctx, hint),
+		)
+		ctx.exit(1)
+		return None
 	if svc is None:
 		# provider / model / api_key 都在、只缺端点时，笼统的「AI 服务未配置」会把人
 		# 引去重填 key；真正要改的是 provider 名或补 base_url。
@@ -98,18 +142,50 @@ def _require_ai_service(ctx: click.Context) -> AIService | None:
 
 
 def _load_resume_text(ctx: click.Context, resume_name: str) -> str | None:
-	"""加载简历纯文本，不存在时输出错误。"""
-	store = _get_resume_store(ctx)
-	resume = store.get(resume_name)
-	if resume is None:
+	"""加载简历纯文本；不存在、文件损坏或名称为空时输出对应错误。
+
+	损坏与缺失必须分开报：坏文件不报 ``RESUME_NOT_FOUND``，否则 Agent 照
+	``resume list`` 只看得到空列表、``resume init`` 又被同名文件挡住
+	（``RESUME_ALREADY_EXISTS``），恢复链断在这里（Issue #1369）。
+	"""
+	if not resume_name.strip():
+		list_cmd = _hint_command(ctx, "resume list")
 		handle_error_output(
-			ctx, "ai",
-			code="RESUME_NOT_FOUND",
-			message=f"简历 '{resume_name}' 不存在",
+			ctx,
+			"ai",
+			code="INVALID_PARAM",
+			message="简历名称不能为空",
+			recovery_action=f"补上简历名称后重试；用 {list_cmd} 查看已有简历",
+			hints={"next_actions": [list_cmd]},
 		)
 		ctx.exit(1)
 		return None
-	return resume_to_text(resume)
+	store = _get_resume_store(ctx)
+	resume, load_error = store.get_with_error(resume_name)
+	if resume is not None:
+		return resume_to_text(resume)
+	if load_error is not None:
+		delete_cmd = _hint_command(ctx, f"resume delete {shell_argument(resume_name)}")
+		handle_error_output(
+			ctx,
+			"ai",
+			code="RESUME_FILE_INVALID",
+			message=f"简历文件 '{resume_name}.json' 损坏：{load_error}",
+			recovery_action=(
+				f"修正 resumes/{resume_name}.json 的 JSON 内容后重试，"
+				f"或执行 {delete_cmd} 后重新创建；该文件只存在本机"
+			),
+			hints={"next_actions": [delete_cmd, _hint_command(ctx, "resume list")]},
+		)
+		ctx.exit(1)
+		return None
+	handle_error_output(
+		ctx, "ai",
+		code="RESUME_NOT_FOUND",
+		message=f"简历 '{resume_name}' 不存在",
+	)
+	ctx.exit(1)
+	return None
 
 
 def _read_text_argument(ctx: click.Context, value: str) -> str | None:
@@ -195,7 +271,8 @@ def _call_ai(ctx: click.Context, svc: AIService, prompt: str) -> dict[str, Any] 
 
 	try:
 		parsed = json.loads(text)
-	except json.JSONDecodeError:
+	# 超长整数（3.11+）与深嵌套同样是模型输出不可解析，走 AI_PARSE_ERROR 信封。
+	except (ValueError, RecursionError):
 		handle_error_output(
 			ctx, "ai",
 			code="AI_PARSE_ERROR",
@@ -269,20 +346,31 @@ def ai_group() -> None:
 @ai_group.command("config")
 @click.option("--provider", default=None, help="AI 提供商（openai/deepseek/moonshot/openrouter/qwen/zhipu/siliconflow/ollama/vllm/custom）")
 @click.option("--model", default=None, help="模型名称（如 gpt-4o / claude-sonnet-4.5 / deepseek-chat）")
-@click.option("--api-key", default=None, help="API 密钥（将加密存储）")
+@click.option("--api-key", default=None, help="API 密钥（将加密存储；空值会被拒绝，清除密钥请用 --clear-api-key）")
+@click.option("--clear-api-key", is_flag=True, default=False, help="删除已存储的 API 密钥（与 --api-key 互斥；没有密钥时也安全）")
 @click.option("--base-url", default=None, help="自定义 API 基础地址（provider=custom 或自建代理时使用）")
 @click.option("--temperature", default=None, type=click.FloatRange(min=0), help="生成温度")
 @click.option("--max-tokens", default=None, type=click.IntRange(min=1), help="最大令牌数")
 @click.pass_context
-def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, api_key: str | None, base_url: str | None, temperature: float | None, max_tokens: int | None) -> None:
+def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, api_key: str | None, clear_api_key: bool, base_url: str | None, temperature: float | None, max_tokens: int | None) -> None:
 	"""查看或设置 AI 服务配置"""
 	store = _get_ai_config_store(ctx)
 
-	# 无参数时显示当前配置
-	has_updates = any([provider, model, api_key, base_url, temperature is not None, max_tokens is not None])
+	# 无参数时显示当前配置。字符串项必须用 `is not None` 判断：`--model ""`
+	# 是显式传入的空值，按真值判断会退化成查看配置，悄悄吞掉调用方的意图
+	# （Issue #1499）。
+	has_updates = (
+		provider is not None
+		or model is not None
+		or api_key is not None
+		or clear_api_key
+		or base_url is not None
+		or temperature is not None
+		or max_tokens is not None
+	)
 	if not has_updates:
 		config = store.load_config()
-		config["api_key_set"] = store.get_api_key() is not None
+		config["api_key_set"] = store.api_key_is_set()
 		config.pop("ai_api_key", None)
 		# 回显解析后的实际端点：只设 --provider 时 ai_base_url 是空的，
 		# 真正生效的地址来自 PROVIDER_BASE_URLS 查表，用户此前无从确认。
@@ -302,6 +390,44 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 				_hint_command(ctx, "ai local configure --runtime ollama --model qwen3:14b"),
 			]},
 		)
+		return
+
+	# 所有校验都在任何写盘之前完成：显式空值绝不能落成空配置、更不能把已存
+	# 密钥覆盖成空串（Issue #1499）。
+	if api_key is not None and clear_api_key:
+		handle_error_output(
+			ctx, "ai-config",
+			code="INVALID_PARAM",
+			message="--api-key 与 --clear-api-key 不能同时使用",
+			recovery_action="设置新密钥用 --api-key <key>，清除已存密钥用 --clear-api-key，二选一",
+		)
+		ctx.exit(1)
+		return
+	if provider is not None and not provider.strip():
+		handle_error_output(
+			ctx, "ai-config",
+			code="INVALID_PARAM",
+			message="--provider 不能为空或只包含空白字符",
+			recovery_action="按 next_actions 传入已登记的 provider 后重试",
+			hints={"next_actions": [
+				_hint_command(ctx, "ai config --provider openai --model gpt-4o --api-key <key>"),
+				_hint_command(ctx, "ai config"),
+			]},
+		)
+		ctx.exit(1)
+		return
+	if api_key is not None and not api_key.strip():
+		handle_error_output(
+			ctx, "ai-config",
+			code="INVALID_PARAM",
+			message="--api-key 不能为空或只包含空白字符；如需清除已存密钥请使用 --clear-api-key",
+			recovery_action="传入真实密钥，或用 --clear-api-key 显式清除已存凭据",
+			hints={"next_actions": [
+				_hint_command(ctx, "ai config --api-key <key>"),
+				_hint_command(ctx, "ai config --clear-api-key"),
+			]},
+		)
+		ctx.exit(1)
 		return
 
 	# provider 写错（如 `openai-cn`）或 provider=custom 没给 base_url 时，端点解析为
@@ -333,9 +459,34 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 	if provider is not None:
 		updates["ai_provider"] = provider
 	if model is not None:
+		if not model.strip():
+			# 空白模型名会原样发进请求，由服务商返回 400，之后每条 AI 命令都
+			# 报可重试的 AI_API_ERROR；写入前拒绝（Issue #1428）。
+			handle_error_output(
+				ctx, "ai-config",
+				code="INVALID_PARAM",
+				message="--model 不能为空或只包含空白字符",
+				recovery_action="按 next_actions 传入真实模型名后重试",
+				hints={"next_actions": [_hint_command(ctx, "ai config --model <model>")]},
+			)
+			ctx.exit(1)
+			return
 		updates["ai_model"] = model
 	if base_url is not None:
-		updates["ai_base_url"] = base_url
+		try:
+			# 空白串 / 缺 scheme / 非 http(s) 地址会让之后每条 AI 命令抛
+			# UnsupportedProtocol 并被兜成可重试的网络错误；写入前拒绝（Issue #1431）。
+			updates["ai_base_url"] = normalize_base_url(base_url)
+		except AIConfigValueError as exc:
+			handle_error_output(
+				ctx, "ai-config",
+				code="INVALID_PARAM",
+				message=str(exc),
+				recovery_action="按 next_actions 传入 http(s) 绝对地址后重试",
+				hints={"next_actions": [_hint_command(ctx, "ai config --base-url https://api.example.com/v1")]},
+			)
+			ctx.exit(1)
+			return
 	if temperature is not None:
 		updates["ai_temperature"] = temperature
 	if max_tokens is not None:
@@ -344,12 +495,18 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 		store.save_config(**updates)
 	if api_key is not None:
 		store.save_api_key(api_key)
+	elif clear_api_key:
+		store.clear_api_key()
 
+	updated_fields = list(updates.keys())
+	if api_key is not None or clear_api_key:
+		updated_fields.append("api_key")
 	handle_output(
 		ctx, "ai-config",
 		{
 			"action": "update",
-			"updated_fields": list(updates.keys()) + (["api_key"] if api_key else []),
+			"updated_fields": updated_fields,
+			"api_key_set": store.api_key_is_set(),
 			# 写入后立刻回显生效的端点，让「刚配的这个 provider 会把数据发去哪」
 			# 在同一屏内可确认，而不是要再跑一次 boss ai config 才看得到。
 			"resolved_base_url": store.get_base_url(),

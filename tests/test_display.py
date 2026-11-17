@@ -567,8 +567,9 @@ class TestHandlePlatformErrorOutput:
 		platform.parse_error.return_value = ("UNKNOWN", "服务开小差了")
 
 		with patch("boss_agent_cli.display.handle_error_output") as mock_err:
+			# 用写命令验证 UNKNOWN 契约；只读命令按 NETWORK_ERROR 处理（Issue #1519）。
 			handle_platform_error_output(
-				ctx, "search", platform, {"code": 999}, fallback_message="搜索失败"
+				ctx, "apply", platform, {"code": 999}, fallback_message="投递失败"
 			)
 			kwargs = mock_err.call_args[1]
 		assert kwargs["code"] == "UNKNOWN"
@@ -1513,3 +1514,34 @@ class TestRegistryRecoveryCommands:
 		handle_error_output(ctx, "fixture", code="INVALID_PARAM", message="缺少必填参数 query")
 
 		assert captured["message"] == "缺少必填参数 query"
+
+
+# ── open_file_command：按平台生成「打开文件」命令（Issue #1441） ──
+
+
+def test_open_file_command_uses_open_on_macos(monkeypatch):
+	from boss_agent_cli.display import open_file_command
+
+	monkeypatch.setattr(sys, "platform", "darwin")
+	assert open_file_command("/tmp/report.html") == "open /tmp/report.html"
+
+
+def test_open_file_command_uses_start_on_windows(monkeypatch):
+	from boss_agent_cli.display import open_file_command
+
+	monkeypatch.setattr(sys, "platform", "win32")
+	assert open_file_command("C:/out/report.html") == 'cmd /c start "" C:/out/report.html'
+
+
+def test_open_file_command_uses_xdg_open_on_linux(monkeypatch):
+	from boss_agent_cli.display import open_file_command
+
+	monkeypatch.setattr(sys, "platform", "linux")
+	assert open_file_command("/tmp/report.html") == "xdg-open /tmp/report.html"
+
+
+def test_open_file_command_quotes_paths_with_spaces(monkeypatch):
+	from boss_agent_cli.display import open_file_command
+
+	monkeypatch.setattr(sys, "platform", "linux")
+	assert open_file_command("/tmp/my report.html") == "xdg-open '/tmp/my report.html'"

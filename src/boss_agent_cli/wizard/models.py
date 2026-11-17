@@ -20,6 +20,22 @@ class WorkflowInputError(ValueError):
 	"""Raised when wizard/headless input cannot form a workflow plan."""
 
 
+def count_or_none(value: Any) -> int | None:
+	"""展示层读取持久化计数的容错入口：缺失或漂移返回 None。
+
+	``workflow_runs.last_result`` 是历史落库的 JSON；``jobs_seen`` 被写成文本、
+	数组或负数时，渲染器的裸 ``int()`` 会让整个状态面板 traceback（渲染没有
+	命令层的错误出口兜底）。展示问题不得中断主流程（Issue #1212）。
+	"""
+	if value is None or isinstance(value, bool):
+		return None
+	try:
+		parsed = int(value)
+	except (TypeError, ValueError, OverflowError):
+		return None
+	return parsed if parsed >= 0 else None
+
+
 @dataclass(frozen=True)
 class WizardInput:
 	role: str
@@ -43,9 +59,18 @@ class WizardInput:
 		inputs = value.get("inputs", {})
 		if not isinstance(inputs, Mapping):
 			raise WorkflowInputError("inputs 必须是 JSON object")
-		requested = value.get("requested_steps", ())
-		if not isinstance(requested, (list, tuple)) or not all(isinstance(item, str) for item in requested):
-			raise WorkflowInputError("requested_steps 必须是字符串数组")
+		requested: Any = ()
+		if "requested_steps" in value:
+			requested = value["requested_steps"]
+			if not isinstance(requested, (list, tuple)) or not all(isinstance(item, str) for item in requested):
+				raise WorkflowInputError("requested_steps 必须是字符串数组")
+			if not requested:
+				# 空数组不能折叠成「执行 goal 的全部步骤」：goal 里可能包含真实平台
+				# 写操作（如 candidate_greet），调用方显式传空子集的预期是不执行任何
+				# 步骤；只有省略字段才表示全量执行（Issue #1236）。
+				raise WorkflowInputError(
+					"requested_steps 不能是空数组；省略该字段才表示执行 goal 的全部步骤"
+				)
 		return cls(
 			role=role,
 			platform=platform,

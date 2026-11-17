@@ -2,6 +2,7 @@
 缓存文件: ~/.boss-agent/cache/index_cache.json
 """
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,11 @@ from boss_agent_cli.output import Logger
 from boss_agent_cli.services.json_files import write_json_atomic
 
 _CACHE_FILE = "index_cache.json"
+# 合理时间戳上限（2100-01-01），与 api/cdp_risk_lock 的区间判定同口径：
+# 负值或超远未来的时间戳只会来自漂移，不能当作真实保存时间参与新鲜度判断。
+_MAX_SAVED_AT = 4_102_444_800.0
+# 搜索结果页码的合理上限：平台分页远达不到，超出即视为漂移。
+_MAX_PAGE = 1_000_000
 
 
 def _cache_path(data_dir: Path) -> Path:
@@ -75,7 +81,10 @@ def _load_cache(data_dir: Path) -> dict[str, Any] | None:
 		return None
 	try:
 		loaded = json.loads(path.read_text(encoding="utf-8"))
-	except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+	except (ValueError, OSError, RecursionError):
+		# ValueError 覆盖 JSONDecodeError / UnicodeDecodeError，以及 Python 3.11+
+		# 对超长整数字面量的位数上限；深嵌套会抛 RecursionError。损坏缓存一律
+		# 按「没有缓存」处理，不能冒泡成可重试的 NETWORK_ERROR（Issue #1224）。
 		return None
 	if not isinstance(loaded, dict):
 		return None
@@ -99,19 +108,67 @@ def get_job_by_index(data_dir: Path, index: int) -> dict[str, Any] | None:
 	return job if isinstance(job, dict) else None
 
 
+def _finite_number(raw: Any) -> int | float | None:
+	"""缓存元信息的数值容错读取：bool、非数值与非有限值一律视为缺失。
+
+	`math.isfinite(10**400)` 与 `float("inf")` 都会让下游的 JSON 序列化 / 时间
+	格式化出问题，`saved_at` 这类字段只接受能安全进入信封的有限数值。
+	"""
+	if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+		return None
+	try:
+		return raw if math.isfinite(float(raw)) else None
+	except OverflowError:
+		return None
+
+
+def _saved_at(raw: Any) -> int | float:
+	"""保存时间只接受有限的 Unix 秒：负值与超远未来按「未知」(0) 处理。"""
+	parsed = _finite_number(raw)
+	if parsed is None or not 0 <= float(parsed) <= _MAX_SAVED_AT:
+		return 0
+	return parsed
+
+
+def _safe_text(raw: Any) -> str:
+	"""字符串元信息还必须能编码成 UTF-8。
+
+	JSON 的 ``"\\ud800"`` 转义会解析出孤立代理字符，嵌入错误信封后
+	``click.echo`` 写 stdout 时抛 ``UnicodeEncodeError``，本地损坏被兜成
+	可重试的 ``NETWORK_ERROR``（Issue #1224）。
+	"""
+	if not isinstance(raw, str):
+		return ""
+	try:
+		raw.encode("utf-8")
+	except UnicodeEncodeError:
+		return ""
+	return raw
+
+
+def _cache_metadata(cache_data: dict[str, Any]) -> dict[str, Any]:
+	"""把缓存元信息归一成信封声明的类型；`jobs` 可用时不因元信息漂移整体丢弃。"""
+	jobs = cache_data.get("jobs")
+	job_count = len(jobs) if isinstance(jobs, list) else 0
+	page = cache_data.get("page")
+	return {
+		"source": _safe_text(cache_data.get("source")),
+		# 旧版本写入的缓存没有 page 字段，未知页码本来就按 None 返回。
+		"page": page if isinstance(page, int) and not isinstance(page, bool) and 1 <= page <= _MAX_PAGE else None,
+		# count 只由已校验的 jobs 决定：save_index 保证两者一致，缓存里的 count
+		# 漂移时越界提示会自相矛盾（「共 5 条」却拒绝编号 5，Issue #1224）。
+		"count": job_count,
+		"saved_at": _saved_at(cache_data.get("saved_at")),
+	}
+
+
 def get_index_info(data_dir: Path) -> dict[str, Any]:
 	"""获取缓存元信息（来源、页码、数量、保存时间）。"""
 	cache_data = _load_cache(data_dir)
 	if cache_data is None:
 		return {"exists": False, "source": "", "page": None, "count": 0, "saved_at": 0}
 
-	return {
-		"exists": True,
-		"source": cache_data.get("source", ""),
-		"page": cache_data.get("page"),
-		"count": cache_data.get("count", 0),
-		"saved_at": cache_data.get("saved_at", 0),
-	}
+	return {"exists": True, **_cache_metadata(cache_data)}
 
 
 def get_index_snapshot(data_dir: Path) -> dict[str, Any] | None:

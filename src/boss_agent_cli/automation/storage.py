@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from boss_agent_cli.automation.models import AutomationEvent, PendingAction, PlatformAction, ReviewItem
+from boss_agent_cli.cache.store import is_cache_busy_error
 from boss_agent_cli.services.chat_utils import sanitize_csv_cell
 
 
@@ -27,6 +28,23 @@ class AutomationStateError(ValueError):
 		super().__init__(f"{path} 无法解析（{detail}）")
 		self.path = path
 		self.detail = detail
+
+
+class AutomationControlBusy(RuntimeError):
+	"""automation 控制锁被其他进程占用：本次控制更新没有生效，可稍后重试。"""
+
+
+class AutomationControlBusyDispatched(AutomationControlBusy):
+	"""周期内控制锁冲突：平台动作可能已经发出，不能沿用「本次操作没有生效」（Issue #1267）。
+
+	执行周期里业务状态落盘与队列推进是两次独立的本地写入：动作派发成功、
+	业务状态尚未落盘时 checkpoint 撞上控制锁，平台侧可能已经生效。调用方
+	必须按「结果可能已提交」的语义上报（禁止自动重发），而不是让操作者直接重试。
+	"""
+
+
+class AutomationRunBusy(RuntimeError):
+	"""另一个 agent run 正在同一数据目录执行：本次调用没有发出任何请求。"""
 
 
 class AutomationStore:
@@ -55,10 +73,23 @@ class AutomationStore:
 			return {}
 		try:
 			loaded = json.loads(self.stop_path.read_text(encoding="utf-8"))
-		except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+		# ValueError 覆盖 JSONDecodeError / UnicodeDecodeError 与 3.11+ 的超长整数
+		# 上限；RecursionError 覆盖深嵌套。熔断状态读不出来必须 fail-closed：
+		# 抛出去会让调用方按「未知状态」继续，只有 corrupt 标记能通知人工核对。
+		except (ValueError, OSError, RecursionError) as exc:
 			return {"open": True, "reason": f"stop.json 无法解析，已按熔断处理：{exc}", "corrupt": True}
 		if not isinstance(loaded, dict):
 			return {"open": True, "reason": "stop.json 顶层不是 JSON object，已按熔断处理", "corrupt": True}
+		if "open" in loaded and not isinstance(loaded["open"], bool):
+			# 熔断开关只认布尔：0 / null / "false" 这类真值漂移若被当成「已关闭」，
+			# 一次写坏就能放行自动化写操作；而 "true" 又会让两个读取器（SafetyGuard
+			# 的真值与 location 的 `is not True`）得到相反结论（Issue #1242）。
+			# 与顶层非 object 一致，按损坏处理并停下等人工核对。
+			return {
+				"open": True,
+				"reason": "stop.json 的 open 字段不是布尔值，已按熔断处理",
+				"corrupt": True,
+			}
 		return cast("dict[str, Any]", loaded)
 
 	def request_stop(self, reason: str) -> None:
@@ -91,15 +122,63 @@ class AutomationStore:
 			return True
 
 	@contextmanager
-	def _control_lock(self) -> Iterator[None]:
-		"""Serialize tiny control updates across processes with a bounded wait."""
-		connection = sqlite3.connect(self.root / ".control-lock.sqlite3", timeout=1.0)
+	def execution_lock(self) -> Iterator[None]:
+		"""Hold a cross-process execution lock for one automation cycle.
+
+		待执行队列是整文件回写的：两个 executor 同时读到同一份快照时，后写者会
+		用旧行覆盖先写者的在途标记，同一条动作可能被派发两次（Issue #1253）。
+		执行锁串行化整个周期；它独立于 `.control-lock.sqlite3`，因此 `agent stop`
+		仍能在运行期间立即写入熔断。
+		"""
+		connection: sqlite3.Connection | None = None
 		try:
-			connection.execute("BEGIN IMMEDIATE")
+			try:
+				connection = sqlite3.connect(self.root / ".run-lock.sqlite3", timeout=0.5)
+				connection.execute("BEGIN IMMEDIATE")
+			except sqlite3.DatabaseError as exc:
+				if isinstance(exc, sqlite3.OperationalError) and is_cache_busy_error(exc):
+					raise AutomationRunBusy(
+						"另一个 boss agent run 正在执行，本次没有发出任何请求"
+					) from exc
+				# 锁文件损坏或路径被同名目录占用是确定性本地状态问题：原样上抛
+				# 会让命令丢掉整个信封，或在 agent run 里被兜成可重试的
+				# NETWORK_ERROR（Issue #1304）。
+				raise AutomationStateError(
+					self.root / ".run-lock.sqlite3",
+					f"自动化执行锁无法打开（{exc}）",
+				) from exc
 			yield
 			connection.commit()
 		finally:
-			connection.close()
+			if connection is not None:
+				connection.close()
+
+	@contextmanager
+	def _control_lock(self) -> Iterator[None]:
+		"""Serialize tiny control updates across processes with a bounded wait."""
+		connection: sqlite3.Connection | None = None
+		try:
+			try:
+				connection = sqlite3.connect(self.root / ".control-lock.sqlite3", timeout=1.0)
+				connection.execute("BEGIN IMMEDIATE")
+			except sqlite3.DatabaseError as exc:
+				# 锁冲突是 automation 自己的并发边界，不是缓存库问题：直接上抛会被
+				# main 的兜底层报成 CACHE_BUSY 并指向 cache/boss_agent.db，而实际的
+				# 锁文件是 automation/.control-lock.sqlite3（Issue #1251）。
+				if isinstance(exc, sqlite3.OperationalError) and is_cache_busy_error(exc):
+					raise AutomationControlBusy(
+						"automation 控制锁正被其他进程占用，本次操作没有生效"
+					) from exc
+				# 锁文件损坏 / 路径被同名目录占用：确定性本地状态问题（Issue #1304）。
+				raise AutomationStateError(
+					self.root / ".control-lock.sqlite3",
+					f"自动化控制锁无法打开（{exc}）",
+				) from exc
+			yield
+			connection.commit()
+		finally:
+			if connection is not None:
+				connection.close()
 
 	def read_state(self) -> dict[str, Any]:
 		if not self.state_path.exists():
@@ -107,7 +186,7 @@ class AutomationStore:
 		else:
 			try:
 				loaded = json.loads(self.state_path.read_text(encoding="utf-8"))
-			except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+			except (ValueError, OSError, RecursionError) as exc:
 				raise AutomationStateError(self.state_path, str(exc)) from exc
 			if not isinstance(loaded, dict):
 				raise AutomationStateError(self.state_path, "顶层必须是 JSON object")
@@ -120,6 +199,10 @@ class AutomationStore:
 			breaker = state.get("autonomy", {}).get("circuit_breaker", {})
 			if not isinstance(breaker, dict):
 				raise AutomationStateError(self.state_path, "autonomy.circuit_breaker 必须是 JSON object")
+			if "open" in breaker and not isinstance(breaker["open"], bool):
+				# 真值语义会让 0 / null 关闭熔断、"false" 打开熔断（Issue #1242）；
+				# 与 consecutive_errors 一样按状态损坏处理。
+				raise AutomationStateError(self.state_path, "autonomy.circuit_breaker.open 必须是布尔值")
 			for candidate_key, prior in state.get("conversations", {}).items():
 				if not isinstance(prior, dict):
 					raise AutomationStateError(self.state_path, f"conversations[{candidate_key!r}] 必须是 JSON object")
@@ -135,7 +218,14 @@ class AutomationStore:
 		# Preserve legacy callers that set the breaker through write_state. A stale
 		# snapshot lacking it can never remove the separate stop latch.
 		with self._control_lock():
-			breaker = state.get("autonomy", {}).get("circuit_breaker", {})
+			autonomy = state.get("autonomy", {})
+			if not isinstance(autonomy, dict):
+				raise AutomationStateError(self.state_path, "autonomy 必须是 JSON object")
+			breaker = autonomy.get("circuit_breaker", {})
+			if not isinstance(breaker, dict):
+				raise AutomationStateError(self.state_path, "autonomy.circuit_breaker 必须是 JSON object")
+			if "open" in breaker and not isinstance(breaker["open"], bool):
+				raise AutomationStateError(self.state_path, "autonomy.circuit_breaker.open 必须是布尔值")
 			stop = self.read_stop()
 			if breaker.get("open") and not stop:
 				self._set_stop(str(breaker.get("reason", "熔断已打开")))
@@ -187,6 +277,12 @@ class AutomationStore:
 		self.write_jsonl("pending-actions.jsonl", [asdict(item) for item in items])
 
 	def approve_review(self, review_id: str, reviewed_at: str) -> PendingAction | None:
+		# 批准会追加待执行行、改写复核队列：与运行中的 cycle 串行化，避免刚入队
+		# 的动作被整文件回写的旧快照覆盖丢失（Issue #1253）。
+		with self.execution_lock():
+			return self._approve_review_locked(review_id, reviewed_at)
+
+	def _approve_review_locked(self, review_id: str, reviewed_at: str) -> PendingAction | None:
 		reviews = self.read_reviews()
 		updated_reviews: list[ReviewItem] = []
 		pending: PendingAction | None = None
@@ -223,11 +319,29 @@ class AutomationStore:
 				updated_reviews.append(item)
 		if pending is None:
 			return None
+		# 先入队、再标记复核项：入队失败时复核项仍是 review，操作员可以直接重试；
+		# 反过来先写 approved 会让动作永久丢失（Issue #1248）。上一次若在两步之间
+		# 失败，pending 里已有同一个 approved_review_id，不重复入队，只补写复核队列。
+		existing = next(
+			(item for item in self.read_pending() if item.approved_review_id == review_id),
+			None,
+		)
+		if existing is None:
+			self.append_pending(pending)
 		self.write_reviews(updated_reviews)
-		self.append_pending(pending)
-		return pending
+		return existing if existing is not None else pending
 
 	def reject_review(
+		self,
+		review_id: str,
+		reason: str,
+		reviewed_at: str,
+	) -> ReviewItem | None:
+		# 拒绝也会改写复核队列：与运行中的 cycle 串行化（Issue #1253）。
+		with self.execution_lock():
+			return self._reject_review_locked(review_id, reason, reviewed_at)
+
+	def _reject_review_locked(
 		self,
 		review_id: str,
 		reason: str,
@@ -263,20 +377,37 @@ class AutomationStore:
 
 	def read_jsonl(self, name: str) -> list[dict[str, Any]]:
 		path = self.root / name
-		if not path.exists():
-			return []
 		rows: list[dict[str, Any]] = []
 		try:
-			lines = path.read_text(encoding="utf-8").splitlines()
-		except (UnicodeDecodeError, OSError):
+			payload = path.read_bytes()
+		except FileNotFoundError:
+			# 只有「文件不存在」才是空队列。不能先用 path.exists() 预判：
+			# 预判与读取之间文件可能被删除，那个 TOCTOU 窗口会让删除变成失败。
 			return rows
-		for line in lines:
+		except OSError as exc:
+			# 权限不足、路径被同名目录占用、磁盘错误都把队列读成空列表时，
+			# `agent run` 会静默跳过已批准动作并照常报 OK（Issue #1406）。
+			# 状态未知时 fail-closed，交由命令层输出 AUTOMATION_STATE_INVALID。
+			raise AutomationStateError(
+				path,
+				f"队列文件无法读取（{exc}）；请确认文件可读（权限正常、路径不是目录）后重试，"
+				"文件损坏时先备份再修正或移除",
+			) from exc
+		for raw_line in payload.splitlines():
+			try:
+				line = raw_line.decode("utf-8")
+			except UnicodeDecodeError:
+				# 整文件 read_text() 解码失败会把前面所有合法行一起丢掉：
+				# 一个 GBK 字节就让 pending / stats 看到空队列（Issue #1337）。
+				# 按行跳过坏字节行，与单行 JSON 损坏的容错口径一致。
+				continue
 			if not line.strip():
 				continue
 			try:
 				parsed = json.loads(line)
-			except json.JSONDecodeError:
-				# 单行损坏（手工编辑、外部写入）不该让 stats / pending 整体失败。
+			except (ValueError, RecursionError):
+				# 单行损坏（手工编辑、外部写入、超长整数、深嵌套）不该让
+				# stats / pending 整体失败。
 				continue
 			if isinstance(parsed, dict):
 				rows.append(parsed)
@@ -404,14 +535,29 @@ def _review_from_row(row: dict[str, Any], path: Path) -> ReviewItem:
 	)
 
 
+#: 待执行队列的合法状态：pending 可执行；executing / verification-required 表示
+#: 动作可能已派发，必须跳过且不重发；executed 是终态。
+_PENDING_STATUSES = frozenset({"pending", "executing", "executed", "verification-required"})
+
+
 def _pending_from_row(row: dict[str, Any], path: Path) -> PendingAction:
+	status = row.get("status", "pending")
+	if not isinstance(status, str) or status not in _PENDING_STATUSES:
+		# status 漂移（null / 数字 / 数组 / 对象 / 大小写不符 / 旧版 "dry-run"）会被
+		# process_pending 静默 continue：已批准的动作永远不执行，agent run
+		# 仍报 OK。数组 / 对象的 `in frozenset` 还会抛 TypeError 被兜成
+		# INTERNAL_ERROR，所以先做类型校验再比对取值。
+		# 与 confidence / action 同口径 fail-closed（Issue #1337 / #1410）。
+		raise AutomationStateError(
+			path, f"记录 {str(row.get('id', ''))!r} 的 status {status!r} 不是已知状态"
+		)
 	return PendingAction(
 		id=str(row.get("id", "")),
 		ts=str(row.get("ts", "")),
 		platform=str(row.get("platform", "")),
 		candidate_key=str(row.get("candidate_key", "")),
 		action=str(row.get("action", "")),
-		status=str(row.get("status", "pending")),
+		status=status,
 		confidence=_row_confidence(row, path),
 		reason=str(row.get("reason", "")),
 		message=str(row.get("message", "")),

@@ -322,7 +322,9 @@ def resolve_lookup_codes(value: str | None, lookup: dict[str, str], label: str) 
 		return None
 	codes: list[str] = []
 	for part in _split_multi_value(value):
-		if part.isdigit():
+		# '①' 这类非 ASCII 数字串 `isdigit()` 为真，但不是平台代码；
+		# 交给标签表按未知标签拒绝，而不是原样发给平台（Issue #1306）。
+		if part.isascii() and part.isdigit():
 			code = part
 		else:
 			found = lookup.get(part)
@@ -419,7 +421,9 @@ _SALARY_BELOW_RE = re.compile(r"(\d+)\s*K以下", re.IGNORECASE)
 
 def parse_salary_range(value: str) -> tuple[int, int] | None:
 	"""Parse salary string like '20-50K' into (low, high) in K. Returns None if unparseable."""
-	if not value or value == "面议":
+	# 平台把 salaryDesc 返回成数字 / null / 对象时按「无法解析」处理：单个坏字段
+	# 不能让整次搜索落 INTERNAL_ERROR（Issue #1335）。
+	if not isinstance(value, str) or not value or value == "面议":
 		return None
 	m = _SALARY_BELOW_RE.search(value)
 	if m:
@@ -437,8 +441,10 @@ def parse_salary_range(value: str) -> tuple[int, int] | None:
 
 def meets_experience_threshold(candidate: str, required: str | None) -> bool:
 	"""Check if candidate experience meets or exceeds required threshold."""
-	if required is None:
-		return True
+	if not isinstance(required, str):
+		return True  # 期望字段漂移（数组 / 对象）按「无要求」处理，Issue #1432
+	if not isinstance(candidate, str):
+		return True  # unknown experience passes（平台字段漂移，Issue #1335）
 	c = _EXPERIENCE_ORDER.get(candidate)
 	r = _EXPERIENCE_ORDER.get(required)
 	if c is None:
@@ -450,8 +456,10 @@ def meets_experience_threshold(candidate: str, required: str | None) -> bool:
 
 def meets_education_threshold(candidate: str, required: str | None) -> bool:
 	"""Check if candidate education meets or exceeds required threshold."""
-	if required is None:
-		return True
+	if not isinstance(required, str):
+		return True  # 期望字段漂移（数组 / 对象）按「无要求」处理，Issue #1432
+	if not isinstance(candidate, str):
+		return True  # unknown education passes（平台字段漂移，Issue #1335）
 	c = _EDUCATION_ORDER.get(candidate)
 	r = _EDUCATION_ORDER.get(required)
 	if c is None:
@@ -530,7 +538,9 @@ def prefilter_job(
 	city = city_constraint(criteria.city)
 	if city:
 		item_city = raw_item.get("cityName", "")
-		if item_city and city not in item_city:
+		# 非字符串城市字段按未知放行：`int in str` 会抛 TypeError，让整次搜索
+		# 落 INTERNAL_ERROR（Issue #1335）。
+		if isinstance(item_city, str) and item_city and city not in item_city:
 			reasons.append(f"城市不匹配: {item_city} != {city}")
 
 	# Salary filter — reject only if candidate max is below required min
@@ -539,7 +549,10 @@ def prefilter_job(
 		item_range = parse_salary_range(raw_item.get("salaryDesc", ""))
 		if req_range and item_range:
 			if item_range[1] < req_range[0]:
-				reasons.append(f"薪资不足: {raw_item.get('salaryDesc', '')} < {criteria.salary}")
+				# 日志原因里不写薪资原值与期望值：职位薪资与用户的期望薪资都属于
+				# 私有数据，CodeQL 会按明文记录敏感数据告警（Issue #1394）；具体
+				# 数值仍保留在搜索结果的 data 里，TTY 表格也照常展示。
+				reasons.append("薪资不足: 低于期望下限")
 
 	# Experience filter
 	if criteria.experience:
@@ -604,7 +617,11 @@ def match_all_welfare(
 	description: str,
 ) -> list[str]:
 	"""Check all welfare conditions (AND). Returns match descriptions or empty list."""
-	text = " ".join(welfare_list)
+	# field_list() 只保证容器是 list：平台可能混入数字 / null / 对象等漂移元素，
+	# 直接 join 会让整次搜索落成 INTERNAL_ERROR。与 dict_items() 同口径跳过
+	# 非字符串元素；description 非字符串按空文本处理（Issue #1329）。
+	text = " ".join(item for item in welfare_list if isinstance(item, str))
+	description = description if isinstance(description, str) else ""
 	full_text = text + " " + description
 	results = []
 	for label, keywords in conditions:
@@ -730,7 +747,12 @@ def _fetch_and_check(
 				raise SearchPipelinePlatformError(code, message or "职位详情获取失败")
 			card_data = _unwrap_platform_data(client, card_raw)
 			card = card_data.get("jobCard", {}) or {}
-			desc = card.get("postDescription", "") or ""
+			# postDescription 可能是数组 / 对象 / 数字：非字符串进 put_job_desc
+			# 会抛 sqlite3.ProgrammingError（--active 串行路径落 NETWORK_ERROR，
+			# 无线程池路径命中项被静默丢弃）。按平台文本字段缺失处理（Issue #1335）；
+			# 不能 str() 成 "['双休']"，否则福利关键词会从坏结构里误命中。
+			raw_desc = card.get("postDescription") if isinstance(card, dict) else None
+			desc = raw_desc if isinstance(raw_desc, str) else ""
 			raw_active = card.get("activeTimeDesc")
 			card_active = raw_active.strip() if isinstance(raw_active, str) else ""
 			outcome.fresh_desc = desc  # 仅新取到的描述需写回缓存（主线程处理）

@@ -21,6 +21,7 @@ from boss_agent_cli.cache.store import CacheStore
 from boss_agent_cli.crawler.service import CrawlOutcome
 from boss_agent_cli.resume.models import ResumeData
 from boss_agent_cli.resume.store import ResumeStore
+from boss_agent_cli.search_filters import resolve_welfare_keywords
 from boss_agent_cli.display import risk_error_message
 from boss_agent_cli.schema.error_codes import ERROR_CODES
 from boss_agent_cli.wizard.models import StepResult, WorkflowInputError, WorkflowPlan, WorkflowStatus, WizardInput
@@ -244,7 +245,10 @@ def test_candidate_search_helper_preserves_filters_welfare_and_pagination():
 	assert captured["criteria"].raw_params == {"degree": "本科"}
 	assert captured["start_page"] == 2
 	assert captured["max_pages"] == 3
-	assert captured["welfare_conditions"] == ["双休", "五险一金"]
+	assert captured["welfare_conditions"] == [
+		("双休", resolve_welfare_keywords("双休")),
+		("五险一金", resolve_welfare_keywords("五险一金")),
+	]
 
 
 def test_candidate_search_normalizes_welfare_input_and_uses_detail_page_budget():
@@ -740,7 +744,7 @@ def test_crawl_actions_use_fixture_service_and_persist_stop(tmp_path, monkeypatc
 				"city_code": "101010100",
 				"pages": 1,
 				"with_detail": False,
-				"browser": {"profile_path": str(tmp_path / "profile"), "cdp_port": 0},
+				"browser": {"profile_path": str(tmp_path / "profile"), "cdp_port": 9333},
 				"hook": {"profile": "none", "source": "user-supplied", "directory": None},
 				"limits": {"max_requests": 20, "max_details": 50, "max_seconds": 600, "max_retries": 1},
 			},
@@ -3269,7 +3273,7 @@ def test_wizard_status_and_stop_after_stop_report_only_terminals(tmp_path):
 		platform="zhipin",
 		goal="shortlist",
 		inputs={},
-		requested_steps=(),
+		requested_steps=("local_shortlist",),
 		mode="headless",
 	)
 	with WorkflowStore(tmp_path) as store:
@@ -3410,7 +3414,7 @@ def test_wizard_stop_hints_quote_run_id_with_shell_metacharacters(tmp_path):
 		platform="zhipin",
 		goal="shortlist",
 		inputs={},
-		requested_steps=(),
+		requested_steps=("local_shortlist",),
 		mode="headless",
 	)
 	run_id = "wrn; echo pwn"
@@ -3553,18 +3557,22 @@ def test_waiting_panel_falls_back_for_legacy_runs(monkeypatch):
 
 
 @pytest.mark.parametrize(
-	"status, error_code",
+	"status, error_code, command",
 	[
-		("risk_stopped", None),
-		("budget_stopped", None),
-		("timeout_stopped", "WORKFLOW_TIMEOUT"),
-		("workflow_stopped", "WORKFLOW_STOPPED"),
-		("stopped", "WORKFLOW_STOPPED"),
-		("failed", "NETWORK_ERROR"),
+		("risk_stopped", None, "resume"),
+		("budget_stopped", None, "status"),
+		("timeout_stopped", "WORKFLOW_TIMEOUT", "resume"),
+		("workflow_stopped", "WORKFLOW_STOPPED", "status"),
+		("stopped", "WORKFLOW_STOPPED", "status"),
+		("failed", "NETWORK_ERROR", "resume"),
 	],
 )
-def test_crawl_outcome_recovery_keeps_checkpoint_directory(tmp_path, status, error_code):
-	"""向导等待和错误路径都复用采集服务提供的恢复命令。"""
+def test_crawl_outcome_recovery_keeps_checkpoint_directory(tmp_path, status, error_code, command):
+	"""向导等待和错误路径都复用采集服务提供的恢复命令。
+
+	stop 与预算用尽不再指向 `crawl resume`：前者会清除用户刚写入的 stop 标记，
+	后者在原预算下必然原地返回（Issue #1238）。
+	"""
 	from boss_agent_cli.wizard.actions import _crawl_outcome_result
 
 	run_id = "run 'one'; $RUN"
@@ -3574,7 +3582,7 @@ def test_crawl_outcome_recovery_keeps_checkpoint_directory(tmp_path, status, err
 		data_dir=data_dir,
 		error="stop requested" if status in {"workflow_stopped", "stopped"} else "fixture stop",
 	)
-	expected = ["boss", "--data-dir", str(data_dir.resolve()), "crawl", "resume", run_id]
+	expected = ["boss", "--data-dir", str(data_dir.resolve()), "crawl", command, run_id]
 	if error_code is not None:
 		with pytest.raises(WorkflowActionError) as exc_info:
 			_crawl_outcome_result(outcome)
@@ -3584,8 +3592,12 @@ def test_crawl_outcome_recovery_keeps_checkpoint_directory(tmp_path, status, err
 		result = _crawl_outcome_result(outcome)
 		assert result.status is WorkflowStatus.WAITING_INPUT
 		assert shlex.split(result.next_action) == expected
-		assert result.next_action == result.data["checkpoint"]["resume_command"]
-		assert any(result.next_action in action for action in result.operator_actions)
+		if command == "resume":
+			assert result.next_action == result.data["checkpoint"]["resume_command"]
+			assert any(result.next_action in action for action in result.operator_actions)
+		else:
+			assert result.next_action not in result.data["checkpoint"]["resume_command"]
+			assert any(result.next_action in action for action in result.operator_actions)
 
 
 def test_crawl_risk_stop_emits_browser_operator_actions():
@@ -4886,3 +4898,18 @@ def test_empty_resume_prompt_keeps_the_bare_command_without_a_data_dir():
 	labels = menu.text_labels
 	assert "可先用 boss resume import <文件> 导入" in labels[0]
 	assert "--data-dir" not in labels[0]
+
+
+@pytest.mark.parametrize(("key", "value"), [("ai_max_tokens", "512"), ("ai_temperature", "hot")])
+def test_ai_assist_rejects_invalid_numeric_ai_config(tmp_path, monkeypatch, key, value):
+	"""向导 AI 步骤与 ai 命令同口径：坏数值在发请求前拦下并给修复命令（Issue #1209）。"""
+	_configure_ai(tmp_path, monkeypatch, ai_provider="moonshot", ai_model="moonshot-v1-8k", **{key: value})
+
+	with patch("boss_agent_cli.ai.service.httpx.post") as post:
+		with pytest.raises(WorkflowActionError) as exc_info:
+			DEFAULT_ACTIONS["ai_assist"](_action_context(tmp_path), {"resume": "default", "prompt": "优化"}, {})
+
+	assert exc_info.value.code == "INVALID_PARAM"
+	assert key in str(exc_info.value)
+	assert "--max-tokens" in exc_info.value.recovery_action
+	assert not post.called, "坏配置必须在发请求之前拦下"

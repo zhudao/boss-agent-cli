@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import random
 import socket
+import sqlite3
+import sys
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -23,12 +25,21 @@ from boss_agent_cli.api.request_budget import (
 	request_control,
 )
 from boss_agent_cli.api.zhipin_errors import normalize_risk_code
-from boss_agent_cli.cache.store import CacheRecordInvalid, CacheStore
+from boss_agent_cli.cache.store import (
+	CacheBusyError,
+	CacheDatabaseInvalid,
+	CacheRecordInvalid,
+	CacheStore,
+)
 from boss_agent_cli.compliance import require_capability_mode
 from boss_agent_cli.crawler.controls import (
 	CrawlExportError as CrawlExportError,
+	CrawlHookDirInvalid as CrawlHookDirInvalid,
 	CrawlLimitExceeded as CrawlLimitExceeded,
+	CrawlProfileBusy as CrawlProfileBusy,
+	CrawlProfilePathInvalid as CrawlProfilePathInvalid,
 	CrawlRuntimeUnavailable as CrawlRuntimeUnavailable,
+	CrawlSessionAuthError as CrawlSessionAuthError,
 	CrawlStopRequested as CrawlStopRequested,
 	CrawlWorkflowStopRequested as CrawlWorkflowStopRequested,
 	CrawlTimeoutRequested as CrawlTimeoutRequested,
@@ -37,6 +48,7 @@ from boss_agent_cli.crawler.exporter import write_run_outputs
 from boss_agent_cli.crawler.hooks import (
 	HookInjection,
 	HookRegistrationError,
+	verify_hook_profile,
 )
 from boss_agent_cli.crawler.transport import CrawlRiskError, CrawlTransport
 from boss_agent_cli.display import boss_command, risk_error_message, shell_argument
@@ -131,6 +143,17 @@ class CrawlSettings:
 		# bool 是 int 的子类：`pages=true` 是类型漂移，不是第 1 页。
 		if not isinstance(pages, int) or isinstance(pages, bool):
 			raise CacheRecordInvalid("crawl_run", run_id, "params.pages", f"期望整数，实际是 {type(pages).__name__}")
+		# 页数必须至少为 1：0 / 负数会通过读取，到 resume 才落成误导性的
+		# INVALID_PARAM（configure 也没有 pages 选项）（Issue #1325）。
+		if pages < 1:
+			raise CacheRecordInvalid("crawl_run", run_id, "params.pages", f"必须是正整数，实际是 {pages}")
+		# chrome_path 原样传给 transport，非字符串会在 set_browser_path 抛 TypeError，
+		# 被 `_run` 记成 stopped 并给出「恢复」指引，重跑永远复现（Issue #1278）。
+		chrome_path = raw.get("chrome_path")
+		if chrome_path is not None and not isinstance(chrome_path, str):
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "params.chrome_path", f"期望字符串或 null，实际是 {type(chrome_path).__name__}"
+			)
 		if not isinstance(with_detail, bool):
 			raise CacheRecordInvalid(
 				"crawl_run", run_id, "params.with_detail", f"期望布尔值，实际是 {type(with_detail).__name__}"
@@ -149,6 +172,74 @@ class CrawlSettings:
 				if value is None
 			]
 			raise CacheRecordInvalid("crawl_run", run_id, "params", f"缺少字段 {', '.join(missing_browser)}")
+		# profile_path 为空串时 `Path("")` 就是 `Path(".")`：resume 会删除 cwd 下
+		# 采集 Chrome 的 Singleton 锁并把浏览器配置写进当前目录；数字 / 对象漂移
+		# 同样会落成相对 cwd 的目录名。断点里的配置目录必须是绝对路径
+		# （Issue #1347）。
+		if not isinstance(profile_path, str):
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "params.browser.profile_path",
+				f"期望绝对路径字符串，实际是 {type(profile_path).__name__}",
+			)
+		if not profile_path.strip():
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "params.browser.profile_path",
+				f"期望非空绝对路径字符串，实际是空字符串（{type(profile_path).__name__}）",
+			)
+		# NUL 等控制字符能通过「非空绝对路径」检查，但会在 transport 的
+		# resolve() / mkdir() 抛 ValueError，被 `_run` 兜成 ok:true 的 stopped
+		# （Issue #1482）。合法路径不可能包含这些字符，断点里出现只能是记录
+		# 损坏或手工篡改。
+		if any(ord(char) < 0x20 for char in profile_path):
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "params.browser.profile_path",
+				f"期望绝对路径字符串，实际包含控制字符 {profile_path!r}",
+			)
+		if not Path(profile_path).is_absolute():
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "params.browser.profile_path",
+				f"期望绝对路径，实际是相对路径 {profile_path!r}（{type(profile_path).__name__}）",
+			)
+		# 断点里的端口必须落在 1–65535：越界值会在 transport 的
+		# socket.connect_ex 抛 OverflowError，被吞成 ok:true 的 stopped 并给出
+		# 可复现的 resume 指引（Issue #1325）。
+		try:
+			parsed_cdp_port = crawl_cdp_port(cdp_port)
+		except ValueError as exc:
+			raise CacheRecordInvalid("crawl_run", run_id, "params.browser.cdp_port", str(exc)) from exc
+		hook_profile = str(hook_profile)
+		if hook_profile not in ("none", "screenshot-full"):
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "params.hook.profile",
+				f"期望 none 或 screenshot-full，实际是 {hook_profile!r}",
+			)
+		hook_dir_raw = raw.get("hook_dir") or hook.get("directory")
+		hook_dir = Path(str(hook_dir_raw)) if hook_dir_raw else None
+		if hook_profile == "screenshot-full" and hook_dir is None:
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "params.hook.directory", "screenshot-full 需要 hook 目录"
+			)
+
+		def _limit(key: str, default: int, *, minimum: int) -> int:
+			# 不能用 `value or default`：0 是损坏值，不能被静默替换成默认预算，
+			# 否则 status 与 resume 对同一行口径不一致（Issue #1325）。
+			value = raw.get(key)
+			if value is None:
+				value = limits.get(key, default)
+			if isinstance(value, bool):
+				raise CacheRecordInvalid("crawl_run", run_id, f"params.limits.{key}", "期望整数，实际是 bool")
+			try:
+				parsed = int(value)
+			except (TypeError, ValueError, OverflowError) as exc:
+				raise CacheRecordInvalid(
+					"crawl_run", run_id, f"params.limits.{key}", f"字段类型无法解析（{exc}）"
+				) from exc
+			if parsed < minimum:
+				raise CacheRecordInvalid(
+					"crawl_run", run_id, f"params.limits.{key}", f"不能小于 {minimum}，实际是 {parsed}"
+				)
+			return parsed
+
 		try:
 			return cls(
 				query=query,
@@ -156,20 +247,20 @@ class CrawlSettings:
 				pages=pages,
 				with_detail=with_detail,
 				profile_path=Path(str(profile_path)),
-				chrome_path=raw.get("chrome_path"),
-				cdp_port=int(cdp_port),
-				hook_profile=str(hook_profile),
-				hook_dir=Path(str(raw.get("hook_dir") or hook.get("directory")))
-				if raw.get("hook_dir") or hook.get("directory")
-				else None,
+				chrome_path=chrome_path,
+				cdp_port=parsed_cdp_port,
+				hook_profile=hook_profile,
+				hook_dir=hook_dir,
 				hook_source=str(raw.get("hook_source") or hook.get("source", "user-supplied")),
-				max_requests=int(raw.get("max_requests") or limits.get("max_requests", 20)),
-				max_details=int(raw.get("max_details") or limits.get("max_details", 50)),
-				max_seconds=int(raw.get("max_seconds") or limits.get("max_seconds", 600)),
-				max_retries=int(raw.get("max_retries") or limits.get("max_retries", 1)),
+				max_requests=_limit("max_requests", 20, minimum=1),
+				max_details=_limit("max_details", 50, minimum=1),
+				max_seconds=_limit("max_seconds", 600, minimum=1),
+				max_retries=_limit("max_retries", 1, minimum=0),
 				operating_mode=str(raw.get("operating_mode", "assisted")),
 			)
-		except (TypeError, ValueError) as exc:
+		except (TypeError, ValueError, OverflowError) as exc:
+			# OverflowError：`1e400` 解析成 inf，`int(inf)` 抛错；与
+			# crawl_int_setting / crawl_cdp_port 同口径按记录损坏处理（Issue #1288）。
 			raise CacheRecordInvalid("crawl_run", run_id, "params", f"字段类型无法解析（{exc}）") from exc
 
 
@@ -184,7 +275,8 @@ def crawl_int_setting(cfg: Mapping[str, Any], key: str, default: int, *, minimum
 		return default
 	try:
 		parsed = int(value)
-	except (TypeError, ValueError) as exc:
+	# OverflowError：``1e400`` 解析成 inf，用户可修复，不能落成 INTERNAL_ERROR。
+	except (TypeError, ValueError, OverflowError) as exc:
 		raise ValueError(f"crawl 配置项 {key} 必须是整数") from exc
 	if parsed < minimum:
 		raise ValueError(f"crawl 配置项 {key} 不能小于 {minimum}")
@@ -202,9 +294,13 @@ def crawl_chrome_path(value: Any) -> str | None:
 
 def crawl_cdp_port(value: Any) -> int:
 	"""校验 crawl 配置中的 cdp_port：1-65535 的整数。"""
+	# bool 是 int 子类（true 不是端口）；float / 1e400 的 int() 会截断或溢出，
+	# 只接受整数与数字字符串，与 CLI 的 IntRange 同口径（Issue #1325）。
+	if isinstance(value, bool) or not isinstance(value, (int, str)):
+		raise ValueError("crawl 配置项 cdp_port 必须是整数")
 	try:
 		port = int(value)
-	except (TypeError, ValueError) as exc:
+	except (TypeError, ValueError, OverflowError) as exc:
 		raise ValueError("crawl 配置项 cdp_port 必须是整数") from exc
 	if not 1 <= port <= 65535:
 		raise ValueError("crawl 配置项 cdp_port 必须在 1-65535 之间")
@@ -348,6 +444,7 @@ class CrawlService:
 		budget_factory: Callable[[CacheStore], CrawlBudget] = CrawlBudget,
 		control_probe: Callable[[], str | None] | None = None,
 		on_run_created: Callable[[str], None] | None = None,
+		preflight: Callable[[], None] | None = None,
 	) -> None:
 		self._cache = cache
 		self._data_dir = data_dir
@@ -355,6 +452,9 @@ class CrawlService:
 		self._budget_factory = budget_factory
 		self._control_probe = control_probe
 		self._on_run_created = on_run_created
+		# 登录态 / 浏览器运行时的本地预检。命令层只在确认还有恢复工作之后
+		# 调用它：已完成的 run 直接返回既有结果（Issue #1412）。
+		self._preflight = preflight
 		self._unpersisted_risk_lock: cdp_risk_lock.RiskLock | None = None
 		self._request_budget = RequestBudget.for_data_dir(data_dir)
 		self._lock_dir = data_dir / "cache" / "crawl-locks"
@@ -395,7 +495,10 @@ class CrawlService:
 		if settings.hook_profile != "none":
 			require_capability_mode(settings.operating_mode, "crawl-hook")
 		run_id = uuid.uuid4().hex[:12]
-		output_dir = self._data_dir / "crawl" / "runs" / run_id
+		# 输出目录必须按当前工作目录解析成绝对路径再落盘：`--data-dir` 允许
+		# 相对路径，原样持久化会让换个 cwd 的 resume 把产物写到无关目录
+		# （Issue #1481）。
+		output_dir = (self._data_dir / "crawl" / "runs" / run_id).resolve()
 		self._cache.create_crawl_run(run_id, settings.as_dict(), str(output_dir), status="queued")
 		if self._on_run_created is not None:
 			self._on_run_created(run_id)
@@ -475,6 +578,19 @@ class CrawlService:
 		self._validate_settings(settings)
 		if not self.has_resume_work(run, pages=pages, with_detail=with_detail):
 			return self._completed_outcome(run)
+		# Hook 目录是本地状态：resume 没有 --hook-dir 参数可以修复，必须在
+		# 打开浏览器之前用与 crawl run/start 相同的清单 / 摘要校验拒绝坏目录
+		# （Issue #1408）。已完成的 run 在上面直接返回，不因目录后来被删而失败。
+		try:
+			verify_hook_profile(settings.hook_profile, settings.hook_dir)
+		except ValueError as exc:
+			# 恢复路径没有参数可改：按确定性本地状态失败上报，不能落进命令层
+			# 的「修正 crawl 配置 / crawl configure --help」通用分支（Issue #1460）。
+			raise CrawlHookDirInvalid(str(exc), hook_dir=settings.hook_dir) from exc
+		if self._preflight is not None:
+			# 登录态与运行时预检放在断点修改与 clear_stop 之前：预检失败时本次
+			# 调用不改动任务（与后台恢复的既有约定一致）。
+			self._preflight()
 		self._check_risk_lock()
 		self._cache.update_crawl_run_params(run_id, settings.as_dict())
 		if clear_stop:
@@ -498,7 +614,7 @@ class CrawlService:
 			jobs_seen=len(rows),
 			detail_checks=0,
 			output_paths=_output_paths(output_dir),
-			hooks=_hook_injections(run.get("hook_results", [])),
+			hooks=_hook_injections(run.get("hook_results", []), run_id=str(run["run_id"])),
 			requests_attempted=int(run["requests_attempted"]),
 			detail_requests_attempted=int(run["detail_requests_attempted"]),
 			elapsed_seconds=int(run["elapsed_seconds"]),
@@ -537,6 +653,9 @@ class CrawlService:
 		detail_checks = 0
 		status = "completed"
 		error = ""
+		# 成功路径在 completed 落库前导出并覆盖这里；异常路径保持空，错误信封
+		# 不会指向不存在的产物（Issue #1238）。
+		paths: dict[str, str] = {}
 		risk_lock: dict[str, Any] | None = None
 		current_page = next_page
 		# 风控/待人工处理时保留采集 Chrome，便于用户在窗口内登录或过验证。
@@ -584,7 +703,11 @@ class CrawlService:
 					self._cache.put_crawl_job(run_id, job_key, current_page, row, detail_done=False)
 
 				current_page += 1
-				list_finished = not bool(jobs_data.get("hasMore", True))
+				# 只有平台显式返回布尔 false 才算列表结束。`not bool(None)` 为真，
+				# 原写法会把显式 null 当成「没有更多」，第一页就停止且 run 报
+				# completed；缺失 / null / 类型漂移一律继续翻页到页数上限
+				# （Issue #1345）。
+				list_finished = jobs_data.get("hasMore") is False
 				self._cache.update_crawl_run(
 					run_id,
 					status="running",
@@ -596,10 +719,19 @@ class CrawlService:
 				write_run_outputs(output_dir, [item["payload"] for item in self._cache.list_crawl_jobs(run_id)])
 				if list_finished:
 					break
+			# 最后一页的导出必须在 completed 落库之前（Issue #1238）：第二次 resume
+			# 时页循环不执行，若导出留在 finally 之后，completed 会先写进数据库，
+			# 导出失败后再也无法重试，后续 resume 会报成功但产物不存在。
+			rows = [item["payload"] for item in self._cache.list_crawl_jobs(run_id)]
+			paths = write_run_outputs(output_dir, rows)
 		except HookRegistrationError as exc:
+			# Hook 注入失败是确定性本地失败：保存断点后原样抛出，由入口按
+			# LOCAL_IO_ERROR 回报并给出具体目录。落成普通 stopped 会让调用方拿到
+			# ok:true 和会无限重复的 resume 指引（Issue #1408）。
 			hooks = exc.injections
 			status = "stopped"
 			error = str(exc)
+			raise
 		except CrawlRiskError as exc:
 			status = "risk_stopped"
 			error = str(exc)
@@ -632,15 +764,51 @@ class CrawlService:
 		except CrawlStopRequested as exc:
 			status = "stopped"
 			error = str(exc)
-		except (CrawlRuntimeUnavailable, CrawlExportError) as exc:
-			# 可选依赖缺失与导出失败都是确定性失败：保存断点后原样抛出，由入口按
-			# CRAWL_UNAVAILABLE / LOCAL_IO_ERROR 回报。落成普通的 stopped 会让调用方
-			# 拿到成功信封与恢复指引（Issue #1050、#1135）。
+		except (CacheBusyError, sqlite3.OperationalError) as exc:
+			# 缓存层写锁冲突：`CacheBusyError` 是 `_GuardedConnection` 归一后的形态，
+			# 原始 `sqlite3.OperationalError('database is locked')` 也可能直接从
+			# 取数路径抛出（`is_cache_busy_error` 的文本形态）。两者都必须保存断点
+			# 后原样上抛，由入口落成可重试的 CACHE_BUSY；落成普通 stopped 会让调用
+			# 方拿到 ok:true 与可无限重复的 resume 指引（Issue #1477）。非锁的
+			# OperationalError（坏页 / 只读库）同样原样上抛，按既有契约分类
+			# （Issue #1350、#1467）。
+			status = "stopped"
+			error = str(exc)
+			raise
+		except (
+			CrawlRuntimeUnavailable,
+			CrawlExportError,
+			CrawlProfileBusy,
+			CrawlProfilePathInvalid,
+			CrawlSessionAuthError,
+			CacheRecordInvalid,
+			CacheDatabaseInvalid,
+			sqlite3.DatabaseError,
+		) as exc:
+			# 可选依赖缺失、导出失败、配置目录被另一个采集 Chrome 占用、配置目录
+			# 路径不可用、本地登录态无法注入采集浏览器、本地记录损坏与缓存库损坏
+			# （含取数阶段才暴露的坏页）都是确定性失败：保存断点后原样抛出，由入口
+			# 按 CRAWL_UNAVAILABLE / LOCAL_IO_ERROR / CRAWL_PROFILE_BUSY /
+			# AUTH_REQUIRED / CACHE_RECORD_INVALID / CACHE_DATABASE_INVALID 回报。
+			# 落成普通的 stopped 会让调用方拿到成功信封与恢复指引，而重跑仍会撞上
+			# 同一个占用者、坏路径、坏目录或坏库（Issue #1050、#1135、#1212、#1266、
+			# #1290、#1350）。CrawlSessionAuthError 尤其不能进入风控分支：本地
+			# Cookie 注入失败不是平台风控，写风险锁会误导用户去 clean（Issue #1405）。
 			status = "stopped"
 			error = str(exc)
 			raise
 		except Exception as exc:
-			status = "stopped"
+			# transport 的控制检查会透传 wizard 的 ambient 信号
+			# （WorkflowActionError 的 WORKFLOW_STOPPED / WORKFLOW_TIMEOUT）；按错误码
+			# 归入 crawl 自己的停止语义。落成普通 stopped 会让调用方看到可重试的
+			# NETWORK_ERROR，甚至给出会清掉 stop 标记的恢复命令（Issue #1238）。
+			code = getattr(exc, "code", None)
+			if code == "WORKFLOW_TIMEOUT":
+				status = "timeout_stopped"
+			elif code == "WORKFLOW_STOPPED":
+				status = "workflow_stopped"
+			else:
+				status = "stopped"
 			error = str(exc)
 		except BaseException:
 			# SystemExit 等退出信号也会进入 finally：先保存中断断点，不能把未完成
@@ -649,21 +817,31 @@ class CrawlService:
 			error = "execution interrupted; verify any unfinished operation before explicitly resuming"
 			raise
 		finally:
-			# Save progress before cleanup: a detached browser can fail to close.
-			self._cache.update_crawl_run_budget(
-				run_id,
-				requests_attempted=run_budget.requests_attempted,
-				detail_requests_attempted=run_budget.detail_requests_attempted,
-				elapsed_seconds=run_budget.elapsed_seconds,
-			)
-			self._cache.update_crawl_run(
-				run_id,
-				status=status,
-				next_page=current_page,
-				error=error,
-				list_finished=list_finished,
-				hook_results=_hook_metadata(hooks),
-			)
+			# 三步各自独立兜底：budget 写失败不能让终态落库与浏览器关闭被跳过，
+			# 否则 run 永远停在 running、本次错误丢失，采集 Chrome 继续占用共享
+			# profile（Issue #1277）。
+			cleanup_errors: list[BaseException] = []
+			try:
+				# Save progress before cleanup: a detached browser can fail to close.
+				self._cache.update_crawl_run_budget(
+					run_id,
+					requests_attempted=run_budget.requests_attempted,
+					detail_requests_attempted=run_budget.detail_requests_attempted,
+					elapsed_seconds=run_budget.elapsed_seconds,
+				)
+			except Exception as exc:
+				cleanup_errors.append(exc)
+			try:
+				self._cache.update_crawl_run(
+					run_id,
+					status=status,
+					next_page=current_page,
+					error=error,
+					list_finished=list_finished,
+					hook_results=_hook_metadata(hooks),
+				)
+			except Exception as exc:
+				cleanup_errors.append(exc)
 			close = getattr(transport, "close", None)
 			if callable(close):
 				try:
@@ -676,10 +854,16 @@ class CrawlService:
 					if status == "completed":
 						status = "stopped"
 					error = f"{error}; browser cleanup failed ({type(close_error).__name__})".lstrip("; ")
-					self._cache.update_crawl_run(run_id, status=status, next_page=current_page, error=error)
+					try:
+						self._cache.update_crawl_run(run_id, status=status, next_page=current_page, error=error)
+					except Exception as exc:
+						cleanup_errors.append(exc)
+			if cleanup_errors and sys.exc_info()[0] is None:
+				# 正常路径上本地清理失败必须暴露（命令层报 CACHE_BUSY / LOCAL_IO_ERROR），
+				# 但不能覆盖正在传播的原始异常（风控 / 中断 / 停止）。
+				raise cleanup_errors[0]
 
 		rows = [item["payload"] for item in self._cache.list_crawl_jobs(run_id)]
-		paths = write_run_outputs(output_dir, rows)
 		return CrawlOutcome(
 			run_id=run_id,
 			status=status,
@@ -790,7 +974,9 @@ class CrawlService:
 		for _ in range(max_retries + 1):
 			try:
 				return action()
-			except (PlatformRiskError, CrawlRiskError, CrawlLimitExceeded, CrawlStopRequested):
+			except (PlatformRiskError, CrawlRiskError, CrawlLimitExceeded, CrawlStopRequested, sqlite3.DatabaseError):
+				# 只读目录 / 磁盘满等本地数据库故障重试同一次请求不会自愈；保留原始
+				# `sqlite3.DatabaseError` 让上层按 LOCAL_IO_ERROR 收口（Issue #1467）。
 				raise
 			except Exception as exc:
 				if is_request_stop(exc):
@@ -924,19 +1110,29 @@ def _hook_metadata(hooks: tuple[HookInjection, ...]) -> list[dict[str, Any]]:
 	]
 
 
-def _hook_injections(raw: Any) -> tuple[HookInjection, ...]:
+def _hook_injections(raw: Any, *, run_id: str = "") -> tuple[HookInjection, ...]:
 	if not isinstance(raw, list):
 		return ()
-	return tuple(
-		HookInjection(
-			name=str(item.get("name", "")),
-			success=bool(item.get("success", False)),
-			sha256=str(item.get("sha256", "")),
-			reason=str(item.get("reason", "")),
+	injections: list[HookInjection] = []
+	for item in raw:
+		if not isinstance(item, dict):
+			continue
+		success = item.get("success", False)
+		# bool("false") / bool(0) 都会把失败的注入显示成成功：断点里的 success
+		# 只认真正的布尔值，类型漂移按记录损坏处理（Issue #1484）。
+		if not isinstance(success, bool):
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "hook_results", f"success 期望布尔值，实际是 {type(success).__name__}"
+			)
+		injections.append(
+			HookInjection(
+				name=str(item.get("name", "")),
+				success=success,
+				sha256=str(item.get("sha256", "")),
+				reason=str(item.get("reason", "")),
+			)
 		)
-		for item in raw
-		if isinstance(item, dict)
-	)
+	return tuple(injections)
 
 
 def _output_paths(output_dir: Path) -> dict[str, str]:

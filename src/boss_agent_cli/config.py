@@ -102,6 +102,21 @@ def expand_budget_directory(value: str) -> Path:
 	return path
 
 
+def _finite_number(value: Any) -> bool:
+	"""数值且可安全转成 float。
+
+	合法 JSON 的大整数（4300 位以内，``json.loads`` 正常解析）在 ``math.isfinite``
+	里转 float 会抛 ``OverflowError``；与 ``inf`` 同等按「无效」处理，不能落成
+	``INTERNAL_ERROR``（Issue #1230）。
+	"""
+	if isinstance(value, bool) or not isinstance(value, (int, float)):
+		return False
+	try:
+		return math.isfinite(value)
+	except OverflowError:
+		return False
+
+
 def validate_request_config(cfg: dict[str, Any]) -> None:
 	"""Validate local pacing limits before they reach a transport or persistence."""
 	for key in ("request_delay", "batch_greet_delay"):
@@ -109,9 +124,7 @@ def validate_request_config(cfg: dict[str, Any]) -> None:
 		if (
 			not isinstance(value, (list, tuple))
 			or len(value) != 2
-			or not all(
-				isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(item) for item in value
-			)
+			or not all(_finite_number(item) for item in value)
 			or not 0 <= value[0] <= value[1]
 		):
 			raise ValueError(f"{key} 必须包含两个有限数值，且满足 0 <= 下限 <= 上限")
@@ -119,7 +132,7 @@ def validate_request_config(cfg: dict[str, Any]) -> None:
 	if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
 		raise ValueError("request_max_per_minute 必须是正整数")
 	seconds = cfg.get("request_wait_timeout", DEFAULTS["request_wait_timeout"])
-	if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds <= 0:
+	if not _finite_number(seconds) or seconds <= 0:
 		raise ValueError("request_wait_timeout 必须是有限正数")
 	directory = cfg.get("request_budget_dir")
 	if directory is not None:
@@ -135,23 +148,36 @@ def load_config(config_path: Path | None) -> dict[str, Any]:
 		with open(config_path, encoding="utf-8") as f:
 			try:
 				user_cfg = json.load(f)
-			except json.JSONDecodeError as exc:
+			except ValueError as exc:
+				# ValueError 覆盖 JSONDecodeError / UnicodeDecodeError，以及 Python
+				# 3.11+ 对超长整数字面量的位数上限；只有 JSONDecodeError 带行列。
 				# 这份文件坏掉时所有命令都在启动阶段退出，连 config reset 也跑不了：
 				# 消息必须给出文件路径和行列，让用户知道要改哪份文件、怎么恢复。
+				position = (
+					f"第 {exc.lineno} 行第 {exc.colno} 列：" if isinstance(exc, json.JSONDecodeError) else ""
+				)
 				raise ValueError(
-					f"{config_path} 不是合法 JSON（第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}）："
+					f"{config_path} 不是合法 JSON（{position}{exc}）："
+					"修正该文件或删除它后重试；删除后所有配置回到默认值"
+				) from exc
+			except RecursionError as exc:
+				raise ValueError(
+					f"{config_path} 不是合法 JSON（嵌套层级过深）："
 					"修正该文件或删除它后重试；删除后所有配置回到默认值"
 				) from exc
 		if not isinstance(user_cfg, dict):
 			raise ValueError(f"{config_path} 必须是 JSON 对象")
 		cfg.update(user_cfg)
 	mode = user_cfg.get("operating_mode")
-	if mode not in {"assisted", "research"}:
+	# 非字符串容器（[] / {} / ["assisted"]）不可哈希，直接 `not in` 会抛
+	# TypeError：启动期所有命令（含 config reset）都失败，而 "bogus" / 123
+	# 却安静回退默认值。与既有口径对齐，非字符串一律走回退分支（Issue #1450）。
+	if not isinstance(mode, str) or mode not in {"assisted", "research"}:
 		if "low_risk_mode" in user_cfg:
 			mode = "research" if user_cfg["low_risk_mode"] is False else "assisted"
 		else:
 			mode = DEFAULTS.get("operating_mode", "assisted")
-	if mode not in {"assisted", "research"}:
+	if not isinstance(mode, str) or mode not in {"assisted", "research"}:
 		mode = "assisted"
 	cfg["operating_mode"] = mode
 	return cfg

@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any
 
 from boss_agent_cli.api.client import PlatformRiskError
+from boss_agent_cli.api.proxy import ProxyConfigurationError
 from boss_agent_cli.api.zhipin_errors import normalize_risk_code
 from boss_agent_cli.auth.browser import (
 	ReusedSessionStaleError,
@@ -72,7 +73,13 @@ class AuthManager:
 		prior_lock = details.get("risk_lock", {})
 		raw_code = details.get("platform_code", prior_lock.get("platform_code") if isinstance(prior_lock, dict) else None) if error is not None else 37
 		saved_token = token or self._token or {}
-		stoken = saved_token.get("stoken") or saved_token.get("cookies", {}).get(cdp_risk_lock.STOKEN_COOKIE)
+		cookies = saved_token.get("cookies")
+		# 登录态结构漂移（cookies 不是对象）时按缺失处理：这里的 AttributeError
+		# 会替换正在传播的 PlatformRiskError，掩盖 ACCOUNT_RISK / ENVIRONMENT_RISK
+		# 信封并跳过风险锁写入（Issue #1212）。
+		stoken = saved_token.get("stoken") or (
+			cookies.get(cdp_risk_lock.STOKEN_COOKIE) if isinstance(cookies, dict) else None
+		)
 		lock = cdp_risk_lock.RiskLock(
 			stoken_sha256=cdp_risk_lock.hash_stoken(stoken) if isinstance(stoken, str) else None,
 			locked_at=time.time(), cdp_url=cdp_url, reason=reason,
@@ -199,17 +206,21 @@ class AuthManager:
 		# 第二步：CDP 自动探测
 		if probe_cdp(cdp_url):
 			self._logger.info("检测到 CDP 可用，尝试 CDP 登录...")
+			# 只有 CDP 登录本身失败才降级到扫码。落盘失败（权限 / 磁盘满）意味着
+			# 平台侧登录已经成功，再扫一次码只会重复失败并丢掉原始本地错误
+			# （Issue #1480）；保存动作因此放在降级 try 之外，原样上抛。
 			try:
 				token = self._cdp_login(cdp_url=cdp_url, timeout=timeout, reuse_existing=reuse_existing)
-				method = "CDP 扫码"
-				self._store.save(token)
-				self._token = token
-				return {**token, "_method": method}
 			except PlatformRiskError:
 				# 风控：立即停止，绝不降级到 patchright 再登一次（#419 / #422 契约）
 				raise
 			except Exception as e:
 				self._logger.info(f"CDP 登录失败（{e}），降级到 patchright")
+			else:
+				method = "CDP 扫码"
+				self._store.save(token)
+				self._token = token
+				return {**token, "_method": method}
 		else:
 			self._logger.info("CDP 不可用，改用浏览器扫码登录")
 
@@ -237,9 +248,9 @@ class AuthManager:
 		return {**token, "_method": "cURL 导入"}
 
 	def _has_primary_cookie(self, token: dict[str, Any]) -> bool:
-		cookies = token.get("cookies", {})
+		cookies = token.get("cookies")
 		primary_cookie = "wt2"
-		return bool(cookies.get(primary_cookie))
+		return isinstance(cookies, dict) and bool(cookies.get(primary_cookie))
 
 	def _verify_cookie(self, token: dict[str, Any]) -> bool:
 		"""验证 Cookie 是否有效。"""
@@ -262,7 +273,9 @@ class AuthManager:
 			)
 			try:
 				data = resp.json()
-			except ValueError:
+			except (ValueError, RecursionError):
+				# ValueError 覆盖 JSON 语法错误；深嵌套响应在 3.11–3.13 抛 RecursionError。
+				# 与解析失败一样按「响应无法解析」处理：Cookie 校验视为失败（Issue #1378）。
 				data = None
 			if isinstance(data, dict):
 				raise_platform_risk_response(data)
@@ -313,6 +326,10 @@ class AuthManager:
 				raise BrowserSourceUnavailable(
 					policy, attempted=(), detail="stoken 刷新需要 --cdp-url，该来源不会探测默认端口"
 				)
+			cookies = current.get("cookies")
+			if not isinstance(cookies, dict):
+				# 本地登录态结构漂移：不要发起刷新再被兜成泛化的「刷新失败」。
+				raise TokenRefreshFailed("本地登录态缺少 cookies，无法刷新，请重新登录")
 			self._logger.info("Token 过期，正在静默刷新...")
 			try:
 				# 按来源策略优先复用 CDP；风险仍须原样停止，不保证平台接受。
@@ -328,9 +345,14 @@ class AuthManager:
 				else:
 					self._logger.info("CDP 不可用，降级到 headless 刷新 stoken")
 					new_stoken = refresh_stoken(
-						current["cookies"],
+						cookies,
 						current.get("user_agent", ""),
 					)
+				if not isinstance(new_stoken, str) or not new_stoken.strip():
+					# 刷新通道返回空值（headless 首页迟迟不产出 stoken）：不能把
+					# 空串存进登录态覆盖旧 stoken，否则之后所有请求都拿空凭证
+					# 打平台、重试到预算耗尽（Issue #1305）。
+					raise TokenRefreshFailed("Token 刷新失败：刷新通道未返回 stoken，请重新登录")
 				refreshed = {**current, "stoken": new_stoken}
 				self._store.save(refreshed)
 				self._token = refreshed
@@ -338,6 +360,21 @@ class AuthManager:
 				self._record_cdp_risk_lock(cdp_url, error=error, token=current)
 				raise
 			except BrowserSourceUnavailable:
+				raise
+			except TokenRefreshFailed:
+				# 刷新链里已经明确失败（例如返回空 stoken），不要二次包装。
+				raise
+			except ProxyConfigurationError:
+				# 代理环境变量非法是确定性配置错误：包装成可重试的
+				# TOKEN_REFRESH_FAILED 只会诱导重试，保留 typed error 交给
+				# 命令层统一映射 INVALID_PARAM（Issue #1423）。
+				raise
+			except OSError:
+				# 刷新本身可能已经成功，失败点是本地登录态落盘（权限 / 磁盘满）：
+				# 包装成可恢复的 TokenRefreshFailed 会让命令层提示重新登录，而重登
+				# 仍会卡在同一次保存上（Issue #1479）。原样上抛，由命令层映射为
+				# 不可重试的 LOCAL_IO_ERROR；网络类 OSError 子类
+				# （ConnectionError / TimeoutError）不会命中本地 IO 分类。
 				raise
 			except Exception as e:
 				raise TokenRefreshFailed(f"Token 刷新失败: {e}") from e

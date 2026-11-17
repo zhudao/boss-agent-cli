@@ -322,6 +322,7 @@ SCHEMA_DATA = {
 					"type": "int",
 					"default": 10,
 					"minimum": 0,
+					"maximum": 10,
 					"description": "打招呼数量上限（最大 10）",
 				},
 				"--dry-run": {
@@ -436,7 +437,7 @@ SCHEMA_DATA = {
 				"-o, --output": {
 					"type": "string",
 					"default": None,
-					"description": "输出文件路径（不指定则自动保存到 config.export_dir，默认 ~/Documents/files/boss，按日期命名同天覆盖）",
+					"description": "输出文件路径；必须配合 --export 使用（只给 -o 会返回 INVALID_PARAM），显式空串无效。省略 -o 时自动保存到 config.export_dir，未配置时使用 <data-dir>/chat-export，按日期命名同天覆盖",
 				},
 				"--page": {
 					"type": "int",
@@ -492,8 +493,8 @@ SCHEMA_DATA = {
 				"--label": {
 					"type": "string",
 					"required": True,
-					"description": "标签名称或 ID",
-					"enum": ["新招呼", "沟通中", "已约面", "已获取简历", "已交换电话", "已交换微信", "不合适", "收藏"],
+					"description": "标签名称或数字 ID（见 boss schema 的 enum；数字 ID 与标签名一一对应）",
+					"enum": ["新招呼", "沟通中", "已约面", "已获取简历", "已交换电话", "已交换微信", "不合适", "牛人发起", "收藏"],
 				},
 				"--remove": {"type": "boolean", "default": False, "description": "移除标签（默认为添加）"},
 			},
@@ -743,7 +744,7 @@ SCHEMA_DATA = {
 						"type": "object",
 						"properties": {
 							"run_id": {"type": "string", "description": "crawl run 标识，由 boss crawl start 返回"},
-							"page": {"type": "integer", "description": "只返回该 crawl 页的结果，省略则返回全部"},
+							"page": {"type": "integer", "minimum": 1, "description": "只返回该 crawl 页的结果，省略则返回全部"},
 							"detail_status": {
 								"type": "string",
 								"enum": ["completed", "pending"],
@@ -1125,7 +1126,12 @@ SCHEMA_DATA = {
 						"description": "AI 提供商（openai/deepseek/moonshot/openrouter/qwen/zhipu/siliconflow/ollama/vllm/custom）",
 					},
 					"--model": {"type": "string", "default": None, "description": "模型名称（如 gpt-4o / deepseek-chat）"},
-					"--api-key": {"type": "string", "default": None, "description": "API 密钥（将加密存储）"},
+					"--api-key": {"type": "string", "default": None, "description": "API 密钥（将加密存储；空值会被拒绝，清除密钥请用 --clear-api-key）"},
+					"--clear-api-key": {
+						"type": "bool",
+						"default": False,
+						"description": "删除已存储的 API 密钥（与 --api-key 互斥）",
+					},
 					"--base-url": {
 						"type": "string",
 						"default": None,

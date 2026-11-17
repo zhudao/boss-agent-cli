@@ -1115,3 +1115,198 @@ def test_ai_http_400_surfaces_provider_reason_and_param_hint(tmp_path, monkeypat
 	assert parsed["error"]["code"] == "AI_API_ERROR"
 	assert "does not support 0.7" in parsed["error"]["message"]
 	assert "--model" in parsed["error"]["recovery_action"]
+
+
+@pytest.mark.parametrize(
+	("key", "value"),
+	[
+		("ai_max_tokens", "512"),
+		("ai_max_tokens", [512]),
+		("ai_max_tokens", True),
+		("ai_max_tokens", 0),
+		("ai_temperature", "hot"),
+		("ai_temperature", []),
+	],
+)
+def test_reply_rejects_invalid_numeric_ai_config(tmp_path, monkeypatch, key, value):
+	"""坏数值不能原样发给服务商，也不能兜成可重试的网络错误（Issue #1209）。"""
+	store = _setup_ai_config(tmp_path, monkeypatch)
+	store.save_config(**{key: value})
+	runner = CliRunner()
+
+	with patch("boss_agent_cli.ai.service.httpx.post") as post:
+		result = _invoke(runner, tmp_path, ["reply", "你好"])
+
+	assert result.exit_code == 1, result.output
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert key in parsed["error"]["message"]
+	assert "--max-tokens" in parsed["error"]["recovery_action"]
+	assert not post.called, "坏配置必须在发请求之前拦下"
+
+
+def test_reply_falls_back_to_defaults_for_null_ai_numeric_config(tmp_path, monkeypatch):
+	"""显式 null 与缺键同口径回落到默认值（与 ai_int_setting 一致）。"""
+	store = _setup_ai_config(tmp_path, monkeypatch)
+	store.save_config(ai_max_tokens=None, ai_temperature=None)
+	runner = CliRunner()
+
+	mock_result = {"intent_analysis": "x", "reply_drafts": [], "key_points": [], "avoid": []}
+	with patch("boss_agent_cli.ai.service.httpx.post", return_value=_mock_ai_response(mock_result)) as post:
+		result = _invoke(runner, tmp_path, ["reply", "你好"])
+
+	assert result.exit_code == 0, result.output
+	payload = post.call_args.kwargs["json"]
+	assert payload["max_tokens"] == 4096
+	assert payload["temperature"] == 0.7
+
+
+# ── 响应体深嵌套（Issue #1365） ──────────────────────────────
+
+
+def test_polish_recursive_response_body_returns_envelope(tmp_path, monkeypatch):
+	"""HTTP 200 + 深嵌套响应体（3.11–3.13 解析抛 RecursionError）仍要输出一个信封。"""
+	_setup_ai_config(tmp_path, monkeypatch)
+	_setup_resume(tmp_path)
+	runner = CliRunner()
+
+	mock_resp = MagicMock()
+	mock_resp.status_code = 200
+	mock_resp.json.side_effect = RecursionError("maximum recursion depth exceeded")
+	mock_resp.raise_for_status = MagicMock()
+	with patch("boss_agent_cli.ai.service.httpx.post", return_value=mock_resp):
+		result = _invoke(runner, tmp_path, ["polish", "test-resume"])
+
+	assert result.exit_code == 1
+	assert result.output.strip(), "stdout 必须包含 JSON 信封，不能为空"
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	# 与既有「响应格式异常」分支一致：响应体解析不了按 AI 服务调用失败上报。
+	assert parsed["error"]["code"] == "AI_API_ERROR"
+	assert parsed["error"]["recoverable"] is True
+
+
+def test_analyze_jd_recursive_error_body_returns_envelope(tmp_path, monkeypatch):
+	"""HTTP 错误 + 深嵌套错误体：_error_detail 不能让 RecursionError 冒泡成 traceback。"""
+	import httpx
+
+	_setup_ai_config(tmp_path, monkeypatch)
+	_setup_resume(tmp_path)
+	runner = CliRunner()
+
+	request = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
+	mock_resp = MagicMock()
+	mock_resp.status_code = 400
+	mock_resp.raise_for_status.side_effect = httpx.HTTPStatusError("bad request", request=request, response=mock_resp)
+	mock_resp.json.side_effect = RecursionError("maximum recursion depth exceeded")
+	with patch("boss_agent_cli.ai.service.httpx.post", return_value=mock_resp):
+		result = _invoke(runner, tmp_path, ["analyze-jd", "some jd", "--resume", "test-resume"])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "AI_API_ERROR"
+	assert "HTTP 400" in parsed["error"]["message"]
+
+
+def test_error_detail_returns_empty_on_recursion_error():
+	"""错误体深嵌套时 _error_detail 返回空串，不抛 RecursionError。"""
+	from boss_agent_cli.ai.service import _error_detail
+
+	mock_resp = MagicMock()
+	mock_resp.json.side_effect = RecursionError("maximum recursion depth exceeded")
+
+	assert _error_detail(mock_resp) == ""
+
+
+# ── 字符串项与 base_url 漂移（Issue #1428 / #1431） ────────────────
+
+
+def test_polish_reports_invalid_param_when_model_is_not_a_string(tmp_path, monkeypatch):
+	"""ai_model 被手改成数组时，命令必须报 INVALID_PARAM 与 --model 修复指引，
+	而不是服务层 rsplit 崩溃后落不可恢复的 INTERNAL_ERROR。"""
+	monkeypatch.setenv("BOSS_AGENT_MACHINE_ID", "test-machine")
+	from boss_agent_cli.ai.config import AIConfigStore
+
+	store = AIConfigStore(tmp_path)
+	store.save_config(ai_provider="openai", ai_model=["gpt-4o"])
+	store.save_api_key("sk-test-key")
+
+	runner = CliRunner()
+	result = _invoke(runner, tmp_path, ["polish", "demo"])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "ai_model" in parsed["error"]["message"]
+	assert parsed["error"]["recovery_action"].endswith("ai config --model <值>")
+
+
+def test_polish_reports_invalid_param_when_base_url_is_not_a_string(tmp_path, monkeypatch):
+	"""ai_base_url 漂移成数组时同样在构造服务前收口，指引 --base-url 修复。"""
+	monkeypatch.setenv("BOSS_AGENT_MACHINE_ID", "test-machine")
+	from boss_agent_cli.ai.config import AIConfigStore
+
+	store = AIConfigStore(tmp_path)
+	store.save_config(ai_provider="openai", ai_model="gpt-4o", ai_base_url=["https://api.openai.com/v1"])
+	store.save_api_key("sk-test-key")
+
+	runner = CliRunner()
+	result = _invoke(runner, tmp_path, ["polish", "demo"])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "ai_base_url" in parsed["error"]["message"]
+	assert "ai config --base-url" in parsed["error"]["recovery_action"]
+
+
+def test_polish_reports_invalid_param_when_base_url_has_no_scheme(tmp_path, monkeypatch):
+	"""缺 scheme 的 base_url 会让 httpx 抛 UnsupportedProtocol；必须按本地配置错误上报。"""
+	monkeypatch.setenv("BOSS_AGENT_MACHINE_ID", "test-machine")
+	from boss_agent_cli.ai.config import AIConfigStore
+
+	store = AIConfigStore(tmp_path)
+	store.save_config(ai_provider="custom", ai_model="m", ai_base_url="api.example.com/v1")
+	store.save_api_key("sk-test-key")
+
+	runner = CliRunner()
+	result = _invoke(runner, tmp_path, ["polish", "demo"])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert "http(s)" in parsed["error"]["message"]
+
+
+def test_config_rejects_blank_model(tmp_path, monkeypatch):
+	"""--model ' ' 会写进配置并在每次调用时由服务商 400；写入前拒绝。"""
+	monkeypatch.setenv("BOSS_AGENT_MACHINE_ID", "test-machine")
+	from boss_agent_cli.ai.config import AIConfigStore
+
+	runner = CliRunner()
+	result = _invoke(runner, tmp_path, ["config", "--model", " "])
+
+	assert result.exit_code == 1
+	parsed = json.loads(result.output)
+	assert parsed["error"]["code"] == "INVALID_PARAM"
+	assert AIConfigStore(tmp_path).load_config()["ai_model"] is None
+
+
+@pytest.mark.parametrize("bad_url", ["", " ", "api.example.com/v1", "ftp://example.com/v1"])
+def test_config_rejects_invalid_base_url(tmp_path, monkeypatch, bad_url):
+	"""空白 / 缺 scheme / 非 http(s) 的 --base-url 写进去后每条 AI 命令都会失败。"""
+	monkeypatch.setenv("BOSS_AGENT_MACHINE_ID", "test-machine")
+	from boss_agent_cli.ai.config import AIConfigStore
+
+	store = AIConfigStore(tmp_path)
+	store.save_config(ai_provider="custom", ai_model="m")
+	store.save_api_key("sk-test-key")
+	runner = CliRunner()
+	result = _invoke(runner, tmp_path, ["config", "--base-url", bad_url])
+
+	# 显式空串同样是「提供了更新」，必须在写盘前按 INVALID_PARAM 拒绝
+	# （Issue #1499）；配置里不能留下坏端点或空端点。
+	assert result.exit_code == 1
+	assert json.loads(result.output)["error"]["code"] == "INVALID_PARAM"
+	assert store.load_config()["ai_base_url"] is None

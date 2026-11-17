@@ -13,6 +13,7 @@ from boss_agent_cli.auth.browser import (
 	_warm_home_for_runtime,
 	login_via_cdp,
 	login_via_browser,
+	probe_cdp,
 	refresh_stoken,
 	refresh_stoken_via_cdp,
 )
@@ -219,22 +220,25 @@ def test_login_via_browser_falls_back_to_cookie_jar_when_home_nav_stalls(mock_sl
 	mock_browser.close.assert_called_once()
 
 
-def test_refresh_stoken_returns_empty_when_home_nav_stalls():
+def test_refresh_stoken_raises_when_home_nav_stalls_and_jar_empty():
 	mock_page = MagicMock()
 	mock_page.goto.side_effect = TimeoutError("Timeout 15000ms exceeded")
 	mock_page.wait_for_load_state.side_effect = Exception("Timeout 3000ms exceeded")
 
 	mock_context = MagicMock()
 	mock_context.new_page.return_value = mock_page
+	mock_context.cookies.return_value = []
 
 	mock_browser = MagicMock()
 	mock_browser.new_context.return_value = mock_context
 
 	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=_mock_playwright_context(mock_browser)):
 		with patch("boss_agent_cli.auth.browser._extract_stoken") as mock_extract:
-			result = refresh_stoken({"wt2": "cookie"}, "UA")
+			# 与 CDP 路径同口径：刷新拿不到 stoken 是失败，不能把空串当成功
+			# 返回、覆盖调用方本地的旧 stoken（Issue #1305）。
+			with pytest.raises(RuntimeError, match="页面未生成 stoken"):
+				refresh_stoken({"wt2": "cookie"}, "UA")
 
-	assert result == ""
 	mock_extract.assert_not_called()
 	mock_browser.close.assert_called_once()
 
@@ -855,3 +859,87 @@ def test_login_via_cdp_stops_before_home_nav_when_page_turns_into_security_page(
 	assert caught.value.details.get("risk_source") == "security_page"
 	# 登录页 commit 之后命中风控，不得再向首页发导航请求
 	mock_page.goto.assert_called_once_with(LOGIN_PAGE_URL, wait_until="commit", timeout=_NAV_TIMEOUT_MS)
+
+
+# ── CDP 探测非对象响应与连接失败清理（Issue #1421 / #1425） ─────────────
+
+
+@pytest.mark.parametrize("payload", [[], None, "ws://127.0.0.1/devtools/browser", 42, True], ids=["list", "null", "string", "int", "bool"])
+@patch("httpx.get")
+def test_probe_cdp_non_object_payload_reports_unavailable(mock_get, payload):
+	"""`/json/version` 返回非对象 JSON 时按 CDP 不可用处理，不得抛 AttributeError（Issue #1421）。
+
+	探测异常会从 ``AuthManager.login`` 的降级链之外冒泡，即使非 ``--cdp`` 强制模式也会
+	直接中止，不再降级到 patchright 扫码；``force_refresh`` 同样会误报网络错误。
+	"""
+	mock_response = MagicMock()
+	mock_response.json.return_value = payload
+	mock_get.return_value = mock_response
+
+	assert probe_cdp() is None
+
+
+@patch("httpx.get")
+def test_probe_cdp_dict_payload_returns_websocket_url(mock_get):
+	"""对象响应仍按 webSocketDebuggerUrl 正常返回，避免过度收紧。"""
+	mock_response = MagicMock()
+	mock_response.json.return_value = {"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser"}
+	mock_get.return_value = mock_response
+
+	assert probe_cdp() == "ws://127.0.0.1/devtools/browser"
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+def test_login_via_cdp_stops_playwright_when_connect_fails(mock_probe_cdp):
+	"""connect_over_cdp 握手失败时必须 stop Playwright driver，避免泄漏（Issue #1425）。"""
+	mock_playwright = MagicMock()
+	mock_playwright.chromium.connect_over_cdp.side_effect = RuntimeError("handshake failed")
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value = mock_playwright
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		with pytest.raises(RuntimeError, match="handshake failed"):
+			login_via_cdp()
+
+	mock_playwright.stop.assert_called_once()
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+def test_login_via_cdp_stops_playwright_when_contexts_read_fails(mock_probe_cdp):
+	"""读取 browser.contexts 失败与握手失败同口径：stop driver 后原样上抛（Issue #1425）。"""
+	mock_browser = MagicMock()
+	type(mock_browser).contexts = PropertyMock(side_effect=RuntimeError("target closed"))
+	mock_playwright = MagicMock()
+	mock_playwright.chromium.connect_over_cdp.return_value = mock_browser
+	mock_launcher = MagicMock()
+	mock_launcher.start.return_value = mock_playwright
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		with pytest.raises(RuntimeError, match="target closed"):
+			login_via_cdp()
+
+	mock_playwright.stop.assert_called_once()
+
+
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_login_via_browser_rejects_empty_final_cookie_read(mock_sleep):
+	"""响应 URI 命中登录接口不等于登录成功：最终读取缺主 cookie 时不得返回空凭证（Issue #1454）。"""
+	mock_page = MagicMock()
+	mock_page.wait_for_load_state.return_value = None
+	mock_page.evaluate.return_value = "UA"
+
+	mock_context = MagicMock()
+	mock_context.new_page.return_value = mock_page
+	mock_context.cookies.side_effect = [
+		[{"name": "wt2", "value": "token", "domain": ".zhipin.com"}],
+		[],
+	]
+
+	mock_browser = MagicMock()
+	mock_browser.new_context.return_value = mock_context
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=_mock_playwright_context(mock_browser)):
+		with pytest.raises(RuntimeError, match="主 cookie"):
+			login_via_browser(timeout=2, platform="zhipin")
+
+	mock_browser.close.assert_called_once()

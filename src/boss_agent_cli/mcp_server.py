@@ -30,7 +30,8 @@ from mcp.types import (
 from boss_agent_cli.api.browser_source import POLICIES as BROWSER_SOURCES
 from boss_agent_cli.mcp_args import _build_args
 from boss_agent_cli.mcp_tools import TOOLS
-from boss_agent_cli.output import envelope_error
+from boss_agent_cli.output import envelope_error, json_safe_value, serialization_failure_envelope
+from boss_agent_cli.search_filters import detail_filter_max_pages
 
 # 向后兼容的再导出：这些符号在拆分前属于本模块，`mcp-server/server.py` wrapper
 # 与既有测试仍按 `boss_agent_cli.mcp_server.<name>` 取用。本模块自身不再使用它们，
@@ -99,6 +100,28 @@ _CLI_TIMEOUT_SECONDS = 120.0
 _CHECKPOINT_GRACE_SECONDS = 5.0
 _TERMINATE_GRACE_SECONDS = 1.0
 
+#: 按参数估算子进程超时时的单次请求预算（秒）。默认节流
+#: ``DEFAULT_REQUEST_DELAY = (30.0, 60.0)`` 的高斯均值是 45s、上界 60s；
+#: 每次按 60s 节流上界 + 5s 抖动 / 请求开销估算。
+_REQUEST_BUDGET_SECONDS = 65.0
+#: 登录态、缓存初始化与信封输出等非请求开销的固定余量。
+_REQUEST_MARGIN_SECONDS = 30.0
+#: 估算超时的封顶：更长的参数应让调用方拆分，而不是让 MCP 调用挂到天荒地老。
+_MAX_CLI_TIMEOUT_SECONDS = 900.0
+#: 搜索结果页固定 15 条；详情筛选要逐条请求。
+_SEARCH_PAGE_SIZE = 15
+#: 招聘者聊天摘要 / 最近消息按每批 50 条请求估算。
+_HR_BATCH_SIZE = 50
+#: pipeline / follow-up / digest 聚合好友列表的估算页数上限。
+_FRIEND_LIST_ESTIMATE_PAGES = 5
+#: batch-greet 的 CLI 默认值与上限（命令内会把 --count 截断到 10）。
+_BATCH_GREET_DEFAULT_COUNT = 10
+_BATCH_GREET_MAX_COUNT = 10
+#: export 的 CLI 默认导出数量。
+_EXPORT_DEFAULT_COUNT = 50
+#: 招聘者聊天摘要与最近消息的 CLI 默认条数。
+_HR_DEFAULT_LIMIT = 100
+
 
 def _default_boss_bin(*, executable: str | None = None, windows: bool | None = None) -> str:
 	"""未显式传 ``--boss-bin`` 时使用的底层 CLI。
@@ -134,13 +157,16 @@ def _configure_boss_invocation(
 	global _BOSS_BIN, _BOSS_GLOBAL_ARGS
 	_BOSS_BIN = boss_bin
 	args: list[str] = []
-	if data_dir:
+	# 空串是显式取值，不是「未提供」：真值判断会在映射层丢弃它，子进程静默回落
+	# 到默认数据目录 / 平台（Issue #1471）。原样传给 CLI，由 CLI 参数校验报
+	# INVALID_PARAM，调用方才能看到自己传错了。
+	if data_dir is not None:
 		args.extend(["--data-dir", data_dir])
-	if platform:
+	if platform is not None:
 		args.extend(["--platform", platform])
-	if role:
+	if role is not None:
 		args.extend(["--role", role])
-	if browser_source:
+	if browser_source is not None:
 		args.extend(["--browser-source", browser_source])
 	_BOSS_GLOBAL_ARGS = args
 
@@ -175,6 +201,10 @@ _READ_ONLY_TOOL_NAMES = frozenset({
 	"boss_favorites_list",
 	"boss_crawl_status",
 	"boss_crawl_results",
+	"boss_chat_summary",
+	"boss_agent_stats",
+	"boss_agent_pending",
+	"boss_agent_review",
 	"boss_hr_whoami",
 	"boss_hr_applications",
 	"boss_hr_candidates",
@@ -202,7 +232,7 @@ _ACTION_DIMENSION_TOOL_NAMES = frozenset(
 )
 
 _WRITE_INTERRUPT_RECOVERY = "检查本地 checkpoint 与平台实际结果，再显式恢复；未确认的写操作不要直接重试"
-_READ_INTERRUPT_RECOVERY = "只读命令已中断，不产生平台写入；确认子进程已退出后可直接重新调用"
+_READ_INTERRUPT_RECOVERY = "只读命令已中断，不产生平台写入；先降低 limit/count 或改用 active=online 再重试"
 #: 子进程没能启动：从未运行过，不可能有平台副作用。真正要处理的是安装 / 路径，
 #: 让 Agent 去核对 checkpoint 与平台结果只会把人引向不存在的现场（Issue #962）。
 _SPAWN_FAILURE_RECOVERY = (
@@ -228,7 +258,87 @@ def _tool_may_write(tool_name: str, arguments: dict[str, Any] | None = None) -> 
 	return isinstance(action, str) and action in write_modes
 
 
+def _option_value(args: tuple[str, ...], flag: str) -> str | None:
+	"""取 ``--flag value`` / ``--flag=value`` 的取值；未出现时返回 None。"""
+	prefix = f"{flag}="
+	for index, arg in enumerate(args):
+		if arg == flag:
+			return args[index + 1] if index + 1 < len(args) else None
+		if arg.startswith(prefix):
+			return arg[len(prefix):]
+	return None
+
+
+def _int_option(args: tuple[str, ...], flag: str, default: int) -> int | None:
+	"""解析整数选项：缺省取 ``default``，显式值非法时返回 None（回退默认超时）。"""
+	raw = _option_value(args, flag)
+	if raw is None:
+		return default
+	try:
+		return int(raw)
+	except (TypeError, ValueError):
+		return None
+
+
+def _estimated_requests(args: tuple[str, ...]) -> int | None:
+	"""按 argv 估算一次调用最坏情况下的平台请求数。
+
+	返回 None 表示这条命令不做参数估算（保持默认 120s 超时）。
+	"""
+	command = args[0]
+	if command == "batch-greet":
+		if "--dry-run" in args:
+			# 只做一次搜索，没有写请求。
+			return 1
+		count = _int_option(args, "--count", _BATCH_GREET_DEFAULT_COUNT)
+		if count is None:
+			return None
+		# 1 次搜索 + 每个候选人 1 次招呼；CLI 会把 --count 截断到 10（Issue #1491）。
+		return 1 + min(max(count, 0), _BATCH_GREET_MAX_COUNT)
+	if command == "search":
+		welfare = _option_value(args, "--welfare") or ""
+		active = _option_value(args, "--active") or ""
+		if not welfare and active in ("", "online"):
+			# 普通搜索 / active=online 只看列表：每页 1 次请求。
+			return 1
+		# 其余档位逐条查职位详情：每页 15 条详情 + 该页列表请求。
+		# 翻页上限与 search / watch / wizard 共用 detail_filter_max_pages。
+		pages = detail_filter_max_pages(welfare, active or None)
+		return pages * (_SEARCH_PAGE_SIZE + 1)
+	if command == "export":
+		count = _int_option(args, "--count", _EXPORT_DEFAULT_COUNT)
+		if count is None or count < 1:
+			return None
+		return math.ceil(count / _SEARCH_PAGE_SIZE)
+	if command == "hr":
+		subcommand = args[1] if len(args) > 1 else ""
+		if subcommand == "chat":
+			summary_limit = _int_option(args, "--summary-limit", _HR_DEFAULT_LIMIT)
+			if summary_limit is None:
+				return None
+			# 1 次好友列表 + 每 50 条摘要一批。
+			return 1 + math.ceil(max(summary_limit, 0) / _HR_BATCH_SIZE)
+		if subcommand == "last-messages":
+			limit = _int_option(args, "--limit", _HR_DEFAULT_LIMIT)
+			if limit is None or limit < 1:
+				return None
+			return math.ceil(limit / _HR_BATCH_SIZE)
+		return None
+	if command in {"pipeline", "follow-up", "digest"}:
+		# 好友列表逐页聚合，按 5 页上限估算。
+		return _FRIEND_LIST_ESTIMATE_PAGES
+	return None
+
+
 def _cli_timeout(args: tuple[str, ...]) -> float:
+	# 超时按最坏情况下的平台请求数估算（Issue #1491 / #1492）：
+	#   默认节流 DEFAULT_REQUEST_DELAY = (30.0, 60.0)，高斯均值 45s、上界 60s；
+	#   RequestThrottle.wait() 首次请求不等待，之后的每次请求最多等 60s。
+	#   单次请求按 60s 节流上界 + 5s 抖动 / 请求开销 = 65s 计，另加 30s 固定余量
+	#   （登录态、缓存初始化、信封输出），并以 900s 封顶。
+	#   例：batch-greet --count 5 = 1 次搜索 + 5 次招呼 → 6×65+30 = 420s；
+	#       search --welfare = 5 页 ×（15 条详情 + 1 次列表）→ 80×65+30 = 5230s，
+	#       按 900s 封顶；普通 search 只有 1 次列表请求 → 95s，仍取默认 120s。
 	# A wizard deadline belongs to the child. The host allows bounded extra
 	# time for that child to commit its result/checkpoint and emit the envelope.
 	if args and args[0] == "wizard" and "--timeout" in args:
@@ -238,7 +348,12 @@ def _cli_timeout(args: tuple[str, ...]) -> float:
 			return _CLI_TIMEOUT_SECONDS
 		if math.isfinite(requested) and requested > 0:
 			return requested + _CHECKPOINT_GRACE_SECONDS
-	return _CLI_TIMEOUT_SECONDS
+		return _CLI_TIMEOUT_SECONDS
+	requests = _estimated_requests(args) if args else None
+	if requests is None:
+		return _CLI_TIMEOUT_SECONDS
+	estimate = requests * _REQUEST_BUDGET_SECONDS + _REQUEST_MARGIN_SECONDS
+	return min(max(estimate, _CLI_TIMEOUT_SECONDS), _MAX_CLI_TIMEOUT_SECONDS)
 
 
 def _cli_failure(
@@ -299,9 +414,41 @@ def _parse_cli_output(
 	)
 
 
+def _dumps_tool_result(payload: dict[str, Any]) -> str:
+	"""把工具结果序列化成可直接放进 ``TextContent`` 的文本。
+
+	平台字段或本地坏文件里可能出现 JSON 合法的孤立代理转义（``\\udcff`` /
+	``\\ud800``）：``json.loads`` 会把它还原成孤立代理，``json.dumps(...,
+	ensure_ascii=False)`` 又原样写回。MCP SDK 用 UTF-8 序列化 ``TextContent`` 时
+	抛 ``PydanticSerializationError``，异常穿出 ``stdio_server()`` 让进程退出，
+	写工具的成功响应就此丢失，客户端还可能重试（Issue #1375）。
+	与 CLI 信封同口径用 ``backslashreplace`` 转成字面 ``\\udcff`` 转义，解析出的
+	值不变，响应始终可编码。
+
+	``allow_nan=False`` 与 CLI 出口同口径（Issue #1391）：NaN / ±Infinity / 超长
+	整数先经 :func:`json_safe_value` 归一为 ``null``；归一后仍无法严格序列化时返回
+	固定 ``INTERNAL_ERROR`` 信封，异常不会穿出工具 handler。
+	"""
+	try:
+		# 快路径：正常结果与修复前逐字节一致。
+		text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
+	except (TypeError, ValueError, RecursionError):
+		try:
+			text = json.dumps(json_safe_value(payload), ensure_ascii=False, indent=2, allow_nan=False)
+		except (TypeError, ValueError, RecursionError):
+			command = payload.get("command") if isinstance(payload, dict) else None
+			text = json.dumps(
+				serialization_failure_envelope(command), ensure_ascii=False, indent=2, allow_nan=False
+			)
+	return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _run_boss(*args: str, may_write: bool = True) -> dict[str, Any]:
 	"""Synchronous compatibility entrypoint; MCP handlers use the async path."""
 	cmd = [_BOSS_BIN, "--json", *_BOSS_GLOBAL_ARGS, *args]
+	unsafe_reason = _unsafe_argv_reason(cmd)
+	if unsafe_reason is not None:
+		return _cli_failure(args, "INVALID_PARAM", unsafe_reason)
 	try:
 		result = subprocess.run(
 			cmd,
@@ -463,6 +610,22 @@ def _tool_argument_error(tool_name: str, message: str) -> CallToolResult:
 	)
 
 
+def _unsafe_argv_reason(args: "list[str] | tuple[str, ...]") -> str | None:
+	"""argv 里的 NUL / 孤立代理项返回原因（Issue #1236）。
+
+	两者都能编码在 JSON-RPC 字符串里，但传给子进程时
+	``create_subprocess_exec`` 会抛 ``ValueError``、UTF-8 编码会抛
+	``UnicodeEncodeError``；异常逃出 handler 会被 MCP SDK 变成
+	"Internal server error"，调用方拿不到错误信封与修复指引。
+	"""
+	for arg in args:
+		if "\x00" in arg:
+			return "参数中含 NUL 字符，无法传给底层 boss CLI；请去掉该字符后重试"
+		if any(0xD800 <= ord(char) <= 0xDFFF for char in arg):
+			return "参数中含孤立代理项字符，无法编码为 UTF-8；请修正文本后重试"
+	return None
+
+
 def _declared_arguments(tool_name: str) -> set[str] | None:
 	tool = next((item for item in TOOLS if item.name == tool_name), None)
 	if tool is None:
@@ -514,6 +677,12 @@ def _argument_type_errors(tool_name: str, arguments: dict[str, Any]) -> list[str
 		if not _matches_json_type(value, expected):
 			errors.append(f"{key} 应为 {expected}，收到 {type(value).__name__}")
 			continue
+		if expected == "array":
+			# 空数组与「不传」在 mapping 层不可区分：例如 last-messages 的
+			# friend_ids=[] 会退化成抓取当前页候选人并发出平台请求（Issue #1218）。
+			min_items = prop.get("minItems")
+			if isinstance(min_items, int) and not isinstance(min_items, bool) and len(value) < min_items:
+				errors.append(f"{key} 至少需要 {min_items} 个元素")
 		items = prop.get("items")
 		item_type = items.get("type") if isinstance(items, dict) else None
 		if expected != "array" or not isinstance(item_type, str) or item_type not in _JSON_TYPE_CHECKS:
@@ -572,11 +741,14 @@ async def call_tool(ctx: Any, params: CallToolRequestParams) -> CallToolResult:
 	except ValueError as exc:
 		# 映射层自己拒绝的非法枚举值（Issue #1002）：不能落进默认分支。
 		return _tool_argument_error(params.name, f"参数取值非法：{exc}")
+	unsafe_reason = _unsafe_argv_reason(args)
+	if unsafe_reason is not None:
+		return _tool_argument_error(params.name, unsafe_reason)
 	result = await _run_boss_async(*args, may_write=_tool_may_write(params.name, arguments))
 	# 信封的 ok 是唯一真源，但 MCP 客户端还需要 is_error 才能把失败标成工具错误；
 	# 两者不一致时，ok:false 会被当成一次成功的工具调用。
 	return CallToolResult(
-		content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))],
+		content=[TextContent(type="text", text=_dumps_tool_result(result))],
 		is_error=result.get("ok") is False,
 	)
 
@@ -710,7 +882,7 @@ def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
 def run(argv: list[str] | None = None) -> None:
 	args = _parse_cli_args(argv)
 	_configure_boss_invocation(
-		boss_bin=args.boss_bin or _default_boss_bin(),
+		boss_bin=args.boss_bin if args.boss_bin is not None else _default_boss_bin(),
 		data_dir=args.data_dir,
 		platform=args.platform,
 		role=args.role,

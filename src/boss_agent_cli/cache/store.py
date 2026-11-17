@@ -1,11 +1,14 @@
 import hashlib
 import json
+import math
 import secrets
 import sqlite3
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, NoReturn, cast
+from typing import Any, Literal, NoReturn, TypeVar, cast, overload
 
 from boss_agent_cli.services.job_identity import deduplicate_job_result
 
@@ -51,7 +54,10 @@ _SAVED_SEARCH_STRING_KEYS = (
 def _decode_saved_params(name: str, raw: Any) -> dict[str, Any]:
 	try:
 		parsed = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
-	except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
+	# ValueError 覆盖 JSONDecodeError / UnicodeDecodeError，以及 Python 3.11+ 对
+	# 超长整数字面量的位数上限；RecursionError 覆盖深嵌套（3.14 起解析器不再
+	# 受限，不能按解释器行为区分）。两者都是确定性损坏，必须报参数无法解析。
+	except (ValueError, TypeError, RecursionError) as exc:
 		raise SavedSearchParamsError(name, str(exc)) from exc
 	if not isinstance(parsed, dict):
 		raise SavedSearchParamsError(name, "顶层必须是 JSON object")
@@ -96,7 +102,7 @@ class CacheRecordInvalid(ValueError):
 def _decode_record(kind: str, record_id: str, column: str, raw: Any, *, expected: type | None = None) -> Any:
 	try:
 		parsed = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
-	except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
+	except (ValueError, TypeError, RecursionError) as exc:
 		raise CacheRecordInvalid(kind, record_id, column, str(exc)) from exc
 	# 结构漂移（合法 JSON 但不是预期的容器）与语法损坏等价：后续按 dict / list
 	# 使用时同样是 AttributeError traceback，必须在读取边界一次拦下。
@@ -133,6 +139,41 @@ def _decode_bool_column(kind: str, record_id: str, column: str, raw: Any) -> boo
 	raise CacheRecordInvalid(kind, record_id, column, f"期望 0 或 1，实际是 {type(raw).__name__}")
 
 
+def _tolerated_timestamp(raw: Any, *, default: float = 0.0) -> float:
+	"""调度用时间戳的容错读取：漂移值按无历史处理（与 Issue #1206 同口径）。
+
+	``crawl_budget.last_request_at`` 是本地节流元数据，不是任务断点：坏值不能
+	拦停采集，更不能被兜成可重试错误。``inf`` / ``nan`` 也不能进入后续的
+	``max()`` 与等待计算，否则一个坏值会让调度永远等下去（Issue #1212）。
+	有限的远未来值同样超出合法预留窗口，由 ``reserve_crawl_budget`` 判定并
+	覆盖自愈（Issue #1422）。
+	"""
+	try:
+		parsed = float(raw)
+	except (TypeError, ValueError):
+		return default
+	return parsed if math.isfinite(parsed) else default
+
+
+#: ``crawl_budget`` 的合法未来预留窗口（Issue #1422）。
+#:
+#: 写入方最多把 ``last_request_at`` 推到 ``now + interval``；更远的有限未来值
+#: 只能是漂移。它会让 ``reserve_crawl_budget`` 返回一个巨大的等待秒数，并把
+#: 值继续推向未来，采集预算永远无法自愈。
+_CRAWL_FUTURE_SKEW_SECONDS = 60.0
+
+
+def _cache_entry_expired(created_at: Any, ttl: float) -> bool:
+	"""缓存 TTL 判断；``created_at`` 漂移时按已过期处理（Issue #1214）。
+
+	``search_cache`` / ``job_desc_cache`` 是本地可再生成的缓存：坏时间戳只应
+	导致一次未命中并删除坏行，不能把 ``TypeError`` 兜成 ``INTERNAL_ERROR``，
+	也不能让 crawl 详情阶段永远停在同一个坏行上。
+	"""
+	parsed = _tolerated_timestamp(created_at, default=-1.0)
+	return parsed < 0 or time.time() - parsed > ttl
+
+
 def _validate_workflow_params(run_id: str, params: dict[str, Any]) -> dict[str, Any]:
 	"""workflow_runs.params 的嵌套结构同样要在读取边界校验。
 
@@ -145,8 +186,18 @@ def _validate_workflow_params(run_id: str, params: dict[str, Any]) -> dict[str, 
 	if inputs is not None and not isinstance(inputs, dict):
 		raise CacheRecordInvalid("workflow_run", run_id, "params.inputs", "必须是 JSON object")
 	steps = params.get("requested_steps")
-	if steps is not None and (not isinstance(steps, list) or not all(isinstance(item, str) for item in steps)):
-		raise CacheRecordInvalid("workflow_run", run_id, "params.requested_steps", "必须是字符串数组")
+	if steps is not None:
+		if not isinstance(steps, list) or not all(isinstance(item, str) for item in steps):
+			raise CacheRecordInvalid("workflow_run", run_id, "params.requested_steps", "必须是字符串数组")
+		if not steps:
+			# 空计划恢复时不会执行任何步骤，runner 却会直接把它标成 completed：
+			# 与 WizardInput.from_mapping 拒绝显式空数组同口径（Issue #1483）。
+			raise CacheRecordInvalid(
+				"workflow_run",
+				run_id,
+				"params.requested_steps",
+				"不能是空数组；省略该字段才表示执行 goal 的全部步骤",
+			)
 	return params
 
 
@@ -192,12 +243,109 @@ def is_cache_busy_error(exc: BaseException) -> bool:
 	return "locked" in message or "busy" in message
 
 
+#: 本地 SQLite 文件/磁盘层面的写失败标记（Issue #1467）。
+#:
+#: ``attempt to write a readonly database`` 是目录或文件只读，``disk I/O error``
+#: 是设备故障，``database or disk is full`` 是磁盘/配额耗尽，``unable to open
+#: database file`` 是路径不可打开。它们都不是库内容损坏：删库重建既修不好，
+#: 还会白白丢掉候选池与断点，所以必须保留原始 ``OperationalError``，由
+#: main/display 的本地 IO 分支给出 ``LOCAL_IO_ERROR``（不可重试）指引。
+_CACHE_LOCAL_IO_MARKERS: tuple[str, ...] = (
+	"attempt to write a readonly database",
+	"disk i/o error",
+	"database or disk is full",
+	"unable to open database file",
+)
+
+
+def is_cache_local_io_error(exc: BaseException) -> bool:
+	"""判断 SQLite 错误是否来自本地文件/磁盘，而不是库内容损坏。
+
+	只认 ``OperationalError``，且与 ``is_cache_busy_error`` 互斥：锁冲突优先按
+	可重试的 ``CACHE_BUSY`` 处理（消息里同时带锁与 IO 字样时以锁为准）。
+	"""
+	if not isinstance(exc, sqlite3.OperationalError):
+		return False
+	if is_cache_busy_error(exc):
+		return False
+	message = str(exc).lower()
+	return any(marker in message for marker in _CACHE_LOCAL_IO_MARKERS)
+
+
 def _has_sqlite_header(path: Path) -> bool:
 	try:
 		with path.open("rb") as handle:
 			return handle.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER
 	except OSError:
 		return False
+
+
+_CursorT = TypeVar("_CursorT", bound=sqlite3.Cursor)
+
+
+class _GuardedCursor(sqlite3.Cursor):
+	"""把取数阶段的 SQLite 数据库错误转成缓存层异常（Issue #1350）。
+
+	多页表的 B 树数据页损坏时，`execute()` 可能已经成功返回首行，直到
+	`fetchone` / `fetchall` / 迭代下一行才抛 `sqlite3.DatabaseError`。这些读取
+	路径不经过 `_GuardedConnection` 的执行期转换：`crawl status` / `results`
+	会拿到裸 `sqlite3.DatabaseError` 只给通用 IO 指引，crawl 执行也把坏库当成
+	可恢复的普通停止并无限 resume。这里按 `_translate` 同一口径转换——锁冲突
+	仍走 `CacheBusyError`，SQL 写错的 `ProgrammingError` 保持原样上抛。
+
+	只转换由 `_GuardedConnection` 创建的游标；直接拿普通连接构造的游标保持
+	原生行为，不去包装 `sqlite3.Connection` 之外的路径。
+	"""
+
+	def __init__(self, connection: sqlite3.Connection, /) -> None:
+		super().__init__(connection)
+		self._guarded: _GuardedConnection | None = connection if isinstance(connection, _GuardedConnection) else None
+
+	def _raise_translated(self, exc: sqlite3.DatabaseError) -> NoReturn:
+		if self._guarded is None:
+			raise exc
+		self._guarded._raise_translated(exc)
+
+	def _cursor_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+		"""调用底层 C 游标方法。
+
+		`sqlite3.Cursor` 的方法不能直接 patch（C 扩展类型），取数阶段坏页的
+		测试通过替换这里注入 `database disk image is malformed`。
+		"""
+		return getattr(super(), method)(*args, **kwargs)
+
+	def _translated_call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+		try:
+			return self._cursor_call(method, *args, **kwargs)
+		except sqlite3.DatabaseError as exc:
+			self._raise_translated(exc)
+
+	def execute(self, *args: Any, **kwargs: Any) -> "_GuardedCursor":
+		self._translated_call("execute", *args, **kwargs)
+		return self
+
+	def executemany(self, *args: Any, **kwargs: Any) -> "_GuardedCursor":
+		self._translated_call("executemany", *args, **kwargs)
+		return self
+
+	def executescript(self, *args: Any, **kwargs: Any) -> "_GuardedCursor":
+		self._translated_call("executescript", *args, **kwargs)
+		return self
+
+	def fetchone(self) -> tuple[Any, ...] | None:
+		return cast("tuple[Any, ...] | None", self._translated_call("fetchone"))
+
+	def fetchmany(self, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+		return cast("list[tuple[Any, ...]]", self._translated_call("fetchmany", *args, **kwargs))
+
+	def fetchall(self) -> list[tuple[Any, ...]]:
+		return cast("list[tuple[Any, ...]]", self._translated_call("fetchall"))
+
+	def __iter__(self) -> "_GuardedCursor":
+		return self
+
+	def __next__(self) -> tuple[Any, ...]:
+		return cast("tuple[Any, ...]", self._translated_call("__next__"))
 
 
 class _GuardedConnection(sqlite3.Connection):
@@ -208,7 +356,8 @@ class _GuardedConnection(sqlite3.Connection):
 	抛到命令层，没有统一装饰器的命令（`shortlist list` / `shortlist add`）
 	stdout 为空并带 traceback（Issue #1174）。`clean` / `stats` 自己开的连接
 	早已按 `CacheDatabaseInvalid` 归一（Issue #1139），这里把 CacheStore 的
-	连接也收进同一口径。
+	连接也收进同一口径。`execute` / `cursor` 返回的游标由 `_GuardedCursor`
+	包装，取数阶段才暴露的坏页同样转换（Issue #1350）。
 
 	两种错误保持原样上抛：busy 锁冲突由 `CacheBusyError` 单独表示（等锁重试，
 	不是数据损坏）；`ProgrammingError` 是代码把 SQL 或绑定参数写错了，不能被
@@ -227,6 +376,11 @@ class _GuardedConnection(sqlite3.Connection):
 			return None
 		if is_cache_busy_error(exc):
 			return CacheBusyError(self.db_path, str(exc))
+		if is_cache_local_io_error(exc):
+			# 只读目录、磁盘满、设备 IO 故障不是库损坏：保留原始 OperationalError，
+			# 让 main/display 的本地 IO 分支输出 LOCAL_IO_ERROR，而不是误导用户
+			# 备份并删除完好的缓存库（Issue #1467）。
+			return None
 		return CacheDatabaseInvalid(self.db_path, str(exc))
 
 	def _raise_translated(self, exc: sqlite3.DatabaseError) -> NoReturn:
@@ -235,21 +389,36 @@ class _GuardedConnection(sqlite3.Connection):
 			raise exc
 		raise translated from exc
 
+	@overload
+	def cursor(self, factory: None = None) -> sqlite3.Cursor: ...
+
+	@overload
+	def cursor(self, factory: Callable[[sqlite3.Connection], _CursorT]) -> _CursorT: ...
+
+	def cursor(self, factory: Callable[[sqlite3.Connection], Any] | None = None) -> Any:
+		"""返回受保护游标；显式传入的自定义 factory 保持调用方语义。"""
+		return super().cursor(_GuardedCursor if factory is None else factory)
+
+	def _guarded_cursor(self) -> sqlite3.Cursor:
+		return super().cursor(_GuardedCursor)
+
 	def execute(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+		# Connection.execute 的默认返回值是普通 sqlite3.Cursor，后续 fetchone /
+		# fetchall 不受 _translate 保护；改为在受保护游标上执行（Issue #1350）。
 		try:
-			return super().execute(*args, **kwargs)
+			return self._guarded_cursor().execute(*args, **kwargs)
 		except sqlite3.DatabaseError as exc:
 			self._raise_translated(exc)
 
 	def executemany(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
 		try:
-			return super().executemany(*args, **kwargs)
+			return self._guarded_cursor().executemany(*args, **kwargs)
 		except sqlite3.DatabaseError as exc:
 			self._raise_translated(exc)
 
 	def executescript(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
 		try:
-			return super().executescript(*args, **kwargs)
+			return self._guarded_cursor().executescript(*args, **kwargs)
 		except sqlite3.DatabaseError as exc:
 			self._raise_translated(exc)
 
@@ -294,6 +463,10 @@ class CacheStore:
 		except sqlite3.OperationalError as exc:
 			# 库文件头正常时多为并发锁或磁盘压力：锁冲突等锁释放后重试即可，单独
 			# 报 CACHE_BUSY；其余仍按原错误上抛（重试可能有效）。
+			# 只读目录 / 磁盘满 / 无法打开等本地 IO 失败与库内容无关：连文件头都
+			# 读不到时也不能归成 CACHE_DATABASE_INVALID 让人删库（Issue #1467）。
+			if is_cache_local_io_error(exc):
+				raise
 			if _has_sqlite_header(db_path):
 				if is_cache_busy_error(exc):
 					raise CacheBusyError(db_path, str(exc)) from exc
@@ -355,6 +528,15 @@ class CacheStore:
 				security_id TEXT NOT NULL,
 				applied_at REAL NOT NULL,
 				PRIMARY KEY (account, job_id, security_id)
+			);
+			CREATE TABLE IF NOT EXISTS candidate_action_claims (
+				account TEXT NOT NULL DEFAULT '',
+				job_id TEXT NOT NULL,
+				action TEXT NOT NULL,
+				security_id TEXT NOT NULL DEFAULT '',
+				status TEXT NOT NULL,
+				updated_at REAL NOT NULL,
+				PRIMARY KEY (account, job_id, action)
 			);
 			CREATE TABLE IF NOT EXISTS shortlist_records (
 				security_id TEXT NOT NULL,
@@ -461,6 +643,24 @@ class CacheStore:
 		self._migrate_crawl_jobs()
 		self._migrate_dedupe_keys()
 
+	@contextmanager
+	def _migration_write_transaction(self) -> Iterator[None]:
+		"""迁移的写事务：拿到写锁后调用方才重新读取 schema。
+
+		``PRAGMA table_info`` 与 ``ALTER TABLE`` 分开执行时，两个进程可能都看到
+		旧列并各自 ALTER，第二个拿到 ``duplicate column name``，被 ``__init__``
+		误判成缓存库损坏（Issue #1510）。``BEGIN IMMEDIATE`` 把「检查 + 变更」
+		串行化；等锁超时仍按 ``CacheBusyError`` 上报，真实失败（列类型不符、
+		唯一索引冲突）原样上抛，不能吞成「无需迁移」。
+		"""
+		self._conn.execute("BEGIN IMMEDIATE")
+		try:
+			yield
+		except BaseException:
+			self._conn.rollback()
+			raise
+		self._conn.commit()
+
 	def _migrate_dedupe_keys(self) -> None:
 		"""把 greet/apply 记录的键换成「账号指纹 + 稳定 job_id」。
 
@@ -483,8 +683,7 @@ class CacheStore:
 		# 需要迁移时才取写锁。整个重建过程放在一个写事务里：迁移中途崩溃不会留下
 		# 缺表或半迁移状态，并发的第二个进程拿到锁后会看到新主键，不会重复迁移
 		# 把账号指纹抹掉。
-		self._conn.execute("BEGIN IMMEDIATE")
-		try:
+		with self._migration_write_transaction():
 			for table, time_column in (("greet_records", "greeted_at"), ("apply_records", "applied_at")):
 				columns = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
 				# table_info 按建表列序返回，pk 字段是该列在主键中的序号，不是主键顺序；
@@ -510,60 +709,97 @@ class CacheStore:
 				""")
 				self._conn.execute(f"DROP TABLE {table}")
 				self._conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
-			self._conn.commit()
-		except Exception:
-			self._conn.rollback()
-			raise
 
 	def _migrate_shortlist_records(self) -> None:
 		columns = {
 			row[1]
 			for row in self._conn.execute("PRAGMA table_info(shortlist_records)").fetchall()
 		}
-		if "tags" not in columns:
-			self._conn.execute("ALTER TABLE shortlist_records ADD COLUMN tags TEXT DEFAULT ''")
-		if "note" not in columns:
-			self._conn.execute("ALTER TABLE shortlist_records ADD COLUMN note TEXT DEFAULT ''")
-		if "lid" not in columns:
-			# 未记录的访问上下文保持未知；不按 job_id 合并或替换历史记录。
-			self._conn.execute("ALTER TABLE shortlist_records ADD COLUMN lid TEXT NOT NULL DEFAULT ''")
-		self._conn.commit()
+		if {"tags", "note", "lid"} <= columns:
+			return
+		# 无锁快路径只用于跳过已是新结构的库；真正变更前必须拿到写锁并重读列，
+		# 否则并发打开的第二个进程会重复 ALTER 并抛 duplicate column（Issue #1510）。
+		with self._migration_write_transaction():
+			columns = {
+				row[1]
+				for row in self._conn.execute("PRAGMA table_info(shortlist_records)").fetchall()
+			}
+			if "tags" not in columns:
+				self._conn.execute("ALTER TABLE shortlist_records ADD COLUMN tags TEXT DEFAULT ''")
+			if "note" not in columns:
+				self._conn.execute("ALTER TABLE shortlist_records ADD COLUMN note TEXT DEFAULT ''")
+			if "lid" not in columns:
+				# 未记录的访问上下文保持未知；不按 job_id 合并或替换历史记录。
+				self._conn.execute("ALTER TABLE shortlist_records ADD COLUMN lid TEXT NOT NULL DEFAULT ''")
 
 	def _migrate_crawl_runs(self) -> None:
 		columns = {
 			row[1]
 			for row in self._conn.execute("PRAGMA table_info(crawl_runs)").fetchall()
 		}
-		if "list_finished" not in columns:
-			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN list_finished INTEGER NOT NULL DEFAULT 0")
-		if "stop_requested" not in columns:
-			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0")
-		if "requests_attempted" not in columns:
-			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN requests_attempted INTEGER NOT NULL DEFAULT 0")
-		if "detail_requests_attempted" not in columns:
-			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN detail_requests_attempted INTEGER NOT NULL DEFAULT 0")
-		if "elapsed_seconds" not in columns:
-			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN elapsed_seconds INTEGER NOT NULL DEFAULT 0")
-		if "hook_results" not in columns:
-			self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN hook_results TEXT NOT NULL DEFAULT '[]'")
-		self._conn.commit()
+		if {
+			"list_finished",
+			"stop_requested",
+			"requests_attempted",
+			"detail_requests_attempted",
+			"elapsed_seconds",
+			"hook_results",
+		} <= columns:
+			return
+		with self._migration_write_transaction():
+			columns = {
+				row[1]
+				for row in self._conn.execute("PRAGMA table_info(crawl_runs)").fetchall()
+			}
+			if "list_finished" not in columns:
+				self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN list_finished INTEGER NOT NULL DEFAULT 0")
+			if "stop_requested" not in columns:
+				self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0")
+			if "requests_attempted" not in columns:
+				self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN requests_attempted INTEGER NOT NULL DEFAULT 0")
+			if "detail_requests_attempted" not in columns:
+				self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN detail_requests_attempted INTEGER NOT NULL DEFAULT 0")
+			if "elapsed_seconds" not in columns:
+				self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN elapsed_seconds INTEGER NOT NULL DEFAULT 0")
+			if "hook_results" not in columns:
+				self._conn.execute("ALTER TABLE crawl_runs ADD COLUMN hook_results TEXT NOT NULL DEFAULT '[]'")
 
 	def _migrate_crawl_jobs(self) -> None:
+		if self._crawl_jobs_migration_done():
+			return
+		# 回填 + 唯一索引必须与列检查在同一写事务里：并发进程各自回填会让
+		# ``CREATE UNIQUE INDEX`` 撞上重复 selector，或重复执行 ALTER。
+		with self._migration_write_transaction():
+			columns = {row[1] for row in self._conn.execute("PRAGMA table_info(crawl_jobs)").fetchall()}
+			if "selector" not in columns:
+				self._conn.execute("ALTER TABLE crawl_jobs ADD COLUMN selector TEXT")
+			missing = self._conn.execute(
+				"SELECT run_id, job_key FROM crawl_jobs WHERE selector IS NULL OR selector = ''"
+			).fetchall()
+			for run_id, job_key in missing:
+				self._conn.execute(
+					"UPDATE crawl_jobs SET selector = ? WHERE run_id = ? AND job_key = ?",
+					(self._new_crawl_selector(), run_id, job_key),
+				)
+			self._conn.execute(
+				"CREATE UNIQUE INDEX IF NOT EXISTS crawl_jobs_run_selector ON crawl_jobs(run_id, selector)"
+			)
+
+	def _crawl_jobs_migration_done(self) -> bool:
 		columns = {row[1] for row in self._conn.execute("PRAGMA table_info(crawl_jobs)").fetchall()}
 		if "selector" not in columns:
-			self._conn.execute("ALTER TABLE crawl_jobs ADD COLUMN selector TEXT")
-		missing = self._conn.execute(
-			"SELECT run_id, job_key FROM crawl_jobs WHERE selector IS NULL OR selector = ''"
-		).fetchall()
-		for run_id, job_key in missing:
+			return False
+		index = self._conn.execute(
+			"SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'crawl_jobs_run_selector'"
+		).fetchone()
+		if index is None:
+			return False
+		return (
 			self._conn.execute(
-				"UPDATE crawl_jobs SET selector = ? WHERE run_id = ? AND job_key = ?",
-				(self._new_crawl_selector(), run_id, job_key),
-			)
-		self._conn.execute(
-			"CREATE UNIQUE INDEX IF NOT EXISTS crawl_jobs_run_selector ON crawl_jobs(run_id, selector)"
+				"SELECT 1 FROM crawl_jobs WHERE selector IS NULL OR selector = '' LIMIT 1"
+			).fetchone()
+			is None
 		)
-		self._conn.commit()
 
 	def _new_crawl_selector(self) -> str:
 		return f"csel_{secrets.token_urlsafe(18)}"
@@ -596,7 +832,7 @@ class CacheStore:
 		).fetchone()
 		if row is None:
 			return None
-		return {
+		record = {
 			"run_id": row[0],
 			"params": _decode_record("crawl_run", run_id, "params", row[1], expected=dict),
 			"status": row[2],
@@ -610,6 +846,36 @@ class CacheStore:
 			"hook_results": _decode_record("crawl_run", run_id, "hook_results", row[11], expected=list),
 			"created_at": row[12], "updated_at": row[13],
 		}
+		# 范围与文本校验：负的 next_page 会让 resume 反复抓第 1 页并把
+		# crawl_jobs.page_no 写成负数，负计数器会推迟预算触发；BLOB 的
+		# output_dir 会让 wizard 的 Path() 抛 TypeError（Issue #1325）。
+		if record["next_page"] < 1:
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "next_page", f"必须从第 1 页开始，实际是 {record['next_page']}"
+			)
+		for column in ("requests_attempted", "detail_requests_attempted", "elapsed_seconds"):
+			if record[column] < 0:
+				raise CacheRecordInvalid("crawl_run", run_id, column, f"不能为负数，实际是 {record[column]}")
+		for column in ("status", "output_dir", "error"):
+			if not isinstance(record[column], str):
+				raise CacheRecordInvalid(
+					"crawl_run", run_id, column, f"期望字符串，实际是 {type(record[column]).__name__}"
+				)
+		# 输出目录必须是绝对路径：配置允许相对 `--data-dir`，但落盘的必须是解析
+		# 后的绝对路径，否则换个 cwd 的 resume 会把产物写到无关目录（Issue #1481）。
+		# 旧版本断点里的相对路径无法安全推断原始位置，按记录损坏 fail-closed。
+		output_dir = record["output_dir"]
+		if not output_dir.strip():
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "output_dir",
+				"期望非空绝对路径，实际是空字符串；旧断点无法安全恢复，请重新执行 crawl start 创建任务",
+			)
+		if not Path(output_dir).is_absolute():
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "output_dir",
+				f"期望绝对路径，实际是相对路径 {output_dir!r}；旧断点无法安全恢复，请重新执行 crawl start 创建任务",
+			)
+		return record
 
 	def update_crawl_run_params(self, run_id: str, params: dict[str, Any]) -> None:
 		self._conn.execute(
@@ -712,8 +978,9 @@ class CacheStore:
 		if row is None:
 			return None
 		return {
-			"selector": row[0], "page_no": row[1],
-			"payload": _decode_record("crawl_job", job_key, "payload", row[2], expected=dict), "detail_done": bool(row[3]),
+			"selector": row[0], "page_no": _decode_int_column("crawl_job", job_key, "page_no", row[1]),
+			"payload": _decode_record("crawl_job", job_key, "payload", row[2], expected=dict),
+			"detail_done": _decode_bool_column("crawl_job", job_key, "detail_done", row[3]),
 		}
 
 	def list_crawl_jobs(self, run_id: str) -> list[dict[str, Any]]:
@@ -723,15 +990,20 @@ class CacheStore:
 		).fetchall()
 		return [
 			{
-				"job_key": row[0], "selector": row[1], "page_no": row[2],
-				"payload": _decode_record("crawl_job", str(row[0]), "payload", row[3], expected=dict), "detail_done": bool(row[4]),
+				"job_key": row[0], "selector": row[1],
+				"page_no": _decode_int_column("crawl_job", str(row[0]), "page_no", row[2]),
+				"payload": _decode_record("crawl_job", str(row[0]), "payload", row[3], expected=dict),
+				"detail_done": _decode_bool_column("crawl_job", str(row[0]), "detail_done", row[4]),
 			}
 			for row in rows
 		]
 
 	def get_crawl_budget(self, budget_key: str) -> float | None:
 		row = self._conn.execute("SELECT last_request_at FROM crawl_budget WHERE budget_key = ?", (budget_key,)).fetchone()
-		return float(row[0]) if row is not None else None
+		if row is None:
+			return None
+		last_request_at = _tolerated_timestamp(row[0], default=-1.0)
+		return last_request_at if last_request_at >= 0 else None
 
 	def put_crawl_budget(self, budget_key: str, requested_at: float) -> None:
 		self._conn.execute(
@@ -753,7 +1025,11 @@ class CacheStore:
 				"SELECT last_request_at FROM crawl_budget WHERE budget_key = ?",
 				(budget_key,),
 			).fetchone()
-			last_reserved = float(row[0]) if row is not None else None
+			last_reserved = _tolerated_timestamp(row[0]) if row is not None else None
+			# 有限的远未来值与文本 / nan / inf 一样按漂移处理：当作没有预留，
+			# 本次预留会覆盖坏值，等待时间回到一个 interval 以内（Issue #1422）。
+			if last_reserved is not None and last_reserved > now + interval + _CRAWL_FUTURE_SKEW_SECONDS:
+				last_reserved = None
 			reserved_at = now if last_reserved is None else max(now, last_reserved + interval)
 			self._conn.execute(
 				"INSERT OR REPLACE INTO crawl_budget (budget_key, last_request_at) VALUES (?, ?)",
@@ -972,7 +1248,8 @@ class CacheStore:
 			return []
 		try:
 			parsed = json.loads(raw)
-		except json.JSONDecodeError:
+		# 超长整数 / 深嵌套与语法损坏等价：退回旧的逗号分隔写法。
+		except (ValueError, RecursionError):
 			return cls._normalize_shortlist_tags(raw.split(","))
 		if not isinstance(parsed, list):
 			return []
@@ -1116,7 +1393,7 @@ class CacheStore:
 		).fetchone()
 		if row is None:
 			return None
-		if time.time() - row[1] > self._search_ttl:
+		if _cache_entry_expired(row[1], self._search_ttl):
 			self._conn.execute("DELETE FROM search_cache WHERE cache_key = ?", (key,))
 			self._conn.commit()
 			return None
@@ -1147,7 +1424,7 @@ class CacheStore:
 		).fetchone()
 		if row is None:
 			return None
-		if time.time() - row[1] > self._search_ttl:
+		if _cache_entry_expired(row[1], self._search_ttl):
 			self._conn.execute("DELETE FROM job_desc_cache WHERE job_id = ?", (job_id,))
 			self._conn.commit()
 			return None
@@ -1279,16 +1556,17 @@ class CacheStore:
 		for item in items:
 			job_key = self._make_watch_job_key(item, account=account)
 			payload = json.dumps(item, ensure_ascii=False, sort_keys=True)
-			row = self._conn.execute(
-				"SELECT 1 FROM watch_hits WHERE search_name = ? AND job_key = ?",
-				(search_name, job_key),
-			).fetchone()
-			if row is None:
+			# 先 SELECT 再 INSERT 时，两个进程对同一个 watch 同时写入会都看到
+			# 「不存在」，第二个 INSERT 撞主键抛 IntegrityError，被上层误判成
+			# 缓存库损坏（Issue #1509）。INSERT OR IGNORE + UPDATE 的每条语句
+			# 本身是原子的：抢到插入的一方记新增，另一方只刷新 payload / 时间。
+			cursor = self._conn.execute(
+				"INSERT OR IGNORE INTO watch_hits (search_name, job_key, payload, first_seen_at, last_seen_at) "
+				"VALUES (?, ?, ?, ?, ?)",
+				(search_name, job_key, payload, now, now),
+			)
+			if cursor.rowcount:
 				new_items.append(item)
-				self._conn.execute(
-					"INSERT INTO watch_hits (search_name, job_key, payload, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?)",
-					(search_name, job_key, payload, now, now),
-				)
 			else:
 				seen_count += 1
 				self._conn.execute(
@@ -1334,6 +1612,79 @@ class CacheStore:
 			(account, job_id, security_id, time.time()),
 		)
 		self._conn.commit()
+
+	def claim_candidate_action(
+		self,
+		security_id: str,
+		job_id: str,
+		action: Literal["greet", "apply"],
+		*,
+		account: str = "",
+	) -> str | None:
+		"""原子预约求职者侧的 greet / apply；抢到返回 None，已有记录返回状态。
+
+		``is_greeted`` / ``is_applied`` + 发送 + ``record_*`` 是跨进程的
+		check-then-act：两个进程可以同时通过检查，各发一次真实请求
+		（Issue #1508）。这里按 ``(account, job_id, action)`` 用
+		``INSERT OR IGNORE`` 抢一个 pending 行，只有 rowcount=1 的那一方发送。
+
+		旧的 greet_records / apply_records 仍然参与判断（历史去重不能丢），
+		命中时返回 ``sent``；并发进程已经抢到 pending 时返回 ``pending``，
+		调用方必须按结果未知处理，不能再发。
+		"""
+		legacy_seen = (
+			self.is_greeted(security_id, job_id=job_id, account=account)
+			if action == "greet"
+			else self.is_applied(security_id, job_id, account=account)
+		)
+		if legacy_seen:
+			return "sent"
+		with self._conn:
+			cursor = self._conn.execute(
+				"INSERT OR IGNORE INTO candidate_action_claims "
+				"(account, job_id, action, security_id, status, updated_at) "
+				"VALUES (?, ?, ?, ?, 'pending', ?)",
+				(account, job_id, action, security_id, time.time()),
+			)
+			if cursor.rowcount:
+				return None
+			row = self._conn.execute(
+				"SELECT status FROM candidate_action_claims WHERE account = ? AND job_id = ? AND action = ?",
+				(account, job_id, action),
+			).fetchone()
+		# 冲突行只可能来自已提交的另一个进程；读不到时按 pending 保守处理。
+		return str(row[0]) if row is not None else "pending"
+
+	def mark_candidate_action_sent(
+		self,
+		security_id: str,
+		job_id: str,
+		action: Literal["greet", "apply"],
+		*,
+		account: str = "",
+	) -> None:
+		"""平台确认成功后把预约 settle 成 sent（历史记录由调用方先写入）。"""
+		with self._conn:
+			self._conn.execute(
+				"INSERT INTO candidate_action_claims "
+				"(account, job_id, action, security_id, status, updated_at) "
+				"VALUES (?, ?, ?, ?, 'sent', ?) "
+				"ON CONFLICT(account, job_id, action) DO UPDATE SET "
+				"security_id = excluded.security_id, status = 'sent', updated_at = excluded.updated_at",
+				(account, job_id, action, security_id, time.time()),
+			)
+
+	def release_candidate_action(
+		self, job_id: str, action: Literal["greet", "apply"], *, account: str = ""
+	) -> bool:
+		"""撤销确定未发出的预约；只删 pending，sent 与结果未知的记录保持原样。"""
+		with self._conn:
+			cursor = self._conn.execute(
+				"DELETE FROM candidate_action_claims "
+				"WHERE account = ? AND job_id = ? AND action = ? AND status = 'pending'",
+				(account, job_id, action),
+			)
+			return bool(cursor.rowcount)
 
 	def is_shortlisted(self, security_id: str, job_id: str) -> bool:
 		row = self._conn.execute(
@@ -1434,12 +1785,21 @@ class CacheStore:
 				if job_id in existing_by_job_id:
 					old_security_id, old_source = existing_by_job_id[job_id]
 					if old_source == source and old_security_id != security_id:
-						self._conn.execute(
+						cursor = self._conn.execute(
 							# 原兼容刷新保留；动态上下文必须来自同一条输入，缺 lid 时不能拼上旧 lid。
-							"UPDATE shortlist_records SET security_id = ?, lid = ? "
+							# 同 job_id 可能已有两行（不同 security_id）：目标键若已存在，
+							# 直接 UPDATE 会撞 (security_id, job_id) 主键并整批回滚。
+							# OR IGNORE 冲突时返回 rowcount=0，再删掉被刷新的旧行、
+							# 保留目标行（Issue #1466）。
+							"UPDATE OR IGNORE shortlist_records SET security_id = ?, lid = ? "
 							"WHERE security_id = ? AND job_id = ?",
 							(security_id, lid, old_security_id, job_id),
 						)
+						if cursor.rowcount == 0:
+							self._conn.execute(
+								"DELETE FROM shortlist_records WHERE security_id = ? AND job_id = ?",
+								(old_security_id, job_id),
+							)
 						existing_by_job_id[job_id] = (security_id, old_source)
 					elif old_source == source and old_security_id == security_id and lid:
 						self._conn.execute(

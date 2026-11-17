@@ -11,6 +11,7 @@ from boss_agent_cli.display import (
 	handle_browser_kernel_missing,
 	handle_error_output,
 	handle_output,
+	open_file_command,
 	render_action_result,
 	render_list_result,
 	render_record_result,
@@ -229,6 +230,18 @@ def resume_init_cmd(ctx: click.Context, name: str | None, template: str | None) 
 	store = _get_store(ctx)
 	if template is None:
 		template = "default"
+	# 仓库只有默认模板一种实现：接受任意 --template 却在成功信封里回显未生效的
+	# 名字，调用方会误以为指定模板已经生效（Issue #1440）。
+	if template.strip() != "default":
+		handle_error_output(
+			ctx, "resume",
+			code="INVALID_PARAM",
+			message=f"不支持的模板: {template!r}；当前仅提供 default",
+			recovery_action="省略 --template 或传 --template default 后重试",
+			hints={"next_actions": [_hint_command(ctx, "resume init --name <name> --template default")]},
+		)
+		ctx.exit(1)
+		return
 	if name is None:
 		name = "default"
 	# 空名称的简历能被写出来，却没法点名：`resume show ` / `resume edit ` 都缺参数，
@@ -392,13 +405,15 @@ def resume_delete_cmd(ctx: click.Context, name: str) -> None:
 	if not store.exists(name):
 		_emit_resume_not_found(ctx, name)
 		return
-	store.delete(name)
 	# 关联表以简历名为外键，但没有任何外键约束：不同步清理的话，之后用同一个名字
 	# 重建简历（`resume init` 默认就叫 default）会继承旧简历的职位关联，包括已经
 	# 标成 applied 的状态和备注，`resume applications` 也就报出这份简历从没关联过的职位。
+	# 必须先清理关联再删简历文件：缓存库繁忙/损坏时命令会失败，但简历本身必须
+	# 原样保留，否则用户看到 exit 1 而文件已经没了（Issue #1465）。
 	removed_links = 0
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		removed_links = cache.remove_resume_links(name)
+	store.delete(name)
 	handle_output(
 		ctx, "resume",
 		{"action": "delete", "name": name, "deleted": True, "removed_links": removed_links},
@@ -447,7 +462,7 @@ def resume_export_cmd(ctx: click.Context, name: str, fmt: str, output_path: str 
 		handle_output(
 			ctx, "resume",
 			{"action": "export", "name": name, "format": fmt, "path": str(out.resolve())},
-			render=lambda d: render_action_result(d, title="resume export", next_steps=[f"open {shell_argument(str(out.resolve()))}"]),
+			render=lambda d: render_action_result(d, title="resume export", next_steps=[open_file_command(str(out.resolve()))]),
 			hints={"next_actions": [_hint_command(ctx, f"resume show {shell_argument(name)}")]},
 		)
 		return
@@ -526,7 +541,7 @@ def resume_import_cmd(ctx: click.Context, file_path: Path, force: bool) -> None:
 			ctx, "resume",
 			code="INVALID_PARAM",
 			message=f"文件 '{file_path}' 导入失败: {exc}",
-			recovery_action=f"按提示修正 JSON 文件（UTF-8 编码、合法 JSON、顶层对象、非空 name 字段）后重试；可用 {export_cmd} 对照结构",
+			recovery_action=f"按提示修正 JSON 文件（UTF-8 编码、合法 JSON、顶层对象、不含路径分隔符 / 盘符 / Windows 保留设备名的非空 name 字段）后重试；可用 {export_cmd} 对照结构",
 			hints={"next_actions": [export_cmd, _hint_command(ctx, "resume list")]},
 		)
 		ctx.exit(1)

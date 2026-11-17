@@ -2,6 +2,367 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.82] - 2026-11-17
+
+### Fixed
+- 招聘自动化的队列派发不读 `state.json` 的会话在途标记：扫描路径发送后进程被杀留下的未确认动作，会被同候选人的已批准队列行再发送一次。现在队列派发前按与扫描路径相同的 fail-closed 口径检查标记，命中时不发送，`verification-required` 状态只跳过该候选人的队列行，其余情况打开熔断，队列行保持 `pending` 供人工核对后继续（Issue #1514）。
+- 队列行发送后被中断、转成 `verification-required` 时只改队列文件，不写 `state.json`；`--resume` 后扫描路径看不到这条结果未知的动作，会按 transcript 再发一次。现在队列行转 `verification-required` 时同步写入同一份会话在途标记，两条路径共享同一份状态（Issue #1515）。
+- 队列成功发送后先落 `executed` 再写 state checkpoint：checkpoint 写盘失败（磁盘满 / 控制锁）时队列行已推进、prior 丢失，下一轮扫描路径会再次发送。现在先持久化 state（prior 与在途标记）再推进队列行；state 未落盘时队列行保持 `executing`，下一轮按结果未知转 `verification-required`，不重发（Issue #1516）。
+- 扫描路径先把标记推进到 `verification-required` 再打开熔断：两步之间进程被杀或熔断落盘失败时，磁盘上只有标记没有 `stop.json`，后续周期把「已通知操作者」误当成成立并静默跳过。现在标记记录 `notified` 位，只在熔断成功落盘后置位；未通知的标记下一轮会重开熔断（旧版本写下的标记按已通知处理，保持兼容）（Issue #1517）。
+- 只读命令（`search` / `chat` 等）拿到无法识别的平台响应时沿用写操作的 `UNKNOWN` 契约：`recoverable=false`、`details.replay_safe=false`，恢复文案要求核对官方页面，Agent 因此拒绝本可安全执行的读取重试。现在按命令的读写属性归一：只读命令报 `NETWORK_ERROR` 并允许重试，写命令与未知命令保持不可重放（Issue #1519）。
+- `agent run` 在请求控制点观察到熔断时抛 `WORKFLOW_STOPPED`，错误信封带 wizard 的「创建新 workflow」文案与预算冷却提示。现在按 `CIRCUIT_BREAKER_OPEN` 上报，`next_actions` 给出带 `--data-dir` / `--role recruiter` 的 `agent stats`，真人指引指向核实后 `agent run --resume`（Issue #1520）。
+- wizard 的联系人缺少 `securityId` 分支返回 `recoverable=true`，`max_retries≥1` 时会自动重跑同一段确定性失败的查询；现在与命令层一致按不可自动重试上报，恢复指引要求先刷新沟通列表（Issue #1521）。
+- 风控信封把「不要通过 CDP 重试」这类真人说明放进了 `hints.next_actions`，而 TTY 只渲染 `operator_actions`，真人在终端反而看不到；现在 `next_actions` 只保留 `boss doctor` 等可执行命令，说明性条目移入 `operator_actions`（Issue #1522）。
+- MCP 只读工具白名单漏掉 `boss_chat_summary` / `boss_agent_stats` / `boss_agent_pending` / `boss_agent_review`，超时或取消被标成结果未知的写操作；现在这些纯读工具按可重试处理（Issue #1523）。
+- `recovery_action` 里的 `boss agent …` 示例命令经登记表改写后丢失 `--role recruiter`，与同信封 `next_actions` 不一致；现在 agent 命令统一保留当前角色（Issue #1524）。
+
+## [3.4.81] - 2026-11-17
+
+### Fixed
+- `clean` 的 `_clean_dir` / `_clean_path` 跟随目录符号链接：`chat-history` / `chat-export` 指向数据目录外时，按 mtime 清理会删掉链接目标里的文件；`--privacy` 先删除登录态、再在目录链接上抛错，留下半完成状态且错误信封 `data=null`。现在 `_clean_dir` 的目录参数、`_clean_path` 的目录链接或目标祖先目录是符号链接时一律跳过，并在结果中用 `skipped_symlinks` 与 `warning` 说明（文件链接仍只删除链接本身，不碰目标）；隐私清理在删除前先做只读预检，失败时错误信封的 `data` 带回已完成 / 失败 / 未处理项（Issue #1497）。
+- `doctor` 的写探针固定写 `auth/.doctor-write-test` 再 `unlink`，该路径是符号链接时会写穿目标并删除链接。现在使用唯一临时文件（`mkstemp` 的 `O_CREAT|O_EXCL`，可用时带 `O_NOFOLLOW`），只清理本次创建的文件；写失败按 `LOCAL_IO_ERROR` 出错误信封，并保留已完成的检查项（Issue #1498）。
+- `boss ai config` 用真值判断「是否提供了更新」：显式空 `--model` / `--provider` / `--base-url` 被当成没传而退回查看模式，`--api-key ""` 还会把已存密钥覆盖成空串，查看输出却仍报 `api_key_set=true`。现在四类字符串选项一律用 `is not None` 判断，并在任何写盘之前返回 `INVALID_PARAM`；新增 `--clear-api-key` 显式清除凭据（与 `--api-key` 互斥），`api_key_set` 按真实存储状态报告，空串与纯空白视为未设置（Issue #1499）。
+- `boss ai local configure --model ""` 会把空模型名写入配置，`ai local status` 随即变成 `configured=false`；`--base-url ""` 被 `or` 静默回退到运行时默认端点。现在两者都在写盘之前返回 `INVALID_PARAM`，只有省略 `--base-url` 才使用默认地址（Issue #1500）。
+- 显式空 `-o ""` 被真值判断当成「未提供」：`boss chat --export md -o ""` 静默写出默认导出文件，`boss export --format html -o ""` 直接向 stdout 输出裸 HTML，`--format csv -o ""` 不写文件却返回成功；现在 chat / export 在任何平台请求前返回 `INVALID_PARAM` 并说明省略 `-o` 才使用默认路径 / stdout，MCP 映射层也把空串原样下发给 CLI 校验（Issue #1501）。
+- `boss chat -o <路径>` 没配 `--export` 时路径被静默忽略，命令仍返回 `ok:true` 与空列表，调用方以为文件已写出；现在入口返回 `INVALID_PARAM`（`-o` 需要配合 `--export`），schema 中 chat 的选项说明同步标注该约束（Issue #1502）。
+- `boss hr download-resume` 把本地写盘 `OSError`（磁盘满、只读目录、权限不足）报成可修正参数的 `INVALID_PARAM`；现在保留 `FileExistsError` 的 `INVALID_PARAM` 分支，其余按不可重试的 `LOCAL_IO_ERROR` 上报，恢复指引包含磁盘空间与目录权限（Issue #1503）。
+- 联系人按 uid 命中但缺少 `securityId` 时被报成可重试的 `NETWORK_ERROR` + 「重试」，却没有后继指引；现在与缺少 uid 的分支同口径，按 `recoverable=false` 上报，并在 `hints.next_actions` 给出带 `--data-dir` 的 `boss chat` 刷新命令（Issue #1504）。
+- `boss schema` 把 `chat -o` 的默认目录写成不存在的 `~/Documents/files/boss`，而实现未配置 `export_dir` 时回退到 `<data-dir>/chat-export`，且 `-o` 仅在 `--export` 时生效；现在 schema 与 `chat --help` 都按实现描述默认路径与生效条件（Issue #1505）。
+- `boss schema` 的 `mark --label` 封闭枚举漏掉实现支持的 `牛人发起`，也未说明接受数字 ID；现在 enum 覆盖 `_LABEL_MAP` 的全部标签，并注明「标签名称或数字 ID」（Issue #1506）。
+- 简历文件名清洗只替换 `/`、`\` 与 NUL，Windows 上 `name="D:evil"` 生成的 `D:evil.json` 与 resumes 目录拼接后会脱离 base；现在 `:` 一并替换，`CON` / `NUL` / `COM1` 等保留设备名（含带扩展名形式）与纯点号名称同样改写，`resume import` 对不安全名称直接返回 `INVALID_PARAM`（Issue #1507，待 Windows 实机验证）。
+- 招聘自动化直接扫描路径在派发写动作前没有把在途动作落盘：发送后进程被杀或 checkpoint 撞控制锁时没有记录，下一轮凭 transcript 重新决策，本地 AI 改写后的问卷匹配不到模板会再次发送；现在派发前把 `inflight_action`（动作、消息 hash、时间、会话 ref）写进 `automation/state.json`，成功后与阶段字段原子清除，重放时转 `verification-required` 并给出核对指引，只有确定未发出的异常才释放标记（Issue #1511）。
+- 求职者 `greet` / `apply` 的去重是跨进程 check-then-act：两个进程同时通过 `is_greeted` / `is_applied` 检查后会各发一次真实请求；现在发送前按 `(账号, job_id, 动作)` 在 SQLite 里原子预约，抢不到时已成功回 `ALREADY_*`、发送中回不可重试的 `ACTION_UNCONFIRMED`，CLI `greet` / `apply` / `batch-greet` 与 wizard 的 candidate_greet / candidate_apply 共用同一收口，旧记录表继续参与去重（Issue #1508）。
+- `watch` 命中写入先 `SELECT` 再 `INSERT`，两个进程对同一个 watch 并发记录时第二个会撞主键抛 `IntegrityError` 并被误判为缓存库损坏；现在改为 `INSERT OR IGNORE` + `UPDATE`，新增 / 已见计数语义不变（Issue #1509）。
+- `shortlist_records`、`crawl_runs`、`crawl_jobs` 的旧库迁移没有事务，双进程首次打开会各自执行 `ALTER TABLE`，第二个拿到 `duplicate column name` 并被误判为库损坏；现在与去重键迁移一致，先 `BEGIN IMMEDIATE` 拿写锁再重读 `table_info`，真实迁移失败（类型不符、唯一索引冲突）仍原样上抛（Issue #1510）。
+
+## [3.4.80] - 2026-11-17
+
+### Fixed
+- MCP 子进程固定 120s 超时让 `batch-greet` 的默认 5 次招呼（每次节流上界 60s）必然超时，SIGINT 后 stdout 为空、结果未知且没有可恢复的部分结果；现在按 argv 估算超时（1 次搜索 + `--count` 次招呼，单次 60s 节流上界 + 5s 抖动 + 30s 余量，封顶 900s），CLI 在批打招呼被中断时输出已完成列表、在途候选人与 `replay_safe=false` 的七键错误信封，并明确不要原样重试（Issue #1491）。
+- MCP 只读工具（`search` / `export` / `hr chat` / `hr last-messages` / `pipeline` / `follow-up` / `digest`）同样固定 120s，详情筛选与分页批量调用会在正常执行中被误杀；现在按参数估算超时（单次 65s + 30s 余量，封顶 900s，解析失败回退 120s），只读中断文案改为先降低 limit/count 或改用 active=online 再重试（Issue #1492）。
+- MCP 的 `boss_wizard` / `boss_config` / `boss_hr_jobs` 按 action 分派时静默丢弃越界参数：`resume` 的新 `goal`、`config list` 的 `key`、`hr jobs online` 的 `page` 等被忽略后仍返回 `ok:true`，调用方以为过滤 / 恢复 / 写入已经生效；现在映射层按 action → 允许键矩阵返回 `INVALID_PARAM` 并提示正确用法，缺省 action 与显式默认 action 行为一致，`run_id` 必须显式搭配 `resume` / `status` / `stop`（Issue #1493）。
+- `boss batch-greet` 的空串 / 纯空白关键词会退化成无关键词搜索，并对默认列表里的职位真实发出招呼；现在在任何平台调用之前返回 `INVALID_PARAM`，工具 schema 的 `query` 同步声明 `minLength: 1`（Issue #1490）。
+- `boss batch-greet --count` 超过 10 时被静默截断，CLI 行为与 schema 声明的上界不一致；现在 `--count` 改为 `IntRange(0, 10)` 在解析阶段拒绝越界值，MCP `limit` 越界同样返回 `INVALID_PARAM`，原生 schema 补上 `maximum: 10`（Issue #1494）。
+
+## [3.4.79] - 2026-11-17
+
+### Fixed
+- 静默刷新 stoken 成功但登录态落盘失败（权限 / 磁盘满）时，本地 `OSError` 被包装成可恢复的 `TokenRefreshFailed` 并提示重新登录；现在原样上抛，按不可重试的 `LOCAL_IO_ERROR` 上报（Issue #1479）。
+- CDP 登录成功但登录态落盘失败时被当成 CDP 失败并继续启动扫码链路，原始本地权限问题被扫码超时覆盖；现在保存动作不再参与降级判定，直接上抛 `LOCAL_IO_ERROR`，CDP 自身不可达时仍降级扫码（Issue #1480）。
+- wizard 在写请求发出后按 Ctrl-C 会用 `WORKFLOW_STOPPED` 覆盖已落盘的 `ACTION_UNCONFIRMED` 标记，checkpoint 丢掉 `replay_safe=false` 与该动作的核对命令，`--resume` 会重放结果未知的写操作；现在保留该标记并把步骤落成失败，标记损坏或 `replay_safe` 类型漂移时同样按结果未知处理（Issue #1478）。
+- `params.requested_steps` 为空数组的 workflow 断点在 `--resume` 后不执行任何步骤却报 `completed`；现在读取边界按 `CACHE_RECORD_INVALID` 拒绝并提示重新创建任务（Issue #1483）。
+- 风险锁文件写入改用统一的原子 JSON 写入（`backslashreplace`），`cdp_url` 含孤立代理字符时不再抛 `UnicodeEncodeError`；记录风控的路径同时按 `(OSError, UnicodeError)` fail-closed，原始 `PlatformRiskError` 不会被本地编码错误替换成可重试的 `NETWORK_ERROR`（Issue #1487）。
+- 代理环境变量非空但解析不出 host（如 `HTTPS_PROXY=http://`、`http://:8080`）时，浏览器通道以 `proxy=None` 启动 Chromium 走真实出口，与挂载坏代理的 httpx 通道不一致；现在 `resolve_proxy` 抛 `ProxyConfigurationError`，登录链路、装饰器命令与 doctor 在线探测统一按 `INVALID_PARAM` 拒绝，不再静默回退直连（Issue #1486）。
+- 招聘者聊天动作读取 `friend_detail` 失败时丢弃平台码，401 / 9 / 37 全部退化成 `UNKNOWN` 并提示提交 issue；现在保留原响应交给平台 `parse_error`，分别映射 `AUTH_EXPIRED` / `RATE_LIMITED` / `TOKEN_REFRESH_FAILED`。`friend_detail` 成功但没有唯一匹配时返回不可重试的 `CONTACT_NOT_FOUND`，`hints.next_actions` 指向同一数据目录的 `hr chat`（Issue #1485）。
+- 采集执行期间另一个进程短暂持有 SQLite 写锁时，`CacheBusyError` 被通用分支吞成 `stopped`，命令却返回 `ok:true`；现在原样上抛，按可重试的 `CACHE_BUSY` 上报（Issue #1477）。
+- `crawl` 把 `--data-dir` 相对路径原样存进断点，在另一个目录执行 `crawl resume` 会把产物写到当前工作目录，`output_dir=''` 时同样落到 `.`；现在创建时持久化绝对路径，读取时按 `CACHE_RECORD_INVALID` 拒绝相对或空值（Issue #1481）。
+- 断点里的 `profile_path` 含 NUL / 控制字符时 `Path.resolve()` 抛 `ValueError`，被泛化分支记成 `stopped` 并返回 `ok:true`；现在读取边界按 `CACHE_RECORD_INVALID` 拒绝，transport 层同时把 `ValueError` 转成 `CrawlProfilePathInvalid`（Issue #1482）。
+- `hook_results.success` 用 `bool()` 归一，字符串 `"false"` 会被报告成成功；现在要求严格布尔，类型漂移按 `CACHE_RECORD_INVALID` 拒绝（Issue #1484）。
+
+## [3.4.78] - 2026-11-17
+
+### Fixed
+- `me` 命令把本地缓存锁冲突与数据库错误兜成可重试的 `NETWORK_ERROR`；现在分别按 `CACHE_BUSY`、`CACHE_DATABASE_INVALID`、`LOCAL_IO_ERROR` 上报（Issue #1464）。
+- `resume delete` 先删除简历文件再清理职位关联，缓存失败会留下悬挂关联并让重试得到 `RESUME_NOT_FOUND`；现在先清理关联，成功后才删除文件（Issue #1465）。
+- 候选池批量导入刷新 `security_id` 时可能撞上 `(security_id, job_id)` 主键并整批回滚；现在冲突时删除旧重复行、保留目标行（Issue #1466）。
+- 缓存取数把只读目录、磁盘满与设备 IO 故障归成 `CACHE_DATABASE_INVALID` 并提示删库；现在保留原始错误，由 CLI 与 wizard 按 `LOCAL_IO_ERROR` 上报（Issue #1467）。
+- `favorites sync` 遇到成功包络但 `zpData` / `cardList` 形状漂移时报不可重试的 `UNKNOWN`；现在返回可重试的 `NETWORK_ERROR`（Issue #1468）。
+- automation 的 `ChatTabCdpUnreachable` / `RecruiterChatTabRequired` / `BrowserSourceUnavailable` 发生在请求发出前，却会把队列行永久留成 `executing`；现在先还原 `pending` 再抛出（Issue #1469）。
+- 风控 / 预算闩锁写入撞上控制锁时会覆盖原始异常并误报 `AUTOMATION_BUSY`；现在保留原始错误，详情标记 `risk_latch_persisted=false`，异常周期不再写 state（Issue #1470）。
+- MCP server 的显式空 `--data-dir` / `--boss-bin` 被真值判断静默丢弃并回落默认值；现在原样传给 CLI，由参数校验拒绝（Issue #1471）。
+- `boss_hr_last_messages` 的 `friend_ids.items` 缺少 `minimum: 1`，与 CLI 的 `IntRange(min=1)` 不一致；现在补上下限（Issue #1472）。
+- 登录错误提示的 `next_actions` 含不存在的 `boss-chrome` 命令；现在移除，并把 Chrome 调试端口指引移到 `operator_actions`（Issue #1473）。
+- 深层本地数据会让脱敏递归溢出，stdout 变成 0 字节并丢失七键信封；现在脱敏有深度上限，信封出口捕获 `RecursionError` 回退固定错误信封（Issue #1474）。
+
+## [3.4.77] - 2026-11-17
+
+### Fixed
+- 扫码登录在最终读取时不再校验主 cookie：页面跳转后读取为空也会报登录成功并覆盖本地登录态；现在空结果直接失败，凭证不落盘（Issue #1454）。
+- CDP HTTP 端点不可达时聊天页动作被报成 `ACTION_UNCONFIRMED`（结果未知、禁止重试）；现在抛出可区分的 `ChatTabCdpUnreachable`，按「动作尚未发送」报告 `CDP_UNAVAILABLE`，重新执行是安全的（Issue #1455）。
+- 聊天页返回平台码 37（登录态失效）时被改写成 `ENVIRONMENT_RISK` 并提示不存在的风险锁；现在按 `TOKEN_REFRESH_FAILED` 报告并要求重新登录，`page_risk` 保留原始码（Issue #1456）。
+- 登录成功但本地登录态保存失败（权限 / 磁盘满）被报成可重试网络错误；现在按 `LOCAL_IO_ERROR` 报告并指向目录权限与磁盘空间（Issue #1457）。
+- 只读请求导航恢复超时时返回裸 `code=-1` 并被判为 `UNKNOWN` + 「勿重试」；读取没有副作用，现在返回可重试的 `NETWORK_ERROR`（Issue #1458）。
+- `agent run --dry-run` 命中安全提示时会把熔断写进 `stop.json`，一次无害预览冻结后续真实运行；现在预览不落闩锁、不改写待执行队列，报告仍显示 `CIRCUIT_BREAKER_OPEN`（Issue #1459）。
+- `crawl resume` 读到损坏的 Hook 目录被报成 `INVALID_PARAM` 并提示无法修复的 `crawl configure`；现在按不可重试的 `LOCAL_IO_ERROR` 收口，指向修复 7 个脚本与 `SHA256SUMS` 或用新 `--hook-dir` 重建任务（Issue #1460）。
+
+### Changed
+- `evals/run_eval.py --mode fixture` 不再要求独立终端：该模式纯本地评分，不启动子进程、不访问平台、不需要 TTY，可直接在 Agent 会话内运行；只有 `--mode external` 启动外部 runner 时仍需独立终端。同步修正 CONTRIBUTING、评测 README 与维护者文档。
+- 发布节奏改为批量：修复累积到 `[Unreleased]` 后按批次发布，不再每个 PR 合并即发一个补丁；补丁号不设上限。`docs/maintainer/release-checklist.md` 新增发布节奏一节。
+
+## [3.4.76] - 2026-11-17
+
+### Fixed
+- 子命令前有带取值的全局选项（`boss --data-dir <dir> detail -<sid>`）时，security_id 保护落在选项取值上并整体失效；CLI 自己生成的 `hints.next_actions` 就是这种形态。现在按 Click 参数元数据跳过选项及其取值、递归定位叶子命令（Issue #1447）。
+- 位置参数在选项之前（`boss detail -<sid> --job-id <jid>`）时，补出的 `--` 把其后的选项吞成额外位置参数；现在把位置参数整体后移，选项及其取值保持原顺序（Issue #1448）。
+- 选项取值以横杠开头且形似 security_id 时（`--security-id -<sid>`、`export -o -2024-report-…`）被误当位置参数，`--` 插到了选项与取值之间；现在选项取值不参与改写（Issue #1449）。
+- `config.json` 的 `operating_mode` 被改成数组 / 对象后 `not in` 抛 `TypeError`，所有命令（含 `config reset`）在启动期失败；现在与 `"bogus"` 等取值同口径回退（Issue #1450）。
+- 登录态里的 User-Agent 一直透传到采集会话却从未应用到 `ChromiumOptions`，新起的采集浏览器与后端登录态指纹不一致；现在注入同一 UA（Issue #1413）。
+- 联系人分页上限的 message 结尾「请重试」与同一信封的 `recovery_action` 矛盾，只按错误码决策的 Agent 会重放最多 50 页；现在指向稳定 uid 查询（Issue #1451）。
+
+## [3.4.75] - 2026-11-17
+
+### Fixed
+- CDP 探测（`/json/version`）返回非对象 JSON（`[]` / `null` / 标量）时 `resp.json().get` 抛 `AttributeError`，在登录降级链之外直接中止；现在按「拿不到调试端口」处理，继续既有降级（Issue #1421）。
+- `login_via_cdp` 的握手与 `browser.contexts` 读取在 `try` 之外，失败时泄漏 Playwright driver；现在纳入统一收尾，失败即 `pw.stop()`（Issue #1425）。
+- 请求预算与采集节流的有限远未来时间戳让等待永久无法自愈；现在按 `now + interval + 60s` / 1 小时冷却上限判定漂移并写回自愈（Issue #1422）。
+- 非法代理端口（`abc` / `99999` / 显式 `:0`）抛裸 `ValueError` 并落到可重试网络错误；新增 `ProxyConfigurationError`，登录 / `me` / wizard / 通用装饰器统一映射 `INVALID_PARAM`，文案不含代理凭据（Issue #1423）。
+- CDP `/json` 返回对象或混入非对象元素时，`_pick_chat_target_ws` 抛 `AttributeError` 被当成「结果未知」；现在打开 WebSocket 前收口为 `RECRUITER_CHAT_TAB_REQUIRED`（Issue #1424）。
+- `ai_model` 被手改成数组 / 数字后服务层 `rsplit` 崩溃，所有 `boss ai *` 命令落 `INTERNAL_ERROR`；现在构造前校验字符串项，报 `INVALID_PARAM` 并给出 `ai config --model` 修复指引（Issue #1428）。
+- `--base-url` 接受空白串 / 缺 scheme / 非 http(s) 地址，之后每条 AI 命令抛 `UnsupportedProtocol` 并被报成可重试错误；现在写入与解析端点两侧都校验（Issue #1431）。
+- 简历 HTML/PDF 模板对 rows 自由字段直接迭代：数字 `content` 抛 `TypeError`、字符串 `tags` 被逐字符渲染、字符串 `columns` 崩溃；现在按 `resume_to_text` 同口径归一（Issue #1429）。
+- PDF 导出绕过符号链接拒绝，静默替换 `-o` 指向的链接；现在与原子写同口径拒绝（Issue #1434）。
+- `resume export --format json` 写出裸 `NaN` / `Infinity`，严格解析器拒绝整份文件；现在与 stdout 信封同口径归一（Issue #1435）。
+- 招聘者 `parse_error` 未走通用兜底：HTTP 401 合成响应与数字字符串码（`"9"` / `"121"`）全部退化为 `UNKNOWN`；现在共用 `classify_platform_error`（保留消息关键词关闭，`code=-1` 仍为 `UNKNOWN`），401 → `AUTH_EXPIRED`（Issue #1430）。
+- `match_score` 与学历 / 经验阈值对平台字段类型漂移直接消费：`skills` 混入数字、期望字段为数组时抛 `TypeError` 落 `INTERNAL_ERROR`；现在逐项归一、坏字段按无此维度处理（Issue #1432）。
+- `ai local import --model registry.json` 会把登记表路径建成目录，登记表自此不可用；现在拒绝与登记表同名的模型名（含大小写变体）（Issue #1433）。
+- `mark --label` 的 4301 位以上数字串让 `int()` 抛裸 `ValueError`，被兜成可重试网络错误；现在报 `INVALID_PARAM` 且消息截断（Issue #1437）。wizard `candidate_mark` 与回退菜单同口径（Issue #1442、#1438）。
+- `mark` 把漂移的 `friendSource` 原样发给标签写接口，发出注定失败的写请求；现在与向导同口径按 0 处理（Issue #1439）。
+- `resume init --template` 接受任意值却固定生成默认模板、成功信封还回显未生效的模板名；现在只接受 `default`（Issue #1440）。
+- `digest` / `stats` / `resume export` 的提示写死 macOS 的 `open`；现在按平台生成 `open` / `cmd /c start` / `xdg-open`（Issue #1441）。
+
+## [3.4.74] - 2026-11-17
+
+### Fixed
+- 采集浏览器的 Cookie 注入失败被静默吞掉，平台返回登录页后误报 `CrawlRiskError` 并写入 `cdp_risk_lock`，要求人工清锁；现在 `_seed_session_cookies` 返回注入明细，失败时抛本地认证错误并映射 `AUTH_REQUIRED`（指引 `boss login`），不写风险锁。真实安全页仍 `risk_stopped` 并保留浏览器与风险锁（Issue #1405）。
+- `crawl resume` 不做 Hook 预检、相对 `--hook-dir` 被原样写入断点，换 cwd 或删改 hook 后要等浏览器导航才报错且 CLI 仍 `ok:true` 提示无限 resume；现在 resume 前校验 hook 清单，断点存绝对路径，`HookRegistrationError` 映射不可恢复的 `LOCAL_IO_ERROR`（Issue #1408）。
+- 导出目录被同名文件占用时 `mkdir` 的 `FileExistsError` 落在异常转换之外，被记成普通 `stopped` 并无限 resume；现在转换为 `CrawlExportError` → `LOCAL_IO_ERROR`（Issue #1409）。
+- 对已完成的 crawl run 执行 `resume` 仍先要求登录；现在登录态按需读取，`crawl run` 仍提前预检，`resume` 在确认有续跑工作后才预检，已完成 run 直接返回结果（Issue #1412）。
+- automation 队列文件不可读（权限/目录/IO）被当作空队列，`agent pending list` 返回 `ok=true items=[]`、`agent run` 静默跳过已批准动作；现在只有 `FileNotFoundError` 视为空队列，其余 fail-closed 报 `AUTOMATION_STATE_INVALID` 并带文件路径与修复方式（Issue #1406）。
+- automation 的 pending `status` 为数组/对象时抛 `TypeError` 被兜成 `INTERNAL_ERROR`；现在先校验字符串类型，按状态损坏报 `AUTOMATION_STATE_INVALID`（Issue #1410）。
+- `agent crawl` 在校验 `--resume` 之前完成整轮采集与短名单导入，`--query` 与 `--run-id` 两条路径都会先产生平台请求与本地写入；现在简历检查前移，空名/缺失/损坏分别报 `INVALID_PARAM`、`RESUME_NOT_FOUND`、`RESUME_FILE_INVALID`（Issue #1407）。
+- `agent crawl` 的简历校验前移后又越过了风险锁检查：已记录 `cdp_risk_lock` 时会先报 `RESUME_NOT_FOUND`，引导用户补完简历后继续触发平台风控；现在 `--query` 路径先检查风险锁（`ENVIRONMENT_RISK_LOCKED`），`--run-id` 只读本地结果与短名单，仍不受锁影响（Issue #1419）。
+- 复核/待办 TTY 列表列键用了不存在的 `review_id` / `score`，两列恒显示 `-`；改为 `id` / `confidence` 并加模型字段守卫（Issue #1411）。
+
+## [3.4.73] - 2026-11-17
+
+### Fixed
+- wizard 的 run/step `status` 只认 `WorkflowStatus` 枚举：NULL / 非字符串 / 未知值此前能绕过 resume 去重（写操作会被重放），现在 `get_checkpoint` 与 `list_recent` 统一报 `CACHE_RECORD_INVALID`；`SearchPipelinePlatformError` 不再被兜成 `NETWORK_ERROR`，保留 AUTH_EXPIRED / RATE_LIMITED / 风控码的原语义与恢复指引（Issue #1382、#1384）。
+- wizard 的 `welfare_conditions` 文档形状（`list[str]`）被逐字符拆包导致静默错误筛选；入口统一归一为 `(label, keywords)`，非法形状报 `INVALID_PARAM`（Issue #1383）。
+- wizard 的 `--timeout` 接受 `nan` / `inf`，超时保护被静默关闭；现在要求有限正数并报 `INVALID_PARAM`。`--status` 的 TTY 恢复命令按 `--data-dir` 改写（Issue #1385、#1386）。
+- 登录风控信封把 `LOGIN_RISK_CONTROL` 报成 `recoverable=true` + 「重试登录」，`display.py` 又只在字段为 `None` 时按登记表补齐；现在按 `ERROR_CODES` 取 `recoverable=false` 与登记表 recovery，`next_actions` 保持为空（Issue #1390）。
+- `boss doctor` 的登录态结论 `stoken=存在/缺失` 被自由文本脱敏替换成 `[REDACTED]`；改为 `stoken_present=...`，真实 token 仍被脱敏（Issue #1393）。
+- stdout 与 MCP 输出遇到非有限浮点会写出 `NaN` / `Infinity`，严格 JSON 解析器拒绝整份信封；现在递归归一为 `null`（超长整数同样归一），并以 `allow_nan=False` 兜底，正常输出逐字节不变（Issue #1391）。
+- MCP 工具 schema 的 `minimum` / `maximum` 与 Click 参数漂移（`timeout=0`、`count=0`、`days=-1` 先被放行再由 CLI 拒绝）；现在以 Click 为真源补齐边界，并新增双向守卫测试防止再次漂移（Issue #1392）。
+- Rich 表格标题直接拼接用户查询词 / 联系人名 / `--data-dir` 路径，`[/bold]` 这类标记会让 TTY 输出崩溃并被兜成可重试 `NETWORK_ERROR`；三个渲染器与空列表路径现在转义标题，`MarkupError` 按不可恢复的 `INTERNAL_ERROR` 分类（Issue #1399）。
+- 磁盘满等 fd 级写失败抛出的 `OSError` 没有 `filename`，被 `is_local_io_error` 判成网络错误并提示重试；原子写现在补上目标路径，按 `LOCAL_IO_ERROR` 报告（Issue #1400）。
+- Windows 上职位 CSV 导出被文本层二次翻译，每行变成 `\r\r\n`；CSV 分支改用 `newline=""` 落盘（Issue #1401）。
+- 联系人接口 `result` 为非空坏元素数组时不再回退合法的 `friendList`，整页被静默当作 0 条，导出还会把空页写成完整快照；现在只要取不出 dict 元素就回退（Issue #1402）。
+- 预筛日志把职位薪资与用户期望薪资拼进 stderr，CodeQL 按明文记录私有数据告警；日志原因改为定性描述，数值仍保留在输出 data 里（Issue #1394）。
+
+## [3.4.72] - 2026-11-17
+
+### Fixed
+- wizard 遇到缓存库损坏（含取数阶段才暴露的坏页）时被兜成可重试的 `NETWORK_ERROR`，Agent 会在同一坏库上无限重试。`wizard/runner.py` 现在输出 `CACHE_DATABASE_INVALID`（`replay_safe=false`），TTY 补齐对应文案（Issue #1362）。
+- 简历 `modules[].rows[]` 的 `content` / `tags` 类型漂移：`content: 123` 抛 `TypeError`，`tags: "abc"` 被拆成 `a, b, c`；`agent crawl` 里该异常被兜成可重试 `NETWORK_ERROR`（重试会重新发起采集），`ai` 落 `INTERNAL_ERROR`。`ai polish` / `agent crawl --resume` 还把损坏简历报成「不存在」。现在行内容按元素归一，损坏简历报 `RESUME_FILE_INVALID` 并给出 `resume delete` 指引，空名报 `INVALID_PARAM`（Issue #1370、#1369）。
+- `agent crawl` 把 `CrawlProfilePathInvalid` / `CrawlExportError` 兜成 `CRAWL_UNAVAILABLE`（安装依赖），按提示重试永远复现；现在与 `crawl run` 同口径报 `LOCAL_IO_ERROR`（Issue #1366）。
+- AI provider 响应与平台 httpx 响应是极深嵌套 JSON 时 `json.loads` 抛 `RecursionError`：AI 命令 stdout 为空 + traceback，平台命令被兜成可重试 `NETWORK_ERROR`。现在两处都捕获 `RecursionError`，AI 按解析失败报 `AI_API_ERROR`，平台响应按不可恢复的 `INTERNAL_ERROR`（不重试）；CDP 探测与页面风险跟踪器的二次解析同步收口（Issue #1365、#1368）。
+- 组预算目录的 `config.json` 损坏（坏 JSON / `request_max_per_minute: 0`）时，平台命令被兜成可重试 `NETWORK_ERROR`；现在启动期校验并输出 `INVALID_PARAM`（不可恢复），指向具体配置文件（Issue #1367）。
+- MCP 响应含孤立代理字符（如 `\udcff`）时，工具结果序列化抛 `PydanticSerializationError`，异常穿出 `stdio_server()`，整个 MCP 进程退出；`boss mark --label ""` 的空标签被模糊匹配成「新招呼」并在平台改标签；`boss_digest` / `boss_stats` 的显式空输出路径被吞成 `ok=true` 但不写文件。现在响应文本按 CLI 同口径把代理写成字面转义、空标签在构造平台实例前报 `INVALID_PARAM`、显式空路径原样下发（Issue #1375、#1376、#1377）。
+- 认证 Cookie 探测与 CDP 探测的响应解析只捕 `ValueError`：极深嵌套 JSON 的 `RecursionError` 逃出后按网络错误处理；现在两处补捕并按「响应无法解析」走既有降级 / 不可用路径（Issue #1378）。
+
+## [3.4.71] - 2026-11-17
+
+### Fixed
+- crawl 列表 `hasMore` 为显式 `null` 时被读成「没有更多」，run 报 `completed` 却只抓第一页；导出 `os.replace` 失败（目标已是目录 / 被占用）逃到 `except Exception`，run 落成 `ok=true` 的 stopped、临时文件残留；断点 `profile_path` 为空串时 `Path("")` 解析到 cwd，resume 会删除当前目录的 Singleton 锁并把 Chrome 配置写进去。现在只有显式布尔 `False` 才结束翻页，替换失败转 `CrawlExportError` 并清理临时文件，`profile_path` 必须是非空绝对路径（写入断点前统一 `resolve()`，相对 `--data-dir` 不受影响）（Issue #1345、#1346、#1347）。
+- `crawl run --hook-dir` 的内容校验发生在建任务、开浏览器之后：目录拼错 / 清单缺失时任务已落库，命令返回 `ok=true` 并提示 `crawl resume`，但 resume 没有 `--hook-dir` 参数可以修复。现在建任务前校验目录存在、清单可读、脚本齐全且摘要匹配；同时 `_tolerated_timestamp` 补齐 `OverflowError` 与 `math.isfinite`，`updated_at` 为 `inf` 时不再让 queued 任务永久排队（Issue #1348、#1349）。
+- 缓存库数据页损坏但首行可读时，游标 `fetchone` / `fetchall` / 迭代抛裸 `sqlite3.DatabaseError`：`crawl status` 只给通用 IO 指引，crawl 执行中被吞成 `ok=true` stopped + resume，坏库下无限重复。现在所有读取路径统一为 `CacheDatabaseInvalid`，命令层输出 `CACHE_DATABASE_INVALID`（Issue #1350）。
+- `friend_list` 的 `result` 为真值非列表时遮蔽合法 `friendList`：`chat` 返回空、`digest` / `pipeline` 全零、`chatmsg` / `mark` / `exchange` 误报 `CONTACT_NOT_FOUND`，`chat --export` 还会把空列表写进当日快照。联系人 `uid` 为 null 时被字符串化成 `"None"` 并发进读写请求，候选人消息被误标「我」；查找超过分页上限被报成可重试的 `NETWORK_ERROR`。现在 `result` 只在非空列表时优先、uid 缺失安全停止并给出带 `--data-dir` 的 `boss chat` 路径、分页上限与 wizard 同口径说明重试不改变结果（Issue #1351、#1352、#1353）。
+- HTML 导出把平台 null 字段渲染成字面量 `None`；`-o` 指向符号链接时原子写入替换链接本身，真实目标保持旧内容；当日聊天快照的读-合并-写没有互斥，并发导出互相覆盖、次日 diff 误报 `added`。现在 `esc` 对 `None` 输出空串、符号链接（含悬空链接）按 `INVALID_PARAM` 拒绝、快照读-合并-写在跨进程锁内完成（Issue #1354、#1355、#1356）。
+
+## [3.4.70] - 2026-11-17
+
+### Fixed
+- 搜索预筛与详情描述对平台字段类型漂移直接消费：`salary` / `experience` / `education` / `city` 为数字、数组或对象时 `.replace` / `in` 抛 `TypeError`，`search` 与 wizard 共用同一条预筛路径直接崩溃；详情 `postDescription` 非字符串时也会在描述筛选处抛错。现在非字符串值一律视为「预筛不排除、后续详情确认」，`postDescription` 非字符串按空文本处理（Issue #1335）。
+- 请求预算库损坏被兜成 `INTERNAL_ERROR`：`<data_dir>/request-budget.sqlite3` 被截断、写入非 SQLite 内容或权限不可读时，`sqlite3.DatabaseError` 直接冒到顶层，恢复指引只说「重试」。现在按 `LOCAL_IO_ERROR` 上报，并给出带数据目录的删除重建指引；`locked` / `busy` 仍走 `CACHE_BUSY`（Issue #1336）。
+- automation 队列坏 `status` 与非 UTF-8 字节被静默吞掉：`null` / 数字 / 大小写不符 / 旧版 `dry-run` 的值被 `str()` 成未知状态后静默跳过，`agent pending list` 看起来「没有待办」；混入非 UTF-8 字节（例如 GBK 手工编辑）会让整个队列文件静默变空。现在未知状态报 `AUTOMATION_STATE_INVALID`，坏行按行跳过、合法行保留（Issue #1337）。
+- watch 与 wizard 运行存量搜索参数时不重新校验：未知城市在流水线深处抛 `ValueError` 被兜成可重试的 `NETWORK_ERROR`，未知薪资 / 经验 / 学历标签被静默丢弃，`watch run` 仍返回 `ok: true`；参数被手工改成数组 / 数字时落 `INTERNAL_ERROR`。现在 `watch run` / `watch run --all` / wizard `candidate_search` / `candidate_watch` 都在平台请求前按 `watch add` 同口径校验：单条失效报 `SAVED_SEARCH_INVALID` 并给出删除重建指引，`--all` 继续执行其余 watch 并在 `invalid` 中列出坏记录（Issue #1338）。
+
+## [3.4.69] - 2026-11-17
+
+### Fixed
+- welfare 筛选对 `welfareList` 元素级漂移直接 `" ".join` 抛 `TypeError`：平台把标签数组混入数字 / null / 对象时，`boss search --welfare` 与 wizard 的 job_search / export / watch 全部落 `INTERNAL_ERROR`（wizard 里可能被兜成可重试的 `NETWORK_ERROR`）。`match_all_welfare()` 现在只拼接字符串元素，非字符串 `description` 按空文本处理（Issue #1329）。
+- wizard 自由输入与本地配置边界：`raw_params` 非 JSON 对象时被 `dict()` 抛 `ValueError` / `TypeError`；`candidate_export` 的 `format` / `output` 校验放在平台搜索之后，非法 format 也会先翻页消耗请求预算，非路径类型的 `output` 落 `INTERNAL_ERROR`；`config.json` 的 `crawl` 段非对象时同样被兜成可重试错误。现在三处都在平台请求前校验：参数 / 目录路径报 `INVALID_PARAM`，父路径不可用报 `LOCAL_IO_ERROR`，crawl 配置的恢复指引指向带 `--data-dir` 的 `config reset crawl`（Issue #1330）。
+- wizard 本地简历损坏与联系人查找上限的错误语义：`ai_assist` 把损坏简历误报成 `RESUME_NOT_FOUND`（照提示 `resume init` 又撞 `RESUME_ALREADY_EXISTS`），`local_resumes` 静默隐藏坏文件，`FriendLookupLimitExceeded` 让候选人「缩小沟通列表范围」。现在分别返回 `RESUME_FILE_INVALID`（带字段级原因与 `resume delete` 指引）、`corrupt` 名单，以及指向 `boss chat` 取 uid 的恢复路径；TTY 补齐 `RESUME_FILE_INVALID` 文案与 `boss resume delete` 的目录改写（Issue #1331）。
+
+## [3.4.68] - 2026-11-17
+
+### Fixed
+- MCP 三个工具把显式空串当成未传：`boss_shortlist_add` 的 `source`、`boss_agent_stop` / `boss_agent_review_reject` 的 `reason` 传 `""` 时，CLI 落到自己的默认值（`manual` / `manual-stop` / `human-rejected`），落库值与调用方参数不一致。现在键存在且非 null 就原样下发，与 `export --url ""` 的口径一致（Issue #1324）。
+- crawl 断点读取补齐范围、枚举与文本校验：`browser.cdp_port` 越界会在 `socket.connect_ex` 抛 `OverflowError` 并被吞成 `ok: true` 的 stopped；`pages` / `limits` 的 0 或负数、负的 `next_page` 与计数器、非枚举的 `hook.profile`、BLOB 的 `status` / `output_dir` / `error` 均缺少读取边界校验。现在统一抛 `CACHE_RECORD_INVALID`，`crawl status` 与 `crawl resume` 对同一行口径一致（Issue #1325）。
+
+### Changed
+- GitHub 公共仓库默认阻止 `pull_request_target`（2026-11-16 brownout，2026-12-02 起永久生效），三个辅助工作流每个 PR 都 `startup_failure`。`Update Contributors` 改为在 `push` 到 `master` 时运行，`Labeler` 改为 `pull_request`（fork / Dependabot 只读 token 直接跳过），删除从未生效的 `Dependabot auto-merge`；新增离线守卫禁止重新引入 `pull_request_target`（Issue #1322）。
+
+## [3.4.67] - 2026-11-17
+
+### Fixed
+- chat 家族三处平台字段漂移：`lastMessageInfo` 非对象时 `boss chat` 落成 `INTERNAL_ERROR`；上一份快照的 `last_ts` 是字符串时 `boss chat --export` 的筛选比较抛 `TypeError`；超过 4300 位的 ASCII 数字 `mid` 让 `boss hr chatmsg` 落成可重试的 `NETWORK_ERROR`。三处现均按「字段不可用」处理（Issue #1317）。
+- 搜索缓存命中时 `data` 的元素不是对象，会让 `--sort score` 与索引缓存写入直接 `AttributeError`；`match_score` 漂移成字符串时排序键混合比较抛 `TypeError`。patchright `browsers.json` 形状漂移（顶层数组 / `browsers` 非数组 / 混入 null）也会打断 `boss doctor`。两处本地读取边界现按「不可用」处理（Issue #1318）。
+
+## [3.4.66] - 2026-11-17
+
+### Fixed
+- 向导 `candidate_mark` 从平台返回的联系人记录里读 `friendSource` 后直接 `int()`：字段漂移成非数字字符串时 `ValueError` 被兜成可重试的 `NETWORK_ERROR`（重试同一份数据必然复现），漂移成对象 / 数组时落成 `INTERNAL_ERROR`（Issue #1314）。`friendSource` 只是回传给标签接口的定位参数，现在非数字值一律按缺失的默认 0 处理。
+
+### Docs
+- ROADMAP 中英「已发布 / Released」列表从 v3.4.54 起把新条目直接拼在上一版条目后面，12 条挤成一整行 3000+ 字符（Issue #1312）。现已按版本拆成独立列表项，并新增文档测试断言防止后续发版继续粘连。
+
+## [3.4.65] - 2026-11-17
+
+### Fixed
+- 自动化执行锁 / 控制锁打开阶段的 `sqlite3.OperationalError`（锁文件被目录占位、不可写、磁盘满）原样上抛，命令层要么报成让人去删缓存的 `CACHE_BUSY`，要么丢掉 JSON 信封（Issue #1304）。现在只有锁冲突报 `AUTOMATION_RUN_BUSY` / `AUTOMATION_CONTROL_BUSY`，其余按 `AUTOMATION_STATE_INVALID` 返回；顶层兜底把非 busy 的 `DatabaseError` 收口为 `LOCAL_IO_ERROR`。
+- 自动化周期里控制锁冲突一律包装成 `LOCAL_STATE_WRITE_FAILED` + `replay_safe=false`，零派发（如刚启动就被 `agent stop` 抢占）时也提示「平台动作可能已发出」（Issue #1307）。现在只有真正派发过动作后才升级该语义，零派发冲突按普通「没有生效」上报。
+- headless 刷新通道返回空 stoken 时被当成功写进登录态，之后所有请求拿空凭证打平台、重试到预算耗尽，`TOKEN_REFRESH_FAILED` 永不产生（Issue #1305）。现在空值按刷新失败处理并保留旧登录态，与 CDP 通道同口径。
+- `str.isdigit()` 对 '①' / '²' 等非 ASCII 数字为真但 `int()` 会抛 `ValueError`：向导标签 / 城市、`mark --label`、`crawl` 城市代码、菜单序号、搜索筛选原始代码与 `hr chatmsg` 游标都会崩溃或被兜成可重试的 `NETWORK_ERROR`（Issue #1306）。现在只把 ASCII 数字串当数字，非法输入走各入口的确定性参数错误。
+
+## [3.4.64] - 2026-11-17
+
+### Fixed
+- argv 里的非法字节会解码成 U+DCFF 之类的孤立代理：本地 JSON 写入、`-o` 文本导出、信封序列化与 `config set` 输入边界原先都会抛 `UnicodeEncodeError`，命令 exit 1 但 stdout 没有信封（MCP 拿不到结果）（Issue #1294）。现在写入用 `backslashreplace` 落成 JSON 合法转义，信封序列化后保证可编码，`config set` 直接报 `INVALID_PARAM`，顶层网兜把 `UnicodeError` 归为 `LOCAL_IO_ERROR`。
+- 平台把纳秒时间戳当毫秒传来（`10**17`）或 JSON 的 `1e400` 变成 `inf` 时，`chat` / `chatmsg` / `hr chat` / `pipeline` / `digest` 的时间格式化抛 `ValueError` / `OverflowError`，被兜成可重试的 `NETWORK_ERROR` 或 `INTERNAL_ERROR`（Issue #1295）。现在统一按「无时间」输出。
+- HTML 导出遇到非字符串平台字段（`brandName` 是数字、`skills` 混入非字符串）时 `html.escape` 抛 `AttributeError`，落成 `INTERNAL_ERROR`，而 md / csv 正常（Issue #1296）。现在统一按文本转义。
+- pipeline 聚合排序遇到混合类型的 `brandName` / `title` 时跨类型比较抛 `TypeError`，一条漂移记录拖垮整份日报（Issue #1297）。排序键统一转字符串。
+- `pipeline` / `digest` 的 `--now-ts-ms 0` 被真值回退吞掉，测试钩子静默失效（Issue #1298）。现在按显式值处理。
+
+## [3.4.63] - 2026-11-16
+
+### Fixed
+- 向导的 `crawl_status` / `crawl_resume` 指向本地损坏的采集记录时，`CacheRecordInvalid` 被 runner 通用兜底记成可重试的 `NETWORK_ERROR`（「重试当前 run_id」），照做只会无限重试同一条坏记录（Issue #1286）。现在 runner 统一映射为 `CACHE_RECORD_INVALID`，恢复方式为重建任务（`replay_safe=false`）。
+- 向导的 `crawl_start` / `crawl_resume` 遇到导出失败（输出目录是同名文件、无权限、磁盘满）时被兜成 `NETWORK_ERROR`，`--max-retries>0` 还会自动重跑步骤、重新打开采集 Chrome 并再次发出平台请求（Issue #1287）。现在与 CLI 一致返回 `LOCAL_IO_ERROR`（recoverable=false，`replay_safe=false`），指引修复输出目录与权限。
+- 采集断点 `params.cdp_port` / `limits.*` 为 `Infinity` / `1e400`，或向导输入 `pages: 1e400` 时，`int()` 抛出的 `OverflowError` 未被捕获，落成 `INTERNAL_ERROR`（「先升级版本」）（Issue #1288）。现在 `CrawlSettings.from_dict` 按记录损坏报 `CACHE_RECORD_INVALID`，向导按 `INVALID_PARAM` 报错。
+- `CRAWL_PROFILE_BUSY` 的信封 `next_actions`、登记表恢复文案与向导恢复文案引用不带值的 `boss crawl status`，照抄返回 `INVALID_PARAM`（缺少必填 `RUN_ID`）（Issue #1289）。现在统一使用 `crawl status <run_id>` 占位形式。
+- 采集配置目录 `crawl/chrome-profile` 被同名文件占用或不可写时，`CrawlTransport.open()` 的 `OSError` 被 `_run` 兜成 `ok=true` 的 `stopped`，`crawl resume` 永远复现（Issue #1290）。现在抛出 `CrawlProfilePathInvalid`：CLI 与向导都按 `LOCAL_IO_ERROR`（recoverable=false）上报，指引检查路径、权限与磁盘空间。
+
+## [3.4.62] - 2026-11-16
+
+### Fixed
+- 采集配置目录被另一个运行中的采集 Chrome 占用时，`CrawlService.create_and_run` 抛出的 `CRAWL_PROFILE_BUSY` 在 `agent crawl`、`crawl run` 与向导路径上被兜底成 `stopped`，调用方拿到 `ok=true` 与永远复现的恢复指引（Issue #1274）。现在三条路径都按 `CRAWL_PROFILE_BUSY` 上报：本次调用未发出请求，指引先用 `crawl status` 确认占用结束。
+- 安全页检查把 DrissionPage 未命中时返回的 `NoneElement` 当成命中（`is None` 永远为假），未登录或安全页会被当成空结果继续（Issue #1276）。现在用真值判断，缺职位列表容器时按风险页停止并写风险锁。
+- 断点 `params.chrome_path` 的类型漂移（非字符串）原样进 `set_browser_path` 抛 `TypeError`，被记成 `stopped` 并给出永远复现的恢复指引（Issue #1278）。现在 `CrawlSettings.from_dict` 按 `CacheRecordInvalid` 报 `CACHE_RECORD_INVALID`，与其它参数漂移一致。
+- 采集因风控停止且风险锁写盘失败时，成功信封没有提示「新进程不再受保护」（Issue #1281）。现在 `risk_stopped` 分支追加与认证错误路径相同的操作者提示。
+- 采集 `_run` 的 `finally` 顺序执行 budget 落库、终态落库与关闭浏览器：前一步失败会跳过后续步骤，run 永远停在 `running`、采集 Chrome 继续占用共享 profile，且清理异常会覆盖传播中的原始异常（Issue #1277）。现在三步各自兜底，正常路径上的清理失败仍然抛出（命令层报缓存或 IO 错误），但不覆盖风控 / 中断 / 停止。
+- 风险锁主文件写盘失败（主文件被占成目录、权限损坏）时，锁只保留在当前进程内存里，进程退出后新进程读不到阻断（Issue #1270）。现在 `write_lock` 会尝试后备位置 `<data_dir>/cache/cdp_risk_lock.json`：`read_lock` / `raise_if_locked` 任一份存在即 fail-closed 锁定，`clean --risk-lock` 同时清理两处；只有两处都失败才保留进程内锁并在信封提示「新进程不再受保护」。
+
+## [3.4.61] - 2026-11-16
+
+### Fixed
+- 不同 crawl run 并发执行时共用同一个采集 Chrome 配置目录（`crawl/chrome-profile`），而端口按 run 随机分配：`CrawlTransport.open()` 只探测自己的端口，空闲就无条件删除 `SingletonLock` 等文件，会破坏另一个 run 正在使用的采集 Chrome（Issue #1266）。现在先读锁里的 `<hostname>-<pid>`，进程仍存活时不删锁、不启动第二个实例，返回 `CRAWL_PROFILE_BUSY`（`recoverable: true`，本次调用未发出请求）；只有进程已不存在、跨主机或格式不可解析的锁才按陈旧锁清理。
+- 命中平台风控且主锁与 group 目录的锁都写失败时，本地锁只在当前进程生效：进程退出后新进程读不到锁会继续访问平台（Issue #1270）。现在风控信封在 `details.risk_lock.persisted` 为 `false` 时追加 `operator_actions`：「本地风险锁未能写入磁盘：当前进程退出后，新的 boss 进程不会再被这把锁阻止；先修复数据目录的写权限与磁盘空间，在确认平台已恢复前不要启动新的 boss 进程」。两条风控出口（`handle_auth_errors` 与登录链路的 `classify_login_error`）共用同一份提示。
+
+## [3.4.60] - 2026-11-16
+
+### Fixed
+- `boss agent run` / `agent train` 执行周期内 checkpoint 撞上 `automation/.control-lock.sqlite3` 时，命令层原先按 `AUTOMATION_BUSY` 报「本次操作没有生效，可稍后重试」（Issue #1267）：动作派发成功、队列已写回 `executed` 之后平台动作可能已经发出，按此指引重试会让操作者误以为消息没有发送。现在 runner 把周期内的控制锁冲突转换成 `AutomationControlBusyDispatched`，命令层按 `LOCAL_STATE_WRITE_FAILED`（`replay_safe: false`）上报：平台动作可能已发出、本地状态保存失败，恢复指引为先核对官方页面、不自动重发。`--dry-run` 与 `--resume` 入口的锁冲突没有产生平台动作，仍返回 `AUTOMATION_BUSY`。
+
+## [3.4.59] - 2026-11-16
+
+### Fixed
+- `boss agent run` / `agent train` 被 Ctrl+C 中断时 stdout 没有任何 JSON 信封（Issue #1262）：runner 打开熔断并保留 checkpoint 后原样重抛 `KeyboardInterrupt`，Click 在 `standalone_mode=False` 下把它转成 `Abort` 上抛，进程以空输出退出；MCP 通过子进程解析 stdout，只能把这次写调用当成结果未知。现在命令层捕获中断并输出 `CIRCUIT_BREAKER_OPEN` 信封（可重试），说明执行被中断、熔断已打开并保留 checkpoint，恢复指引为核对未确认动作后执行 `--resume`。
+
+## [3.4.58] - 2026-11-16
+
+### Fixed
+- `boss agent run --dry-run` 遇到上一轮真实运行中断后遗留的 `executing` 待执行行时会打开熔断并改写队列（Issue #1257）：预览的 `process_pending` 把该行转成 `verification-required` 并写入 `stop.json`，之后普通 `agent run` 直接返回 `CIRCUIT_BREAKER_OPEN`，操作者需要额外 `--resume` 才能继续，违反「预览不改写待执行队列」的契约。现在 dry-run 只追加一条 `DRY_RUN` 事件，说明真实运行会把它转为 `verification-required` 并要求人工核对、不会自动重发，不改写队列也不打开熔断；真实运行保持既有行为。
+- `boss agent crawl --run-id` 读取到损坏的本地 crawl run 记录时误报 `INVALID_PARAM`（Issue #1259）：`CacheRecordInvalid` 是 `ValueError` 子类，被参数错误的 `except ValueError` 接住，恢复指引让人去修关键词、城市或 crawl 配置——调整任何参数都不可能修好一条写坏的本地记录。现在单独捕获并返回 `CACHE_RECORD_INVALID`，`next_actions` 指向 `crawl start`（重新创建任务）与 `crawl status`（核对 ID），与 `crawl status` / `crawl resume` 的恢复契约一致。
+
+## [3.4.57] - 2026-11-16
+
+### Fixed
+- automation 执行周期没有跨进程互斥（Issue #1253）：待执行队列按整文件回写，两个 executor 同时处理同一数据目录时，后写者会用旧快照覆盖先写者的 `executing` 在途标记（Issue #1245），同一条已批准动作可能被发送两次，被覆盖回 `pending` 的动作下一轮还会再发；并发的 `agent review approve` 也可能被整文件回写吞掉。现在整个周期持有 `automation/.run-lock.sqlite3` 的跨进程执行锁，第二个 executor 在发出任何请求前返回新登记的 `AUTOMATION_RUN_BUSY`（可重试，附 `agent stats`），显式 `--resume` 也在锁内执行；`agent review approve` / `reject` 与执行周期互斥，冲突时不入队、复核项保持 `review`。执行锁独立于控制锁，`agent stop` 仍能在运行期间立即写入熔断。
+
+## [3.4.56] - 2026-11-16
+
+### Fixed
+- automation 控制锁冲突不再被误报成 `CACHE_BUSY`（Issue #1251）：`automation/.control-lock.sqlite3` 被其他 boss 命令占用时，`BEGIN IMMEDIATE` 抛出的 `database is locked` 穿透到兜底层后被归为缓存库错误，恢复指引让人去等 `cache/boss_agent.db` 的写入者，而 `agent stop` 实际上没有生效。现在控制锁冲突返回新登记的 `AUTOMATION_BUSY`（可重试），指引指向真正的锁文件并说明锁文件完好、不需要删除；`agent stop` 与 `agent run` 的恢复/写状态路径都按此上报。非锁类 `OperationalError` 原样上抛，不伪装成可重试的占用。
+
+## [3.4.55] - 2026-11-16
+
+### Fixed
+- `boss agent review approve` 先写复核队列再追加待执行队列（Issue #1248）：第二步失败（磁盘满、权限、中断）时复核项已是 `approved`、pending 里却没有对应行，重试因为找不到 `review` 记录直接报「不存在或已处理」，已批准的动作永久丢失。现在改为先入队、再标记复核项；入队失败可直接重试，两步之间失败时按 `approved_review_id` 去重，只补写复核队列。
+
+## [3.4.54] - 2026-11-16
+
+### Fixed
+- 招聘自动化的待执行动作在写请求发出后中断时仍保持 `pending`，`agent run --resume` 或下一次普通运行会把可能已生效的动作再发一遍（Issue #1245）。现在派发前先落盘 `executing` 标记：中断、进程被杀、响应风控与本地回写失败都停在 `executing`，下一轮转成 `verification-required` 并打开熔断，提示先核对官方页面；只有预算 / 时限在请求发出前抛出（`request_sent=false`）时才恢复 `pending` 可安全重试。`docs/commands.md` 同步补充该语义。
+
+## [3.4.53] - 2026-11-16
+
+### Fixed
+- 招聘自动化的熔断开关 `circuit_breaker.open` 只按 JSON 真值读取（Issue #1242）：`stop.json` 为 `{"open": 0}` / `{"open": null}` 时停止开关被错误关闭、自动化照常发送写操作，且该轮 checkpoint 会把 `state.json` 里原本的 `open: true` 覆写成 `0`；`{"open": 1}` / `{"open": "true"}` 时 `SafetyGuard` 与 `boss hr location` 的读取口径相反。现在 `read_stop` 对非布尔 `open` fail-closed 并标记损坏，`read_state` / `write_state` 对类型漂移报 `AUTOMATION_STATE_INVALID`，操作员仍可通过显式 `agent resume` 解除熔断。
+
+## [3.4.52] - 2026-11-16
+
+### Fixed
+- `boss crawl` 的停止状态机与导出顺序（Issue #1238）：transport 透传的 wizard 控制信号（`WORKFLOW_STOPPED` / `WORKFLOW_TIMEOUT`）原先落成普通 `stopped`，命令层会给出可重试的 `NETWORK_ERROR` 与会清除 stop 标记的 `crawl resume`；现在按错误码落成 `workflow_stopped` / `timeout_stopped`。最后一页导出移到 `completed` 落库之前，导出失败后再次 `resume` 仍能补齐产物，而不是带着 `completed` 报成功却无文件。
+- `boss crawl` 导出失败原先被兜成 `CRAWL_UNAVAILABLE`（指引用户安装 crawl 依赖），现在映射为不可重试的 `LOCAL_IO_ERROR`；`budget_stopped` / `workflow_stopped` 的 `next_actions` 改为只读的 `crawl status`，`operator_actions` 说明预算已用尽需新建任务、stop 后需要显式 resume。
+
+## [3.4.51] - 2026-11-16
+
+### Fixed
+- `boss wizard --input-json` / MCP `boss_wizard` 的 `requested_steps` 传空数组时，原先会被折叠成「执行 goal 全部步骤」——对 `candidate_greet` 这类含真实平台写入的 goal，调用方本意是不执行任何步骤，却会执行全部写操作（Issue #1236）。现在空数组以 `INVALID_PARAM` 拒绝，只有省略该字段才表示全量执行；工具 schema 同步声明 `minItems: 1`。
+- MCP 工具参数含 NUL 或孤立代理项字符时，原先在派生 `boss` CLI 的子进程编码阶段抛 `UnicodeEncodeError`，被兜成不可读的 `INTERNAL_ERROR`（Issue #1236）。现在在调用 `boss` CLI 前统一校验 argv，返回可读的 `INVALID_PARAM` 信封，且不会生成子进程。
+
+## [3.4.50] - 2026-11-16
+
+### Fixed
+- 平台成功包络里的 `zpData` 返回非对象真值（字符串 / 数组 / 数字 / 布尔）时，`unwrap_data(...) or {}` 只挡 `null` 与空容器（Issue #1233）：`boss wizard --goal last_messages` 读 `friendList` 抛 `AttributeError`、整轮 wizard 落不可重试的 `INTERNAL_ERROR`；`boss hr download-resume` 在附件已经落盘后用 `**` 展开抛 `TypeError`，用户拿到失败信封但文件已下载；`boss hr jobs detail` 把畸形值放进 `ok:true` 的 `data`；`boss favorites list` 走写操作口径的 `UNKNOWN`（「先核对是否生效」），对只读列表不可重试且误导。现在按期望容器类型兜底：wizard 按空页继续、download-resume 报下载成功、jobs detail 的 `data` 归一为空对象、favorites list 返回可重试的 `NETWORK_ERROR`；列表命令与 `me` 各 section 的 `data` 保持既有原样透传契约。
+
+## [3.4.49] - 2026-11-16
+
+### Fixed
+- 本地数值转换的溢出边界一次收口（Issue #1230）：`json.loads` 能正常解析 4300 位以内的大整数与 `1e400`（→ `inf`），但 `float()` / `int()` / `math.isfinite()` 在溢出时抛 `OverflowError`——`BossCliGroup` 把它归入不可重试的 `INTERNAL_ERROR`（指引「升级版本」），搜索缓存路径则被兜成可重试的 `NETWORK_ERROR`。现在：搜索缓存里的坏行按未命中处理、继续正常搜索；`config.json` 的 `request_delay` / `request_wait_timeout` 大整数与 `config set automation|crawl` 的 `1e400` 返回 `INVALID_PARAM` 并给修复入口；`ai_temperature` 大整数返回 `INVALID_PARAM`；本地模型输出的 `confidence` 大整数或深嵌套走模板话术降级并要求人工复核，不再中止整轮自动化；AI fit 输出的 `match_score: 1e400` 按 0 分处理并继续返回结果。
+
+## [3.4.48] - 2026-11-16
+
+### Fixed
+- 本地 JSON 读取补齐「超长整数」与「深嵌套」两类确定性解析异常（Issue #1227）：Python 3.11+ 的 `json.loads` 对超过 4300 位的整数字面量抛裸 `ValueError`（不是 `JSONDecodeError`），深嵌套数组在 3.11–3.13 抛 `RecursionError`；只捕 `JSONDecodeError` 的读取边界会让它们穿透成 traceback 或可重试的 `NETWORK_ERROR`。`boss agent stats` / `boss resume show` 之前直接 traceback、stdout 没有信封；`automation/storage.py` 的熔断 latch（`stop.json`）读不出来时没有 fail-closed。现在所有本地解析边界统一按各自契约兜底：熔断 latch 返回 `open: true` / `corrupt: true`，`state.json` 与队列记录报 `AUTOMATION_STATE_INVALID`，简历文件报 `RESUME_FILE_INVALID` / `ResumeImportError`，聊天快照按不可用降级，SQLite 断点报 `CACHE_RECORD_INVALID` / `SavedSearchParamsError`，坏行跳过，配置文件与 `--input-json` / `--set` 结构化值按损坏输入处理。
+
+## [3.4.47] - 2026-11-16
+
+### Fixed
+- 索引缓存的读路径补齐解析、自洽与展示边界（Issue #1224）：写入合法 JSON 的超长整数（Python 3.11+ 的 4300 位转换上限）或深嵌套数组时，`json.loads` 抛裸 `ValueError` / `RecursionError`，`boss show` 被兜成可重试的 `NETWORK_ERROR`；现在损坏缓存按「没有缓存」返回 `INVALID_PARAM` 并提示重新搜索。缓存里的 `count` 与 `jobs` 不一致时越界提示会自相矛盾（「共 5 条」却拒绝编号 5），现在 `count` 始终等于已校验的 `len(jobs)`。`source` 含孤立代理字符（`"\ud800"` 转义）会让错误信封在 stdout 编码时抛 `UnicodeEncodeError`、同样落成可重试的网络错误，现在按空串归一。`count` / `page` 不再绕过溢出防护（超大整数按实际条数 / `None`），`saved_at` 限定在合理的 Unix 秒区间（负值与 2100 年以后按 0 处理）。
+
+## [3.4.46] - 2026-11-16
+
+### Fixed
+- `index_cache.json` 的元信息字段类型漂移不再原样进入 `index_snapshot` 信封（Issue #1221）：`_load_cache` 只校验顶层与 `jobs`，`source` / `page` / `count` / `saved_at` 被写成字符串、布尔或 `inf` 时，`boss show` 的 `data.index_snapshot` 与 `search` / `recommend` 的 `pagination.index_snapshot` 会带出违反 schema 的类型（`count: "many"`、`saved_at: "yesterday"`），Agent 按 schema 解析失败。现在读路径按容错口径归一：非字符串 `source` 按空串、非法 `page` 按 `None`、非法 `count` 回退 `len(jobs)`、非有限 `saved_at` 按 0，`jobs` 可用时不整体丢弃缓存。
+
+## [3.4.45] - 2026-11-16
+
+### Fixed
+- `boss_hr_last_messages` 显式传空 `friend_ids` 数组不再退化为抓取当前页候选人（Issue #1218）：映射层的 `for friend_id in arguments.get("friend_ids") or []` 把空数组与未传混为一谈，CLI 的 `--friend-id` 是 `multiple=True`，于是进入 page 模式发起平台请求并返回非 null 的 `pagination`。现在 schema 声明 `minItems: 1`，MCP 入口统一校验 schema 声明的 `minItems` 并返回 `INVALID_PARAM`；缺省仍走 page 模式，合法非空数组行为不变。
+
+## [3.4.44] - 2026-11-16
+
+### Fixed
+- 缓存 TTL、风险锁时间戳与令牌刷新前的登录态读取收口（Issue #1214）：`search_cache` / `job_desc_cache` 的 `created_at` 被写成文本或 `inf` 时，TTL 比较抛 `TypeError`——`boss search` 兜成不可重试的 `INTERNAL_ERROR`，crawl 详情阶段吞成没有错误码的 `stopped` 且重跑仍读同一坏行。现在坏时间戳按已过期处理并删除坏行，后续请求正常重取。风险锁的 `locked_at` 写成超长整数时 `float()` 抛 `OverflowError`，绕过 fail-closed 分支并把 `ACCOUNT_RISK` / `ENVIRONMENT_RISK` 替换成 `INTERNAL_ERROR`；写成 `inf` 时 `lock_status` 的 `time.localtime` 崩溃。现在只接受有限且落在合理区间的时间戳，两种坏值都按「时间未知」展示，锁的阻断语义不变。刷新 stoken 前先校验 `cookies` 是对象，结构漂移时直接提示重新登录，不再先发起刷新再误报成泛化的 `TOKEN_REFRESH_FAILED`。
+
+## [3.4.43] - 2026-11-16
+
+### Fixed
+- 本地记录数值与容器漂移在四处读取边界收口（Issue #1212）：`crawl_budget.last_request_at` 与 `request_state` / `request_attempts` 的时间列被写成非数值文本时，`reserve_crawl_budget` 抛 `ValueError`（被 `handle_auth_errors` 兜成可重试的 `NETWORK_ERROR`），`RequestBudget.attempt` 抛 `TypeError`（全部平台请求落成不可重试的 `INTERNAL_ERROR`）；坏行还会永久占满每分钟额度并让等待超时。现在调度元数据按无历史 / 0 容错，`typeof` 漂移的行在下一轮清理，坏 `cooldown_until` 在写入与读取两侧归一（此前 SQLite 的 `MAX(text, real)` 会选中文本，新冷却被静默吞掉）。`crawl_jobs.page_no` / `detail_done` 与 `crawl_runs` 一样在读取边界校验，`crawl start` / `resume` 把 `CacheRecordInvalid` 作为确定性失败重抛，入口返回 `CACHE_RECORD_INVALID` 而不是 `ok:true` 的 stopped。向导状态面板与结果菜单对历史 `last_result.data.jobs_seen` / `jobs` 的漂移值降级展示，不再 traceback。`_record_cdp_risk_lock` 在登录态 `cookies` 不是对象时按缺失处理，保证风险锁照常写入、原始 `ACCOUNT_RISK` / `ENVIRONMENT_RISK` 异常不被 `AttributeError` 替换。
+
+## [3.4.42] - 2026-11-16
+
+### Fixed
+- `boss ai` 各命令、`boss agent crawl` 与向导 AI 步骤不再把坏 AI 配置原样发给服务商（Issue #1209）：`ai_temperature` / `ai_max_tokens` 被手改成字符串、数组或 `bool` 时，构造 `AIService` 时裸读，坏值进入请求 payload，由服务商返回 400，用户只看到泛化的 `AI_API_ERROR`。现在与非向导消费点（#1196）同口径：`ai/config.py` 新增 `ai_float_setting`，两个消费点在发请求前校验，命令返回 `INVALID_PARAM` 并把 recovery 指向 `boss ai config --max-tokens 4096 --temperature 0.7`；向导步骤抛同码的 `WorkflowActionError`。`null` 与缺键继续按默认值。
+
+## [3.4.41] - 2026-11-16
+
+### Fixed
+- `crawl resume --background` 在断点的 `updated_at` 列被写成非数字文本时不再返回可重试的 `NETWORK_ERROR`（Issue #1206）：`_prepare_background_resume` 用裸 `float()` 读取该列（存储层按 #1192 的既定口径故意不校验时间戳），`ValueError` 被 `handle_auth_errors` 兜成「重试」，Agent 会拿同一条命令无限重试。现在与状态排序、排队探测共用同一容错读数，漂移按 0 降级，后台恢复照常排队/启动，预检失败还原时写回归一后的 0.0。
+
+## [3.4.40] - 2026-11-16
+
+### Added
+- MCP 补齐两个 CLI 已有参数的映射（Issue #1202）：`boss_greet` 新增可选 `message`（自定义打招呼语，缺省使用平台默认招呼），`boss_apply` 新增可选 `lid`（与 `security_id` 同一列表项的访问上下文，取自 search 结果）。两者缺省 / `null` 不下发，自由文本空串按未传处理（与 `boss_detail` 的 `lid` 同口径）。
+
+## [3.4.39] - 2026-11-16
+
+### Fixed
+- `boss_hr_chatmsg` 的显式游标 0 不再被 MCP 映射层静默吞掉（Issue #1199）：`max_msg_id` 此前用真值判断，传 `0` 时 argv 不含 `--max-msg-id`，工具却返回 `ok=true`，调用方以为翻页生效、实际拿到默认最新一页。现在键存在即下发（显式 `null` 仍在入口剥离），由 CLI 的 `IntRange(min=1)` 返回 `INVALID_PARAM`；schema 标注 `minimum: 1`。
+- `boss_exchange` 可以通过 MCP 请求微信交换（Issue #1200）：工具描述承诺「手机号或微信」，但 schema 没有 `type`、映射固定走默认 phone，显式传 `type` 会被未知参数拒绝。现在 schema 暴露 `type`（enum `phone|wechat`，默认 `phone`），映射省略 `type` 或传 `phone` 时不带选项、`wechat` 下发 `--type wechat`、空串原样交给 CLI 枚举诊断（与 `boss_hr_exchange` 同口径）。
+
 ## [3.4.38] - 2026-11-16
 
 ### Fixed

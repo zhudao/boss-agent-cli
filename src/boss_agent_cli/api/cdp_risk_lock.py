@@ -12,15 +12,19 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from boss_agent_cli.api.zhipin_errors import normalize_risk_code
+from boss_agent_cli.services.json_files import write_json_atomic
 
 LOCK_FILENAME = "cdp_risk_lock.json"
+#: 主锁写盘失败时的后备位置（Issue #1270）。cache 子目录不随 `clean --risk-lock`
+#: 之外的清理被删除，读写路径与主位置同源，fail-closed 语义不变。
+FALLBACK_LOCK_DIR = "cache"
 STOKEN_COOKIE = "__zp_stoken__"
 #: 记录时没有 stoken cookie 的诊断占位摘要，不用于决定恢复权限。
 ABSENT_STOKEN = "absent"
@@ -28,9 +32,31 @@ _ZHIPIN_HOST = "zhipin.com"
 
 _LOCK_VERSION = 1
 
+#: 风险锁诊断时间的合理上界（2100-01-01）；超过按写坏处理，锁本身仍有效。
+_MAX_TIMESTAMP = 4_102_444_800.0
+
+
+def _finite_timestamp(raw: Any) -> float:
+	"""``locked_at`` 只用于展示与诊断；超大整数 / ``inf`` 不能穿透到调用方。
+
+	``float(10**400)`` 抛 ``OverflowError``，会绕过 ``read_lock`` 的 fail-closed
+	分支；``inf`` 能通过读取，却会让 ``lock_status`` 的 ``time.localtime`` 崩溃。
+	两种坏值都按「时间未知」处理，锁的阻断语义不变（Issue #1214）。
+	"""
+	try:
+		parsed = float(raw or 0)
+	except (OverflowError, TypeError, ValueError):
+		return 0.0
+	return parsed if math.isfinite(parsed) and 0 <= parsed <= _MAX_TIMESTAMP else 0.0
+
 
 def lock_path(data_dir: Path) -> Path:
 	return data_dir / LOCK_FILENAME
+
+
+def lock_paths(data_dir: Path) -> tuple[Path, Path]:
+	"""风险锁的候选位置：主位置在前，后备位置在后（Issue #1270）。"""
+	return (lock_path(data_dir), data_dir / FALLBACK_LOCK_DIR / LOCK_FILENAME)
 
 
 def hash_stoken(value: str | None) -> str:
@@ -70,17 +96,14 @@ class RiskLock:
 		return current_hash == self.stoken_sha256
 
 
-def read_lock(data_dir: Path) -> RiskLock | None:
-	path = lock_path(data_dir)
-	if not path.exists():
-		return None
+def _read_lock_file(path: Path) -> RiskLock:
 	try:
 		payload = json.loads(path.read_text(encoding="utf-8"))
 		if not isinstance(payload, dict):
 			raise ValueError("lock payload is not an object")
 		raw_hash = payload.get("stoken_sha256")
 		stoken_hash = str(raw_hash) if isinstance(raw_hash, str) and raw_hash else None
-		locked_at = float(payload.get("locked_at") or 0)
+		locked_at = _finite_timestamp(payload.get("locked_at"))
 		cdp_url = payload.get("cdp_url")
 		reason = "ACCOUNT_RISK" if payload.get("reason") == "ACCOUNT_RISK" else "ENVIRONMENT_RISK"
 		raw_code = payload.get("platform_code", 36 if reason == "ACCOUNT_RISK" else 37)
@@ -91,9 +114,35 @@ def read_lock(data_dir: Path) -> RiskLock | None:
 			reason=reason,
 			platform_code=normalize_risk_code(raw_code),
 		)
-	except (OSError, ValueError, TypeError):
-		# 损坏的锁按「仍被锁」处理（fail-closed），提示用户手动清除。
+	# ValueError 覆盖 JSONDecodeError / UnicodeDecodeError 与 3.11+ 的超长整数
+	# 上限；RecursionError 覆盖深嵌套。损坏的锁按「仍被锁」处理（fail-closed），
+	# 提示用户手动清除；解析异常穿透会让风控信封被兜成内部错误。
+	except (OSError, ValueError, TypeError, OverflowError, RecursionError):
 		return RiskLock(stoken_sha256=None, locked_at=0.0, corrupt=True)
+
+
+def _read_lock_entry(data_dir: Path) -> tuple[RiskLock, Path] | None:
+	"""返回命中的锁与实际文件路径；毫不过问主 / 后备之外的来源。"""
+	corrupt: tuple[RiskLock, Path] | None = None
+	for path in lock_paths(data_dir):
+		if not path.exists():
+			continue
+		lock = _read_lock_file(path)
+		if not lock.corrupt:
+			return lock, path
+		if corrupt is None:
+			corrupt = (lock, path)
+	return corrupt
+
+
+def read_lock(data_dir: Path) -> RiskLock | None:
+	"""读风险锁：主位置与后备位置任一存在即锁定（Issue #1270）。
+
+	主位置写盘失败时后备位置可能持有锁；两份都可解析时以主位置为准，
+	损坏的那份按 fail-closed 返回（不能因为备份较好而放行）。
+	"""
+	entry = _read_lock_entry(data_dir)
+	return entry[0] if entry is not None else None
 
 
 def write_lock(
@@ -105,14 +154,17 @@ def write_lock(
 	reason: str = "ENVIRONMENT_RISK",
 	platform_code: int | None = 37,
 ) -> RiskLock:
-	"""原子写入锁文件（0600）。``stoken_sha256`` 必须是摘要，不接受原值。"""
+	"""原子写入锁文件（0600）。``stoken_sha256`` 必须是摘要，不接受原值。
+
+	主位置写失败时尝试后备位置（Issue #1270）：主文件本身被占用 / 权限损坏时，
+	后备位置仍能让新进程 fail-closed 读到阻断。两处都失败才抛出最后一个
+	``OSError``，调用方保留进程内锁并在信封里说明「新进程不再受保护」。
+	写入成功后清掉另一位置的旧锁，避免主锁被手工删除后陈旧后备复活。
+	"""
 	lock = RiskLock(
 		stoken_sha256=stoken_sha256, locked_at=time.time() if now is None else now, cdp_url=cdp_url,
 		reason=reason, platform_code=platform_code,
 	)
-	data_dir.mkdir(parents=True, exist_ok=True)
-	path = lock_path(data_dir)
-	tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
 	payload = {
 		"version": _LOCK_VERSION,
 		"reason": lock.reason,
@@ -121,22 +173,40 @@ def write_lock(
 		"locked_at": lock.locked_at,
 		"cdp_url": cdp_url,
 	}
-	tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-	try:
-		os.chmod(tmp, 0o600)
-	except OSError:
-		pass
-	os.replace(tmp, path)
-	return lock
+	errors: list[OSError | UnicodeError] = []
+	for path in lock_paths(data_dir):
+		try:
+			# 走统一的原子 JSON 写入：`mkstemp` 默认 0600，且用
+			# `errors="backslashreplace"` 处理孤立代理字符（Issue #1294 / #1487）。
+			# 风险锁里的 `cdp_url` 直接来自 CLI / 配置，非法 UTF-8 字节解码出的
+			# U+DCFF 会让严格编码抛 `UnicodeEncodeError`；它是 `ValueError` 而不是
+			# `OSError`，既不会触发后备位置，还会在记录风控的分支里覆盖原始
+			# `PlatformRiskError`，把风控硬边界降级成可重试的本地错误。
+			write_json_atomic(path, payload, indent=None)
+		except (OSError, UnicodeError) as exc:
+			errors.append(exc)
+			continue
+		for stale in lock_paths(data_dir):
+			if stale == path:
+				continue
+			try:
+				stale.unlink()
+			except OSError:
+				pass
+		return lock
+	raise errors[-1]
 
 
 def clear_lock(data_dir: Path) -> bool:
-	"""删除锁文件；原本没有锁时返回 False。"""
-	try:
-		lock_path(data_dir).unlink()
-		return True
-	except FileNotFoundError:
-		return False
+	"""删除主位置与后备位置的锁文件；原本没有锁时返回 False。"""
+	removed = False
+	for path in lock_paths(data_dir):
+		try:
+			path.unlink()
+			removed = True
+		except FileNotFoundError:
+			continue
+	return removed
 
 
 def raise_if_locked(data_dir: Path) -> None:
@@ -150,13 +220,14 @@ def raise_if_locked(data_dir: Path) -> None:
 
 def lock_status(data_dir: Path, *, now: float | None = None) -> dict[str, Any]:
 	"""给 doctor / status 用的只读摘要：只读本地文件，不连浏览器、不访问网络。"""
-	lock = read_lock(data_dir)
-	if lock is None:
+	entry = _read_lock_entry(data_dir)
+	if entry is None:
 		return {"locked": False}
+	lock, path = entry
 	current = time.time() if now is None else now
 	info: dict[str, Any] = {
 		"locked": True,
-		"path": str(lock_path(data_dir)),
+		"path": str(path),
 		"corrupt": lock.corrupt,
 		"reason": lock.reason,
 		"platform_code": lock.platform_code,
@@ -164,8 +235,12 @@ def lock_status(data_dir: Path, *, now: float | None = None) -> dict[str, Any]:
 		"stoken_recorded": lock.stoken_sha256 is not None and lock.stoken_sha256 != ABSENT_STOKEN,
 	}
 	if lock.locked_at > 0:
-		info["locked_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(lock.locked_at))
-		info["age_seconds"] = max(0, int(current - lock.locked_at))
+		try:
+			info["locked_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(lock.locked_at))
+			info["age_seconds"] = max(0, int(current - lock.locked_at))
+		except (OverflowError, OSError, ValueError):
+			# 展示层不得因为一个坏时间戳崩掉 doctor / status；锁仍然有效。
+			info["locked_at"] = "未知时间"
 	return info
 
 

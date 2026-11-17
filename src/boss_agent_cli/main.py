@@ -16,6 +16,7 @@ from boss_agent_cli.config import (
 	DEFAULT_REQUEST_DELAY,
 	DEFAULTS,
 	ROLES,
+	expand_budget_directory,
 	is_valid_cdp_url,
 	load_config,
 	validate_request_config,
@@ -87,6 +88,71 @@ def _resolve_data_dir(data_dir: str) -> Path:
 	# 用户可读。历史安装的宽松权限在启动时尽力收紧；共享目录（如 /tmp）不动。
 	tighten_private_directory(resolved)
 	return resolved
+
+
+class _StartupConfigBadParameter(click.BadParameter):
+	"""启动期配置文件错误：恢复指引要直接点名需要修正的文件。
+
+	通用的 ``BadParameter`` 恢复指引停在「用 boss --help 查看参数说明」，
+	而这里要修的是数据目录外的另一份 config.json，必须把路径交给 Agent。
+	"""
+
+	def __init__(self, message: str, *, recovery_action: str, param_hint: str) -> None:
+		super().__init__(message, param_hint=param_hint)
+		self.recovery_action = recovery_action
+
+
+def _validate_group_budget_config(data_dir: Path, cfg: dict[str, Any]) -> None:
+	"""启动期加载并校验共享请求预算目录的 config.json。
+
+	成员目录的 ``request_budget_dir`` 指向组目录时，``RequestBudget.for_data_dir``
+	会在客户端构造阶段读取组目录配置。组配置是坏 JSON 或限流值非法时，那里的
+	``ValueError`` 会被命令层通用兜底报成 ``NETWORK_ERROR`` + ``recoverable=true``，
+	而重试必然复现（Issue #1367）。这里在启动期按参数错误拒绝，命令不会构造客户端。
+	"""
+	raw = cfg.get("request_budget_dir")
+	if raw is None:
+		return
+	if not isinstance(raw, str):
+		# validate_request_config 已把非法类型按参数错误拒绝；这里只防御直接调用。
+		return
+	try:
+		group_dir = expand_budget_directory(raw).resolve()
+	except ValueError as exc:
+		raise _StartupConfigBadParameter(
+			f"成员配置的 request_budget_dir 无效：{exc}",
+			recovery_action=f"修正 {data_dir / 'config.json'} 的 request_budget_dir 后重试",
+			param_hint="config.json 的 request_budget_dir",
+		) from exc
+	if group_dir == data_dir.resolve():
+		# 指向自身时没有共享组目录，仍是启动期已校验过的主目录 config，不重复校验。
+		return
+	group_config_path = group_dir / "config.json"
+	recovery = f"修正或删除 {group_config_path} 后重试；每次平台命令都会在启动期读取该文件"
+	try:
+		group_cfg = load_config(group_config_path)
+	except OSError as exc:
+		raise _StartupConfigBadParameter(
+			f"无法读取共享请求预算目录的配置 {group_config_path}: {exc.strerror or exc}；"
+			"修正文件权限或删除该文件后重试",
+			recovery_action=recovery,
+			param_hint="config.json 的 request_budget_dir",
+		) from exc
+	except (ValueError, TypeError) as exc:
+		# load_config 的消息已带文件路径与行列，统一前缀便于定位是组目录配置。
+		raise _StartupConfigBadParameter(
+			f"共享请求预算目录的配置不可用：{exc}",
+			recovery_action=recovery,
+			param_hint="config.json 的 request_budget_dir",
+		) from exc
+	try:
+		validate_request_config(group_cfg)
+	except (ValueError, TypeError) as exc:
+		raise _StartupConfigBadParameter(
+			f"共享请求预算目录的配置 {group_config_path} 无效：{exc}",
+			recovery_action=recovery,
+			param_hint="config.json 的 request_budget_dir",
+		) from exc
 
 
 def _missing_subcommand_error(ctx: click.Context | None) -> tuple[str, str, dict[str, Any]] | None:
@@ -447,9 +513,13 @@ def _localized_bad_parameter_error(exc: click.ClickException) -> tuple[str, str,
 		return None
 	hint = _parameter_display_name(exc)
 	subject = f"的 {hint} 取值无效" if hint else "的参数取值无效"
+	custom_recovery = getattr(exc, "recovery_action", None)
+	recovery_action = (
+		custom_recovery if isinstance(custom_recovery, str) and custom_recovery else f"用 {path} --help 查看参数说明"
+	)
 	return (
 		f"{path} {subject}：{exc.message}",
-		f"用 {path} --help 查看参数说明",
+		recovery_action,
 		{"next_actions": [f"{path} --help"]},
 	)
 
@@ -602,8 +672,74 @@ def _top_level_command_name(ctx: click.Context | None, fallback: str) -> str:
 	return top.info_name or fallback
 
 
+def _option_value_count(param: click.Option) -> int:
+	"""一个选项要吃掉几个后续 argv。布尔开关（is_flag / count）不取值。"""
+	if param.is_flag or param.count:
+		return 0
+	return max(int(param.nargs), 0)
+
+
+def _match_declared_option(command: click.Command, token: str) -> tuple[click.Option | None, bool]:
+	"""按 Click 参数元数据匹配选项，返回 ``(选项, 取值是否附着在同一 token)``。
+
+	长选项支持 ``--name`` 与 ``--name=value``；短选项支持 ``-o`` 与 ``-ovalue``
+	（Click 会把短选项后面剩余字符当成取值）。只匹配命令声明过的选项，其余
+	横杠 token 由调用方按「未知选项」跳过。
+	"""
+	if token in ("-", "--") or not token.startswith("-"):
+		return None, False
+	for param in command.params:
+		if not isinstance(param, click.Option):
+			continue
+		for name in (*param.opts, *param.secondary_opts):
+			if token == name:
+				return param, False
+			if name.startswith("--") and token.startswith(f"{name}="):
+				return param, True
+	for param in command.params:
+		if not isinstance(param, click.Option):
+			continue
+		for name in (*param.opts, *param.secondary_opts):
+			if not name.startswith("--") and len(name) == 2 and token.startswith(name) and len(token) > 2:
+				return param, True
+	return None, False
+
+
+def _resolve_argv_command(
+	group: click.Group, args: Sequence[str]
+) -> tuple[click.Command, int] | None:
+	"""定位 argv 里真正要执行的命令及其 token 结束位置。
+
+	子命令前可能有带取值的全局选项（``boss --data-dir <dir> detail …``），直接取
+	「第一个非横杠 token」会落在选项取值上；这里按参数元数据跳过选项及其取值，
+	并递归进入 ``hr`` 这类 Group，让后面的位置参数判定拿到叶子命令的选项表。
+	"""
+	current: click.Command = group
+	index = 0
+	path_end = 0
+	while index < len(args):
+		token = args[index]
+		if token == "--":
+			break
+		if isinstance(current, click.Group) and token in current.commands:
+			current = current.commands[token]
+			index += 1
+			path_end = index
+			continue
+		if token.startswith("-") and token != "-":
+			param, attached = _match_declared_option(current, token)
+			index += 1
+			if param is not None and not attached:
+				index += _option_value_count(param)
+			continue
+		break
+	if path_end == 0:
+		return None
+	return current, path_end
+
+
 def _declare_dash_prefixed_positionals(
-	group: click.Group, ctx: click.Context | None, args: list[str]
+	group: click.Group, ctx: click.Context | None, args: Sequence[str]
 ) -> list[str]:
 	"""在形如 security_id 的横杠开头位置参数前插入 ``--``。
 
@@ -613,35 +749,50 @@ def _declare_dash_prefixed_positionals(
 
 	限定两件事以免掩盖真正的拼写错误：
 
-	- 只处理**看起来像 security_id** 的取值（``-`` 开头 + ≥20 个 base64url 字符）；
+	- 只处理**看起来像 security_id** 的位置参数（``-`` 开头 + ≥20 个 base64url
+	  字符），选项取值即使形如 security_id 也不参与改写（Issue #1449）；
 	- 只处理命令**未声明**的选项名，且命令行里还没有 ``--`` 分隔符。
+
+	所有位置参数整体后移到 ``--`` 之后，选项及其取值保持原有相对顺序，避免补出来的
+	分隔符把「位置参数在先、选项在后」的调用（``boss detail <sid> --job-id <jid>``）
+	里的选项吞成位置参数（Issue #1448）。
 	"""
 	if "--" in args:
-		return args
+		return list(args)
 
-	command_index = next((i for i, token in enumerate(args) if not token.startswith("-")), None)
-	if command_index is None:
-		return args
-	if ctx is None:
-		command = group.commands.get(args[command_index])
-	else:
-		command = group.get_command(ctx, args[command_index])
-	if command is None or not isinstance(command, click.Command):
-		return args
+	resolved = _resolve_argv_command(group, args)
+	if resolved is None:
+		return list(args)
+	command, path_end = resolved
 
-	declared: set[str] = set()
-	for param in command.params:
-		if isinstance(param, click.Option):
-			declared.update(param.opts)
-			declared.update(param.secondary_opts)
-
-	for index in range(command_index + 1, len(args)):
+	kept = list(args[:path_end])
+	positionals: list[str] = []
+	index = path_end
+	while index < len(args):
 		token = args[index]
-		if token in declared:
+		param, attached = _match_declared_option(command, token)
+		if param is not None:
+			kept.append(token)
+			index += 1
+			if not attached:
+				value_count = _option_value_count(param)
+				kept.extend(args[index : index + value_count])
+				index += value_count
 			continue
-		if _SECURITY_ID_LIKE.match(token):
-			return [*args[:index], "--", *args[index:]]
-	return args
+		if token.startswith("-") and token != "-":
+			if _SECURITY_ID_LIKE.match(token):
+				# 选项匹配之后仍命中的，就是本函数要保护的位置参数。
+				positionals.append(token)
+			else:
+				kept.append(token)
+			index += 1
+			continue
+		positionals.append(token)
+		index += 1
+
+	if not any(_SECURITY_ID_LIKE.match(token) for token in positionals):
+		return list(args)
+	return [*kept, "--", *positionals]
 
 
 class BossCliGroup(click.Group):
@@ -734,11 +885,23 @@ class BossCliGroup(click.Group):
 				recovery_action=busy_recovery_action,
 			)
 			return None
-		except sqlite3.OperationalError as exc:
-			# 只在兜底层收口锁冲突；其他 OperationalError 保持原样，避免把代码缺陷
-			# 说成「等锁释放后重试」。
-			if not is_cache_busy_error(exc):
-				raise
+		except sqlite3.DatabaseError as exc:
+			# 锁冲突统一收口；其余的数据库错误（文件损坏、路径被同名目录占用）
+			# 是确定性本地失败：原样上抛会让命令丢掉整个信封，或在带装饰器的
+			# 命令里被兜成可重试的 NETWORK_ERROR（Issue #1304）。
+			if not (isinstance(exc, sqlite3.OperationalError) and is_cache_busy_error(exc)):
+				if not standalone_mode:
+					raise
+				command = _invoked_command_name(args, self.name or "boss")
+				db_recoverable, db_recovery_action = error_contract_for_code("LOCAL_IO_ERROR")
+				emit_error(
+					command,
+					code="LOCAL_IO_ERROR",
+					message=f"{command} 本地数据库文件无法打开: {exc}",
+					recoverable=db_recoverable,
+					recovery_action=db_recovery_action,
+				)
+				return None
 			if not standalone_mode:
 				raise
 			command = _invoked_command_name(args, self.name or "boss")
@@ -783,6 +946,21 @@ class BossCliGroup(click.Group):
 				message=f"{command} 失败: {type(exc).__name__}: {exc}",
 				recoverable=internal_recoverable,
 				recovery_action=internal_recovery_action,
+			)
+			return None
+		except UnicodeError as exc:
+			# 孤立代理字符等不可编码内容属于确定性本地数据问题：既不是平台网络
+			# 故障（重试无意义），也不是「升级版本可解」的内部缺陷（Issue #1294）。
+			if not standalone_mode:
+				raise
+			command = _invoked_command_name(args, self.name or "boss")
+			encode_recoverable, encode_recovery_action = error_contract_for_code("LOCAL_IO_ERROR")
+			emit_error(
+				command,
+				code="LOCAL_IO_ERROR",
+				message=f"{command} 处理本地文本失败: {exc}",
+				recoverable=encode_recoverable,
+				recovery_action=encode_recovery_action,
 			)
 			return None
 		except OSError as exc:
@@ -909,6 +1087,9 @@ def cli(
 			validate_request_config({**cfg, "request_delay": ctx.obj["delay"]})
 		except ValueError as exc:
 			raise click.BadParameter(str(exc), param_hint="config.json") from exc
+		# 组目录配置只在客户端构造时才会加载；启动期先校验，避免确定性配置
+		# 错误被兜成可重试的 NETWORK_ERROR，也避免命令先构造客户端再失败。
+		_validate_group_budget_config(resolved_dir, cfg)
 
 	raw_level = log_level or cfg["log_level"]
 	# Logger 对未知级别会静默回退到 error 阈值：config.json 手改出的坏值会让
@@ -967,6 +1148,10 @@ def cli(
 		resolved_browser_source = DEFAULTS["browser_source"]
 	ctx.obj["browser_source"] = resolved_browser_source
 
+	if platform_name == "":
+		# 显式空平台与未提供不同：真值回退会静默使用配置或 zhipin，MCP 宿主
+		# 传错值却拿到另一份平台状态（Issue #1471）。
+		raise click.BadParameter("平台名不能为空", param_hint="--platform")
 	resolved_platform = platform_name or cfg.get("platform") or "zhipin"
 	available = list_platforms()
 	if resolved_platform not in available:

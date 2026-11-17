@@ -1,11 +1,33 @@
 import ast
+import errno
 import json
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
-from boss_agent_cli.output import envelope_success, envelope_error, emit_error, emit_success, Logger
+from boss_agent_cli.main import cli
+from boss_agent_cli.output import (
+	envelope_success,
+	envelope_error,
+	emit_error,
+	emit_success,
+	is_local_io_error,
+	json_safe_value,
+	Logger,
+	_MAX_REDACTION_DEPTH,
+	redact_sensitive,
+)
 from boss_agent_cli.schema.error_codes import ERROR_CODES
+
+
+def _reject_json_constant(value: str) -> None:
+	"""严格 JSON 解析器：遇到 NaN / Infinity / -Infinity 直接失败。"""
+	raise ValueError(f"非严格 JSON 常量: {value}")
+
+
+def _strict_json_loads(text: str):
+	return json.loads(text, parse_constant=_reject_json_constant)
 
 
 def test_envelope_success_minimal():
@@ -582,3 +604,194 @@ def test_caller_supplied_replay_safe_wins_over_registry():
 	details = payload["error"]["details"]
 	assert details["replay_safe"] is True
 	assert details["outcome_unknown"] is False
+
+
+# ── 严格 JSON 出口（Issue #1391）──────────────────────────────────
+
+
+def test_envelope_success_normalizes_non_finite_floats_to_null() -> None:
+	"""NaN / ±Infinity 不能写成裸字面量，归一为 null 后 stdout 仍是严格 JSON。"""
+	result = envelope_success(
+		"config",
+		{"value": [float("nan"), 5.0, float("inf"), float("-inf")]},
+		hints={"next_actions": ["boss config list"], "score": float("nan")},
+	)
+
+	parsed = _strict_json_loads(result)
+	assert parsed["data"]["value"] == [None, 5.0, None, None]
+	assert parsed["hints"]["score"] is None
+	assert "NaN" not in result
+	assert "Infinity" not in result
+
+
+def test_envelope_success_normalizes_nested_tuple_and_keeps_regular_values() -> None:
+	result = envelope_success(
+		"status",
+		{
+			"pair": (1, float("nan")),
+			"nested": {"items": [float("inf"), (2, float("-inf"))]},
+			"flag": True,
+			"count": 0,
+			"big_but_safe": 2**63,
+			"zero": 0.0,
+		},
+	)
+
+	parsed = _strict_json_loads(result)
+	assert parsed["data"]["pair"] == [1, None]
+	assert parsed["data"]["nested"]["items"] == [None, [2, None]]
+	assert parsed["data"]["flag"] is True
+	assert parsed["data"]["count"] == 0
+	assert parsed["data"]["big_but_safe"] == 2**63
+	assert parsed["data"]["zero"] == 0.0
+
+
+def test_envelope_success_normalizes_oversized_integer_to_null() -> None:
+	"""超过 int→str 上限的整数不能让出口抛 ValueError（默认上限 4300 位）。"""
+	huge = 10**5000
+	result = envelope_success("status", {"value": huge, "items": [huge, 1]})
+
+	parsed = _strict_json_loads(result)
+	assert parsed["ok"] is True
+	assert parsed["data"]["value"] is None
+	assert parsed["data"]["items"] == [None, 1]
+	# 归一为 null 而不是把 5000 位数字写进 stdout。
+	assert "0" * 1000 not in result
+
+
+def test_envelope_success_keeps_largest_serializable_integer() -> None:
+	"""4300 位以内（bit_length <= 14284）的整数仍按原值输出。"""
+	value = 10**4300 - 1
+	parsed = _strict_json_loads(envelope_success("status", {"value": value}))
+	assert parsed["data"]["value"] == value
+
+
+def test_json_safe_value_preserves_bool_before_int_branch() -> None:
+	assert json_safe_value(True) is True
+	assert json_safe_value(False) is False
+	assert json_safe_value({"ok": True}) == {"ok": True}
+
+
+def test_envelope_success_last_resort_returns_error_envelope_for_nan_key() -> None:
+	"""NaN 作为 dict 键时键保持原样，归一无法救回——出口返回可解析的错误信封。"""
+	result = envelope_success("status", {float("nan"): "value"})
+
+	parsed = _strict_json_loads(result)
+	assert parsed["ok"] is False
+	assert parsed["command"] == "status"
+	assert parsed["error"]["code"] == "INTERNAL_ERROR"
+	assert parsed["error"]["recoverable"] is False
+	assert parsed["error"]["recovery_action"]
+
+
+def test_envelope_success_last_resort_handles_unserializable_type() -> None:
+	result = envelope_success("status", {"blob": b"not-json"})
+
+	parsed = _strict_json_loads(result)
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "INTERNAL_ERROR"
+
+
+def test_config_get_with_non_finite_value_emits_strict_json(tmp_path: Path) -> None:
+	"""真实路径：config.json 手写 NaN 后，config get 的 stdout 仍是严格 JSON。"""
+	(tmp_path / "config.json").write_text('{"request_delay": [NaN, 5]}', encoding="utf-8")
+
+	result = CliRunner().invoke(
+		cli, ["--data-dir", str(tmp_path), "config", "get", "request_delay"]
+	)
+
+	assert result.exit_code == 0
+	parsed = _strict_json_loads(result.output)
+	assert parsed["ok"] is True
+	assert parsed["data"]["value"] == [None, 5]
+	assert "NaN" not in result.output
+
+
+# ── 本地 IO 分类：fd 级失败不带 filename（Issue #1400） ────────────────
+
+
+# Windows 的 errno 模块不一定定义 EDQUOT；缺失时该用例不参与参数化。
+_LOCAL_IO_ERRNOS = [errno.ENOSPC, errno.EIO]
+if hasattr(errno, "EDQUOT"):
+	_LOCAL_IO_ERRNOS.append(errno.EDQUOT)
+
+
+@pytest.mark.parametrize("code", _LOCAL_IO_ERRNOS)
+def test_filename_less_local_io_errnos_are_local(code: int) -> None:
+	"""write / flush / fsync 在 fd 层失败时异常没有 filename，仍是本地写失败。"""
+	exc = OSError(code, "local io failure")
+
+	assert exc.filename is None
+	assert is_local_io_error(exc) is True
+
+
+def test_filename_less_socket_reset_stays_network_error() -> None:
+	"""扩展 errno 判定不能把普通套接字错误也算成本地文件问题。"""
+	exc = OSError(errno.ECONNRESET, "Connection reset by peer")
+
+	assert exc.filename is None
+	assert is_local_io_error(exc) is False
+
+
+@pytest.mark.parametrize("exc", [ConnectionResetError(errno.ECONNRESET, "reset"), TimeoutError("timed out")])
+def test_network_error_types_stay_network_even_with_no_filename(exc: OSError) -> None:
+	assert is_local_io_error(exc) is False
+
+
+# ── 脱敏深度上限：深层本地数据不能丢掉整个信封（Issue #1474） ────────
+
+
+def _nested_mapping(depth: int, leaf: dict) -> dict:
+	value: dict = leaf
+	for _ in range(depth):
+		value = {"child": value}
+	return value
+
+
+def _follow_child_chain(node: object) -> int:
+	depth = 0
+	while isinstance(node, dict) and "child" in node:
+		node = node["child"]
+		depth += 1
+	return depth
+
+
+def test_envelope_success_truncates_deeply_nested_data() -> None:
+	"""200+ 层 data 不能再让脱敏阶段爆栈、丢掉七键信封。"""
+	deep = _nested_mapping(_MAX_REDACTION_DEPTH * 3, {"token": "token-secret", "value": "value-secret"})
+
+	result = envelope_success("deep", deep)
+
+	parsed = json.loads(result)
+	assert set(parsed) == {"ok", "schema_version", "command", "data", "pagination", "error", "hints"}
+	assert parsed["ok"] is True
+	# 超出上限的子树整体按 [REDACTED] 截断：既不走递归，也不把深层值带进 stdout。
+	assert _follow_child_chain(parsed["data"]) == _MAX_REDACTION_DEPTH
+	assert "token-secret" not in result
+	assert "value-secret" not in result
+
+
+def test_envelope_error_truncates_deeply_nested_details() -> None:
+	deep = _nested_mapping(_MAX_REDACTION_DEPTH * 3, {"token": "token-secret", "value": "value-secret"})
+
+	result = envelope_error("deep", code="NETWORK_ERROR", message="请求失败", details=deep)
+
+	parsed = json.loads(result)
+	assert set(parsed) == {"ok", "schema_version", "command", "data", "pagination", "error", "hints"}
+	assert parsed["ok"] is False
+	assert parsed["error"]["code"] == "NETWORK_ERROR"
+	assert _follow_child_chain(parsed["error"]["details"]) == _MAX_REDACTION_DEPTH
+	assert "token-secret" not in result
+	assert "value-secret" not in result
+
+
+@pytest.mark.parametrize("wrap", [lambda value: [value], lambda value: (value,)])
+def test_redact_sensitive_truncates_deep_list_and_tuple(wrap) -> None:
+	"""list / tuple 两条递归路径同样受深度上限约束。"""
+	value: object = {"token": "deep-secret"}
+	for _ in range(_MAX_REDACTION_DEPTH * 3):
+		value = wrap(value)
+
+	redacted = redact_sensitive(value)
+
+	assert "deep-secret" not in json.dumps(redacted)

@@ -12,8 +12,10 @@ from click.testing import CliRunner
 from rich.console import Console
 from boss_agent_cli.api import cdp_risk_lock
 from boss_agent_cli.api.client import AccountRiskError, EnvironmentRiskError
+from boss_agent_cli.api.proxy import ProxyConfigurationError
 from boss_agent_cli.display import risk_error_contract
 from boss_agent_cli.main import cli
+from boss_agent_cli.output import redact_sensitive_text
 
 
 # ── 辅助 ─────────────────────────────────────────────────────────────
@@ -282,6 +284,24 @@ def test_auth_session_file_exists_but_undecryptable(tmp_path):
 	assert "损坏" in session["detail"]
 
 
+@pytest.mark.parametrize(
+	"token, expected",
+	[
+		({"cookies": {"wt2": "fixture", "wbg": "1", "zp_at": "a"}, "stoken": "real-secret-stoken"}, "存在"),
+		({"cookies": {"wt2": "fixture", "wbg": "1", "zp_at": "a"}}, "缺失"),
+	],
+)
+def test_auth_session_detail_survives_free_text_redaction(tmp_path, token, expected):
+	"""auth_session 的 stoken 结论不能被自由文本脱敏整段替换（Issue #1393）。"""
+	_, parsed = _invoke_doctor(tmp_path, token=token)
+	session = _find_check(parsed["data"]["checks"], "auth_session")
+	detail = redact_sensitive_text(session["detail"])
+	assert f"stoken_present={expected}" in detail
+	# 结论可读不等于放松脱敏：真实凭据值仍按原规则替换。
+	assert redact_sensitive_text("stoken=real-secret-stoken") == "stoken=[REDACTED]"
+	assert redact_sensitive_text("token=real-secret-token；继续") == "token=[REDACTED]；继续"
+
+
 # ── 6. CDP 可用/不可用 ───────────────────────────────────────────────
 
 
@@ -498,6 +518,7 @@ def test_doctor_damaged_auth_requires_human_confirmation(tmp_path):
 		health = assess.return_value
 		health.token_present = True
 		health.auth_state = "invalid"
+		health.auth_dir = tmp_path / "auth"
 		health.salt_path = tmp_path / "salt"
 		health.checks_as_dicts.return_value = [{"name": "auth_token_quality", "status": "error", "detail": "损坏"}]
 		code, parsed = _invoke_doctor(tmp_path, cdp_ws="ws://fixture")
@@ -818,7 +839,8 @@ def test_doctor_live_probe_stops_after_candidate_risk(tmp_path):
 	assert parsed["data"]["live_probe_risk"] == "ENVIRONMENT_RISK"
 	next_actions = parsed["hints"]["next_actions"]
 	assert not any("--live" in action for action in next_actions)
-	assert any("不要刷新 Token" in action for action in next_actions)
+	# 真人说明放 operator_actions，next_actions 只留可执行命令（Issue #1522）。
+	assert any("不要刷新 Token" in action for action in parsed["hints"]["operator_actions"])
 	# ENVIRONMENT_RISK 的解锁命令在 recovery_action 里：必须指向本次诊断的数据目录（Issue #978）。
 	assert f"boss --data-dir {tmp_path.resolve()} clean --risk-lock" in parsed["data"]["checks"][0].get(
 		"recovery_action", ""
@@ -846,7 +868,7 @@ def test_doctor_live_probe_stops_after_recruiter_risk(tmp_path):
 	)[0]
 	assert "secret-account-text" not in output
 	assert parsed["data"]["live_probe_risk"] == "ACCOUNT_RISK"
-	assert any("不要通过 CDP" in action for action in parsed["hints"]["next_actions"])
+	assert any("不要通过 CDP" in action for action in parsed["hints"]["operator_actions"])
 	recruiter.list_jobs.assert_called_once()
 
 
@@ -865,7 +887,7 @@ def test_doctor_live_probe_risk_response_does_not_continue(tmp_path):
 	assert _find_check(parsed["data"]["checks"], "recruiter_live_read") is not None
 	recruiter.list_jobs.assert_not_called()
 	assert parsed["data"]["live_probe_risk"] == "ENVIRONMENT_RISK"
-	assert any("不要刷新 Token" in action for action in parsed["hints"]["next_actions"])
+	assert any("不要刷新 Token" in action for action in parsed["hints"]["operator_actions"])
 	platform.is_success.assert_called_once()
 
 
@@ -1053,6 +1075,38 @@ def test_doctor_live_probe_recovery_keeps_the_data_dir(tmp_path):
 	assert f"--data-dir {tmp_path.resolve()}" in recovery
 	assert "boss --data-dir" in recovery
 	assert "运行 boss status" not in recovery
+
+
+def test_doctor_live_probe_reports_hostless_proxy_as_invalid_param(tmp_path):
+	"""代理环境变量非法是在线探测发不出去的确定性配置错误（Issue #1486）。
+
+	不能落进「探测异常」通用兜底并建议检查登录态——那会让 Agent 在坏配置上
+	反复重试；恢复动作必须直接指向代理环境变量。
+	"""
+	parsed, _, _, _ = _run_live_probe(
+		tmp_path,
+		platform_side_effect=ProxyConfigurationError("HTTPS_PROXY"),
+	)
+
+	check = _find_check(parsed["data"]["checks"], "candidate_live_user_info")
+	assert check["status"] == "warn"
+	assert "INVALID_PARAM" in check["detail"]
+	assert "HTTPS_PROXY" in check["detail"]
+	assert "HTTPS_PROXY" in check["recovery_action"]
+	assert "不会回退为直连" in check["recovery_action"]
+	assert "status" not in check["recovery_action"]
+
+
+def test_doctor_live_probe_recruiter_probe_reports_hostless_proxy(tmp_path):
+	parsed, _, _, _ = _run_live_probe(
+		tmp_path,
+		recruiter_side_effect=ProxyConfigurationError("ALL_PROXY"),
+	)
+
+	check = _find_check(parsed["data"]["checks"], "recruiter_live_read")
+	assert "INVALID_PARAM" in check["detail"]
+	assert "ALL_PROXY" in check["recovery_action"]
+	assert "不会回退为直连" in check["recovery_action"]
 
 
 def test_doctor_recruiter_side_hint_keeps_the_data_dir(tmp_path):

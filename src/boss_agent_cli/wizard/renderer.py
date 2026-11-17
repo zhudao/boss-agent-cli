@@ -15,6 +15,7 @@ from rich.table import Table
 
 from boss_agent_cli import display
 from boss_agent_cli.wizard.catalog import GOALS
+from boss_agent_cli.wizard.models import count_or_none
 from boss_agent_cli.wizard.prompts import STATUS_LABELS
 
 STEP_LABELS = {
@@ -61,6 +62,7 @@ ERROR_LABELS = {
 	"INTERNAL_ERROR": "程序内部出错",
 	"BROWSER_NAV_TIMEOUT": "浏览器首页加载超时",
 	"BROWSER_KERNEL_MISSING": "浏览器内核缺失或版本不匹配",
+	"CDP_UNAVAILABLE": "浏览器调试端口不可达",
 	"RATE_LIMITED": "请求过于频繁",
 	"ACCOUNT_RISK": "平台已暂停本次操作",
 	"ENVIRONMENT_RISK": "平台判定当前访问环境异常",
@@ -75,7 +77,10 @@ ERROR_LABELS = {
 	"WORKFLOW_STOPPED": "任务已停止",
 	"WORKFLOW_BUSY": "该任务正在另一个窗口或进程中执行",
 	"CRAWL_BUSY": "该采集任务正在另一个窗口或进程中执行",
+	"CRAWL_PROFILE_BUSY": "采集配置目录正被运行中的采集浏览器占用",
 	"CACHE_BUSY": "本地缓存正被另一个进程写入",
+	"CACHE_DATABASE_INVALID": "本地缓存数据库已损坏",
+	"CACHE_RECORD_INVALID": "本地任务记录已损坏",
 	"CRAWL_UNAVAILABLE": "采集所需的可选依赖没有安装",
 	"WORKFLOW_PLAN_MISMATCH": "任务信息与已有记录不一致",
 	"INVALID_PARAM": "请求参数无效",
@@ -89,6 +94,7 @@ ERROR_LABELS = {
 	"EXCHANGE_NOT_AVAILABLE": "交换联系方式按钮尚未解锁",
 	"LOCAL_IO_ERROR": "本地文件读写失败",
 	"LOCAL_STATE_WRITE_FAILED": "平台操作已完成，但本地状态保存失败",
+	"RESUME_FILE_INVALID": "本地简历文件损坏",
 	"RESUME_NOT_FOUND": "本地简历不存在",
 	"SAVED_SEARCH_INVALID": "本地预设或监控的参数已损坏",
 	"UNKNOWN": "平台返回了未识别的错误",
@@ -102,6 +108,7 @@ RECOVERY_LABELS = {
 	"INTERNAL_ERROR": "这不是网络问题，重试不会有帮助。请升级到最新版本，仍出现时把这次的命令和报错反馈给维护者。",
 	"BROWSER_NAV_TIMEOUT": "请用已登录的 Chrome 调试端口重试，或先重新登录后再恢复任务。",
 	"BROWSER_KERNEL_MISSING": "这不是网络问题，重试不会有帮助。请退出向导，运行 python -m patchright install chromium（使用运行 boss 的同一个解释器）安装浏览器内核后重新执行命令。",
+	"CDP_UNAVAILABLE": "本次操作尚未发送，重新执行是安全的：确认带调试端口的 Chrome 仍在运行，或改用扫码登录后重新执行。",
 	"RATE_LIMITED": "请稍后再试。",
 	"ACCOUNT_RISK": "请停止自动操作并在平台内检查账号状态；确认风险解除后，由你本人执行 boss clean --risk-lock，再重新启动向导恢复任务。",
 	"ENVIRONMENT_RISK": "请停止自动操作，保留当前浏览器 profile，在平台官方页面确认风险解除后，由你本人执行 boss clean --risk-lock，再重新启动向导恢复任务。",
@@ -125,6 +132,7 @@ RECOVERY_LABELS = {
 	"EXCHANGE_NOT_AVAILABLE": "先回复候选人（boss hr reply）或请求附件简历，再重新执行交换。",
 	"LOCAL_IO_ERROR": "确认目标路径是可写目录、权限与磁盘空间正常后，再执行。",
 	"LOCAL_STATE_WRITE_FAILED": "先在官方页面核对操作是否已生效；不要自动重发，确认磁盘空间与缓存目录权限后再继续。",
+	"RESUME_FILE_INVALID": "修正 resumes/ 下对应的 .json 内容，或执行 boss resume delete <名称> 后重新创建。",
 	"RESUME_NOT_FOUND": "先用 boss resume list 查看可用简历，再重新选择。",
 	"SAVED_SEARCH_INVALID": "执行 boss preset remove <名称>（watch 用 boss watch remove）后重新添加。",
 	"UNKNOWN": "不要自动重试：先在平台官方页面核对操作是否生效，并用 boss doctor 检查登录态与网络。",
@@ -134,7 +142,10 @@ RECOVERY_LABELS = {
 	# 具体安装命令由 recovery_message 按当前已有的依赖组动态拼出（Issue #1068）。
 	"CRAWL_UNAVAILABLE": "这不是网络问题，重试不会有帮助。请退出向导，补上 crawl 可选依赖后重新执行。",
 	"CRAWL_BUSY": "请等它结束；需要确认进度时执行 boss crawl status <run_id>，不要并发恢复同一个任务。",
+	"CRAWL_PROFILE_BUSY": "请等正在运行的采集结束；需要确认进度时执行 boss crawl status <run_id>，不要删除 profile 目录里的 SingletonLock，也不要并发使用同一数据目录的采集浏览器。",
 	"CACHE_BUSY": "请等正在运行的 boss 命令结束后选择“恢复已有任务”继续；库文件本身完好，不需要删除。",
+	"CACHE_DATABASE_INVALID": "先备份 cache/boss_agent.db（--data-dir 指定时在对应目录下），再删除该文件后重新执行；命令会自动重建空库。",
+	"CACHE_RECORD_INVALID": "请返回并重新创建任务；同一条损坏记录重试无法恢复。",
 }
 
 #: 风控恢复动作里由 runner / actions 注入的真实解锁命令（Issue #978 / #976）。
@@ -158,6 +169,7 @@ _RECOVERY_COMMANDS: dict[str, tuple[str, ...]] = {
 	"boss preset list": ("preset list",),
 	"boss resume list": ("resume list",),
 	"boss resume import": ("resume import",),
+	"boss resume delete": ("resume delete",),
 	"boss watch remove": ("watch remove",),
 	"boss watch list": ("watch list",),
 	"boss crawl status": ("crawl status",),
@@ -551,8 +563,8 @@ def render_run(
 		data = _as_mapping(last.get("data")) or {}
 		# Live crawl already finished with jobs — prefer crawl result panel.
 		live = str(data.get("live_crawl_status") or data.get("status") or "")
-		jobs_seen = data.get("jobs_seen")
-		if live == "completed" and int(jobs_seen or 0) > 0:
+		jobs_seen = count_or_none(data.get("jobs_seen"))
+		if live == "completed" and (jobs_seen or 0) > 0:
 			if _render_crawl_summary(run, with_preview=with_preview):
 				return
 		reason = display.escape_markup(
@@ -566,7 +578,7 @@ def render_run(
 		]
 		if inner:
 			lines.append(f"内部采集编号：{inner}")
-		if int(jobs_seen or 0) > 0:
+		if (jobs_seen or 0) > 0:
 			lines.append(f"本地已有职位：{jobs_seen} 条（可在「查看采集进度与产物」中浏览）")
 		operator_actions = last.get("operator_actions") or []
 		if operator_actions:
@@ -1213,17 +1225,17 @@ def _render_crawl_summary(run: Mapping[str, Any], *, with_preview: bool = True) 
 		return False
 
 	crawl_status = data.get("live_crawl_status") or data.get("status") or last.get("status")
-	jobs_seen = data.get("jobs_seen")
+	jobs_seen = count_or_none(data.get("jobs_seen"))
 	completed_like = (
 		str(crawl_status) == "completed"
 		or bool(run.get("effective_completed"))
 		or str(run.get("status")) == "completed"
 	)
-	success = completed_like and int(jobs_seen or 0) > 0
+	jobs_count = jobs_seen or 0
+	success = completed_like and jobs_count > 0
 
 	# ── Headline: strongest visual weight ───────────────────────────
 	headline = Text()
-	jobs_count = int(jobs_seen or 0)
 	if success:
 		headline.append("● ", style="bold green")
 		headline.append(f"{jobs_count} 个职位", style="bold cyan")
@@ -1321,7 +1333,7 @@ def _render_crawl_summary(run: Mapping[str, Any], *, with_preview: bool = True) 
 
 	if preview_rows:
 		shown = len(preview_rows)
-		total = int(jobs_seen or shown)
+		total = jobs_seen or shown
 		section = Text()
 		section.append("职位预览", style="bold")
 		section.append(f"  ·  前 {shown}/{total} 条", style="dim")
@@ -1332,7 +1344,7 @@ def _render_crawl_summary(run: Mapping[str, Any], *, with_preview: bool = True) 
 				section,
 				_render_job_preview_table(
 					preview_rows,
-					total=int(jobs_seen) if jobs_seen is not None else None,
+					total=jobs_seen,
 				),
 			]
 		)

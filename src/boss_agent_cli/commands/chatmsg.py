@@ -1,4 +1,3 @@
-import datetime
 import re
 from typing import Any
 
@@ -6,10 +5,10 @@ import click
 
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
-from boss_agent_cli.commands._contact_lookup import current_friend_security_id_or_emit, resolve_friend_or_emit
+from boss_agent_cli.commands._contact_lookup import current_friend_security_id_or_emit, current_friend_uid_or_emit, resolve_friend_or_emit
 from boss_agent_cli.commands._platform import get_platform_instance
 from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_not_supported, handle_output, handle_platform_error_output, render_simple_list
-from boss_agent_cli.services.chat_utils import int_code, message_list
+from boss_agent_cli.services.chat_utils import int_code, message_list, safe_local_time
 from boss_agent_cli.services.pagination import UNKNOWN_HAS_MORE_OPERATOR_ACTION, list_pagination
 
 _MSG_TYPE_MAP = {
@@ -50,7 +49,9 @@ def chatmsg_cmd(ctx: click.Context, security_id: str, page: int, count: int, sho
 		)
 		if friend_item is None:
 			return
-		gid = str(friend_item.get("uid", ""))
+		gid = current_friend_uid_or_emit(ctx, "chatmsg", friend_item)
+		if gid is None:
+			return
 		friend_name = friend_item.get("name") or "-"
 		# securityId 是每请求轮换的令牌，必须用本次 friend_list 返回的新值，
 		# 否则会拿一个已失效的令牌去请求消息历史。
@@ -117,20 +118,28 @@ def _normalize_message(
 	include_raw: bool = False,
 ) -> dict[str, Any]:
 	from_obj = msg.get("from", {})
-	is_self = False
-	from_name = friend_name
+	sender_uid = ""
+	sender_name: Any = None
 	if isinstance(from_obj, dict):
-		is_self = str(from_obj.get("uid", "")) != gid
-		if not is_self:
-			from_name = from_obj.get("name", friend_name)
-	if is_self:
+		sender_uid = str(from_obj.get("uid") or "").strip()
+		sender_name = from_obj.get("name")
+	# 发送方 uid 缺失（含 null）时无法判断是谁：旧实现用 ``"" != gid`` 把
+	# 这类消息误标成「我」（Issue #1352）。缺失按「未知」处理，只有明确的
+	# 非空 uid 才能判定发送方。
+	if not sender_uid:
+		from_name = "未知"
+	elif sender_uid == gid:
+		from_name = sender_name or friend_name
+	else:
 		from_name = "我"
 
 	msg_time = ""
 	ts = msg.get("time")
 	# 平台偶尔把时间戳写成字符串 / 对象：只接受真正的数字，坏值按「无时间」输出。
 	if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts:
-		msg_time = datetime.datetime.fromtimestamp(ts / 1000).strftime("%m-%d %H:%M")
+		msg_dt = safe_local_time(ts)
+		# 越界 / 非有限时间戳是确定性坏数据，按「无时间」处理（Issue #1295）。
+		msg_time = msg_dt.strftime("%m-%d %H:%M") if msg_dt is not None else ""
 
 	body = _message_body(msg)
 	text = msg.get("text") or body.get("text", "") or ""

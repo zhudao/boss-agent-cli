@@ -33,7 +33,8 @@ def _settings(tmp_path: Path) -> CrawlSettings:
 		profile_path=tmp_path / "profile",
 		chrome_path=None,
 		cdp_port=9222,
-		hook_profile="screenshot-full",
+		# 断点必须满足自身约束：screenshot-full 需要 hook 目录，这里用 none。
+		hook_profile="none",
 	)
 
 
@@ -246,6 +247,31 @@ def test_agent_crawl_invalid_city_points_at_crawl_config(tmp_path: Path) -> None
 	assert payload["hints"]["next_actions"] == [expected_help]
 
 
+def test_agent_crawl_corrupt_run_record_points_at_recreating_task(tmp_path: Path) -> None:
+	"""本地 run 记录损坏不是参数错误：指引重新创建任务（Issue #1259）。"""
+	runner = CliRunner()
+	_init_resume(runner, tmp_path)
+	with CacheStore(tmp_path / "cache" / "boss_agent.db") as cache:
+		cache.create_crawl_run("run-broken", _settings(tmp_path).as_dict(), str(tmp_path / "crawl" / "runs" / "run-broken"))
+		cache._conn.execute("UPDATE crawl_runs SET params = '[]' WHERE run_id = 'run-broken'")
+		cache._conn.commit()
+
+	result = runner.invoke(
+		cli,
+		["--data-dir", str(tmp_path), "--json", "agent", "crawl", "--run-id", "run-broken", "--resume", "test-resume"],
+	)
+
+	assert result.exit_code == 1
+	payload = json.loads(result.output)
+	assert payload["error"]["code"] == "CACHE_RECORD_INVALID"
+	assert payload["command"] == "agent.crawl"
+	# 参数 / 配置指引修不好一条写坏的本地记录。
+	recovery = payload["error"]["recovery_action"]
+	assert "crawl start" in recovery
+	assert "crawl configure --help" not in recovery
+	assert any("crawl start" in action for action in payload["hints"]["next_actions"])
+
+
 def test_agent_crawl_does_not_process_risk_stopped_runs(tmp_path: Path, monkeypatch) -> None:
 	runner = CliRunner()
 	_init_resume(runner, tmp_path)
@@ -338,3 +364,21 @@ def test_agent_crawl_new_query_without_crawl_dependencies_creates_no_run(tmp_pat
 	assert "next_actions" not in payload["hints"]
 	with sqlite3.connect(tmp_path / "cache" / "boss_agent.db") as conn:
 		assert conn.execute("SELECT COUNT(*) FROM crawl_runs").fetchone()[0] == 0, "依赖缺失不该留下任务"
+
+
+def test_agent_crawl_reports_recorded_risk_lock_before_missing_resume(tmp_path: Path) -> None:
+	"""风控锁优先于简历校验：不禁导用户补完简历再撞平台风控（#1407 回归）。"""
+	from boss_agent_cli.api import cdp_risk_lock
+
+	cdp_risk_lock.write_lock(tmp_path, None, reason="ENVIRONMENT_RISK", platform_code=37)
+	result = CliRunner().invoke(
+		cli,
+		[
+			"--data-dir", str(tmp_path), "--json", "agent", "crawl",
+			"--query", "fixture", "--city", "杭州", "--resume", "ghost",
+		],
+	)
+	assert result.exit_code == 1, result.output
+	payload = json.loads(result.output)
+	assert payload["command"] == "agent.crawl"
+	assert payload["error"]["code"] == "ENVIRONMENT_RISK_LOCKED"

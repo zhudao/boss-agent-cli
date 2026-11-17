@@ -21,6 +21,7 @@ def _ctx_mock(mock_cls):
 	instance.__exit__ = lambda self, *a: None
 	instance.unwrap_data.side_effect = lambda response: response.get("zpData") if "zpData" in response else response.get("data")
 	instance.is_success.side_effect = lambda response: response.get("code", 0) in (0, 200)
+	instance.claim_candidate_action.return_value = None
 	return instance
 
 
@@ -319,6 +320,73 @@ def test_batch_greet_dry_run(mock_cache_cls, mock_auth_cls, mock_client_cls, moc
 	assert parsed["ok"] is True
 	assert parsed["data"]["dry_run"] is True
 	assert parsed["data"]["count"] == 1
+
+
+def _batch_greet_job(index: int) -> dict:
+	return {
+		"encryptJobId": f"j{index}",
+		"jobName": f"Golang {index}",
+		"brandName": f"Company {index}",
+		"salaryDesc": "30K",
+		"cityName": "北京",
+		"jobExperience": "3-5年",
+		"jobDegree": "本科",
+		"bossName": "张",
+		"bossTitle": "CTO",
+		"bossOnline": True,
+		"securityId": f"sec_{index}",
+	}
+
+
+@patch("boss_agent_cli.commands.greet.time")
+@patch("boss_agent_cli.commands.greet.get_platform_instance")
+@patch("boss_agent_cli.commands.greet.AuthManager")
+@patch("boss_agent_cli.commands.greet.CacheStore")
+def test_batch_greet_keyboard_interrupt_emits_partial_progress(
+	mock_cache_cls, mock_auth_cls, mock_client_cls, mock_time,
+):
+	"""SIGINT 中断批打招呼时必须给出部分结果与「不要原样重试」的七键信封（Issue #1491）。
+
+	MCP 超时后发送 SIGINT：stdout 为空时调用方只能报结果未知。这里确认 CLI
+	自己输出已完成列表、在途候选人，并明确 ``replay_safe=false``。
+	"""
+	mock_cache = _ctx_mock(mock_cache_cls)
+	mock_cache.is_greeted.return_value = False
+	mock_client = _ctx_mock(mock_client_cls)
+	mock_client.search_jobs.return_value = {
+		"zpData": {"jobList": [_batch_greet_job(1), _batch_greet_job(2), _batch_greet_job(3)]},
+	}
+	# 第一个候选人成功，第二个请求收到 SIGINT（等价于 MCP 超时信号）。
+	mock_client.greet.side_effect = [{"code": 0}, KeyboardInterrupt()]
+
+	runner = CliRunner()
+	result = runner.invoke(cli, ["--json", "batch-greet", "golang", "--count", "3"])
+
+	assert result.exit_code == 1
+	# stdout 必须恰好是一个信封；多余输出会让 MCP 的 json.loads 失败。
+	parsed = json.loads(result.output)
+	assert set(parsed) == {
+		"ok", "schema_version", "command", "data", "pagination", "error", "hints",
+	}
+	assert parsed["ok"] is False
+	assert parsed["command"] == "batch-greet"
+	assert parsed["data"] is None
+	assert parsed["error"]["code"] == "WORKFLOW_STOPPED"
+	assert parsed["error"]["recoverable"] is False
+	assert parsed["error"]["details"]["outcome_unknown"] is True
+	assert parsed["error"]["details"]["replay_safe"] is False
+	# 第一个招呼已完成；第二个在途未知；第三个尚未触碰。
+	assert parsed["error"]["details"]["processed"] == 1
+	assert parsed["error"]["details"]["remaining"] == 2
+	assert parsed["error"]["details"]["total_greeted"] == 1
+	assert [item["security_id"] for item in parsed["error"]["details"]["completed"]] == ["sec_1"]
+	assert [item["security_id"] for item in parsed["error"]["details"]["greeted"]] == ["sec_1"]
+	assert parsed["error"]["details"]["unconfirmed"]["security_id"] == "sec_2"
+	assert parsed["error"]["details"]["unconfirmed"]["status"] == "unconfirmed"
+	assert "不要原样重试" in parsed["error"]["recovery_action"]
+	assert parsed["hints"]["operator_actions"]
+	assert "核对" in parsed["hints"]["operator_actions"][0]
+	assert "不要原样重试" in parsed["hints"]["operator_actions"][0]
 
 
 def test_cities_command():
@@ -2627,3 +2695,26 @@ def test_mark_rejects_blank_identifier(mock_auth_cls, mock_client_cls):
 	assert parsed["hints"]["next_actions"] == [f"boss --data-dir {_DEFAULT_DATA_DIR} chat"]
 	assert f"boss --data-dir {_DEFAULT_DATA_DIR} chat" in parsed["error"]["recovery_action"]
 	mock_client.friend_list.assert_not_called()
+
+
+@patch("boss_agent_cli.commands.mark.get_platform_instance")
+@patch("boss_agent_cli.commands.mark.AuthManager")
+@patch("boss_agent_cli.commands.mark.resolve_friend_or_emit")
+@patch("boss_agent_cli.commands.mark.current_friend_uid_or_emit")
+def test_mark_normalizes_drifted_friend_source_to_zero(
+	mock_uid, mock_resolve, mock_auth_cls, mock_platform_cls, tmp_path
+):
+	"""friendSource 漂移成对象 / 字符串时按 0 处理，不把坏值原样发给标签写接口
+	（与向导侧 Issue #1314 同口径，Issue #1439）。"""
+	platform = _ctx_mock(mock_platform_cls)
+	platform.friend_label.return_value = {"code": 0, "zpData": {}}
+	mock_resolve.return_value = {"uid": "u1", "name": "候选人", "securityId": "s1", "friendSource": {"bad": 1}}
+	mock_uid.return_value = "u1"
+
+	runner = CliRunner()
+	result = runner.invoke(
+		cli, ["--json", "--data-dir", str(tmp_path), "mark", "u1", "--label", "沟通中"]
+	)
+
+	assert result.exit_code == 0, result.output
+	platform.friend_label.assert_called_once_with("u1", 2, 0, remove=False)

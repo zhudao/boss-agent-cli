@@ -16,6 +16,7 @@ from boss_agent_cli.display import (
 	is_json_mode,
 	platform_error_contract,
 	platform_error_message,
+	read_only_platform_code,
 	render_job_table,
 	shell_argument,
 	show_command_for_ctx,
@@ -57,9 +58,17 @@ def _parse_cached_result(raw: str) -> dict[str, Any] | None:
 	"""
 	try:
 		parsed = json.loads(raw)
-	except json.JSONDecodeError:
+	# ValueError 覆盖 JSONDecodeError / UnicodeDecodeError 与 3.11+ 的超长整数
+	# 上限；RecursionError 覆盖深嵌套。缓存是本地确定性数据，坏了按未命中处理，
+	# 不能让 Agent 拿到「重试」指引反复命中同一坏行（Issue #1230）。
+	except (ValueError, RecursionError):
 		return None
 	if not isinstance(parsed, dict) or not isinstance(parsed.get("data"), list):
+		return None
+	# 元素必须都是对象：坏元素（字符串 / null）命中后会让 `--sort score` 的
+	# `.get` 与索引缓存写入直接 AttributeError，把「本地缓存写坏」升级成
+	# INTERNAL_ERROR；按未命中处理，本次搜索会覆盖同一坏行（Issue #1318）。
+	if not all(isinstance(item, dict) for item in parsed["data"]):
 		return None
 	# pagination 只能是对象或 null：形状漂移的缓存按未命中处理，不让非法类型
 	# 原样进入成功信封（Issue #1136）。
@@ -70,7 +79,13 @@ def _parse_cached_result(raw: str) -> dict[str, Any] | None:
 
 def _sort_search_items(items: list[dict[str, Any]], sort: str) -> list[dict[str, Any]]:
 	if sort == "score":
-		return sorted(items, key=lambda item: item.get("match_score", 0), reverse=True)
+		# match_score 由本工具写成整数；缓存被改坏成字符串时会与整数混合
+		# 比较抛 TypeError（Issue #1318）。
+		def _score(item: dict[str, Any]) -> int:
+			value = item.get("match_score")
+			return value if type(value) is int else 0
+
+		return sorted(items, key=_score, reverse=True)
 	return items
 
 
@@ -555,11 +570,15 @@ def search_cmd(
 			except SearchPipelinePlatformError as exc:
 				# 风控码必须走风险契约：不可恢复、不提示重试；登录过期等
 				# 可恢复错误按登记表给出 recovery_action，而不是一律 false。
-				recoverable, recovery_action, error_hints = platform_error_contract(exc.code, ctx=ctx)
+				# search 只读：未识别响应按 NETWORK_ERROR 允许安全重试（#1519）。
+				error_code = read_only_platform_code("search", exc.code)
+				recoverable, recovery_action, error_hints = platform_error_contract(
+					error_code, ctx=ctx, read_only=True
+				)
 				handle_error_output(
 					ctx, "search",
-					code=exc.code,
-					message=platform_error_message(exc.code, exc.message, "搜索结果获取失败"),
+					code=error_code,
+					message=platform_error_message(error_code, exc.message, "搜索结果获取失败"),
 					recoverable=recoverable,
 					recovery_action=recovery_action,
 					details=exc.details,

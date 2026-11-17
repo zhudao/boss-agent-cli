@@ -11,6 +11,9 @@ from unittest.mock import MagicMock, patch
 from click.testing import CliRunner
 
 from boss_agent_cli.ai.config import AIConfigStore
+from boss_agent_cli.api.browser_client import ChatTabCdpUnreachable, RecruiterChatTabRequired
+from boss_agent_cli.api.browser_source import POLICIES, BrowserSourceUnavailable
+from boss_agent_cli.api.client import AccountRiskError
 from boss_agent_cli.automation.adapters import build_automation_adapter
 from boss_agent_cli.automation.boss_adapter import BossRecruiterAutomationPlatform
 from boss_agent_cli.automation.mock_adapter import MockRecruiterAutomationPlatform
@@ -32,7 +35,7 @@ from boss_agent_cli.automation.models import (
 from boss_agent_cli.automation.runner import run_automation_cycle
 from boss_agent_cli.automation.reply_ai import parse_reply_draft
 from boss_agent_cli.automation.safety import SafetyGuard
-from boss_agent_cli.automation.storage import AutomationStore
+from boss_agent_cli.automation.storage import AutomationControlBusy, AutomationStore
 from boss_agent_cli.main import cli
 
 
@@ -898,6 +901,21 @@ def test_agent_queue_accepts_numeric_confidence(tmp_path: Path) -> None:
 	assert [item["confidence"] for item in json.loads(result.output)["data"]["items"]] == [1.0, 0.5, 0.0]
 
 
+def test_agent_queue_tty_columns_match_model_fields() -> None:
+	"""TTY 列键必须存在于数据模型字段，否则复核 / 待执行表格的列恒显示 “-”（Issue #1411）。"""
+	from boss_agent_cli.commands.agent import _PENDING_LIST_COLUMNS, _REVIEW_LIST_COLUMNS
+
+	review_keys = {key for _, key, _ in _REVIEW_LIST_COLUMNS}
+	pending_keys = {key for _, key, _ in _PENDING_LIST_COLUMNS}
+
+	assert review_keys <= set(ReviewItem.__dataclass_fields__)
+	assert pending_keys <= set(PendingAction.__dataclass_fields__)
+	assert {"id", "confidence"} <= review_keys
+	assert {"id", "status"} <= pending_keys
+	assert "review_id" not in review_keys | pending_keys
+	assert "score" not in review_keys
+
+
 def test_corrupt_stop_latch_fails_closed(tmp_path: Path) -> None:
 	store = AutomationStore(tmp_path)
 	(store.root / "stop.json").write_text("not json", encoding="utf-8")
@@ -1207,6 +1225,74 @@ def test_dry_run_keeps_pending_actions_for_the_next_live_run(tmp_path: Path) -> 
 	assert adapter.messages == ["您好，想确认下近期是否看机会？"]
 
 
+def _pending_action(item_id: str = "approved-1") -> PendingAction:
+	return PendingAction(
+		id=item_id,
+		ts="2026-11-12T00:00:00+00:00",
+		platform="zhipin",
+		candidate_key="候选人A",
+		action=PlatformAction.SEND_QUESTIONNAIRE.value,
+		status="pending",
+		confidence=0.9,
+		reason="approved review",
+		message="您好，想确认下近期是否看机会？",
+	)
+
+
+def test_dry_run_startup_warning_does_not_write_stop_json(tmp_path: Path) -> None:
+	"""预览命中安全提示时只报告熔断，不得落 stop.json（Issue #1459）。
+
+	演练不是执行：写下的熔断闩锁会让之后每一次真实运行在显式 ``--resume``
+	之前全部停下，操作者一次无害的 preview 反而冻结了自动化。
+	"""
+	store = AutomationStore(tmp_path)
+	adapter = MockRecruiterAutomationPlatform("zhipin", [], warning="检测到安全验证页")
+	config = AutomationConfig()
+
+	preview = run_automation_cycle(adapter, store, config, platform="zhipin", dry_run=True)
+
+	assert preview.status == EventStatus.CIRCUIT_BREAKER_OPEN.value
+	assert [event.status for event in preview.events] == [EventStatus.CIRCUIT_BREAKER_OPEN.value]
+	assert not (store.root / "stop.json").exists()
+	assert store.read_state().get("autonomy", {}).get("circuit_breaker") is None
+
+	# 真实运行仍然保留熔断：同一提示必须在 live 周期落盘并挡住后续运行。
+	live = run_automation_cycle(adapter, store, config, platform="zhipin", dry_run=False)
+	assert live.status == EventStatus.CIRCUIT_BREAKER_OPEN.value
+	assert (store.root / "stop.json").exists()
+
+
+def test_dry_run_action_warning_does_not_latch_or_rewrite_pending_queue(tmp_path: Path) -> None:
+	"""动作前的安全提示在预览里只产生事件，不写队列、不落熔断（Issue #1459）。"""
+	store = AutomationStore(tmp_path)
+	store.append_pending(_pending_action())
+	before = store.pending_path.read_bytes()
+
+	class _WarningAfterStartup(MockRecruiterAutomationPlatform):
+		def __init__(self) -> None:
+			super().__init__("zhipin", [])
+			self.warning_calls = 0
+
+		def detect_safety_warning(self) -> str | None:
+			self.warning_calls += 1
+			# 第一次是周期启动探测；之后模拟页面在派发前出现安全提示。
+			return None if self.warning_calls == 1 else "检测到安全验证页"
+
+		def scan_conversations(self, tabs, max_per_tab):  # type: ignore[override]
+			return []
+
+	adapter = _WarningAfterStartup()
+	report = run_automation_cycle(adapter, store, AutomationConfig(), platform="zhipin", dry_run=True)
+
+	assert report.status == EventStatus.CIRCUIT_BREAKER_OPEN.value
+	assert [event.status for event in report.events] == [EventStatus.CIRCUIT_BREAKER_OPEN.value]
+	assert not (store.root / "stop.json").exists()
+	assert store.pending_path.read_bytes() == before
+	assert [item.status for item in store.read_pending()] == ["pending"]
+	assert adapter.executed == []
+
+
+
 def test_interview_lead_is_deduplicated_across_cycles(tmp_path: Path) -> None:
 	"""同一候选人的同一面试时间只记一次（Issue #889）。
 
@@ -1319,3 +1405,121 @@ def test_action_result_separates_unsent_page_errors_from_interrupted_actions() -
 		"message": "交换联系方式请求失败: ExchangeWx Vue component not found",
 	})
 	assert deterministic.status == "blocked"
+
+
+@pytest.mark.parametrize(
+	"make_error",
+	[
+		pytest.param(ChatTabCdpUnreachable, id="chat-tab-cdp-unreachable"),
+		pytest.param(RecruiterChatTabRequired, id="recruiter-chat-tab-required"),
+		pytest.param(
+			lambda: BrowserSourceUnavailable(POLICIES["existing-browser"], ("cdp",)),
+			id="browser-source-unavailable",
+		),
+	],
+)
+def test_predispatch_error_restores_pending_without_latch(tmp_path: Path, make_error) -> None:
+	"""发送前异常必须把队列行还原成 pending（Issue #1469）。
+
+	ChatTabCdpUnreachable / RecruiterChatTabRequired / BrowserSourceUnavailable
+	都明确表示请求尚未发出。旧实现只在 RequestBudgetExceeded 且
+	details.request_sent=False 时还原，这三类异常会让队列行永久停在 executing：
+	下一轮被当成结果未知转成 verification-required 并落 stop.json，一个从未派发
+	的动作反而冻结了后续自动化。
+	"""
+	store = AutomationStore(tmp_path)
+	store.append_pending(_pending_action())
+	error = make_error()
+
+	class _PreDispatchFailure(MockRecruiterAutomationPlatform):
+		def __init__(self) -> None:
+			super().__init__("zhipin", [])
+
+		def execute_action(
+			self,
+			action: PlatformAction,
+			message: str,
+			ref: ConversationRef,
+		) -> ActionResult:
+			raise error
+
+	with pytest.raises(type(error)):
+		run_automation_cycle(
+			_PreDispatchFailure(),
+			store,
+			AutomationConfig(),
+			platform="zhipin",
+			dry_run=False,
+		)
+
+	assert [item.status for item in store.read_pending()] == ["pending"]
+	assert not (store.root / "stop.json").exists()
+
+
+def test_risk_error_is_not_masked_by_control_lock_busy(tmp_path: Path, monkeypatch) -> None:
+	"""风控闩锁撞上控制锁时仍要上报原始风控异常（Issue #1470）。
+
+	旧实现里 ``guard.open_circuit_breaker()`` / ``store.append_event()`` 抛出的
+	``AutomationControlBusy`` 会覆盖 ``PlatformRiskError``，命令因此报
+	AUTOMATION_BUSY；``finally`` 无条件写 state 再撞一次锁，风控闩锁也没落盘。
+	"""
+	store = AutomationStore(tmp_path)
+
+	class _RiskAdapter(MockRecruiterAutomationPlatform):
+		def __init__(self) -> None:
+			super().__init__("zhipin", [])
+
+		def ensure_session(self) -> None:
+			raise AccountRiskError("risk")
+
+	def _busy(self, reason: str) -> None:
+		raise AutomationControlBusy("busy")
+
+	def _forbidden_write_state(state: dict) -> None:
+		raise AssertionError("异常周期不应再写 state")
+
+	monkeypatch.setattr(SafetyGuard, "open_circuit_breaker", _busy)
+	monkeypatch.setattr(store, "write_state", _forbidden_write_state)
+
+	with pytest.raises(AccountRiskError) as excinfo:
+		run_automation_cycle(
+			_RiskAdapter(),
+			store,
+			AutomationConfig(),
+			platform="zhipin",
+			dry_run=False,
+		)
+
+	assert excinfo.value.details["risk_latch_persisted"] is False
+	assert "AutomationControlBusy" in excinfo.value.details["risk_latch_error"]
+	assert "busy" in excinfo.value.details["risk_latch_error"]
+
+
+def test_normal_cycle_still_writes_state(tmp_path: Path, monkeypatch) -> None:
+	"""无异常周期仍要执行 finally 的 state 写回（Issue #1470）。
+
+	条件写回不能把正常路径一起跳过：本轮的成功 checkpoint / 阶段推进必须落盘。
+	"""
+	store = AutomationStore(tmp_path)
+	calls: list[dict] = []
+	real_write_state = store.write_state
+
+	def _spy_write_state(state: dict) -> None:
+		calls.append(state)
+		real_write_state(state)
+
+	class _QuietAdapter(MockRecruiterAutomationPlatform):
+		def scan_conversations(self, tabs: list[str], max_per_tab: int) -> list[ConversationRef]:
+			return []
+
+	monkeypatch.setattr(store, "write_state", _spy_write_state)
+	report = run_automation_cycle(
+		_QuietAdapter("zhipin", []),
+		store,
+		AutomationConfig(),
+		platform="zhipin",
+		dry_run=False,
+	)
+
+	assert report.status == "OK"
+	assert len(calls) == 1

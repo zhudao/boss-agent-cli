@@ -14,6 +14,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from boss_agent_cli.services.output_path import refuse_symlink_target
+
 DIRECTORY_MODE = 0o700
 FILE_MODE = 0o600
 
@@ -51,17 +53,28 @@ def write_private_bytes(path: Path, data: bytes) -> None:
 	"""原子写入仅当前用户可读的字节文件。
 
 	``mkstemp`` 默认 0600 且同目录 ``os.replace`` 原子替换，避免半截文件与默认
-	umask 的 0644 权限。
+	umask 的 0644 权限。私有文件写入不经过 ``-o`` 预检，符号链接目标必须在这里
+	直接拒绝：``os.replace`` 只会替换链接本身（Issue #1355）。
 	"""
+	refuse_symlink_target(path)
 	path.parent.mkdir(parents=True, exist_ok=True)
-	fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-	temporary = Path(temporary_name)
+	temporary: Path | None = None
 	try:
+		fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+		temporary = Path(temporary_name)
 		with os.fdopen(fd, "wb") as handle:
 			handle.write(data)
 			handle.flush()
 			os.fsync(handle.fileno())
 		os.replace(temporary, path)
+	except OSError as error:
+		# fd 级写入（write / flush / fsync）失败的异常没有 filename：补上目标路径，
+		# 调用方才会把它归成本地文件错误，而不是一次值得重试的网络异常
+		# （与 file_lock._acquire 同口径，Issue #1400）。
+		if error.filename is None:
+			error.filename = str(path)
+		raise
 	finally:
-		temporary.unlink(missing_ok=True)
+		if temporary is not None:
+			temporary.unlink(missing_ok=True)
 	chmod_best_effort(path, FILE_MODE)

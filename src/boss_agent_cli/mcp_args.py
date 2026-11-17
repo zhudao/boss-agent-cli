@@ -34,15 +34,114 @@ _ENUM_KEYS: frozenset[str] = frozenset(
 	}
 )
 
+#: 显式空串必须原样下发的输出路径参数（按 (子命令, MCP 键) 登记，Issue #1377）。
+#: ``click.Path`` 把空串转成当前目录，真正写盘时得到 ``LOCAL_IO_ERROR``；映射层
+#: 若按真值判断丢弃，调用方以为已指定输出文件，CLI 却返回 ``ok:true`` 且不写文件。
+#: chat / export 的空 ``-o ""`` 会由 CLI 判成 ``INVALID_PARAM``（Issue #1501），
+#: 同样必须原样下发，否则 MCP 调用方仍会静默拿到默认导出文件。
+_EXPLICIT_EMPTY_KEYS: frozenset[tuple[str, str]] = frozenset(
+	{
+		("digest", "output"),
+		("stats", "output_file"),
+		("chat", "output_file"),
+		("export", "output_file"),
+	}
+)
 
-def _optional(args: list[str], flag: str, key: str, arguments: dict[str, Any]) -> None:
-	"""下发可选字符串参数：枚举参数的空串也要原样下发（Issue #982）。"""
+#: action → 该 action 实际会下发的键（Issue #1493）。
+#: 矩阵之外的键若带非空值，`_build_args` 直接拒绝而不是静默丢弃：越界参数被
+#: 忽略后调用仍会成功，调用方会以为过滤、恢复或写入已经生效。
+#: 键集合以 CLI 为准：wizard 的 --timeout / --max-retries 对四种 action 都可用，
+#: config 的 key 对应 get/set/reset 三个子命令（没有 unset），hr jobs 的 page
+#: 只属于 list、job_id 只属于 online/offline。
+_WIZARD_ACTION_KEYS: dict[str, frozenset[str]] = {
+	"run": frozenset({"action", "role", "platform", "goal", "inputs", "requested_steps", "timeout", "max_retries"}),
+	"resume": frozenset({"action", "run_id", "timeout", "max_retries"}),
+	"status": frozenset({"action", "run_id", "timeout", "max_retries"}),
+	"stop": frozenset({"action", "run_id", "timeout", "max_retries"}),
+}
+_WIZARD_KEY_USAGE = {
+	"role": "仅用于 action=run",
+	"platform": "仅用于 action=run",
+	"goal": "仅用于 action=run",
+	"inputs": "仅用于 action=run",
+	"requested_steps": "仅用于 action=run",
+	"run_id": "仅用于 action=resume/status/stop",
+}
+_CONFIG_ACTION_KEYS: dict[str, frozenset[str]] = {
+	"list": frozenset({"action"}),
+	"get": frozenset({"action", "key"}),
+	"set": frozenset({"action", "key", "value"}),
+	"reset": frozenset({"action", "key"}),
+}
+_CONFIG_KEY_USAGE = {
+	"key": "仅用于 action=get/set/reset",
+	"value": "仅用于 action=set",
+}
+_HR_JOBS_ACTION_KEYS: dict[str, frozenset[str]] = {
+	"list": frozenset({"action", "page"}),
+	"online": frozenset({"action", "job_id"}),
+	"offline": frozenset({"action", "job_id"}),
+}
+_HR_JOBS_KEY_USAGE = {
+	"job_id": "仅用于 action=online/offline（这两个 action 必填）",
+	"page": "仅用于 action=list",
+}
+
+
+def _is_blank_action_value(value: Any) -> bool:
+	"""action 用不到的键只在值非空时才算越界（Issue #1493）。
+
+	显式 ``null`` 已在 `call_tool` 之前剥离；空串 / 空数组 / 空对象与「没传」
+	等价，不能因为 schema 里有这个字段就拒绝缺省形态。
+	"""
+	if value is None:
+		return True
+	if isinstance(value, (str, list, tuple, dict, set)):
+		return not value
+	return False
+
+
+def _reject_incompatible_action_args(
+	tool_name: str,
+	action: str,
+	arguments: dict[str, Any],
+	allowed: frozenset[str],
+	usage: dict[str, str],
+) -> None:
+	"""拒绝「值非空但该 action 用不到」的键，异常由 `call_tool` 转成 INVALID_PARAM。
+
+	错误消息点名参数、action 与正确用法，让 Agent 能自己改成合法组合。
+	"""
+	unused = [
+		key
+		for key, value in arguments.items()
+		if key not in allowed and not _is_blank_action_value(value)
+	]
+	if not unused:
+		return
+	details = "；".join(f"{key} {usage.get(key, '不适用于该 action')}" for key in unused)
+	raise ValueError(
+		f"{tool_name} 的 action={action} 与参数不兼容：{details}；"
+		"请去掉不适用于该 action 的参数，或改用支持它的 action"
+	)
+
+
+def _optional(
+	args: list[str],
+	flag: str,
+	key: str,
+	arguments: dict[str, Any],
+	*,
+	command: str | None = None,
+) -> None:
+	"""下发可选字符串参数：枚举参数与登记的输出路径空串也要原样下发（Issue #982）。"""
 	if key not in arguments:
 		return
 	value = arguments[key]
 	if value is None:
 		return
-	if not value and key not in _ENUM_KEYS:
+	if not value and key not in _ENUM_KEYS and (command, key) not in _EXPLICIT_EMPTY_KEYS:
 		return
 	args.extend([flag, str(value)])
 
@@ -66,9 +165,17 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		# 显式空串同样是非法取值（与 Issue #982 的枚举契约一致），只有缺省 /
 		# ``null`` 才落回 schema 默认的 run。
 		raw_action = arguments.get("action")
+		# schema 只说 run_id 是 resume/status/stop 的参数，没有承诺缺省 action 会
+		# 按 run_id 恢复；默认仍是 run，不能猜测调用方意图（Issue #1493）。
+		if raw_action is None and not _is_blank_action_value(arguments.get("run_id")):
+			raise ValueError(
+				"boss_wizard 收到 run_id 但缺少 action：run_id 仅用于 action=resume/status/stop，"
+				"缺省 action 是 run；请显式传入 action"
+			)
 		action = "run" if raw_action is None else str(raw_action)
-		if action not in {"run", "resume", "status", "stop"}:
+		if action not in _WIZARD_ACTION_KEYS:
 			raise ValueError(f"action 应为 run / resume / status / stop，收到 {action!r}")
+		_reject_incompatible_action_args("boss_wizard", action, arguments, _WIZARD_ACTION_KEYS[action], _WIZARD_KEY_USAGE)
 		if action in {"resume", "status", "stop"}:
 			run_id = str(arguments["run_id"])
 			args = ["wizard", f"--{action}", run_id]
@@ -138,7 +245,10 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		return _literal_positionals(args)
 
 	if name == "greet":
-		return _literal_positionals([name, arguments["security_id"], arguments["job_id"]], count=2)
+		args = [name, arguments["security_id"], arguments["job_id"]]
+		# 缺省使用平台默认招呼语；自由文本空串按未传处理（Issue #1202）。
+		_optional(args, "--message", "message", arguments)
+		return _literal_positionals(args, count=2)
 
 	if name == "chat":
 		args = [name]
@@ -148,7 +258,7 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		if "page" in arguments:
 			args.extend(["--page", str(arguments["page"])])
 		_optional(args, "--export", "format", arguments)
-		_optional(args, "--output", "output_file", arguments)
+		_optional(args, "--output", "output_file", arguments, command=name)
 		return args
 
 	if name == "me":
@@ -185,10 +295,18 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		return _literal_positionals(args)
 
 	if name == "exchange":
-		return _literal_positionals([name, arguments["security_id"]])
+		args = [name, arguments["security_id"]]
+		# 描述承诺「手机号或微信」，但 CLI 默认 phone：省略/显式 phone 不下发，
+		# 空串等非法值交给 CLI 的枚举诊断（Issue #982、#1200）。
+		if "type" in arguments and arguments["type"] is not None and arguments["type"] != "phone":
+			args.extend(["--type", str(arguments["type"])])
+		return _literal_positionals(args)
 
 	if name == "apply":
-		return _literal_positionals([name, arguments["security_id"], arguments["job_id"]], count=2)
+		args = [name, arguments["security_id"], arguments["job_id"]]
+		# 与 detail 的 lid 同口径：列表项访问上下文可选，空串按未传处理（Issue #1202）。
+		_optional(args, "--lid", "lid", arguments)
+		return _literal_positionals(args, count=2)
 
 	if name == "batch_greet":
 		args = ["batch-greet", arguments["query"]]
@@ -229,7 +347,8 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 
 	if name == "agent_review_reject":
 		args = ["agent", "review", "reject", str(arguments["id"])]
-		if arguments.get("reason"):
+		# 显式空串要原样下发（Issue #1324）：CLI 的 default 只在选项缺席时生效。
+		if arguments.get("reason") is not None:
 			args.extend(["--reason", str(arguments["reason"])])
 		return _literal_positionals(args, start=3)
 
@@ -241,7 +360,8 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 
 	if name == "agent_stop":
 		args = ["agent", "stop"]
-		if arguments.get("reason"):
+		# 显式空串要原样下发（Issue #1324）：CLI 的 default 只在选项缺席时生效。
+		if arguments.get("reason") is not None:
 			args.extend(["--reason", str(arguments["reason"])])
 		return args
 
@@ -259,7 +379,7 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		if "count" in arguments:
 			args.extend(["--count", str(arguments["count"])])
 		_optional(args, "--format", "format", arguments)
-		_optional(args, "-o", "output_file", arguments)
+		_optional(args, "-o", "output_file", arguments, command=name)
 		if arguments.get("include_private"):
 			args.append("--include-private")
 		return _literal_positionals(args, count=int("query" in arguments and arguments["query"] is not None))
@@ -277,6 +397,11 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		# 需要默认行为的工具（boss_hr_jobs / boss_wizard）在 schema 里声明
 		# 非 required + default，映射层才允许补默认值。
 		action = arguments["action"]
+		# 只有 list/get/set/reset 有矩阵；未识别的 action 原样交给 CLI 的
+		# "No such command" 拒绝，不在映射层猜测（Issue #1493）。
+		allowed_config = _CONFIG_ACTION_KEYS.get(action) if isinstance(action, str) else None
+		if allowed_config is not None:
+			_reject_incompatible_action_args("boss_config", action, arguments, allowed_config, _CONFIG_KEY_USAGE)
 		args = [name, action]
 		if action in ("get", "set", "reset") and "key" in arguments:
 			args.append(arguments["key"])
@@ -299,7 +424,7 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		if "days_stale" in arguments:
 			args.extend(["--days-stale", str(arguments["days_stale"])])
 		_optional(args, "--format", "format", arguments)
-		_optional(args, "-o", "output", arguments)
+		_optional(args, "-o", "output", arguments, command=name)
 		return args
 
 	if name == "stats":
@@ -307,7 +432,7 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		if "days" in arguments:
 			args.extend(["--days", str(arguments["days"])])
 		_optional(args, "--format", "format", arguments)
-		_optional(args, "--output", "output_file", arguments)
+		_optional(args, "--output", "output_file", arguments, command=name)
 		return args
 
 	if name == "ai_reply":
@@ -405,8 +530,10 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 
 	if name == "shortlist_add":
 		args = ["shortlist", "add", arguments["security_id"], arguments["job_id"]]
+		# 显式空串要原样下发（Issue #1324）：CLI 的 default 只在选项缺席时生效，
+		# 真值判断会把 "" 化装成没传，落库的 source 与调用方参数不一致。
 		for opt in ("title", "company", "city", "salary", "source"):
-			if arguments.get(opt):
+			if arguments.get(opt) is not None:
 				args.extend([f"--{opt}", str(arguments[opt])])
 		if arguments.get("lid"):
 			args.extend(["--lid", str(arguments["lid"])])
@@ -497,7 +624,9 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		args = ["hr", "chatmsg", str(arguments["friend_id"])]
 		if "count" in arguments:
 			args.extend(["--count", str(arguments["count"])])
-		if arguments.get("max_msg_id"):
+		# 存在即下发（显式 null 已在入口剥离）：游标 0 是非法取值，但不能被
+		# 真值判断化装成「没传」，否则调用方拿到默认最新一页还以为翻页生效（Issue #1199）。
+		if "max_msg_id" in arguments:
 			args.extend(["--max-msg-id", str(arguments["max_msg_id"])])
 		return _literal_positionals(args, start=2)
 
@@ -582,6 +711,10 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 
 	if name == "hr_jobs":
 		action = arguments.get("action", "list")
+		# 缺省 action 与 schema 默认的 list 一致；未识别的 action 交给 CLI 拒绝。
+		allowed_jobs = _HR_JOBS_ACTION_KEYS.get(action) if isinstance(action, str) else None
+		if allowed_jobs is not None:
+			_reject_incompatible_action_args("boss_hr_jobs", action, arguments, allowed_jobs, _HR_JOBS_KEY_USAGE)
 		args = ["hr", "jobs", action]
 		if action in {"online", "offline"}:
 			args.append(str(arguments["job_id"]))

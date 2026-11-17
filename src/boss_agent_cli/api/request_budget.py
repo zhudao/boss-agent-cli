@@ -27,6 +27,36 @@ if TYPE_CHECKING:
 	from boss_agent_cli.api.cdp_risk_lock import RiskLock
 
 
+def _tolerated_timestamp(raw: Any, *, default: float = 0.0) -> float:
+	"""节流元数据的容错读取：漂移值按 0 处理。
+
+	``request_state`` / ``request_attempts`` 是本地调度缓存，坏值不能让所有平台
+	请求抛 ``TypeError``（会被兜成不可重试的 ``INTERNAL_ERROR``），也不能让等待
+	时间无限延长（Issue #1212）。有限的远未来值同样超出合法预留窗口，由
+	``attempt()`` 按 ``now + interval + skew`` 判定并写回（Issue #1422）。
+	"""
+	try:
+		parsed = float(raw)
+	except (TypeError, ValueError):
+		return default
+	return parsed if math.isfinite(parsed) else default
+
+
+#: 本地调度元数据允许的超前窗口（Issue #1422）。
+#:
+#: 写入方最多把 ``next_at`` 推到 ``now + interval``；读写之间只该有很小的
+#: 时钟与调度偏移。更远的「未来」值只能是漂移：它会让每条命令都撞
+#: ``REQUEST_BUDGET_EXHAUSTED``，而拒绝等待的路径不会写回，预算从此无法自愈。
+_FUTURE_SKEW_SECONDS = 60.0
+
+#: 服务器 ``Retry-After`` 冷却的本地上限（Issue #1422）。
+#:
+#: 冷却可以合法地长于请求间隔（平台限流反馈），所以不能套用上面的窗口；
+#: 但也没有平台会要求等待超过一小时。超过的本地值按漂移截断并写回，恢复
+#: 指引沿用 ``REQUEST_BUDGET_EXHAUSTED`` 的契约（等待冷却后显式恢复）。
+_MAX_COOLDOWN_SECONDS = 60.0 * 60.0
+
+
 class RequestBudgetExceeded(RuntimeError):
 	"""An unsent operation cannot obtain a slot within its remaining time."""
 
@@ -235,11 +265,11 @@ class RequestBudget:
 		self._unpersisted_risk_lock = cdp_risk_lock.RiskLock(
 			stoken_sha256=None, locked_at=time.time(), reason=reason, platform_code=platform_code
 		)
-		failure: OSError | None = None
+		failure: OSError | UnicodeError | None = None
 		for directory in dict.fromkeys((self.data_dir, self.root)):
 			try:
 				cdp_risk_lock.write_lock(directory, None, reason=reason, platform_code=platform_code)
-			except OSError as error:
+			except (OSError, UnicodeError) as error:
 				failure = error
 		if failure is not None:
 			raise failure
@@ -315,17 +345,32 @@ class RequestBudget:
 				# Close releases the POSIX/Windows lease even after an exception.
 
 	def _connect(self) -> sqlite3.Connection:
-		connection = sqlite3.connect(self.root / "request-budget.sqlite3", timeout=0.1)
-		connection.executescript("""
-			CREATE TABLE IF NOT EXISTS request_state (
-				id INTEGER PRIMARY KEY CHECK(id=1), last_at REAL NOT NULL DEFAULT 0,
-				next_at REAL NOT NULL DEFAULT 0, cooldown_until REAL NOT NULL DEFAULT 0
-			);
-			INSERT OR IGNORE INTO request_state(id) VALUES(1);
-			CREATE TABLE IF NOT EXISTS request_attempts (
-				id INTEGER PRIMARY KEY, requested_at REAL NOT NULL, kind TEXT NOT NULL
-			);
-		""")
+		path = self.root / "request-budget.sqlite3"
+		try:
+			connection = sqlite3.connect(path, timeout=0.1)
+			connection.executescript("""
+				CREATE TABLE IF NOT EXISTS request_state (
+					id INTEGER PRIMARY KEY CHECK(id=1), last_at REAL NOT NULL DEFAULT 0,
+					next_at REAL NOT NULL DEFAULT 0, cooldown_until REAL NOT NULL DEFAULT 0
+				);
+				INSERT OR IGNORE INTO request_state(id) VALUES(1);
+				CREATE TABLE IF NOT EXISTS request_attempts (
+					id INTEGER PRIMARY KEY, requested_at REAL NOT NULL, kind TEXT NOT NULL
+				);
+			""")
+		except sqlite3.DatabaseError as exc:
+			# 锁冲突保持原有语义（等锁释放即可）；其余是文件损坏 / 被同名目录
+			# 占位，属于确定性本地失败。带上路径与自愈方式，命令层统一报
+			# LOCAL_IO_ERROR，而不是 NETWORK_ERROR +「重试」让 Agent 反复打平台
+			# （Issue #1336）。
+			if isinstance(exc, sqlite3.OperationalError) and any(
+				word in str(exc).lower() for word in ("locked", "busy")
+			):
+				raise
+			raise sqlite3.DatabaseError(
+				f"{path} 不是可用的 SQLite 数据库（{exc}）；"
+				"该文件只保存请求节流元数据，备份后删除即可自动重建"
+			) from exc
 		return connection
 
 	@contextmanager
@@ -356,12 +401,53 @@ class RequestBudget:
 				self._check(check)
 				now = time.time()
 				with self._database() as db:
+					# typeof 漂移的行既不会被数值比较删除，也会让 MIN() 返回文本；
+					# 本地调度元数据无保留价值，直接归零让下一轮自愈。
+					db.execute(
+						"UPDATE request_state SET last_at=0,next_at=0 "
+						"WHERE typeof(last_at) NOT IN ('integer','real') OR typeof(next_at) NOT IN ('integer','real')"
+					)
+					db.execute(
+						"UPDATE request_state SET cooldown_until=0 WHERE typeof(cooldown_until) NOT IN ('integer','real')"
+					)
 					last_at, next_at, cooldown = db.execute(
 						"SELECT last_at,next_at,cooldown_until FROM request_state WHERE id=1"
 					).fetchone()
+					last_at = _tolerated_timestamp(last_at)
+					next_at = _tolerated_timestamp(next_at)
+					cooldown = _tolerated_timestamp(cooldown)
+					# 有限的远未来值与 inf/nan 一样是漂移（Issue #1422）：
+					# next_at 的合法上限是 now + interval，超过后拒绝等待的
+					# 路径不会写回，所有后续命令都会卡在同一条坏记录上。
+					future_limit = now + self.interval + _FUTURE_SKEW_SECONDS
+					reset_last_at = last_at > future_limit
+					reset_next_at = next_at > future_limit
+					if reset_last_at:
+						last_at = 0.0
+					if reset_next_at:
+						next_at = 0.0
+					# cooldown_until 来自服务器 Retry-After，单独用更宽的上限；
+					# 合法的短冷却保持原值，超过上限则截断并写回自愈。
+					clamped_cooldown = min(cooldown, now + _MAX_COOLDOWN_SECONDS)
+					if reset_last_at or reset_next_at or clamped_cooldown != cooldown:
+						cooldown = clamped_cooldown
+						db.execute(
+							"UPDATE request_state SET last_at=?,next_at=?,cooldown_until=? WHERE id=1",
+							(last_at, next_at, cooldown),
+						)
 					db.execute("DELETE FROM request_attempts WHERE requested_at <= ?", (now - 60.0,))
+					# 未来的尝试记录同样是漂移：它永不满足清理条件，会一直占住
+					# 每分钟名额并把 window_ready 推到不可达的时间点。
+					db.execute(
+						"DELETE FROM request_attempts WHERE requested_at > ?",
+						(now + _FUTURE_SKEW_SECONDS,),
+					)
+					db.execute("DELETE FROM request_attempts WHERE typeof(requested_at) NOT IN ('integer','real')")
+					# 自愈写回先落盘：下面的超时拒绝（raise 会回滚本事务）或
+					# claim 失败都不能让漂移记录原样留在库里。
+					db.commit()
 					count, oldest = db.execute("SELECT COUNT(*),MIN(requested_at) FROM request_attempts").fetchone()
-					window_ready = oldest + 60.0 if count >= self.max_per_minute else 0.0
+					window_ready = _tolerated_timestamp(oldest) + 60.0 if count >= self.max_per_minute else 0.0
 					ready = max(next_at, last_at + self.interval if last_at else 0.0, cooldown, window_ready)
 					wait = max(0.0, ready - now)
 					if wait <= 0:
@@ -394,7 +480,16 @@ class RequestBudget:
 			self._store_cooldown(seconds)
 
 	def _store_cooldown(self, seconds: float) -> None:
+		now = time.time()
 		with self._database() as db:
-			db.execute(
-				"UPDATE request_state SET cooldown_until=MAX(cooldown_until,?) WHERE id=1", (time.time() + seconds,)
-			)
+			row = db.execute("SELECT cooldown_until FROM request_state WHERE id=1").fetchone()
+			# 已有值漂移成文本 / inf 时 SQL 的 MAX(text, real) 会选中文本，
+			# 新冷却被静默吞掉（服务器冷却失效）。先归一再取较大值。
+			existing = _tolerated_timestamp(row[0]) if row is not None else 0.0
+			# 有限的远未来值同样是漂移：不归零会让 MAX() 永远选中坏值，
+			# 合法的服务器冷却再也写不进去（Issue #1422）。
+			if existing > now + _MAX_COOLDOWN_SECONDS:
+				existing = 0.0
+			# 服务器 Retry-After 也有本地上限：一个坏值不能把预算推到多年以后。
+			until = min(max(existing, now + seconds), now + _MAX_COOLDOWN_SECONDS)
+			db.execute("UPDATE request_state SET cooldown_until=? WHERE id=1", (until,))

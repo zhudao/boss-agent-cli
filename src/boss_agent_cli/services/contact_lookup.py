@@ -1,6 +1,6 @@
 from typing import Any
 
-from boss_agent_cli.api.models import dict_items
+from boss_agent_cli.services.friend_list_pages import friend_list_page_items
 
 
 class FriendLookupLimitExceeded(RuntimeError):
@@ -38,8 +38,7 @@ def find_friend(
 			# 页面数据形状漂移（如返回字符串）按空页处理，不把 AttributeError
 			# 兜成 INTERNAL_ERROR（Issue #1141 同一口径）。
 			platform_data = {}
-		raw_items = platform_data.get("result") or platform_data.get("friendList")
-		page_items = dict_items(raw_items)
+		page_items = friend_list_page_items(platform_data)
 		# 同一页先完整检查稳定 uid，再回退到轮换的 securityId。这样即使某个
 		# securityId 恰好与另一条记录的 uid 文本相同，也不会命中错误联系人。
 		for item in page_items:
@@ -67,7 +66,10 @@ def find_friend(
 		page += 1
 
 	if not terminated:
-		raise FriendLookupLimitExceeded("沟通列表分页遍历超过上限，未能确认联系人是否存在，请重试")
+		raise FriendLookupLimitExceeded(
+			"沟通列表分页遍历超过上限，未能确认联系人是否存在；"
+			"请先用 boss chat 取到稳定 uid 再查询，不要重放同一 security_id 查询"
+		)
 	return None, None
 
 

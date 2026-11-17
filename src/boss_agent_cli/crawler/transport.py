@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import socket
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ContextManager, Protocol
 from urllib.parse import parse_qs, quote, urlsplit
@@ -19,7 +21,12 @@ from boss_agent_cli.api.request_budget import (
 	is_request_stop,
 	retry_after_seconds,
 )
-from boss_agent_cli.crawler.controls import CrawlRuntimeUnavailable
+from boss_agent_cli.crawler.controls import (
+	CrawlProfileBusy,
+	CrawlProfilePathInvalid,
+	CrawlRuntimeUnavailable,
+	CrawlSessionAuthError,
+)
 from boss_agent_cli.crawler.hooks import HookInjection, HookRegistrationError, inject_hook_profile
 from boss_agent_cli.display import risk_error_message
 from boss_agent_cli.services.install_extras import EXTRA_MODULES, extras_requirement, module_available
@@ -111,6 +118,24 @@ class CrawlRiskError(RuntimeError):
 		return cls(f"平台返回{cause} code={code}: {message}。{hint}", reason=reason, platform_code=code)
 
 
+@dataclass(frozen=True)
+class SessionSeedResult:
+	"""本地 Cookie 注入结果；只保留数量、Cookie 名称与失败原因，不保留任何原值。"""
+
+	attempted: int = 0
+	injected: int = 0
+	failures: tuple[str, ...] = ()
+	navigation_error: str = ""
+
+	@property
+	def failed(self) -> bool:
+		return bool(self.failures) or bool(self.navigation_error)
+
+	@property
+	def missing(self) -> int:
+		return max(0, self.attempted - self.injected)
+
+
 class CrawlTransport(Protocol):
 	def open(self) -> list[HookInjection]: ...
 	def fetch_page(self, query: str, city_code: str, page_no: int) -> dict[str, Any]: ...
@@ -192,8 +217,18 @@ class DrissionCrawlerSession:
 		except ImportError as exc:
 			raise CrawlRuntimeUnavailable("crawl 需要 DrissionPage；请安装 boss-agent-cli[crawl]") from exc
 		options = ChromiumOptions()
-		self._profile_path = self._profile_path.resolve()
-		self._profile_path.mkdir(parents=True, exist_ok=True)
+		try:
+			self._profile_path = self._profile_path.resolve()
+			self._profile_path.mkdir(parents=True, exist_ok=True)
+		except (OSError, ValueError) as exc:
+			# 路径被同名文件占用或不可写（OSError），或含 NUL 等控制字符
+			# （ValueError）：确定性本地失败。原样上抛会被 _run 兜成
+			# status=stopped + crawl resume，重跑永远复现（Issue #1290、#1482）。
+			raise CrawlProfilePathInvalid(
+				f"采集配置目录 {self._profile_path!r} 无法创建或不是目录（{exc}）；"
+				"请检查该路径是否被同名文件占用、是否包含 NUL 等控制字符，"
+				"或修复数据目录的写权限后重试"
+			) from exc
 		port_busy = self._port_is_in_use(self._cdp_port)
 		if port_busy:
 			# risk_stopped 后会故意保留采集 Chrome；恢复时附着同一调试端口，而不是报占用。
@@ -201,23 +236,36 @@ class DrissionCrawlerSession:
 			options.existing_only(True)
 		else:
 			# 上次异常退出会留下 lock；端口空闲时清理，避免“闪一下就退出/起不来”。
+			# 但端口按 run 随机分配，端口空闲不代表配置目录空闲：另一个 run 的采集
+			# Chrome 可能正用同一个 profile，删掉它的 SingletonLock 会把两边都
+			# 搞坏（Issue #1266）。锁里记录的进程还活着时不删锁、不起第二个实例。
+			owner = self._profile_owner(self._profile_path)
+			if owner is not None:
+				raise CrawlProfileBusy(
+					f"采集配置目录 {self._profile_path} 正被运行中的采集 Chrome（pid {owner}）使用；"
+					"请等待该采集结束或先停止它，不要并发使用同一数据目录的采集浏览器，也不要删除 SingletonLock"
+				)
 			self._clear_stale_profile_locks(self._profile_path)
 			if self._chrome_path:
 				options.set_browser_path(self._chrome_path)
+			if self._user_agent:
+				# 采集 Cookie 是在登录浏览器的 UA 下取得的；新起的采集浏览器不声明
+				# 同一个 UA，平台看到的登录态与指纹就不一致。参数一直从登录态透传
+				# 到这里却从未应用，注入等于静默丢失（Issue #1413）。
+				options.set_user_agent(self._user_agent)
 			options.set_local_port(self._cdp_port)
 			options.set_user_data_path(str(self._profile_path))
 		# 采集浏览器与日常 Chrome 隔离；必须注入 boss login 的 Cookie，否则首页是登录 HTML。
 		self._page = ChromiumPage(options)
 		self._raise_if_platform_risk_page()
-		if not port_busy:
-			self._seed_session_cookies()
-		else:
-			# 附着已有窗口时仍刷新 Cookie，方便用户刚完成登录/验证。
-			self._seed_session_cookies()
+		# 注入 boss login 的 Cookie（附着已有窗口时也刷新，方便用户刚完成登录/验证）。
+		# 注入结果的失败信号必须在进入业务页之前消费：原来的 `pass`/`continue`
+		# 把本地 CDP 失败吞掉，随后登录页被误判成平台风控并写风险锁（Issue #1405）。
+		self._raise_if_seed_auth_failure(self._seed_session_cookies())
 		results = inject_hook_profile(self._page, self._hook_profile, self._hook_dir)
 		failed = [item for item in results if not item.success]
 		if failed:
-			raise HookRegistrationError(results)
+			raise HookRegistrationError(results, hook_dir=self._hook_dir)
 		self._start_joblist_listener()
 		return results
 
@@ -518,11 +566,26 @@ class DrissionCrawlerSession:
 			connection.settimeout(0.2)
 			return connection.connect_ex(("127.0.0.1", port)) == 0
 
-	def _seed_session_cookies(self) -> None:
-		"""Inject boss-login cookies into the isolated crawl profile."""
+	@staticmethod
+	def _failure_reason(error: BaseException) -> str:
+		"""异常文本只用于本地诊断：压成单行并截断，且绝不拼接 Cookie 原值。"""
+		text = str(error).replace("\r", " ").replace("\n", " ").strip()
+		if len(text) > 200:
+			text = text[:200] + "…"
+		return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+	def _seed_session_cookies(self) -> SessionSeedResult:
+		"""Inject boss-login cookies into the isolated crawl profile.
+
+		返回注入成功数与失败明细；调用方必须在进入业务页之前消费这个结果
+		（Issue #1405）。seed 导航异常只放过 stop 信号，其余记录为失败原因而
+		不再静默吞掉；真正的安全页仍由 ``_raise_if_platform_risk_page`` 抛
+		``CrawlRiskError``，风控硬边界不变。
+		"""
 		if self._page is None or not self._seed_cookies:
-			return
+			return SessionSeedResult()
 		# Ensure domain context before setting cookies.
+		navigation_error = ""
 		try:
 			with self._attempt("seed-navigation"):
 				self._page.get("https://www.zhipin.com/")
@@ -531,6 +594,7 @@ class DrissionCrawlerSession:
 		except Exception as error:
 			if is_request_stop(error):
 				raise
+			navigation_error = self._failure_reason(error)
 		self._raise_if_platform_risk_page()
 		cookie_items = [
 			{
@@ -543,21 +607,94 @@ class DrissionCrawlerSession:
 			if name and value is not None
 		]
 		if not cookie_items:
-			return
+			return SessionSeedResult(navigation_error=navigation_error)
+		attempted = len(cookie_items)
 		set_cookies = getattr(getattr(self._page, "set", None), "cookies", None)
-		if callable(set_cookies):
-			try:
-				set_cookies(cookie_items)
-				return
-			except Exception:
-				pass
-		# Fallback: one-by-one for older DrissionPage APIs.
+		if not callable(set_cookies):
+			return SessionSeedResult(
+				attempted=attempted,
+				navigation_error=navigation_error,
+				failures=("当前 DrissionPage 版本不提供 set.cookies",),
+			)
+		try:
+			set_cookies(cookie_items)
+			return SessionSeedResult(attempted=attempted, injected=attempted, navigation_error=navigation_error)
+		except Exception:
+			# Fallback: one-by-one for older DrissionPage APIs.
+			pass
+		injected = 0
+		failures: list[str] = []
 		for item in cookie_items:
 			try:
-				if callable(set_cookies):
-					set_cookies(item)
-			except Exception:
-				continue
+				set_cookies(item)
+				injected += 1
+			except Exception as error:
+				failures.append(f"{item['name']}: {self._failure_reason(error)}")
+		return SessionSeedResult(
+			attempted=attempted,
+			injected=injected,
+			failures=tuple(failures),
+			navigation_error=navigation_error,
+		)
+
+	def _raise_if_seed_auth_failure(self, seed: SessionSeedResult) -> None:
+		"""本地登录态没准备好时按认证前置条件停止，不得落入平台风控路径。
+
+		只有「注入失败 / seed 导航失败」才进入这里；页面是真正的安全页时
+		``_raise_if_platform_risk_page`` 已经抛 ``CrawlRiskError``。为了不把
+		浏览器 / CDP 的临时故障误报成账号风险，这里还要求页面像登录页
+		（或 seed 导航本身失败）才停止（Issue #1405）。
+		"""
+		if self._page is None or not seed.failed:
+			return
+		url = str(getattr(self._page, "url", "")).lower()
+		html = str(getattr(self._page, "html", ""))[:4000].lower()
+		if not seed.navigation_error and not self._looks_like_login(url, html):
+			return
+		details: list[str] = []
+		if seed.navigation_error:
+			details.append(f"seed 首页导航失败（{seed.navigation_error}）")
+		if seed.missing:
+			failure_text = "；".join(seed.failures) if seed.failures else "注入异常"
+			details.append(f"Cookie 注入失败 {seed.missing}/{seed.attempted}（{failure_text}）")
+		raise CrawlSessionAuthError(
+			"采集浏览器无法注入 boss login 的本地 Cookie（未命中平台风控）："
+			+ "；".join(details)
+			+ "。请重新执行 boss login 并确认采集 Chrome 可正常启动后重试"
+		)
+
+	@staticmethod
+	def _profile_owner(profile_path: Path) -> int | None:
+		"""返回正在使用该配置目录的 Chrome pid；锁陈旧、跨主机或不可解析时返回 None。
+
+		Chrome 的 SingletonLock 是指向 ``<hostname>-<pid>`` 的符号链接。端口按 run
+		随机分配时两个 run 的端口互不相同，端口探测发现不了共享 profile 的另一个
+		Chrome，只有锁里的 pid 能说明配置目录正在被使用（Issue #1266）。读不出
+		或者格式不认识时按陈旧处理，保持异常退出后自动恢复的既有行为；非 POSIX
+		平台没有可读的锁目标，同样走清理路径。
+		"""
+		try:
+			target = os.readlink(profile_path / "SingletonLock")
+		except (OSError, ValueError):
+			return None
+		host, _, pid_text = target.rpartition("-")
+		if host != socket.gethostname():
+			return None
+		try:
+			pid = int(pid_text)
+		except ValueError:
+			return None
+		if pid <= 0:
+			return None
+		try:
+			os.kill(pid, 0)
+		except ProcessLookupError:
+			return None
+		except PermissionError:
+			return pid
+		except OSError:
+			return None
+		return pid
 
 	@staticmethod
 	def _clear_stale_profile_locks(profile_path: Path) -> None:
@@ -620,7 +757,9 @@ class DrissionCrawlerSession:
 		if not callable(find):
 			return
 		try:
-			if find(".job-list-box", timeout=0) is None and find(".job-card-wrapper", timeout=0) is None:
+			# DrissionPage 未命中时返回 NoneElement（__bool__ 为 False、__eq__(None)
+			# 为 True），不是 None；`is None` 会让这项风险检查永远不触发（Issue #1276）。
+			if not find(".job-list-box", timeout=0) and not find(".job-card-wrapper", timeout=0):
 				raise CrawlRiskError("页面缺少职位列表容器，疑似未登录或安全页")
 		except CrawlRiskError:
 			raise

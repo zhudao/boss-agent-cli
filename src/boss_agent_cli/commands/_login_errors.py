@@ -3,12 +3,16 @@
 import click
 
 from boss_agent_cli.api.client import PlatformRiskError
+from boss_agent_cli.api.proxy import ProxyConfigurationError
 from boss_agent_cli.display import (
 	boss_command_for_ctx,
+	error_contract_for_code,
 	login_action_for_ctx,
 	risk_error_contract,
 	risk_error_message,
+	risk_lock_persistence_actions,
 )
+from boss_agent_cli.output import is_local_io_error
 from boss_agent_cli.services.browser_runtime import is_browser_kernel_missing, patchright_install_command
 
 
@@ -36,10 +40,14 @@ def classify_login_error(exc: Exception, ctx: click.Context) -> dict[str, object
 		operator_actions: list[str],
 		recovery: str | None = None,
 	) -> dict[str, object]:
+		# recoverable 以错误码登记表为准：风控码必须报不可恢复，否则 Agent 会把
+		# 「重试登录」当成合法动作反复触发风控（Issue #1390）。未登记的码保留
+		# 登录链路既有的可重试语义。
+		recoverable, _ = error_contract_for_code(code, fallback_recoverable=True)
 		return {
 			"code": code,
 			"message": user_message,
-			"recoverable": True,
+			"recoverable": recoverable,
 			"recovery_action": recovery or recovery_action,
 			"hints": {
 				"next_actions": next_actions,
@@ -50,6 +58,16 @@ def classify_login_error(exc: Exception, ctx: click.Context) -> dict[str, object
 	if isinstance(exc, PlatformRiskError):
 		# 复用登录态的只读探测命中风控：与其他命令共用同一份终止契约，不建议重试登录。
 		recovery, hints = risk_error_contract(exc.code, ctx=ctx)
+		persistence_actions = risk_lock_persistence_actions(exc.details)
+		if persistence_actions:
+			# 锁只留在进程内时，新进程不会再被它阻止：必须让操作者知道（Issue #1270）。
+			hints = {
+				**(hints or {}),
+				"operator_actions": [
+					*((hints or {}).get("operator_actions") or []),
+					*persistence_actions,
+				],
+			}
 		return {
 			"code": exc.code,
 			# 风控信封不透传平台响应文本（可能带临时凭据），只给登记表文案。
@@ -59,6 +77,33 @@ def classify_login_error(exc: Exception, ctx: click.Context) -> dict[str, object
 			"hints": hints or None,
 			"details": exc.details or None,
 		}
+
+	if isinstance(exc, ProxyConfigurationError):
+		# 代理环境变量非法是确定性配置错误：登录链路不重试、不回退直连，
+		# 也不能把带凭据的代理 URL 透传到信封（Issue #1423）。
+		return {
+			"code": "INVALID_PARAM",
+			"message": str(exc),
+			"recoverable": False,
+			"recovery_action": "修正或清除 HTTPS_PROXY/ALL_PROXY 等代理环境变量后重试",
+			"hints": {
+				"operator_actions": [
+					"确认代理地址形如 scheme://host:port，端口为 1-65535 的整数",
+					"不使用代理时请清除 HTTPS_PROXY/ALL_PROXY 等对应环境变量；CLI 不会回退为直连",
+				]
+			},
+		}
+
+	if is_local_io_error(exc):
+		# 平台侧登录可能已经成功，但登录态没写进本地：重复扫码或检查网络都不会
+		# 改变结果，必须报确定性本地失败（Issue #1457）。
+		return payload(
+			"LOCAL_IO_ERROR",
+			f"登录成功但本地登录态保存失败: {raw_message}",
+			[],
+			["确认登录态目录可写、磁盘空间充足后重新执行登录"],
+			recovery="修正本地目录权限或磁盘空间后重新执行登录",
+		)
 
 	if isinstance(exc, ValueError):
 		# 选项互斥等用法错误：不是登录链路失败，按 INVALID_PARAM 契约返回，不建议重试登录。
@@ -73,11 +118,11 @@ def classify_login_error(exc: Exception, ctx: click.Context) -> dict[str, object
 		return payload(
 			"LOGIN_TIMEOUT",
 			f"登录等待超时: {raw_message}",
-			[f"{login_cmd} --timeout 180", "boss-chrome"],
+			[f"{login_cmd} --timeout 180"],
 			[
 				"确认二维码已完成扫码并在网页端授权登录",
 				"网络较慢时可延长超时时间后重试",
-				"如已打开本机 Chrome，可先启动带调试端口的 Chrome 再重试登录",
+				"如需复用已登录的 Chrome，请先以 --remote-debugging-port=9222 启动带调试端口的 Chrome，再重试登录",
 			],
 		)
 
@@ -95,14 +140,17 @@ def classify_login_error(exc: Exception, ctx: click.Context) -> dict[str, object
 		return payload(
 			"CDP_UNAVAILABLE",
 			f"Chrome 调试连接不可用: {raw_message}",
-			["boss-chrome", login_cmd],
+			[login_cmd],
 			[
-				"启动带调试端口的 Chrome 后重试，或去掉 --cdp 让命令自动降级到 Cookie / 扫码链路",
+				"以 --remote-debugging-port=9222 启动带调试端口的 Chrome 后重试，或去掉 --cdp 让命令自动降级到 Cookie / 扫码链路",
 				"确认 --cdp-url 指向可访问的 Chrome DevTools 地址",
 			],
 		)
 
 	if any(term in message for term in ("403", "forbidden", "风控", "risk", "rate limit", "too many")):
+		# 风控是硬边界：恢复动作取登记表原文，不能沿用 login_action_for_ctx 的
+		# 默认「重新登录」，否则信封会诱导 Agent 反复重试（Issue #1390）。
+		_, risk_recovery = error_contract_for_code("LOGIN_RISK_CONTROL")
 		return payload(
 			"LOGIN_RISK_CONTROL",
 			f"登录请求可能触发平台风控: {raw_message}",
@@ -112,6 +160,7 @@ def classify_login_error(exc: Exception, ctx: click.Context) -> dict[str, object
 				"降低请求频率，避免短时间重复登录或刷新",
 				"必要时联系平台客服确认账号是否受限",
 			],
+			recovery=risk_recovery,
 		)
 
 	if any(term in message for term in ("401", "unauthorized", "expired", "过期", "未登录")):
@@ -129,10 +178,11 @@ def classify_login_error(exc: Exception, ctx: click.Context) -> dict[str, object
 		return payload(
 			"LOGIN_CREDENTIAL_EXTRACTION_FAILED",
 			f"登录成功后提取凭证失败: {raw_message}",
-			[f"{login_cmd} --cookie-source chrome", "boss-chrome"],
+			[f"{login_cmd} --cookie-source chrome"],
 			[
 				"确认浏览器已完成登录并进入平台首页",
 				"若 Cookie 提取失败，可改用 --cookie-source 指定 chrome/firefox/edge",
+				"如需通过 CDP 复用已登录的 Chrome，请先以 --remote-debugging-port=9222 启动带调试端口的 Chrome",
 			],
 		)
 

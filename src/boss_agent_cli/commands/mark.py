@@ -3,7 +3,7 @@ import click
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._platform import get_platform_instance
-from boss_agent_cli.commands._contact_lookup import resolve_friend_or_emit
+from boss_agent_cli.commands._contact_lookup import current_friend_uid_or_emit, resolve_friend_or_emit
 from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_not_supported, handle_output, handle_platform_error_output, render_message_panel
 
 _LABEL_MAP = {
@@ -14,12 +14,34 @@ _LABEL_MAP = {
 _LABEL_NAMES = {v: k for k, v in _LABEL_MAP.items()}
 
 
+def _brief_label(value: str, limit: int = 40) -> str:
+	"""错误信息里回显的标签值：超长输入截断，信封不随输入规模膨胀（Issue #1437）。"""
+	if len(value) <= limit:
+		return value
+	return f"{value[:limit]}…（共 {len(value)} 字符）"
+
+
 def _resolve_label(label_input: str) -> int:
 	"""将标签名称或 ID 解析为数字 ID。"""
+	# 空串是任何标签名的子串，模糊匹配会把它解析成「新招呼」并真的在平台上
+	# 添加 / 移除标签（Issue #1376）；纯空白同样不可能是有效标签。
+	if not label_input.strip():
+		raise click.BadParameter(
+			f"标签不能为空。可用: {', '.join(_LABEL_MAP.keys())}"
+		)
 	if label_input in _LABEL_MAP:
 		return _LABEL_MAP[label_input]
-	if label_input.isdigit():
-		return int(label_input)
+	# 全角 / 上标数字（'①'、'²'）的 `isdigit()` 为真但 `int()` 会抛 ValueError，
+	# 落成参数错误以外的内部错误；只接受 ASCII 数字串（Issue #1306）。
+	# 长度上限：4300 位以上纯数字串让 int() 抛裸 ValueError（int_max_str_digits），
+	# 被顶层兜成可重试的 NETWORK_ERROR（Issue #1437）。标签 ID 是远端小整数。
+	if label_input.isascii() and label_input.isdigit():
+		try:
+			return int(label_input)
+		except ValueError:
+			raise click.BadParameter(
+				f"标签 ID 无效: {_brief_label(label_input)}。可用: {', '.join(_LABEL_MAP.keys())}"
+			) from None
 	for name, lid in _LABEL_MAP.items():
 		if label_input in name:
 			return lid
@@ -30,7 +52,7 @@ def _resolve_label(label_input: str) -> int:
 
 @click.command("mark")
 @click.argument("security_id", metavar="UID_OR_SECURITY_ID")
-@click.option("--label", required=True, help="标签名称（新招呼/沟通中/已约面/已获取简历/已交换电话/已交换微信/不合适/收藏）或 ID")
+@click.option("--label", required=True, help="标签名称（新招呼/沟通中/已约面/已获取简历/已交换电话/已交换微信/不合适/牛人发起/收藏）或数字 ID")
 @click.option("--remove", is_flag=True, default=False, help="移除标签（默认为添加）")
 @click.pass_context
 @handle_auth_errors("mark")
@@ -51,8 +73,17 @@ def mark_cmd(ctx: click.Context, security_id: str, label: str, remove: bool) -> 
 		friend_item = resolve_friend_or_emit(ctx, "mark", platform, security_id)
 		if friend_item is None:
 			return
-		friend_id = str(friend_item.get("uid", ""))
+		friend_id = current_friend_uid_or_emit(ctx, "mark", friend_item)
+		if friend_id is None:
+			return
 		friend_source = friend_item.get("friendSource", 0)
+		# friendSource 只是回传给标签接口的定位参数：平台字段漂移成非数字串 /
+		# 对象 / 1e400 时按缺失的默认 0 处理，与向导侧同口径（Issue #1314、#1439）。
+		# 原值直接进 httpx params 会发出一次注定失败的写请求（消耗预算、可能触发风控）。
+		try:
+			friend_source = int(friend_source or 0)
+		except (TypeError, ValueError, OverflowError):
+			friend_source = 0
 		friend_name = friend_item.get("name") or "-"
 
 		try:
