@@ -8,6 +8,16 @@ from urllib.parse import parse_qs, urlsplit
 
 from boss_agent_cli.api.endpoints import CODE_ACCOUNT_RESTRICTED, CODE_IP_RESTRICTED
 
+def is_platform_success_code(value: Any) -> bool:
+	"""按平台成功码判定 ``code``；布尔值不是状态码（Issue #1599）。
+
+	Python 的 ``False == 0`` 会把形状异常的 ``code=false`` 误判为成功，进而把
+	采集错误响应当成正常数据、把未确认的写动作标成 ``executed``。只接受整数
+	零（整数字符串零按同一业务码兼容）。
+	"""
+	return (type(value) is int and value == 0) or value == "0"
+
+
 Code37Kind = Literal["token_expired", "environment_risk"]
 
 
@@ -72,7 +82,12 @@ def classify_code_37(response: dict[str, Any]) -> Code37Kind:
 def is_security_verification_response(*, url: str = "", content_type: str = "", body: str = "") -> bool:
 	"""识别官方安全页，不把 JSON 文案或业务页面里的验证说明当作安全页。"""
 	try:
-		if urlsplit(url).path.rstrip("/") in ("/web/passport/zp/verify.html", "/web/passport/zp/security.html"):
+		parts = urlsplit(url)
+		host = parts.hostname or ""
+		is_platform_host = not parts.netloc or host == "zhipin.com" or host.endswith(".zhipin.com")
+		if is_platform_host and parts.path.rstrip("/") in (
+			"/web/passport/zp/verify.html", "/web/passport/zp/security.html"
+		):
 			return True
 	except ValueError:
 		pass

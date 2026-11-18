@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "boss-agent-cli"
-version = "3.4.82"
+version = "3.4.103"
 description = "AI Agent 专用的 BOSS 直聘求职 CLI 工具"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -152,6 +152,7 @@ exclude = [
 [[tool.mypy.overrides]]
 module = [
 	"boss_agent_cli.output",
+	"boss_agent_cli.capabilities",
 	"boss_agent_cli.config",
 	"boss_agent_cli.hooks",
 	"boss_agent_cli.digest",

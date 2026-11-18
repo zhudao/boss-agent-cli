@@ -56,6 +56,7 @@ boss --json wizard --resume <run_id>
 - `stdout` 只读 JSON 信封
 - `ok=true` 代表成功，`ok=false` 时读取 `error.code` 与 `error.recovery_action`
 - `boss schema` 除了返回 `supported_platforms` / `supported_recruiter_platforms`，还会给每个命令附带 `availability`，可直接按 `role/platform` 做工具路由
+- 只能通过 MCP 接入时，调用只读工具 `boss_schema`（参数 `format`）读取同一份能力真源，无需另开 CLI
 - `boss show <#>` 的编号绑定最近一次 `search` / `recommend` 的快照，`data.index_snapshot` 给出 `source` / `page` / `count` / `saved_at`；`search` / `recommend` 的 `pagination.index_snapshot` 返回同一份快照身份，可直接与 `show` 的字段比对。重跑搜索或翻页后旧编号会指向新结果，必须重新定位
 
 ### Agent 授权边界
@@ -83,7 +84,7 @@ CLI 中，`boss agent crawl --run-id <run_id> --resume <简历名>` 只处理已
 boss agent crawl --query "AI 工程师" --city 杭州 --pages 3 --with-detail --resume <简历名>
 ```
 
-默认不注入 Hook。只有拥有相应授权时，才可在 CLI 显式传 `--hook-profile screenshot-full --hook-dir <含 SHA256SUMS 的目录>`；项目不随包发布第三方脚本。需要立即终止时执行 `boss crawl stop <run_id>`。当 `crawl_status` 返回 `risk_stopped` 时，同 `data_dir` 的风险锁会在浏览器构造前阻断所有新采集和恢复；保留 `run_id`，由用户确认官方目标业务页恢复后执行 `boss clean --risk-lock`，再显式 `boss crawl resume <run_id>`。恢复步骤属于 `operator_actions`，Agent 不自行清锁。`budget_stopped` 需处理预算后恢复；两者均不应重新建任务或循环重试。本地状态、结果和导入仍可用。
+默认不注入 Hook。只有拥有相应授权时，才可在 CLI 显式传 `--hook-profile screenshot-full --hook-dir <含 SHA256SUMS 的目录>`；项目不随包发布第三方脚本。需要立即终止时执行 `boss crawl stop <run_id>`。当 `crawl_status` 返回 `risk_stopped` 时，同 `data_dir` 的风险锁会在浏览器构造前阻断所有新采集和恢复；保留 `run_id`，由用户确认官方目标业务页恢复后执行 `boss clean --risk-lock`，再显式 `boss crawl resume <run_id>`。恢复步骤属于 `operator_actions`，Agent 不自行清锁。`budget_stopped` 需处理预算后恢复；两者均不应重新建任务或循环重试。`throttle_stopped` 是本地共享请求预算等待超时（不是任务预算耗尽），等待后用 `crawl resume` 从断点继续。本地状态、结果和导入仍可用。
 
 同一 `run_id` 同时只允许一个执行器：另一次 `crawl start` / `crawl resume` / wizard 采集步骤还在执行时，后到者返回 `CRAWL_BUSY`，不发出请求、不推进断点，也不清除停止请求。按 `hints.next_actions` 查 `boss crawl status <run_id>`，等当前执行结束后再恢复；不要并发恢复同一个 `run_id`，也不要为了让位去 `--stop` 一次正常的执行。`status` / `results` / `stop` 不受影响，不同 `run_id` 互不阻塞；执行进程异常退出后执行权由操作系统自动释放，无须清理锁文件。
 
@@ -138,6 +139,7 @@ boss status
 - `CRAWL_BUSY`：同一 crawl `run_id` 同时只允许一次执行；另一次 `crawl start` / `crawl resume` / wizard 采集步骤还在执行时，本次调用不发出请求、不推进断点、也不清除停止请求。按 `hints.next_actions` 用 `boss crawl status <run_id>` 查看进度，等它结束后再恢复；不要并发恢复同一个 `run_id`，也不要为了让位去 `--stop` 一次正常的执行。`status` / `results` / `stop` 不受影响，不同 `run_id` 互不阻塞；执行进程异常退出后执行权由操作系统自动释放，无须清理锁文件
 - `CRAWL_UNAVAILABLE`：采集运行环境不可用，最常见的是默认安装没有带 `crawl` 可选依赖。入口在创建任务、启动后台进程之前就返回它，重试或恢复不会改变结果；按 `error.recovery_action` 安装 `boss-agent-cli[crawl]` 后重新执行原命令。
 - `INVALID_PARAM`：校正参数（城市、福利、页码等）；MCP 侧还包括未知工具名、不符合 `inputSchema` 声明类型的参数（例如把 `dry_run` 传成字符串 `"true"`；数组参数按 `items.type` 逐元素校验，错误带下标，如 `add_tags[1] 应为 string，收到 bool`），以及 `inputSchema.properties` 之外的未知参数（工具的 schema 已声明顶层 `additionalProperties: false`）。枚举参数（`format` / `sort` / `from_who` / `section` / `detail_status` / `tone` / `lang` / `type`）传显式空串会原样到达 CLI，得到带可选值列表的取值诊断，不会静默落回默认值；任意已声明参数传 `null` 与不传等价（入口在类型检查与参数映射之前剔除 `null` 值），必填参数传 `null` 按缺参返回 `INVALID_PARAM`。`boss_wizard.action` 的非法值（如 `resum`、`STOP`、空串）同样在进入 CLI 前被拒绝并列出 `run / resume / status / stop`，不会静默新建一次 workflow run；只有缺省或 `null` 才落回默认的 `run`
+- `CONFIG_INVALID`：本地配置（`config.json` / AI 配置）损坏或取值类型、枚举非法，命令在发起平台请求前停止。先按 `recovery_action` 用 `boss config reset <项>` / `boss ai config` / `boss ai local configure` 修复，再重新执行；修复前原样重跑会复现，`boss wizard` 也不会自动重试同一步
 
 缺少或写错子命令时，`hints.next_actions` 会列出各子命令的帮助命令（例如 `boss resume init --help`）。先读取帮助，再按目标与必填参数执行具体动作。
 
@@ -155,7 +157,7 @@ boss schema --format anthropic-tools  # Claude Tool Use API
 boss schema --format mcp-tools        # Model Context Protocol Tools
 ```
 
-三个工具格式均来自运行时共享的 79 个 MCP 工具目录，名称与输入参数保持一致；原生格式继续按 39 个顶层命令描述 CLI。
+三个工具格式均来自运行时共享的 80 个 MCP 工具目录，名称与输入参数保持一致；原生格式继续按 39 个顶层命令描述 CLI。
 
 输出可直接喂给对应 host，无需手写适配。
 

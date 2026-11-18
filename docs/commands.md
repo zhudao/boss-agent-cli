@@ -127,7 +127,7 @@ boss crawl resume <run_id>
 boss crawl stop <run_id>
 ```
 
-配置值在开始运行时按类型与范围校验：`max_requests` / `max_details` / `max_seconds` 必须 ≥ 1，`max_retries` 可以设为 `0` 表示不重试，`cdp_port` 必须在 1-65535 之间，`chrome_path` 必须是字符串或 `null`。`config set crawl` 在写入时即按同一组规则校验并拒绝非法值（不落盘）；手工编辑写入的错误类型 / 越界值由 `crawl run` / `start` 与 `boss wizard` 的采集动作返回 `INVALID_PARAM` 并指出配置项，不会悄悄套用默认值或落到 `INTERNAL_ERROR`。向导的采集动作只接受 `hook_profile=none`（自定义 Hook 需显式运行 `boss crawl run --hook-profile screenshot-full --hook-dir`），`pages` 输入（含恢复）要求 ≥ 1 的整数，非法值返回 `INVALID_PARAM`。
+配置值在开始运行时按类型与范围校验：`max_requests` / `max_details` / `max_seconds` 必须 ≥ 1，`max_retries` 可以设为 `0` 表示不重试，`cdp_port` 必须在 1-65535 之间，`chrome_path` 必须是字符串或 `null`。显式空 `--chrome-path`（`crawl configure` 与 `crawl run`）在写盘或创建任务之前返回 `INVALID_PARAM`，不会被当成当前目录。`config set crawl` 在写入时即按同一组规则校验并拒绝非法值（不落盘）；手工编辑写入的错误类型 / 越界值由 `crawl run` / `start` 返回 `INVALID_PARAM`，`boss wizard` 的采集动作返回 `CONFIG_INVALID`（修正后可重新执行）并指出配置项，不会悄悄套用默认值或落到 `INTERNAL_ERROR`。向导的采集动作只接受 `hook_profile=none`（自定义 Hook 需显式运行 `boss crawl run --hook-profile screenshot-full --hook-dir`），`pages` 输入（含恢复）要求 ≥ 1 的整数，非法值返回 `INVALID_PARAM`。
 
 | 命令 | 说明 |
 |------|------|
@@ -136,22 +136,26 @@ boss crawl stop <run_id>
 | `boss crawl start <query> --city <城市或代码> [...]` | 创建后台任务并立即返回 `run_id`；供本地任务调度使用 |
 | `boss crawl status <run_id>` / `boss crawl results <run_id>` | 仅读取 SQLite 中的页游标、风险状态、详情进度和已持久化职位；不打开浏览器 |
 | `boss crawl resume <run_id> [--pages N] [--with-detail] [--background]` | 从页游标、已见职位和待补详情队列恢复；`--background` 立即返回以便轮询；可提高正数页数上限并补全详情，不重复写入已完成项 |
-| `boss crawl stop <run_id>` | 请求运行中任务在下一个安全点停止并保留 checkpoint |
+| `boss crawl stop <run_id>` | 请求运行中任务在下一个安全点停止并保留 checkpoint；仅对 queued / running 生效，已结束的任务返回 `CRAWL_RUN_FINISHED` |
 | `boss crawl shortlist <run_id> (--all \| --selector <csel_...>)` | 将 crawl 结果导入原项目的本地候选池；不请求平台，保留内部职位关联和详情缓存供 `boss ai fit` 使用 |
 
-同一采集 `run_id` 同时只允许一个执行器。重叠的前台恢复返回 `CRAWL_BUSY`（`recoverable: true`，`--exit-codes sysexits` 下为 75），不发出请求、不修改断点或清除停止请求；`hints.next_actions` 只给原数据目录的 `crawl status <run_id>`，等当前执行结束后再恢复。新建采集、后台 worker 与向导采集步骤共用这项互斥；向导的失败信封与该失败任务的状态查询同样只建议查看内部采集状态。`--background` 对有待恢复工作的非排队任务先探测执行锁，再立即返回供轮询：仍被占用时返回 `running`，不另起 worker，也不清除停止请求；原 worker 已退出、锁已释放但记录仍为 `running` 时，会启动恢复并返回 `queued`。父进程在启动前释放探测锁，worker 重新取得执行权后才读取最新断点，保留已提交页面和累计预算。刚进入 `queued` 的任务继续等待原 worker；排队超过 30 秒仍未被接手（后台进程被强制终止等）时，同样先探测执行锁——仍被占用返回 `running`，空闲则重新启动 worker，此时 `crawl status` 的 `hints.next_actions` 也会给出 `crawl resume <run_id> --background`。`status` / `results` / `stop` 在执行期间照常可用；锁按 `run_id` 隔离，进程退出后由操作系统释放，不需手工删除锁文件。同一数据目录的采集共用一个 Chrome 配置目录（`crawl/chrome-profile`）：另一个 run 的采集 Chrome 仍在运行时，新 run 不会删除它的 `SingletonLock`，而是返回 `CRAWL_PROFILE_BUSY`（`recoverable: true`），不发出请求；只有锁里记录的进程已不存在时才按陈旧锁清理。无法准备执行锁时返回 `LOCAL_IO_ERROR`，不发出请求。Python API 的 `CrawlService.resume()` 在任务被占用时抛出 `CrawlBusyError`，可在当前执行结束后再次恢复。
+同一采集 `run_id` 同时只允许一个执行器。重叠的前台恢复返回 `CRAWL_BUSY`（`recoverable: true`，`--exit-codes sysexits` 下为 75），不发出请求、不修改断点或清除停止请求；`hints.next_actions` 只给原数据目录的 `crawl status <run_id>`，等当前执行结束后再恢复。新建采集、后台 worker 与向导采集步骤共用这项互斥；向导的失败信封与该失败任务的状态查询同样只建议查看内部采集状态。`--background` 对有待恢复工作的非排队任务先探测执行锁，再立即返回供轮询：仍被占用时返回 `running`，不另起 worker，也不清除停止请求；原 worker 已退出、锁已释放但记录仍为 `running` 时，会启动恢复并返回 `queued`。父进程在启动前释放探测锁，worker 重新取得执行权后才读取最新断点，保留已提交页面和累计预算。刚进入 `queued` 的任务继续等待原 worker；排队超过 30 秒仍未被接手（后台进程被强制终止等）时，同样先探测执行锁——仍被占用返回 `running`，空闲则重新启动 worker，此时 `crawl status` 的 `hints.next_actions` 也会给出 `crawl resume <run_id> --background`。`status` / `results` / `stop` 在执行期间照常可用；锁按 `run_id` 隔离，进程退出后由操作系统释放，不需手工删除锁文件。同一数据目录的采集共用一个 Chrome 配置目录（`crawl/chrome-profile`）：另一个 run 的采集 Chrome 仍在运行时，新 run 不会删除它的 `SingletonLock`，而是返回 `CRAWL_PROFILE_BUSY`（`recoverable: true`），不发出请求；只有锁里记录的进程已不存在或 pid 无法解析（如超大数值）时才按陈旧锁清理。无法准备执行锁时返回 `LOCAL_IO_ERROR`，不发出请求。Python API 的 `CrawlService.resume()` 在任务被占用时抛出 `CrawlBusyError`，可在当前执行结束后再次恢复。
 
 后台 worker 的输出不回传给调用方，所以登录态由父进程先查：`crawl start` 与需要启动 worker 的 `crawl resume --background` 在本地登录态缺失、没有 Cookie 或缺少 `wt2` 时直接返回 `AUTH_REQUIRED`，不创建任务、不解除停止请求、不启动进程；参数错误仍先于登录检查报出，已完成或仍在排队的任务不受影响。worker 若在接手之前退出（登录态在启动瞬间失效、风险锁等），而任务仍显示 `queued` 或 `running`，会把它落为 `stopped` 并在 `error` 写明「后台任务未能开始执行」与错误码，`crawl status` 可见，登录或解除阻断后用 `crawl resume` 重新启动；任务已处于终态（上一次执行的结果）或另一个执行器持有执行权时不改写，此时再次执行 `crawl resume --background` 会由父进程报出原因。
 
 采集在浏览器打开、抓页或补详情时收到 `SystemExit` / `KeyboardInterrupt` 等退出信号，会先保存 `stopped`、页游标、待补详情和已消耗预算，再向外传播原退出信号；不会把未完成任务标为 `completed`。显式执行 `crawl resume <run_id>` 后续跑未完成页面和详情，已提交页面不重抓。
 
+采集浏览器没起来（Chrome 未安装、`chrome_path` 配错、调试端口被占用或上次保留的窗口已关闭）属于确定性本地失败：`crawl run/resume`、`crawl start` 与 `agent crawl` 返回 `CRAWL_UNAVAILABLE`，本次没有发出请求，恢复指引检查 Chrome 安装、`chrome_path` 与调试端口，而不是只提示安装可选依赖。配置 `BOSS_EGRESS_PROBE_URL` 后若出口地区与客户端声明的语言/时区矛盾，采集在创建任务前以 `EGRESS_CONTRADICTION`（`recoverable: false`）停止，`error.details.egress` 列出矛盾项。本地共享请求预算等待超时（另一个进程占用或平台冷却未结束）落成 `throttle_stopped`：run 自身预算没有耗尽，等待后用 `crawl resume` 从断点继续；只有 `CrawlLimitExceeded`（任务预算耗尽）才是 `budget_stopped` 并需要新建任务。
+
 采集任务的状态、结果、停止、恢复及候选池后继命令，以及 `checkpoint.resume_command`，都显式携带原 `--data-dir` 的绝对路径；换一个工作目录执行提示时仍定位同一份本地任务。任务不存在或记录损坏时的核对提示同样保留目录。采集服务、向导采集动作与 `agent crawl` 返回的任务恢复指引也保留目录，避免误读或停止默认目录中的同名任务。风险停止仍须先完成人工恢复；人工解锁提示中的 `boss clean --risk-lock` 也携带原数据目录，解锁后显式执行恢复命令。运行结果 `data.error` 与错误信封 `error.message` 里的同类命令（如「由用户执行 `boss clean --risk-lock`」）同样改写为原数据目录的完整命令。
 
 `crawl results` 的后继导入命令还携带本次返回职位的全部 `--selector`，只导入所见结果；`--page` / `--detail-status` 的筛选范围因此保持不变。空结果改为提示查看同一 run 的 `crawl status`。路径、run_id 和 selector 按 shell 参数转义，终端与信封使用同一条命令。
 
-默认 Hook 为 `none`。`screenshot-full` 仅在用户明确选择 `--hook-profile screenshot-full --hook-dir <目录>` 时启用；目录必须由用户拥有相应授权，并提供原始 7 个脚本及 `SHA256SUMS`。缺少 `--hook-dir` 时 `crawl run` / `crawl start` 在创建任务、打开浏览器之前返回 `INVALID_PARAM`。项目不再发布这些第三方脚本，运行前逐文件校验 SHA-256 并记录脚本标识与摘要；不记录 Cookie、请求头或完整请求体。
+默认 Hook 为 `none`。`screenshot-full` 仅在用户明确选择 `--hook-profile screenshot-full --hook-dir <目录>` 时启用；目录必须由用户拥有相应授权，并提供原始 7 个脚本及 `SHA256SUMS`。缺少 `--hook-dir` 时 `crawl run` / `crawl start` 在创建任务、打开浏览器之前返回 `INVALID_PARAM`；`--hook-dir` 与其它 profile 同时给出或显式为空时同样在创建任务之前拒绝，不会静默忽略目录。项目不再发布这些第三方脚本，运行前逐文件校验 SHA-256 并记录脚本标识与摘要；不记录 Cookie、请求头或完整请求体。
 
-候选人侧可用 `boss agent crawl --run-id <run_id> --resume <简历名>` 执行“完成的 crawl → shortlist → ai fit → 按匹配分排序”，不会启动浏览器；`boss agent crawl --query <关键词> --city <城市> --resume <简历名>` 会新建真实采集，与 `crawl run` 一样把 `boss login` 的登录 Cookie 与 User-Agent 注入独立采集浏览器；本地登录态缺失、没有 Cookie 或缺少 `wt2` 时在打开浏览器之前返回 `AUTH_REQUIRED`，不创建任务。已有同 `data_dir` 风险锁时，run/start/resume 和 agent 的新采集在浏览器构造、连接及后台拉起前阻断；resume 只恢复自身断点，不能清锁。新风险保持 `risk_stopped` outcome、已采集队列与 checkpoint，并在 `data.risk_lock` 保留结构化原因和可用业务码，未知业务码为 `null`；人工恢复步骤只放在 `hints.operator_actions`，不提供可自动执行的恢复动作。状态、结果、本地 shortlist 导入和读取已完成 run 仍可用。
+候选人侧可用 `boss agent crawl --run-id <run_id> --resume <简历名>` 执行“完成的 crawl → shortlist → ai fit → 按匹配分排序”，不会启动浏览器；`boss agent crawl --query <关键词> --city <城市> --resume <简历名>` 会新建真实采集，与 `crawl run` 一样把 `boss login` 的登录 Cookie 与 User-Agent 注入独立采集浏览器；本地登录态缺失、没有 Cookie 或缺少 `wt2` 时在打开浏览器之前返回 `AUTH_REQUIRED`，不创建任务。已有同 `data_dir` 风险锁时，run/start/resume 和 agent 的新采集在浏览器构造、连接及后台拉起前阻断；resume 只恢复自身断点，不能清锁。新风险保持 `risk_stopped` outcome、已采集队列与 checkpoint，并在 `data.risk_lock` 保留结构化原因和可用业务码，未知业务码为 `null`；人工恢复步骤只放在 `hints.operator_actions`，不提供可自动执行的恢复动作。状态、结果、本地 shortlist 导入和读取已完成 run 仍可用。`--run-id` 只分析已有任务：同时给出 `--city`、显式 `--pages` 或 `--with-detail` 时在读取任务之前返回 `INVALID_PARAM`，不再静默丢弃这些新采集参数；`--run-id` 与 `--query` 同时出现（含空串）按互斥参数拒绝，显式空 `--query` 同样在创建任务之前拒绝。
+
+列表项缺少 `securityId` 时不会伪造空详情：该职位保持待补状态，详情状态记为 `missing-security-id`，可用 `crawl results --detail-status pending` 查看，后续恢复会重试补全。
 
 每页完成后更新 `<data-dir>/crawl/runs/<run_id>/jobs.json`、`jobs.csv` 和带筛选/冻结首行的 `jobs.xlsx`。XLSX 保留完整值但所有数据行固定为单行和统一行高，长内容仅在表格中截断显示。JSON/CSV/XLSX 不包含 `security_id`、职位 ID、selector、招聘者姓名或职位；`crawl results` 同样不暴露平台标识与招聘者信息，但会返回供本地导入使用的 selector。真实平台标识保留在受限本地 SQLite 状态，`boss clean --privacy` 会删除 crawl 运行、预算和导出。风险码 `31` / `32` / `35` / `36` / `37`、code `38` 的身份资料流程、安全页、职位列表容器异常、预算耗尽或 stop 请求都会保存断点并停止；code `38` 不等同于验证码。stdout 始终只输出 JSON 信封和恢复命令。
 
@@ -175,7 +179,7 @@ boss crawl stop <run_id>
 | `boss chat` | 查看沟通列表，支持分页和来源筛选 |
 | `boss chatmsg <uid-or-sid> [--raw]` | 查看聊天历史；优先使用 `boss chat` 输出的稳定 `uid`，`--raw` 保留结构化 body、链接和职位卡片字段 |
 | `boss chat-summary <uid-or-sid>` | 基于聊天历史生成结构化摘要；优先使用稳定 `uid` |
-| `boss mark <uid-or-sid> --label X` | 添加或移除联系人标签；优先使用稳定 `uid` |
+| `boss mark <uid-or-sid> --label X` | 添加或移除联系人标签；优先使用稳定 `uid`；标签名或对应数字 ID（1/2/3/4/5/6/7/8/11），其他数字会被拒绝 |
 | `boss interviews` | 面试邀请 |
 | `boss history` | 浏览历史 |
 
@@ -196,7 +200,7 @@ boss crawl stop <run_id>
 | `boss pipeline` | 聚合会话和面试数据生成候选进度 |
 | `boss follow-up` | 筛选需要跟进的会话和面试项 |
 | `boss digest` | 汇总新增职位、待跟进会话和面试项 |
-| `boss watch add/list/remove/run` | 保存、列出、删除或执行增量职位监控 |
+| `boss watch add/list/remove/run` | 保存、列出、删除或执行增量职位监控（`run` 的点名与 `--all` 只能选一个） |
 | `boss shortlist add/list/annotate/compare/remove` | 本地候选池：支持标签、备注和离线对比 |
 | `boss favorites list/sync` | 读取 BOSS 职位收藏并呈现有效状态；sync 只导入明确有效职位（按职位去重、刷新动态访问 ID，保留首次收藏时间） |
 | `boss preset add/list/remove` | 搜索预设 |
@@ -208,6 +212,8 @@ boss crawl stop <run_id>
 `favorites` 与 `shortlist` 的 `hints.next_actions` 保留原 `--data-dir` 与平台：从收藏预览继续翻页、同步，再读取或比较候选池时，始终使用同一账号与本地目录。`shortlist` 参数错误时的恢复命令也保留目录；加入后的删除提示和缺失条目的重建提示会对两个标识按 shell 参数转义，可直接复制执行。
 
 `boss shortlist add <sid> <jid> --lid <lid>` 可保存与 `sid` 同一列表项的访问上下文，`list` / `compare` 会返回该值；crawl 和 favorites 导入也保留对应上下文，favorites 预览继续脱敏。`lid` 可省略，保存不代表其仍有效，不推断有效期或跨账号身份。
+
+`boss shortlist annotate` 至少需要一个非空 `--add-tag` / `--remove-tag` 或 `--note`；空标签与空 `--tag` 会返回 `INVALID_PARAM`，不会静默变成「没有过滤」或 `updated: true`。`--note ""` 仍表示清空备注。
 
 `history` / `favorites list` 的 `pagination.has_more` 与 `recommend` / `chat` 同一口径：只有平台返回布尔 `hasMore` 时才是 `true` / `false`；缺失或类型不明确时为 `null`、`has_more_source=unknown`，不会默认成 `false`，也不提示下一页。`total` 始终是本页返回条数（`total_kind=returned_page_count`）。
 
@@ -269,9 +275,9 @@ boss hr location 10001 --yes
 
 招聘自动化命令的后继与恢复提示显式携带原 `--data-dir` 与 `--role recruiter`：`agent run` / `train` / `stats` / `control` / `stop` 与 `agent review list|approve|reject`、`agent pending list` 的 `hints.next_actions`、终端 `next_steps`、`agent control` 返回的 `data.commands`，以及复核项缺失、`automation` 配置损坏时的 `recovery_action` 都指回同一份 `automation/` 状态。`agent` 组不在 `hr` 组下，重放招聘者命令必须显式带角色，否则会按候选人角色读取另一套本地状态。候选人侧的 `agent crawl` 后继命令只保留目录、不强制角色；AI 未配置时给出的 `ai config` 与 AI 匹配失败后的重试命令同样保留目录。
 
-在同一浏览器、同一账号完成官方验证并确认原先受阻页面正常后，由操作者明确恢复：`boss --role recruiter agent run --resume`。该选项解除本地停止状态并复用已确认动作与队列，不代表平台风险已经解除；普通 `agent run` 不解锁。MCP `boss_agent_run` 的 `resume` 默认 `false`，Agent 只有收到操作者明确恢复指令后才可设置为 `true`。wizard 和 crawl 的可恢复 run 继续使用各自的 `--resume <run_id>` / `crawl resume <run_id>`；已被 `wizard --stop` 置为 `stopped` 的 run 保持终止，应新建 workflow 或恢复其内部任务。`wizard --stop <run_id>` 可重复执行：外层停止已经落盘、内部采集停止尚未写完时，重试会补齐停止传播，不会恢复或重跑业务步骤；不存在或已完成的任务仍返回 `WORKFLOW_NOT_FOUND`。结果未知的写动作（`ACTION_UNCONFIRMED`，或平台已成功但本地记账失败）会把 `replay_safe: false` 写入步骤错误；`--resume` 不会重跑该步骤，只返回原失败与核对指引，确认平台实际状态后应新建 workflow。写请求发出之前，该动作的「结果未知」与核对命令就已经落在执行中的步骤上：执行进程在结果确认前被终止（被 kill、终端关闭、断电）时，步骤会停在 `running` 但带有这条记录，`--resume` 同样不重放，而是把步骤与 run 记为失败并返回 `ACTION_UNCONFIRMED`；只读步骤与尚未走到写请求的中断照常重跑。执行期间查询 `--status` 看到 `running` 步骤带 `ACTION_UNCONFIRMED` 即表示该写请求在途。失败的 run 若待执行步骤的结果无法重放（`replay_safe: false`），`--status` / `--stop` 的 `hints.next_actions` 不再给 `--resume`，只给 `--status` 与新建 workflow；与 TTY「恢复已有任务」列表的筛选口径一致。同一数据目录上的并发 `agent run` 由执行锁串行化：另一个进程正在执行时，本次调用在发出任何请求前返回 `AUTOMATION_RUN_BUSY`；`agent review approve|reject` 同样与执行中的周期互斥，避免整文件回写的旧快照吞掉刚入队的动作。执行周期内若控制锁被 `agent stop` 等命令占用，平台动作可能已经发出：此时返回 `LOCAL_STATE_WRITE_FAILED`（`replay_safe: false`），恢复指引为先核对官方页面、不自动重发；队列里已确认的动作不会重发，但熔断状态可能落后。`--dry-run` 与 `--resume` 入口的冲突没有产生平台动作，仍返回 `AUTOMATION_BUSY`。
+在同一浏览器、同一账号完成官方验证并确认原先受阻页面正常后，由操作者明确恢复：`boss --role recruiter agent run --resume`。该选项解除本地停止状态并复用已确认动作与队列，不代表平台风险已经解除；普通 `agent run` 不解锁。MCP `boss_agent_run` 的 `resume` 默认 `false`，Agent 只有收到操作者明确恢复指令后才可设置为 `true`；恢复必须显式传 `dry_run=false`，与预览（默认 `dry_run=true`）同时给出会在入口返回 `INVALID_PARAM`。wizard 和 crawl 的可恢复 run 继续使用各自的 `--resume <run_id>` / `crawl resume <run_id>`；已被 `wizard --stop` 置为 `stopped` 的 run 保持终止，应新建 workflow 或恢复其内部任务。`wizard --stop <run_id>` 可重复执行：外层停止已经落盘、内部采集停止尚未写完时，重试会补齐停止传播，不会恢复或重跑业务步骤；不存在的任务仍返回 `WORKFLOW_NOT_FOUND`；已完成的任务返回 `WORKFLOW_ALREADY_FINISHED`，给出 `wizard --status <run_id>` 的结果读取指引。结果未知的写动作（`ACTION_UNCONFIRMED`，或平台已成功但本地记账失败）会把 `replay_safe: false` 写入步骤错误；`--resume` 不会重跑该步骤，只返回原失败与核对指引，确认平台实际状态后应新建 workflow。写请求发出之前，该动作的「结果未知」与核对命令就已经落在执行中的步骤上：执行进程在结果确认前被终止（被 kill、终端关闭、断电）时，步骤会停在 `running` 但带有这条记录，`--resume` 同样不重放，而是把步骤与 run 记为失败并返回 `ACTION_UNCONFIRMED`；只读步骤与尚未走到写请求的中断照常重跑。执行期间查询 `--status` 看到 `running` 步骤带 `ACTION_UNCONFIRMED` 即表示该写请求在途。失败的 run 若待执行步骤的结果无法重放（`replay_safe: false`），`--status` / `--stop` 的 `hints.next_actions` 不再给 `--resume`，只给 `--status` 与新建 workflow；与 TTY「恢复已有任务」列表的筛选口径一致。同一数据目录上的并发 `agent run` 由执行锁串行化：另一个进程正在执行时，本次调用在发出任何请求前返回 `AUTOMATION_RUN_BUSY`；`agent review approve|reject` 同样与执行中的周期互斥，避免整文件回写的旧快照吞掉刚入队的动作。执行周期内若控制锁被 `agent stop` 等命令占用，平台动作可能已经发出：此时返回 `LOCAL_STATE_WRITE_FAILED`（`replay_safe: false`），恢复指引为先核对官方页面、不自动重发；队列里已确认的动作不会重发，但熔断状态可能落后。`--dry-run` 与 `--resume` 入口的冲突没有产生平台动作，仍返回 `AUTOMATION_BUSY`。
 
-MCP 的长运行使用异步子进程，运行期间仍能调用停止/状态工具。取消或超时会尝试中断并回收子进程；写操作被强制终止后可能有未知副作用，`error.details.outcome_unknown=true` 时不可自动重试；只读工具（如 search / show / status）返回 `outcome_unknown=false` 与 `replay_safe=true`，确认子进程已退出后可直接重试。`CLI_ERROR` 同样带这组字段：底层 `boss` 没能启动（不在 MCP server 的 `PATH` 中、`--boss-bin` 路径有误）时进程从未运行，返回 `outcome_unknown=false` 并提示修正安装或 `boss-mcp --boss-bin`；子进程运行后没有输出 JSON 信封时，写工具按结果未知处理（`outcome_unknown=true`），只读工具为 `outcome_unknown=false`。正常返回的 wizard 超时保留可恢复结果，MCP 等待覆盖其显式超时及保存进度的宽限期。
+MCP 的长运行使用异步子进程，运行期间仍能调用停止/状态工具。取消或超时会尝试中断并回收子进程；写操作被强制终止后可能有未知副作用，`error.details.outcome_unknown=true` 时不可自动重试；只读工具（如 search / show / status）返回 `outcome_unknown=false` 与 `replay_safe=true`，确认子进程已退出后可直接重试。`CLI_ERROR` 同样带这组字段：底层 `boss` 没能启动（不在 MCP server 的 `PATH` 中、`--boss-bin` 路径有误）时进程从未运行，返回 `outcome_unknown=false` 并提示修正安装或 `boss-mcp --boss-bin`；子进程运行后没有输出 JSON 信封时，写工具按结果未知处理（`outcome_unknown=true`），只读工具为 `outcome_unknown=false`。正常返回的 wizard 超时保留可恢复结果，MCP 等待覆盖其显式超时及保存进度的宽限期，并按 900 秒封顶；太长的 wizard 超时不会让宿主无限期等待。工具入口还会按 `inputSchema` 校验条件必填字符串、数值上下界与数组元素长度，空 `run_id` / `job_id` / 标签、越界数值都在调用 CLI 之前返回 `INVALID_PARAM`。
 
 平台要求招聘者先在会话里发过消息，换电话/换微信按钮才会解锁（求简历不受限）。交换前会先看按钮组件是否处于禁用状态（`disabled` 属性、`aria-disabled`、`disabled`/`gray` 等 class、`pointer-events: none`，或组件 props/data 里的禁用标记）；页面上判断不了时，再看动作前读到的完整聊天记录里有没有你发出的消息。确定未解锁时不调用页面交换动作，直接返回 `EXCHANGE_NOT_AVAILABLE`（`recoverable=true`），先回复候选人再试即可；信号拿不准时不拦截，按原流程执行。
 
@@ -352,7 +358,7 @@ boss config set platform zhipin
 boss --platform zhipin config set platform zhipin
 ```
 
-结构化配置项 `automation`、`crawl` 必须以 JSON object 传值，例如 `boss config set automation '{"mode": "training"}'`；标量文本会被拒绝并返回 `INVALID_PARAM`，不会写入配置文件。`automation` 的内容还会按运行时解析器校验，非法枚举或数值（如 `mode` 拼错、阈值不是数字）同样返回 `INVALID_PARAM` 且不落盘。手工编辑 `config.json` 造成该键不是对象或 `automation` 内容非法时，`boss agent run` / `train` 返回 `INVALID_PARAM` 并给出 `boss config reset automation` 修复入口，不再以 traceback 退出。`config.json` 本身读不出来（权限不足、路径被同名目录占用）时，任何命令都在启动阶段返回 `INVALID_PARAM` 并在消息里给出文件路径；写配置失败（目录只读、磁盘已满）返回 `LOCAL_IO_ERROR`，同样不落盘、不以 traceback 退出。文件内容不是合法 JSON 或不是对象时同样在启动阶段返回 `INVALID_PARAM`，消息给出文件路径与出错行列；这类损坏需要手动修正或删除该文件（删除后所有配置回到默认值），`config set/reset` 本身也依赖可读取的配置文件。
+结构化配置项 `automation`、`crawl` 必须以 JSON object 传值，例如 `boss config set automation '{"mode": "training"}'`；标量文本会被拒绝并返回 `INVALID_PARAM`，不会写入配置文件。`automation` 的内容还会按运行时解析器校验，非法枚举或数值（如 `mode` 拼错、阈值不是数字）同样返回 `INVALID_PARAM` 且不落盘。手工编辑 `config.json` 造成该键不是对象或 `automation` 内容非法时，`boss agent run` / `train` 返回 `CONFIG_INVALID` 并给出 `boss config reset automation` 修复入口，不再以 traceback 退出。`config.json` 本身读不出来（权限不足、路径被同名目录占用）时，任何命令都在启动阶段返回 `INVALID_PARAM` 并在消息里给出文件路径；写配置失败（目录只读、磁盘已满）返回 `LOCAL_IO_ERROR`，同样不落盘、不以 traceback 退出。文件内容不是合法 JSON 或不是对象时同样在启动阶段返回 `INVALID_PARAM`，消息给出文件路径与出错行列；这类损坏需要手动修正或删除该文件（删除后所有配置回到默认值），`config set/reset` 本身也依赖可读取的配置文件。
 
 ### 共享请求预算与冷却
 
@@ -360,7 +366,7 @@ boss --platform zhipin config set platform zhipin
 
 | 配置项 | 默认值 | 含义 |
 | --- | --- | --- |
-| `request_delay` | `[1.5, 3.0]` | 实例内间隔范围；高斯采样限制在该范围，额外停顿仍可能延长间隔 |
+| `request_delay` | `[30.0, 60.0]` | 实例内间隔范围；高斯采样限制在该范围，额外停顿仍可能延长间隔 |
 | `request_max_per_minute` | `20` | 共享滑动 60 秒窗口内的主动操作上限，必须为正整数 |
 | `request_wait_timeout` | `30.0` | 每次申请执行锁、节流、预算和冷却的总等待上限（秒）；workflow 截止时间更早时优先停止 |
 | `request_budget_dir` | `null` | 默认使用当前 `data_dir`；绝对路径可将多个数据目录显式加入同一预算组 |
@@ -379,7 +385,7 @@ HTTP `429` 或业务 code `9` 会保存共享冷却，支持 `Retry-After` 的�
 
 计量覆盖接入预算的 HTTP dispatch、浏览器 fetch / 首页导航 / 招聘者前端动作、附件下载，以及 crawl 的导航、分页动作、页面 fetch 和 CDP fallback；不同尝试分别计数。这是主动操作预算：一个页面动作可能产生多条网站请求，浏览器自主资源、轮询、自动重定向和认证启动内部请求未逐包计量，也不会按公网 IP 自动发现或合并其他进程。该机制限制本地负载，不保证平台接受访问，也不解除平台封禁。
 
-`--delay`、`request_delay` 和 `batch_greet_delay` 必须是有限数值且满足 `0 <= 下限 <= 上限`；非法预算配置返回 `INVALID_PARAM`，不会写入配置文件。已有非法配置仍可通过 `config set/reset` 修复。
+`--delay`、`request_delay` 和 `batch_greet_delay` 必须是有限数值且满足 `0 <= 下限 <= 上限`；非法预算配置返回 `INVALID_PARAM`，不会写入配置文件。已有非法配置仍可通过 `config set/reset` 修复。显式 `--delay ""` / `--cdp-url ""` 同样按参数错误拒绝，不会回落到配置文件；只有省略选项时才使用已保存的值。
 
 ## 搜索筛选参数详解
 

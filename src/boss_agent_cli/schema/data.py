@@ -2,6 +2,7 @@
 
 from boss_agent_cli.api.browser_source import POLICIES as BROWSER_SOURCES
 from boss_agent_cli.api.endpoints import INDUSTRY_CODES
+from boss_agent_cli.capabilities import ALL_CAPABILITIES
 from boss_agent_cli.platforms import list_platforms
 from boss_agent_cli.schema.error_codes import ERROR_CODES
 
@@ -55,19 +56,7 @@ SCHEMA_DATA = {
 					"type": "string",
 					"default": None,
 					"description": "按现有本地能力矩阵反查平台状态；返回 available / not_supported，blocked_by_policy 仅保留空兼容分组",
-					"choices": [
-						"search",
-						"detail",
-						"recommend",
-						"me",
-						"status",
-						"greet",
-						"apply",
-						"shortlist",
-						"stats",
-						"config",
-						"schema",
-					],
+					"choices": list(ALL_CAPABILITIES),
 				},
 			},
 		},
@@ -193,7 +182,7 @@ SCHEMA_DATA = {
 				"--welfare": {
 					"type": "string",
 					"default": None,
-					"description": "福利筛选关键词（如 双休、五险一金）。启用后会逐个检查职位详情，自动翻页直到找到匹配结果",
+					"description": "福利筛选关键词（如 双休、五险一金）。启用后会逐个检查职位详情，最多自动翻页 5 页；达到上限仍未匹配时返回已扫描结果",
 					"examples": ["双休", "五险一金", "年终奖", "餐补", "住房补贴"],
 				},
 				"--active": {
@@ -366,7 +355,7 @@ SCHEMA_DATA = {
 					"description": "输出格式",
 					"enum": ["html", "csv", "json"],
 				},
-				"-o, --output": {"type": "string", "default": None, "description": "输出文件路径（不指定则输出到 stdout JSON 信封）"},
+				"-o, --output": {"type": "string", "default": None, "description": "输出文件路径；CSV/JSON 不指定时输出到 stdout JSON 信封，HTML 不指定时直出 stdout（--json 下放入 data.content）"},
 				"--include-private": {
 					"type": "bool",
 					"default": False,
@@ -493,8 +482,12 @@ SCHEMA_DATA = {
 				"--label": {
 					"type": "string",
 					"required": True,
-					"description": "标签名称或数字 ID（见 boss schema 的 enum；数字 ID 与标签名一一对应）",
-					"enum": ["新招呼", "沟通中", "已约面", "已获取简历", "已交换电话", "已交换微信", "不合适", "牛人发起", "收藏"],
+					"description": "标签名称或与之一一对应的数字 ID（1/2/3/4/5/6/7/8/11）；其他数字会被拒绝（见 boss schema 的 enum）",
+					"enum": [
+						"新招呼", "沟通中", "已约面", "已获取简历", "已交换电话",
+						"已交换微信", "不合适", "牛人发起", "收藏",
+						"1", "2", "3", "4", "5", "6", "7", "8", "11",
+					],
 				},
 				"--remove": {"type": "boolean", "default": False, "description": "移除标签（默认为添加）"},
 			},
@@ -577,9 +570,9 @@ SCHEMA_DATA = {
 				"run": {
 				"description": "执行一条或全部 watch，把新增职位写入本地缓存。",
 					"args": [
-						{"name": "name", "required": False, "description": "只运行指定 watch；省略时运行全部"},
+						{"name": "name", "required": False, "description": "要运行的 watch 名称；与 --all 必须且只能选一个"},
 					],
-					"--all": {"type": "bool", "default": False, "description": "跑所有已保存 watch；风控命中时停止后续 watch"},
+					"--all": {"type": "bool", "default": False, "description": "运行全部已保存 watch（不能与 watch 名称同时使用）；风控命中时停止后续 watch"},
 				},
 			},
 			"subcommands": {
@@ -594,8 +587,8 @@ SCHEMA_DATA = {
 			"args": [],
 			"options": {
 				"configure": {
-				"description": "设置 crawl 专用 Chrome 和 Hook 配置。",
-					"--chrome-path": {"type": "string", "default": None, "description": "chrome.exe 路径"},
+				"description": "设置 crawl 专用 Chrome、调试端口与请求预算。",
+					"--chrome-path": {"type": "string", "default": None, "minLength": 1, "description": "chrome.exe 路径；省略时保留当前配置，空字符串会被拒绝"},
 					"--port": {"type": "int", "default": None, "minimum": 1, "maximum": 65535, "description": "Chrome 远程调试端口（1-65535）"},
 					"--max-requests": {"type": "int", "default": None, "minimum": 1, "description": "每个 crawl run 的总请求上限（≥1）"},
 					"--max-details": {"type": "int", "default": None, "minimum": 1, "description": "每个 crawl run 的详情请求上限（≥1）"},
@@ -619,12 +612,14 @@ SCHEMA_DATA = {
 					"--hook-dir": {
 						"type": "string",
 						"default": None,
-						"description": "screenshot-full 必填：用户已授权的原始 Hook 目录，须含 SHA256SUMS",
+						"minLength": 1,
+						"description": "与 --hook-profile screenshot-full 成对使用：该 profile 下必填，其他 profile 下给出会被拒绝；用户已授权的原始 Hook 目录须含 SHA256SUMS",
 					},
 					"--chrome-path": {
 						"type": "string",
 						"default": None,
-						"description": "覆盖配置的 Chrome 可执行文件路径",
+						"minLength": 1,
+						"description": "覆盖配置的 Chrome 可执行文件路径；省略时读取 crawl 配置，空字符串会被拒绝",
 					},
 					"--port": {
 						"type": "int",
@@ -699,7 +694,8 @@ SCHEMA_DATA = {
 					"--hook-dir": {
 						"type": "string",
 						"default": None,
-						"description": "与 screenshot-full 一起显式指定的用户脚本目录，须含 SHA256SUMS",
+						"minLength": 1,
+						"description": "与 --hook-profile screenshot-full 成对使用：该 profile 下必填，其他 profile 下给出会被拒绝；用户脚本目录须含 SHA256SUMS",
 					},
 				},
 				"status": {
@@ -709,7 +705,7 @@ SCHEMA_DATA = {
 					],
 				},
 				"stop": {
-				"description": "请求运行中的 crawl 在下一安全点停止并保留 checkpoint。",
+				"description": "请求 queued / running 的 crawl 在下一安全点停止并保留 checkpoint；已结束的任务返回 CRAWL_RUN_FINISHED，不会报 stop_requested。",
 					"args": [
 						{"name": "run_id", "required": True, "description": "要停止的 crawl run 标识"},
 					],
@@ -764,17 +760,26 @@ SCHEMA_DATA = {
 							"selectors": {
 								"type": "array",
 								"items": {"type": "string"},
-								"description": "要导入的职位 selector 列表，取自 boss_crawl_results 的返回；与 all 二选一",
+								"minItems": 1,
+								"description": "要导入的职位 selector 列表，取自 boss_crawl_results 的返回；与 all 必须且只能选一个",
 							},
 							"all": {
 								"type": "boolean",
 								"default": False,
-								"description": "导入该 run 的全部可关联职位；与 selectors 二选一",
+								"description": "导入该 run 的全部可关联职位；与 selectors 必须且只能选一个",
 							},
 							"tags": {"type": "string", "description": "写入候选池的本地标签，逗号分隔"},
 							"note": {"type": "string", "description": "写入候选池的本地备注"},
 						},
 						"required": ["run_id"],
+						# CLI 用 include_all == bool(selectors) 拒绝缺省和同时给出
+						# （Issue #1577）；schema 必须编码同一约束，否则「schema 合法
+						# 但命令必失败」。
+						"anyOf": [
+							{"required": ["selectors"]},
+							{"properties": {"all": {"const": True}}, "required": ["all"]},
+						],
+						"not": {"required": ["selectors", "all"]},
 					},
 				},
 			],
@@ -888,18 +893,18 @@ SCHEMA_DATA = {
 					"--note": {"type": "string", "default": "", "description": "本地备注"},
 				},
 				"annotate": {
-				"description": "给候选池条目增删标签或替换备注；条目不存在时报错而不是静默成功。",
+				"description": "给候选池条目增删标签或替换备注；条目不存在时报错而不是静默成功；至少提供 --add-tag、--remove-tag 或 --note。",
 					"args": [
 						{"name": "security_id", "required": True, "description": "安全 ID"},
 						{"name": "job_id", "required": True, "description": "加密职位 ID"},
 					],
-					"--add-tag": {"type": "string", "default": None, "description": "添加本地标签，可重复"},
-					"--remove-tag": {"type": "string", "default": None, "description": "移除本地标签，可重复"},
-					"--note": {"type": "string", "default": None, "description": "替换本地备注"},
+					"--add-tag": {"type": "string", "default": None, "minLength": 1, "description": "添加本地标签，可重复；空值或只含逗号 / 空白会被拒绝"},
+					"--remove-tag": {"type": "string", "default": None, "minLength": 1, "description": "移除本地标签，可重复；空值或只含逗号 / 空白会被拒绝"},
+					"--note": {"type": "string", "default": None, "description": "替换本地备注；显式空串表示清空"},
 				},
 				"compare": {
 				"description": "并排比较候选池条目（可按标签过滤）。",
-					"--tag": {"type": "string", "default": None, "description": "只比较包含该本地标签的候选职位"},
+					"--tag": {"type": "string", "default": None, "minLength": 1, "description": "只比较包含该本地标签的候选职位；省略时比较全部，空值或纯空白会被拒绝"},
 				},
 				"remove": {
 				"description": "从本地候选池中移除一个职位。",
@@ -992,7 +997,7 @@ SCHEMA_DATA = {
 				"--privacy": {
 					"type": "bool",
 					"default": False,
-					"description": "清理本地敏感数据（登录会话、简历、聊天快照和导出文件）；清理后需要重新登录",
+					"description": "清理本地敏感数据（登录会话、简历、聊天快照、导出文件，以及 crawl 任务、预算与导出）；清理后需要重新登录",
 				},
 				"--risk-lock": {
 					"type": "bool",
@@ -1101,7 +1106,7 @@ SCHEMA_DATA = {
 				},
 			},
 			"subcommands": {
-				"init": "从 BOSS 直聘简历或默认模板初始化本地简历",
+				"init": "从默认模板初始化本地简历",
 				"list": "列出所有本地简历",
 				"show": "查看简历详情",
 				"edit": "编辑简历字段",
@@ -1245,16 +1250,16 @@ SCHEMA_DATA = {
 					"args": [
 						{"name": "resume_name", "required": True, "description": "要优化的本地简历名称"},
 					],
-					"--jd": {"type": "string", "default": None, "description": "目标职位描述文本或 @文件路径"},
-					"--job-id": {"type": "string", "default": None, "description": "从缓存读取职位描述的 job_id"},
+					"--jd": {"type": "string", "default": None, "description": "目标职位描述文本或 @文件路径；与 --job-id 必须且只能给一个"},
+					"--job-id": {"type": "string", "default": None, "description": "从缓存读取职位描述的 job_id；与 --jd 必须且只能给一个"},
 				},
 				"cover-letter": {
 				"description": "基于本地简历与目标岗位起草求职信/自我介绍（仅草稿，不发送）。",
 					"args": [
 						{"name": "resume_name", "required": True, "description": "本地简历名称"},
 					],
-					"--jd": {"type": "string", "default": None, "description": "目标职位描述文本或 @文件路径"},
-					"--job-id": {"type": "string", "default": None, "description": "从缓存读取职位描述的 job_id"},
+					"--jd": {"type": "string", "default": None, "description": "目标职位描述文本或 @文件路径；与 --job-id 必须且只能给一个"},
+					"--job-id": {"type": "string", "default": None, "description": "从缓存读取职位描述的 job_id；与 --jd 必须且只能给一个"},
 					"--tone": {
 						"type": "string",
 						"default": "简洁专业",
@@ -1297,12 +1302,12 @@ SCHEMA_DATA = {
 					"--resume": {
 						"type": "bool",
 						"default": False,
-						"description": "操作者确认官方验证完成后显式解除停止状态，保留已确认动作与断点；Agent 不应自行添加",
+						"description": "操作者确认官方验证完成后显式解除停止状态，保留已确认动作与断点；Agent 不应自行添加，不能与 --dry-run 同时使用",
 					},
 					"--dry-run": {
 						"type": "bool",
 						"default": False,
-						"description": "只演练自动化决策，不执行真实平台动作，也不改写对话阶段、待执行队列或面试线索",
+						"description": "只演练自动化决策，不执行真实平台动作，也不改写对话阶段、待执行队列或面试线索；MCP 工具 boss_agent_run 缺省为 true（安全演练），真实执行需显式传 false",
 					},
 					"--limit": {
 						"type": "int",
@@ -1313,11 +1318,11 @@ SCHEMA_DATA = {
 				},
 				"crawl": {
 				"description": "新建或读取 crawl 结果，导入候选池并执行 ai fit。",
-					"--run-id": {"type": "string", "default": None, "description": "分析指定的已完成 crawl run"},
-					"--query": {"type": "string", "default": None, "description": "新采集的职位关键词"},
-					"--city": {"type": "string", "default": None, "description": "新采集城市；与 --query 同时使用"},
-					"--pages": {"type": "int", "default": 5, "minimum": 1, "description": "新采集严格页数上限"},
-					"--with-detail": {"type": "bool", "default": False, "description": "新采集时串行补职位详情"},
+					"--run-id": {"type": "string", "default": None, "minLength": 1, "description": "分析指定的已完成 crawl run；与 --query 必须且只能选一个，且不能与 --city / --pages / --with-detail 同时使用"},
+					"--query": {"type": "string", "default": None, "minLength": 1, "description": "新采集的职位关键词；与 --run-id 必须且只能选一个，使用时必须同时提供 --city"},
+					"--city": {"type": "string", "default": None, "description": "新采集城市；仅 --query 路径使用，--run-id 路径给出会被拒绝"},
+					"--pages": {"type": "int", "default": 5, "minimum": 1, "description": "新采集严格页数上限；仅 --query 路径使用，--run-id 路径给出会被拒绝"},
+					"--with-detail": {"type": "bool", "default": False, "description": "新采集时串行补职位详情；仅 --query 路径使用，--run-id 路径给出会被拒绝"},
 					"--resume": {"type": "string", "required": True, "description": "用于 ai fit 的本地简历名称"},
 					"--limit": {"type": "int", "default": 10, "minimum": 1, "description": "按匹配分返回前 N 个职位"},
 				},
@@ -1381,11 +1386,11 @@ SCHEMA_DATA = {
 				"resume": {
 				"description": "查看候选人简历或请求交换联系方式。",
 					"args": [
-						{"name": "geek_id", "required": False, "description": "候选人 geek ID；省略时使用 --security-id"},
+						{"name": "geek_id", "required": False, "description": "候选人 geek ID；查看简历时必填，需与 --security-id 和 --job-id 同时提供；交换联系方式时不需要"},
 					],
-					"--job-id": {"type": "string", "default": "", "description": "职位 ID"},
-					"--security-id": {"type": "string", "default": None, "description": "安全 ID"},
-					"--exchange": {"type": "bool", "default": False, "description": "请求交换联系方式"},
+					"--job-id": {"type": "string", "default": "", "description": "职位 ID；查看简历时必填（非空），交换联系方式路径不需要"},
+					"--security-id": {"type": "string", "default": None, "description": "安全 ID；查看简历时必填"},
+					"--exchange": {"type": "bool", "default": False, "description": "请求交换联系方式；需要 --friend-id（从 hr chat 获取）"},
 					"--type": {
 						"type": "string",
 						"default": "phone",

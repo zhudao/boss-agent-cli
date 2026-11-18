@@ -83,6 +83,18 @@ def _interactive_error(
 	raise SystemExit(1)
 
 
+def _error_metadata(error: Mapping[str, Any]) -> tuple[bool, str | None]:
+	"""信封出口只接受已校验的布尔 / 字符串；任何漏网的漂移都按不可重试处理。
+
+	持久化记录在 WorkflowStore 读取边界已经 fail-closed（Issue #1592）；这里
+	再收一次类型，避免未来某条内存路径把 ``bool("false")`` 或数字恢复指引
+	直接写进信封。
+	"""
+	recoverable = error.get("recoverable")
+	recovery_action = error.get("recovery_action")
+	return recoverable is True, recovery_action if isinstance(recovery_action, str) else None
+
+
 def _wizard_error(
 	ctx: click.Context,
 	interactive: bool,
@@ -295,8 +307,7 @@ def _run_plan(
 
 	# TTY：列表结果可连续选择；职位详情后提供打招呼等操作；失败交给 _emit_run。
 	if interactive and (
-		run.get("status") == "completed"
-		or (run.get("effective_completed") and has_result_follow_up(run))
+		run.get("status") == "completed" or (run.get("effective_completed") and has_result_follow_up(run))
 	):
 		list_run = run
 		if has_result_follow_up(list_run):
@@ -407,13 +418,14 @@ def _emit_run(ctx: click.Context, run: Mapping[str, Any], *, interactive: bool) 
 		if interactive:
 			render_run(run, command_for=_command_for_ctx(ctx))
 			return
+		recoverable, recovery_action = _error_metadata(error)
 		_wizard_error(
 			ctx,
 			interactive,
 			code=str(error.get("code") or "NETWORK_ERROR"),
 			message=str(error.get("message") or "任务执行失败"),
-			recoverable=bool(error.get("recoverable")),
-			recovery_action=error.get("recovery_action"),
+			recoverable=recoverable,
+			recovery_action=recovery_action,
 			details={"run": dict(run)},
 		)
 		return
@@ -425,7 +437,13 @@ def _emit_run(ctx: click.Context, run: Mapping[str, Any], *, interactive: bool) 
 		"wizard",
 		run,
 		render=lambda payload: render_run(payload, command_for=_command_for_ctx(ctx)),
-		hints={"next_actions": [boss_command_for_ctx(ctx, f"wizard --status {shell_argument(str(run['run_id']))}", include_data_dir=True)]},
+		hints={
+			"next_actions": [
+				boss_command_for_ctx(
+					ctx, f"wizard --status {shell_argument(str(run['run_id']))}", include_data_dir=True
+				)
+			]
+		},
 	)
 
 
@@ -811,6 +829,33 @@ def _run_wizard_command(
 			)
 			return
 		if stop_run_id:
+			# 先读断点区分「不存在」与「已结束」：request_stop 只排除 completed，
+			# 把存在但已完成的任务误报为 ID 写错（Issue #1585）。损坏的断点不影响
+			# 停止标记本身，仍交给 request_stop 按既有补偿语义处理。
+			existing_run: dict[str, Any] | None = None
+			try:
+				existing_run = store.get_checkpoint(stop_run_id, validate_replay_markers=False)
+			except CacheRecordInvalid:
+				pass
+			if existing_run is not None and existing_run.get("status") == "completed":
+				_wizard_error(
+					ctx,
+					interactive,
+					code="WORKFLOW_ALREADY_FINISHED",
+					message=f"任务已结束，无法停止: {stop_run_id}",
+					recovery_action=(
+						f"{boss_command_for_ctx(ctx, 'wizard --status <run_id>', include_data_dir=True)} 查看结果与最终状态，或 "
+						f"{boss_command_for_ctx(ctx, 'wizard', include_data_dir=True)} 新建 workflow"
+					),
+					hints={
+						"next_actions": [
+							boss_command_for_ctx(
+								ctx, f"wizard --status {shell_argument(stop_run_id)}", include_data_dir=True
+							)
+						]
+					},
+				)
+				return
 			if not store.request_stop(stop_run_id):
 				_wizard_error(
 					ctx,
@@ -825,7 +870,9 @@ def _run_wizard_command(
 				)
 				return
 			run = _run_after_stop(store, stop_run_id)
-			handle_output(ctx, "wizard", run, render=render_run, hints={"next_actions": _workflow_next_actions(ctx, run)})
+			handle_output(
+				ctx, "wizard", run, render=render_run, hints={"next_actions": _workflow_next_actions(ctx, run)}
+			)
 			return
 
 		# 纯 TTY 无 flag：多轮主菜单循环；flag / headless 仍是单次执行。
@@ -912,13 +959,14 @@ def _run_wizard_command(
 		if interactive:
 			render_run(run, command_for=_command_for_ctx(ctx))
 			raise SystemExit(1)
+		recoverable, recovery_action = _error_metadata(error)
 		_wizard_error(
 			ctx,
 			interactive,
 			code=str(error.get("code") or "NETWORK_ERROR"),
 			message=str(error.get("message") or "任务执行失败"),
-			recoverable=bool(error.get("recoverable")),
-			recovery_action=error.get("recovery_action"),
+			recoverable=recoverable,
+			recovery_action=recovery_action,
 			details={"run": run},
 			hints=_busy_hints(ctx, error),
 		)
@@ -928,7 +976,13 @@ def _run_wizard_command(
 		"wizard",
 		run,
 		render=lambda payload: render_run(payload, command_for=_command_for_ctx(ctx)),
-		hints={"next_actions": [boss_command_for_ctx(ctx, f"wizard --status {shell_argument(str(run['run_id']))}", include_data_dir=True)]},
+		hints={
+			"next_actions": [
+				boss_command_for_ctx(
+					ctx, f"wizard --status {shell_argument(str(run['run_id']))}", include_data_dir=True
+				)
+			]
+		},
 	)
 
 

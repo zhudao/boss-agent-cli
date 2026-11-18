@@ -9,7 +9,13 @@ from pathlib import Path
 
 import click
 
-from boss_agent_cli.ai.config import AIConfigStore, ai_int_setting
+from boss_agent_cli.ai.config import (
+	AIConfigValueError,
+	AIConfigStore,
+	ai_int_setting,
+	ai_text_setting,
+	normalize_base_url,
+)
 from boss_agent_cli.ai.local_models import (
 	RUNTIME_BASE_URLS,
 	LocalModelManifestError,
@@ -129,20 +135,39 @@ def local_configure_cmd(ctx: click.Context, runtime: str, model: str, base_url: 
 		)
 		ctx.exit(1)
 		return
-	if base_url is not None and not base_url.strip():
-		handle_error_output(
-			ctx,
-			"ai.local.configure",
-			code="INVALID_PARAM",
-			message="--base-url 不能为空或只包含空白字符；省略该选项才会使用 runtime 默认地址",
-			recovery_action="去掉 --base-url 使用 runtime 默认地址，或传入完整的 http(s) 地址",
-			hints={"next_actions": [
-				_hint_command(ctx, f"ai local configure --runtime {runtime} --model {shell_argument(model)}"),
-				_hint_command(ctx, "ai local status"),
-			]},
-		)
-		ctx.exit(1)
-		return
+	if base_url is not None:
+		if not base_url.strip():
+			handle_error_output(
+				ctx,
+				"ai.local.configure",
+				code="INVALID_PARAM",
+				message="--base-url 不能为空或只包含空白字符；省略该选项才会使用 runtime 默认地址",
+				recoverable=False,
+				recovery_action="去掉 --base-url 使用 runtime 默认地址，或传入完整的 http(s) 地址",
+				hints={"next_actions": [
+					_hint_command(ctx, f"ai local configure --runtime {runtime} --model {shell_argument(model)}"),
+					_hint_command(ctx, "ai local status"),
+				]},
+			)
+			ctx.exit(1)
+			return
+		try:
+			base_url = normalize_base_url(base_url)
+		except AIConfigValueError as exc:
+			handle_error_output(
+				ctx,
+				"ai.local.configure",
+				code="INVALID_PARAM",
+				message=str(exc),
+				recoverable=False,
+				recovery_action=exc.recovery_hint,
+				hints={"next_actions": [
+					_hint_command(ctx, f"ai local configure --runtime {runtime} --model {shell_argument(model)}"),
+					_hint_command(ctx, "ai local status"),
+				]},
+			)
+			ctx.exit(1)
+			return
 	store = AIConfigStore(ctx.obj["data_dir"])
 	store.save_config(
 		ai_provider=runtime,
@@ -175,6 +200,17 @@ def local_configure_cmd(ctx: click.Context, runtime: str, model: str, base_url: 
 @click.pass_context
 def local_pull_cmd(ctx: click.Context, model: str, confirm_download: bool) -> None:
 	"""通过 Ollama 下载模型权重。"""
+	if not model.strip():
+		handle_error_output(
+			ctx,
+			"ai.local.pull",
+			code="INVALID_PARAM",
+			message="--model 不能为空或只包含空白字符",
+			recoverable=False,
+			recovery_action="传入真实的本地模型名后重试，本次未启动下载子进程",
+		)
+		ctx.exit(1)
+		return
 	if not confirm_download:
 		handle_error_output(
 			ctx,
@@ -275,7 +311,7 @@ def local_smoke_cmd(ctx: click.Context) -> None:
 	api_key = store.get_api_key()
 	base_url = store.get_base_url()
 	model = config.get("ai_model")
-	if not api_key or not base_url or not model:
+	if not api_key or not base_url or model is None:
 		provider = store.unresolved_provider()
 		message = (
 			"本地 AI 服务未配置"
@@ -297,24 +333,30 @@ def local_smoke_cmd(ctx: click.Context) -> None:
 		return
 	# 输出上限用配置值而不是写死的小数：思考模型在几十个 token 内写不完思考，
 	# 健康检查应和自动化用同一个上限，「调大 max_tokens」的建议才对它生效。
-	# 配置值被手改成数组 / 字符串时按参数错误给信封，而不是 INTERNAL_ERROR
-	# 加「不要重试」（Issue #1196）。
+	# 配置值被手改成数组 / 字符串时按配置损坏给信封，而不是 INTERNAL_ERROR
+	# 加「不要重试」（Issue #1196、#1525）。
 	try:
 		max_tokens = ai_int_setting(config, "ai_max_tokens", 512)
-	except ValueError as exc:
+		model_value = ai_text_setting(config, "ai_model")
+		model = model_value or ""
+		base_url = normalize_base_url(base_url)
+	except (AIConfigValueError, ValueError) as exc:
 		handle_error_output(
 			ctx,
 			"ai.local.smoke",
-			code="INVALID_PARAM",
+			code="CONFIG_INVALID",
 			message=str(exc),
 			recoverable=True,
-			recovery_action=_hint_command(ctx, "ai config --max-tokens 512"),
+			recovery_action=(
+				_hint_command(ctx, "ai config --max-tokens 512")
+				+ " 或 " + _hint_command(ctx, "ai local configure --runtime ollama --model qwen3:14b")
+			),
 		)
 		return
 	service = AIService(
 		base_url=base_url,
 		api_key=api_key,
-		model=str(model),
+		model=model,
 		temperature=0.1,
 		max_tokens=max_tokens,
 	)

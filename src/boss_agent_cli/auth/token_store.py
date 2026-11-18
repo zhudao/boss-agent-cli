@@ -14,9 +14,15 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 
+from boss_agent_cli.services.file_lock import exclusive_file_lock
 from boss_agent_cli.services.private_files import chmod_best_effort, write_private_bytes
 
 _LOCK_TIMEOUT = 30
+_LOCK_POLL_SECONDS = 0.05
+
+
+class RefreshLockBusy(Exception):
+	"""另一个进程持有刷新锁超过等待上限：本次没有刷新，也没有改动对方的锁。"""
 
 
 class TokenStore:
@@ -77,11 +83,24 @@ class TokenStore:
 		return hashlib.sha256(fingerprint.encode()).hexdigest()
 
 	def _get_salt(self) -> bytes:
+		# salt 决定 session.enc 的派生密钥：两个进程首登时若各自生成一次，
+		# 后写盘的那份会让先保存的密文永久解不开（Issue #1633）。
+		# O_EXCL 保证只有一个创建者；随后在刷新锁内重读，后到者必须复用胜出值。
+		try:
+			fd = os.open(self._salt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+		except FileExistsError:
+			pass
+		else:
+			with os.fdopen(fd, "wb") as file:
+				file.write(os.urandom(16))
+		chmod_best_effort(self._salt_path, 0o600)
+		with exclusive_file_lock(self._lock_path) as acquired:
+			if acquired:
+				return self._salt_path.read_bytes()
+		# 锁超时也不能用新 salt 加密：读到什么就用什么；确实不存在才按错误处理。
 		if self._salt_path.exists():
 			return self._salt_path.read_bytes()
-		salt = os.urandom(16)
-		write_private_bytes(self._salt_path, salt)
-		return salt
+		raise RuntimeError("登录态 salt 尚未创建，且无法获取跨进程锁")
 
 	def _derive_key(self) -> bytes:
 		salt = self._get_salt()
@@ -122,22 +141,20 @@ class TokenStore:
 
 	@contextmanager
 	def refresh_lock(self) -> Iterator[None]:
-		"""原子文件锁：使用 O_CREAT|O_EXCL 避免 TOCTOU 竞态条件。"""
-		deadline = time.time() + _LOCK_TIMEOUT
-		fd = None
+		"""跨进程刷新互斥：内核文件锁，持有者退出即释放。
+
+		旧实现用 ``O_CREAT|O_EXCL`` 建文件当锁，等待超过 ``_LOCK_TIMEOUT`` 就删除
+		锁文件继续。刷新走 CDP / headless 浏览器，合法持有时间可以超过 30 秒：
+		等待方会删掉仍在使用的锁，先持有者退出时又会删掉后来者的锁，互斥失效
+		（Issue #1554）。``file_lock`` 的 flock / msvcrt 语义由内核释放，不存在
+		「残留锁」需要清理；超时也绝不删除对方的锁，而是按可重试失败返回。
+		"""
+		deadline = time.monotonic() + _LOCK_TIMEOUT
 		while True:
-			try:
-				fd = os.open(str(self._lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-				break  # 成功获取锁
-			except FileExistsError:
-				if time.time() > deadline:
-					# 超时：锁可能是残留的，强制释放
-					self._lock_path.unlink(missing_ok=True)
-					continue
-				time.sleep(0.5)
-		try:
-			if fd is not None:
-				os.close(fd)
-			yield
-		finally:
-			self._lock_path.unlink(missing_ok=True)
+			with exclusive_file_lock(self._lock_path) as acquired:
+				if acquired:
+					yield
+					return
+			if time.monotonic() >= deadline:
+				raise RefreshLockBusy(f"另一个进程正在刷新登录态，等待 {_LOCK_TIMEOUT:g} 秒仍未释放锁")
+			time.sleep(_LOCK_POLL_SECONDS)

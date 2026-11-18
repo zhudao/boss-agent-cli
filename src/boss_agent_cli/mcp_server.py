@@ -177,6 +177,7 @@ def _configure_boss_invocation(
 _READ_ONLY_TOOL_NAMES = frozenset({
 	"boss_status",
 	"boss_doctor",
+	"boss_schema",
 	"boss_search",
 	"boss_recommend",
 	"boss_detail",
@@ -309,25 +310,35 @@ def _estimated_requests(args: tuple[str, ...]) -> int | None:
 		count = _int_option(args, "--count", _EXPORT_DEFAULT_COUNT)
 		if count is None or count < 1:
 			return None
-		return math.ceil(count / _SEARCH_PAGE_SIZE)
+		# 整数除法避免超大 JSON 整数在浮点除法时抛 OverflowError（Issue #1609）。
+		# 超时最终按 900 秒封顶，这里没必要保留比封顶更大的精确页数。
+		pages = -(-count // _SEARCH_PAGE_SIZE)
+		return min(pages, _MAX_ESTIMATED_REQUESTS)
 	if command == "hr":
 		subcommand = args[1] if len(args) > 1 else ""
 		if subcommand == "chat":
 			summary_limit = _int_option(args, "--summary-limit", _HR_DEFAULT_LIMIT)
 			if summary_limit is None:
 				return None
-			# 1 次好友列表 + 每 50 条摘要一批。
-			return 1 + math.ceil(max(summary_limit, 0) / _HR_BATCH_SIZE)
+			# 1 次好友列表 + 每 50 条摘要一批。整数除法避免超大整数在
+			# 浮点除法时抛 OverflowError（Issue #1612）。
+			batches = -(-max(summary_limit, 0) // _HR_BATCH_SIZE)
+			return min(1 + batches, _MAX_ESTIMATED_REQUESTS)
 		if subcommand == "last-messages":
 			limit = _int_option(args, "--limit", _HR_DEFAULT_LIMIT)
 			if limit is None or limit < 1:
 				return None
-			return math.ceil(limit / _HR_BATCH_SIZE)
+			# 与 summary-limit 分支同口径：整数分页并封顶（Issue #1612）。
+			return min(-(-limit // _HR_BATCH_SIZE), _MAX_ESTIMATED_REQUESTS)
 		return None
 	if command in {"pipeline", "follow-up", "digest"}:
 		# 好友列表逐页聚合，按 5 页上限估算。
 		return _FRIEND_LIST_ESTIMATE_PAGES
 	return None
+
+
+# 任何单命令的超时估算都不会超过这个上限；同时作为大整数分页的封顶值。
+_MAX_ESTIMATED_REQUESTS = int(_MAX_CLI_TIMEOUT_SECONDS // _REQUEST_BUDGET_SECONDS) + 1
 
 
 def _cli_timeout(args: tuple[str, ...]) -> float:
@@ -347,7 +358,9 @@ def _cli_timeout(args: tuple[str, ...]) -> float:
 		except (IndexError, ValueError):
 			return _CLI_TIMEOUT_SECONDS
 		if math.isfinite(requested) and requested > 0:
-			return requested + _CHECKPOINT_GRACE_SECONDS
+			# wizard 子进程自己的 --timeout 没有上限：宿主若按任意大值等待，
+			# 客户端一次超时调用会把 MCP server 挂到近似无界（Issue #1594）。
+			return min(requested + _CHECKPOINT_GRACE_SECONDS, _MAX_CLI_TIMEOUT_SECONDS)
 		return _CLI_TIMEOUT_SECONDS
 	requests = _estimated_requests(args) if args else None
 	if requests is None:
@@ -449,12 +462,29 @@ def _run_boss(*args: str, may_write: bool = True) -> dict[str, Any]:
 	unsafe_reason = _unsafe_argv_reason(cmd)
 	if unsafe_reason is not None:
 		return _cli_failure(args, "INVALID_PARAM", unsafe_reason)
+	# 超时估算同样必须遵守 schema 的数值边界；本地参数错误不能伪装成 CLI 失败。
+	try:
+		timeout = _cli_timeout(args)
+	except (ArithmeticError, ValueError) as exc:
+		estimate_error = _cli_failure(
+			args,
+			"INVALID_PARAM",
+			f"参数超出本地估算范围：{exc}",
+			outcome_unknown=False,
+		)
+		# envelope_error 会从登记表补齐 recovery_action；本地参数错误未启动子进程，
+		# 不能沿用其它 INVALID_PARAM 来源的「修正参数」笼统文案。
+		estimate_error["error"]["recovery_action"] = (
+			"减小 --summary-limit / --limit / --count 后重试；本次未启动子进程。"
+			"参数提示由 --help 给出，输入未进入 CLI"
+		)
+		return estimate_error
 	try:
 		result = subprocess.run(
 			cmd,
 			capture_output=True,
 			text=True,
-			timeout=_cli_timeout(args),
+			timeout=timeout,
 			stdin=subprocess.DEVNULL,
 		)
 	except subprocess.TimeoutExpired:
@@ -570,8 +600,21 @@ async def _run_boss_async(*args: str, may_write: bool = True) -> dict[str, Any]:
 		stdout, _ = await asyncio.shield(_stop_cli_process(process, output))
 		return _interrupted_failure(args, "WORKFLOW_STOPPED", stdout, may_write=may_write)
 	output = asyncio.create_task(process.communicate())
+	# 超时估算必须在 spawn 之后仍可安全求值：异常先停子进程并回标准失败信封，
+	# 不能把 OverflowError 漏成 MCP 内部错误（Issue #1609）。
 	try:
-		stdout, stderr = await asyncio.wait_for(asyncio.shield(output), _cli_timeout(args))
+		timeout = _cli_timeout(args)
+	except (ArithmeticError, ValueError) as exc:
+		stdout, _ = await asyncio.shield(_stop_cli_process(process, output))
+		return _cli_failure(
+			args,
+			"INVALID_PARAM",
+			f"参数超出本地估算范围：{exc}",
+			outcome_unknown=False,
+			recovery_action="减小 count / summary-limit 后重试；本次子进程已停止，未返回结果",
+		)
+	try:
+		stdout, stderr = await asyncio.wait_for(asyncio.shield(output), timeout)
 	except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
 		stdout, _ = await asyncio.shield(_stop_cli_process(process, output))
 		code = "WORKFLOW_STOPPED" if isinstance(exc, asyncio.CancelledError) else "WORKFLOW_TIMEOUT"
@@ -644,6 +687,15 @@ _JSON_TYPE_CHECKS: dict[str, tuple[type, ...]] = {
 
 #: 单个数组最多逐条列出的元素错误数，其余只报数量：错误信封不随输入规模膨胀。
 _MAX_ELEMENT_TYPE_ERRORS = 3
+# 超过这个位数的整数不直接转十进制文本：Python 的 int→str 位数上限会让
+# 错误信息本身抛 ValueError，进而把 tools/call 变成内部错误（Issue #1620）。
+_MAX_BRIEF_NUMBER_BITS = 256
+
+
+def _brief_numeric(value: object) -> str:
+	if isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > _MAX_BRIEF_NUMBER_BITS:
+		return f"超大整数（{value.bit_length()} bit）"
+	return str(value)
 
 
 def _matches_json_type(value: Any, expected: str) -> bool:
@@ -661,6 +713,8 @@ def _argument_type_errors(tool_name: str, arguments: dict[str, Any]) -> list[str
 	数组还要按 `items.type` 逐元素校验（Issue #1105）：`_build_args` 用 `str()`
 	拼装元素，布尔值或对象会变成 `False`、`{'k': 'v'}` 这样的文本写进本地标签，
 	整数数组里的错误元素则要到 CLI 才得到一条不指明位置的参数错误。
+	数值上下界与数组元素的 minLength 也按 inputSchema 校验（Issue #1594 / #1595），
+	避免越界值到 CLI 后被静默截断、空标签写进本地候选池。
 	"""
 	tool = next((item for item in TOOLS if item.name == tool_name), None)
 	if tool is None:
@@ -677,6 +731,19 @@ def _argument_type_errors(tool_name: str, arguments: dict[str, Any]) -> list[str
 		if not _matches_json_type(value, expected):
 			errors.append(f"{key} 应为 {expected}，收到 {type(value).__name__}")
 			continue
+		if expected == "string":
+			# schema 声明了 minLength 时，入口按同一约束拒绝（Issue #1533）：
+			# 空串在 CLI 上大多只能得到参数错误，客户端本可以在发送前拦下。
+			min_length = prop.get("minLength")
+			if isinstance(min_length, int) and not isinstance(min_length, bool) and len(value) < min_length:
+				errors.append(f"{key} 至少需要 {min_length} 个字符")
+		if expected in {"integer", "number"}:
+			minimum = prop.get("minimum")
+			maximum = prop.get("maximum")
+			if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) and value < minimum:
+				errors.append(f"{key}={_brief_numeric(value)} 不能小于 {minimum}")
+			if isinstance(maximum, (int, float)) and not isinstance(maximum, bool) and value > maximum:
+				errors.append(f"{key}={_brief_numeric(value)} 不能大于 {maximum}")
 		if expected == "array":
 			# 空数组与「不传」在 mapping 层不可区分：例如 last-messages 的
 			# friend_ids=[] 会退化成抓取当前页候选人并发出平台请求（Issue #1218）。
@@ -694,6 +761,23 @@ def _argument_type_errors(tool_name: str, arguments: dict[str, Any]) -> list[str
 		)
 		if len(invalid) > _MAX_ELEMENT_TYPE_ERRORS:
 			errors.append(f"{key} 另有 {len(invalid) - _MAX_ELEMENT_TYPE_ERRORS} 个元素类型错误")
+		if not isinstance(items, dict):
+			return errors
+		item_min_length = items.get("minLength")
+		item_minimum = items.get("minimum")
+		item_maximum = items.get("maximum")
+		for index, item in enumerate(value):
+			if isinstance(item_min_length, int) and not isinstance(item_min_length, bool):
+				# schema 的 items.minLength 是客户端与入口共同的契约：空标签不会
+				# 走到 CLI，也不会在 mapping 层被拼成 `--add-tag ""`（Issue #1595）。
+				if isinstance(item, str) and len(item) < item_min_length:
+					errors.append(f"{key}[{index}] 至少需要 {item_min_length} 个字符")
+			if isinstance(item_minimum, (int, float)) and not isinstance(item_minimum, bool):
+				if isinstance(item, (int, float)) and not isinstance(item, bool) and item < item_minimum:
+					errors.append(f"{key}[{index}]={_brief_numeric(item)} 不能小于 {item_minimum}")
+			if isinstance(item_maximum, (int, float)) and not isinstance(item_maximum, bool):
+				if isinstance(item, (int, float)) and not isinstance(item, bool) and item > item_maximum:
+					errors.append(f"{key}[{index}]={_brief_numeric(item)} 不能大于 {item_maximum}")
 	return errors
 
 
@@ -721,13 +805,17 @@ async def call_tool(ctx: Any, params: CallToolRequestParams) -> CallToolResult:
 	# 在类型检查与映射之前剔除；必填参数传 null 因此走缺参分支，而不是把
 	# ``str(None)`` 拼成 "None" 发给 CLI（Issue #1108）。
 	arguments = {key: value for key, value in arguments.items() if value is not None}
-	type_errors = _argument_type_errors(params.name, arguments)
+	try:
+		type_errors = _argument_type_errors(params.name, arguments)
+	except (ArithmeticError, TypeError, ValueError) as exc:
+		# 本地校验不能把不可格式化的超大整数等异常漏成 MCP 内部错误（Issue #1620）。
+		return _tool_argument_error(params.name, f"参数校验失败：{type(exc).__name__}")
 	if type_errors:
 		# 类型错误同样不能交给 `_build_args` 的 truthiness 判断：`"false"` 是 truthy，
 		# `is True` 对 `"true"` 为假，`dry_run` / `yes` 会因此静默丢失或反向生效。
 		return _tool_argument_error(
 			params.name,
-			"参数类型错误：" + "；".join(type_errors) + "；请按 tools/list 的 inputSchema 传参",
+			"参数无效：" + "；".join(type_errors) + "；请按 tools/list 的 inputSchema 传参",
 		)
 	try:
 		args = _build_args(params.name, arguments)
@@ -740,6 +828,10 @@ async def call_tool(ctx: Any, params: CallToolRequestParams) -> CallToolResult:
 		return _tool_argument_error(params.name, f"缺少必填参数：{missing}")
 	except ValueError as exc:
 		# 映射层自己拒绝的非法枚举值（Issue #1002）：不能落进默认分支。
+		# 超大整数的十进制转换也可能在这里抛 ValueError（Issue #1620），
+		# 此时不能把 Python 的位数上限原文回显给调用方。
+		if "integer string conversion" in str(exc):
+			return _tool_argument_error(params.name, "参数取值非法：存在超出本地数值表示范围的参数")
 		return _tool_argument_error(params.name, f"参数取值非法：{exc}")
 	unsafe_reason = _unsafe_argv_reason(args)
 	if unsafe_reason is not None:

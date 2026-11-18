@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 import click
+from click.core import ParameterSource
 
 from boss_agent_cli.config import DEFAULT_REQUEST_DELAY
 from boss_agent_cli.api.cdp_risk_lock import unlock_operator_actions, raise_if_locked
@@ -31,16 +32,20 @@ from boss_agent_cli.automation.storage import (
 from boss_agent_cli.ai.service import AIServiceError
 from boss_agent_cli.cache.store import CacheRecordInvalid, CacheStore
 from boss_agent_cli.commands.ai_cmd import _build_fit_prompt, _create_ai_service
+from boss_agent_cli.api.egress import EgressContradictionError
 from boss_agent_cli.commands.crawl import (
 	_LoginSeedUnavailable,
 	_report_corrupt_run,
+	_report_crawl_browser_start_failure,
 	_report_crawl_runtime_missing,
+	_report_egress_contradiction,
 	_report_login_required,
 	_require_crawl_capabilities,
 	_seeded_transport_factory,
 	_settings_from_context,
 )
 from boss_agent_cli.crawler.controls import (
+	CrawlBrowserStartError,
 	CrawlExportError,
 	CrawlProfileBusy,
 	CrawlProfilePathInvalid,
@@ -117,6 +122,22 @@ def _crawl_hint_command(ctx: click.Context, command: str) -> str:
 @handle_auth_errors("agent.run")
 def run_cmd(ctx: click.Context, dry_run: bool, limit: int | None, resume: bool) -> None:
 	"""运行一轮招聘自动化。"""
+	# --resume 会清除操作者停止标志与熔断闩锁；预览不得产生这种控制副作用。
+	# 拒绝要在构造 adapter / 取执行锁之前，避免 dry-run 误解锁后真实运行发动作（Issue #1591）。
+	if dry_run and resume:
+		handle_error_output(
+			ctx,
+			"agent.run",
+			code="INVALID_PARAM",
+			message="--dry-run 与 --resume 不能同时使用：预览不得解除停止标志或熔断",
+			recoverable=True,
+			recovery_action="仅预览时去掉 --resume；确认已完成官方验证并核对未确认动作后，由操作者单独执行 live 模式的 agent run --resume",
+			hints={
+				"next_actions": [_hint_command(ctx, "agent stats")],
+				"operator_actions": ["恢复必须如实执行一轮真实自动化，不能用预览代替"],
+			},
+		)
+		return
 	report = _run_agent(ctx, dry_run=dry_run, limit=limit, force_mode=None, command="agent.run", resume=resume)
 	handle_output(
 		ctx,
@@ -165,7 +186,7 @@ def crawl_cmd(
 		return
 	crawl_by_run = _crawl_hint_command(ctx, "agent crawl --run-id <run_id> --resume <简历>")
 	crawl_by_query = _crawl_hint_command(ctx, "agent crawl --query <关键词> --city <城市> --resume <简历>")
-	if bool(run_id) == bool(query):
+	if (run_id is None) == (query is None):
 		handle_error_output(
 			ctx,
 			"agent.crawl",
@@ -173,6 +194,48 @@ def crawl_cmd(
 			message="必须且只能使用 --run-id 或 --query",
 			recovery_action="只传 --run-id，或只传 --query 后重试",
 			hints={"next_actions": [crawl_by_run, crawl_by_query]},
+		)
+		return
+	if run_id is not None:
+		# --run-id 只分析已完成任务：--city / --pages / --with-detail 只对 --query
+		# 新建采集有意义。旧实现用真值判断，显式空 run-id 会被静默当成「没传」，
+		# 这些参数则被整组丢弃却仍返回 ok:true（Issue #1558）。
+		if not run_id.strip():
+			handle_error_output(
+				ctx,
+				"agent.crawl",
+				code="INVALID_PARAM",
+				message="--run-id 的值不能为空",
+				recovery_action="补上要分析的 crawl run_id，或用 --query 新建采集",
+				hints={"next_actions": [crawl_by_run, crawl_by_query]},
+			)
+			return
+		ignored = []
+		if ctx.get_parameter_source("pages") == ParameterSource.COMMANDLINE:
+			ignored.append("--pages")
+		if city is not None:
+			ignored.append("--city")
+		if with_detail:
+			ignored.append("--with-detail")
+		if ignored:
+			handle_error_output(
+				ctx,
+				"agent.crawl",
+				code="INVALID_PARAM",
+				message=f"{'、'.join(ignored)} 只用于 --query 新建采集，--run-id 路径不会使用它们",
+				recovery_action="去掉这些参数后只分析已有任务，或改用 --query 新建采集",
+				hints={"next_actions": [crawl_by_run, crawl_by_query]},
+			)
+			return
+	elif query is not None and not query.strip():
+		# 显式空查询不是「不筛选」：与 crawl run/start 同口径，在创建任务之前拒绝。
+		handle_error_output(
+			ctx,
+			"agent.crawl",
+			code="INVALID_PARAM",
+			message="--query 的值不能为空",
+			recovery_action=f"补上搜索关键词后重试，例如 {crawl_by_query}",
+			hints={"next_actions": [crawl_by_query]},
 		)
 		return
 	if query and not _require_crawl_capabilities(ctx):
@@ -370,8 +433,16 @@ def crawl_cmd(
 			),
 		)
 		return
+	except CrawlBrowserStartError as exc:
+		# 浏览器没起来：本次没有发出请求，不能兜成 stopped 的 ok:true（Issue #1553）。
+		_report_crawl_browser_start_failure(ctx, "agent.crawl", exc)
+		return
 	except CrawlRuntimeUnavailable as exc:
 		_report_crawl_runtime_missing(ctx, "agent.crawl", str(exc))
+		return
+	except EgressContradictionError as exc:
+		# 出口与声明的语言/时区矛盾：安全拒绝，不是依赖缺失（Issue #1555）。
+		_report_egress_contradiction(ctx, "agent.crawl", exc)
 		return
 	except RuntimeError as exc:
 		configure_cmd = boss_command_for_ctx(ctx, "crawl configure", include_data_dir=True)
@@ -406,13 +477,13 @@ def crawl_cmd(
 	try:
 		svc = _create_ai_service(ctx)
 	except ValueError as exc:
-		# 本地配置坏值重试必然复现：给 INVALID_PARAM 与修复命令（Issue #1209）。
+		# 本地配置坏值重试必然复现：给 CONFIG_INVALID 与修复命令（Issue #1209、#1525）。
 		# 字符串项自带更贴题的修复子命令（Issue #1428、#1431）。
 		hint = getattr(exc, "recovery_hint", None) or "ai config --max-tokens 4096 --temperature 0.7"
 		handle_error_output(
 			ctx,
 			"agent.crawl",
-			code="INVALID_PARAM",
+			code="CONFIG_INVALID",
 			message=f"本地 AI 配置损坏：{exc}",
 			recoverable=True,
 			recovery_action=_crawl_hint_command(ctx, hint),
@@ -469,20 +540,33 @@ def crawl_cmd(
 
 
 @agent_group.command("train")
-@click.option(
-	"--dry-run/--live",
-	"dry_run",
-	default=True,
-	help="训练模式默认只演练；传 --live 执行满足阈值的动作",
-)
+@click.option("--dry-run", is_flag=True, default=False, help="只演练不执行；不传 --live 时的默认行为")
+@click.option("--live", is_flag=True, default=False, help="执行满足阈值的动作；只有操作者明确授权时才可用")
 @click.option("--limit", default=None, type=click.IntRange(min=1), help="本轮最多处理多少个会话")
 @click.pass_context
 @handle_auth_errors("agent.train")
-def train_cmd(ctx: click.Context, dry_run: bool, limit: int | None) -> None:
+def train_cmd(ctx: click.Context, dry_run: bool, live: bool, limit: int | None) -> None:
 	"""运行训练校准模式：默认演练，--live 直接执行满足阈值的动作。"""
+	# 配对布尔标志 `--dry-run/--live` 在 Click 里不互斥，同时给出时最后一个生效：
+	# `--dry-run --live` 会真实执行，而 schema 声称两者互斥（Issue #1568）。
+	# 真实的写操作不能依赖 argv 顺序，必须在任何登录检查与 automation 周期之前拒绝。
+	if dry_run and live:
+		train_cmd_hint = _hint_command(ctx, "agent train")
+		handle_error_output(
+			ctx,
+			"agent.train",
+			code="INVALID_PARAM",
+			message="--dry-run 与 --live 只能选一个：同时给出时无法判断是否真实执行",
+			recovery_action="去掉其中一个后重试；不传 --live 就是默认演练",
+			hints={
+				"next_actions": [train_cmd_hint],
+				"operator_actions": ["确需真实执行时，由操作者确认后单独使用 --live，不要与 --dry-run 同时给出"],
+			},
+		)
+		return
 	report = _run_agent(
 		ctx,
-		dry_run=dry_run,
+		dry_run=not live,
 		limit=limit,
 		force_mode=AutomationMode.TRAINING,
 		command="agent.train",
@@ -780,7 +864,7 @@ def _run_agent(
 		handle_error_output(
 			ctx,
 			command,
-			code="INVALID_PARAM",
+			code="CONFIG_INVALID",
 			message="automation 配置必须是 JSON object",
 			recoverable=True,
 			recovery_action=boss_command_for_ctx(ctx, "config reset automation", include_data_dir=True),
@@ -794,7 +878,7 @@ def _run_agent(
 		handle_error_output(
 			ctx,
 			command,
-			code="INVALID_PARAM",
+			code="CONFIG_INVALID",
 			message=f"automation 配置无效: {exc}",
 			recoverable=True,
 			recovery_action=boss_command_for_ctx(ctx, "config reset automation", include_data_dir=True),

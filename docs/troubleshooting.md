@@ -343,6 +343,7 @@ httpx 带着从 Chrome 拷出来的 Cookie，把 `__zp_stoken__` 当查询参数
 | `TOKEN_REFRESH_FAILED` | Token 刷新失败 | `boss login` |
 | `ENVIRONMENT_RISK` | 访问环境存在异常 | 停止自动化访问；保留当前专用 profile，在官方页面确认并降低访问频率 |
 | `ENVIRONMENT_RISK_LOCKED` | CDP Chrome 的 stoken 此前命中 code 37 且尚未更新，本次请求未发送 | 停止自动化；由用户在该 Chrome 打开职位列表页确认能正常加载，等几分钟后再重试（见上文） |
+| `EGRESS_CONTRADICTION` | 配置 `BOSS_EGRESS_PROBE_URL` 后探测到出口地区与客户端声明的语言/时区矛盾，采集在发起任何平台请求前停止 | 不要原样重试：保持声明的语言/时区不变，换回与之一致的出口；不需要该检查时撤销 `BOSS_EGRESS_PROBE_URL`。程序不会自动改写语言或时区，`error.details.egress` 给出矛盾项 |
 | `ACCOUNT_RISK` | 风控拦截 | 停止当前 workflow，保留 run ID/checkpoint；处理登录或安全页后再显式恢复 |
 | `COMPLIANCE_BLOCKED` | 历史版本模式策略阻断 | 升级当前版本后重试；当前版本不主动产生此错误 |
 | `WIZARD_INPUT_REQUIRED` | headless workflow 缺少 role/platform/goal/inputs | 按 `boss schema` catalog 补齐 `--input-json` |
@@ -350,15 +351,18 @@ httpx 带着从 Chrome 拷出来的 Cookie，把 `__zp_stoken__` 当查询参数
 | `WORKFLOW_PLAN_MISMATCH` | 现有 `run_id` 与请求 plan 不一致 | 使用原 plan 恢复，或不传 `run_id` 创建新任务 |
 | `WORKFLOW_BUSY` | 同一 `run_id` 正在由另一次调用执行（另一个终端、Agent 或 MCP 调用）；本次调用没有执行任何步骤，也没有改动 checkpoint | 用 `boss wizard --status <run_id>` 查看进度，等当前执行结束后再 `--resume`；不要并发恢复同一个 `run_id` |
 | `WORKFLOW_NOT_FOUND` | 本地 workflow 任务不存在或 `run_id` 有误（`boss wizard --status` / `--stop` / `--resume`） | 执行 `boss wizard` 新建任务，或先用 `boss wizard --status <run_id>` 核对 ID |
+| `WORKFLOW_ALREADY_FINISHED` | 对已完成（completed）的 workflow 请求停止；任务存在且没有修改状态 | 用 `boss wizard --status <run_id>` 查看结果与最终状态，需要时新建 workflow |
 | `CRAWL_BUSY` | 同一采集任务正由另一次调用执行；本次调用未发出请求，也未修改采集断点 | 用返回的同一数据目录的 `boss crawl status <run_id>` 查看进度，等当前执行结束后再恢复；不要并发恢复同一任务；`status` / `results` / `stop` 仍可用 |
 | `CRAWL_PROFILE_BUSY` | 同一数据目录的采集配置目录正被另一个运行中的采集 Chrome 使用（`SingletonLock` 里的 pid 仍存活）；本次调用未发出请求，也没有删除锁文件 | 用 `boss crawl status <run_id>` 查看正在运行的采集，等它结束后再启动或恢复；不要并发使用同一数据目录的采集浏览器，也不要删除 `SingletonLock` |
 | `CRAWL_RUN_NOT_FOUND` | 本地采集任务不存在或 `run_id` 有误（`boss crawl status` / `resume` / `results` 等） | 执行 `boss crawl start <query>` 新建任务，或用真实 `run_id` 执行 `boss crawl status <run_id>` 核对 |
+| `CRAWL_RUN_FINISHED` | 对已结束（completed / failed / stopped / risk_stopped）的采集任务请求停止；本次没有修改任务状态 | 用 `boss crawl status <run_id>` 查看最终状态、`boss crawl results <run_id>` 读取已采集结果；需要重新采集时新建任务 |
 | `CONTACT_NOT_FOUND` | 沟通列表里没有这个联系人：`security_id` 可能已轮换，或对方已不在列表 | 先 `boss chat` 查看会话；已知 uid 时改用 uid 重试 |
 | `SAVED_SEARCH_NOT_FOUND` | 本地预设或 watch 不存在：`boss search --preset` / `boss watch run` 引用了没保存过的名字 | `boss preset list` / `boss watch list` 查看已有条目，需要时用 `boss preset add` / `boss watch add` 重建 |
 | `SHORTLIST_ENTRY_NOT_FOUND` | 候选池里没有这个职位（`security_id` / `job_id` 组合），`boss shortlist annotate` 没有可标注的记录 | 先 `boss shortlist add <security_id> <job_id>` 加入候选池，或 `boss shortlist list` 核对已有条目 |
 | `RESUME_FILE_INVALID` | 本地简历文件损坏或字段类型不正确，`boss resume show` / `edit` / `export` / `clone` / `diff` 读不出来（`boss resume list` 会把这些文件列在 `hints.corrupt`） | 修正 `resumes/` 下对应的 `.json` 后重试，或 `boss resume delete <name>` 后重新创建；文件只在本机 |
 | `JOB_NOT_FOUND` | 职位不存在或已下架 | 用 `boss search <关键词>` 重新搜索，或 `boss recommend` 查看推荐职位 |
 | `INVALID_PARAM` | 参数错误 | 修正参数 |
+| `CONFIG_INVALID` | 本地配置文件（`config.json` / AI 配置）损坏或取值类型、枚举非法：命令在发起平台请求前停止，同一条命令重跑会复现 | 按信封的 `recovery_action` 用 `boss config reset <项>` / `boss ai config` / `boss ai local configure` 修正后再重试；修复前不要让 Agent 原样重跑 |
 | `ALREADY_GREETED` | 已打过招呼 | 跳过 |
 | `CONFIRMATION_REQUIRED` | 未确认操作目标与内容 | 先用 `hr greet --dry-run`、`hr accept-resume <friend_id> --message-id <mid> --dry-run` 或 `hr location <friend_id> --dry-run` 预览；操作者明确批准后才加 `--yes`，Agent 不可自行补确认 |
 | `RESUME_ACCEPT_RESULT_UNKNOWN` | 同意附件简历请求的结果未确认 | 保留 `accepted=null`，在官方页面核对请求状态；禁止自动重试同意操作 |

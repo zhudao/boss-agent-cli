@@ -80,7 +80,16 @@ class AutomationStore:
 			return {"open": True, "reason": f"stop.json 无法解析，已按熔断处理：{exc}", "corrupt": True}
 		if not isinstance(loaded, dict):
 			return {"open": True, "reason": "stop.json 顶层不是 JSON object，已按熔断处理", "corrupt": True}
-		if "open" in loaded and not isinstance(loaded["open"], bool):
+		if "open" not in loaded:
+			# 缺少开关字段同样意味着「停止状态未知」：老读者会把它当没停止，
+			# resume() 也看不到可解除的闩锁（Issue #1598）。与类型漂移、解析
+			# 失败一样 fail-closed，不给自动化放行任何写操作。
+			return {
+				"open": True,
+				"reason": "stop.json 缺少 open 字段，已按熔断处理",
+				"corrupt": True,
+			}
+		if not isinstance(loaded["open"], bool):
 			# 熔断开关只认布尔：0 / null / "false" 这类真值漂移若被当成「已关闭」，
 			# 一次写坏就能放行自动化写操作；而 "true" 又会让两个读取器（SafetyGuard
 			# 的真值与 location 的 `is not True`）得到相反结论（Issue #1242）。
@@ -462,8 +471,11 @@ class AutomationStore:
 
 	def stats(self) -> dict[str, Any]:
 		events = self.read_jsonl("action-log.jsonl")
-		reviews = self.read_jsonl("human-review-queue.jsonl")
-		pending = self.read_jsonl("pending-actions.jsonl")
+		# 与 agent pending list / agent run 共用同一套行校验：统计页是熔断后的
+		# 恢复入口，若用原始 JSONL 行计数，坏 confidence / status 会被当作
+		# 正常待执行量，操作者据此判断「还有多少动作要核对」（Issue #1667）。
+		reviews = [asdict(item) for item in self.read_reviews()]
+		pending = [asdict(item) for item in self.read_pending()]
 		state = self.read_state()
 		today = datetime.now(timezone.utc).date().isoformat()
 		recent_errors = [

@@ -56,11 +56,14 @@ def open_file_command(path: str) -> str:
 	Windows / Linux 上会 command not found。Windows 用 ``cmd /c start``（cmd 与
 	PowerShell 都能调用），其余 Unix 用 ``xdg-open``。
 	"""
+	if sys.platform.startswith("win"):
+		# cmd.exe 不认 POSIX 单引号；含空格路径必须用双引号，并中和 %VAR% 展开
+		# 与 cmd 元字符。start 的第一个参数是窗口标题，保留空串占位。
+		windows_path = path.replace("^", "^^").replace("%", "%%").replace('"', '""')
+		return f'cmd /c start "" "{windows_path}"'
 	quoted = shell_argument(path)
 	if sys.platform == "darwin":
 		return f"open {quoted}"
-	if sys.platform.startswith("win"):
-		return f'cmd /c start "" {quoted}'
 	return f"xdg-open {quoted}"
 
 
@@ -154,7 +157,9 @@ _REGISTRY_COMMANDS: dict[str, str] = {
 	"boss ai config": "ai config",
 	"boss chat": "chat",
 	"boss clean --risk-lock": "clean --risk-lock",
+	"boss config reset": "config reset",
 	"boss crawl configure": "crawl configure",
+	"boss crawl results": "crawl results",
 	"boss crawl resume": "crawl resume",
 	"boss crawl start": "crawl start",
 	"boss crawl status": "crawl status",
@@ -370,7 +375,7 @@ def render_operator_actions(hints: dict[str, Any] | None) -> None:
 	console.print()
 	for index, action in enumerate(actions):
 		prefix = "↓ 你需要：" if index == 0 else "　　　　　"
-		console.print(f"[yellow]{prefix}[/yellow]{escape_markup(action)}")
+		console.print(f"[yellow]{prefix}[/yellow]{escape_markup(redact_sensitive_text(str(action)))}")
 
 
 def handle_output(
@@ -485,6 +490,7 @@ _READ_ONLY_COMMANDS = frozenset({
 	"chat",
 	"chat-summary",
 	"chatmsg",
+	"detail",
 	"digest",
 	"export",
 	"favorites-list",
@@ -529,6 +535,7 @@ def handle_platform_error_output(
 	*,
 	fallback_message: str,
 	extra_hints: dict[str, Any] | None = None,
+	read_only_operation: bool | None = None,
 ) -> None:
 	"""Emit a schema-backed error envelope for an unsuccessful platform response.
 
@@ -537,10 +544,12 @@ def handle_platform_error_output(
 	``UNKNOWN`` 沿用登记表的「先核对、勿自动重试」契约：写命令曾把它改写成
 	可重试的 ``NETWORK_ERROR``，批量与 wizard 因此重放可能已生效的写操作
 	（Issue #990）。
+	``read_only_operation`` 供同一命令同时包含读写分支时覆盖按命令名的默认值：
+	`hr resume --exchange` 是写操作，不能被只读命令名误判成可重试（Issue #1605）。
 	"""
 	code, message = platform.parse_error(response)
-	read_only = command in _READ_ONLY_COMMANDS
-	code = read_only_platform_code(command, code)
+	read_only = command in _READ_ONLY_COMMANDS if read_only_operation is None else read_only_operation
+	code = code if read_only_operation is False else read_only_platform_code(command, code)
 	recoverable, recovery_action, risk_hints = platform_error_contract(code, ctx=ctx, read_only=read_only)
 	hints = {**(extra_hints or {}), **(risk_hints or {})} or None
 	details = None

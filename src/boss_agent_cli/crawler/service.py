@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from boss_agent_cli.api import cdp_risk_lock
+from boss_agent_cli.api.models import field_text
 from boss_agent_cli.api.client import PlatformRiskError
 from boss_agent_cli.api.request_budget import (
 	RequestBudget,
@@ -24,7 +25,7 @@ from boss_agent_cli.api.request_budget import (
 	is_request_stop,
 	request_control,
 )
-from boss_agent_cli.api.zhipin_errors import normalize_risk_code
+from boss_agent_cli.api.zhipin_errors import is_platform_success_code, normalize_risk_code
 from boss_agent_cli.cache.store import (
 	CacheBusyError,
 	CacheDatabaseInvalid,
@@ -178,12 +179,16 @@ class CrawlSettings:
 		# （Issue #1347）。
 		if not isinstance(profile_path, str):
 			raise CacheRecordInvalid(
-				"crawl_run", run_id, "params.browser.profile_path",
+				"crawl_run",
+				run_id,
+				"params.browser.profile_path",
 				f"期望绝对路径字符串，实际是 {type(profile_path).__name__}",
 			)
 		if not profile_path.strip():
 			raise CacheRecordInvalid(
-				"crawl_run", run_id, "params.browser.profile_path",
+				"crawl_run",
+				run_id,
+				"params.browser.profile_path",
 				f"期望非空绝对路径字符串，实际是空字符串（{type(profile_path).__name__}）",
 			)
 		# NUL 等控制字符能通过「非空绝对路径」检查，但会在 transport 的
@@ -192,12 +197,16 @@ class CrawlSettings:
 		# 损坏或手工篡改。
 		if any(ord(char) < 0x20 for char in profile_path):
 			raise CacheRecordInvalid(
-				"crawl_run", run_id, "params.browser.profile_path",
+				"crawl_run",
+				run_id,
+				"params.browser.profile_path",
 				f"期望绝对路径字符串，实际包含控制字符 {profile_path!r}",
 			)
 		if not Path(profile_path).is_absolute():
 			raise CacheRecordInvalid(
-				"crawl_run", run_id, "params.browser.profile_path",
+				"crawl_run",
+				run_id,
+				"params.browser.profile_path",
 				f"期望绝对路径，实际是相对路径 {profile_path!r}（{type(profile_path).__name__}）",
 			)
 		# 断点里的端口必须落在 1–65535：越界值会在 transport 的
@@ -210,15 +219,15 @@ class CrawlSettings:
 		hook_profile = str(hook_profile)
 		if hook_profile not in ("none", "screenshot-full"):
 			raise CacheRecordInvalid(
-				"crawl_run", run_id, "params.hook.profile",
+				"crawl_run",
+				run_id,
+				"params.hook.profile",
 				f"期望 none 或 screenshot-full，实际是 {hook_profile!r}",
 			)
 		hook_dir_raw = raw.get("hook_dir") or hook.get("directory")
 		hook_dir = Path(str(hook_dir_raw)) if hook_dir_raw else None
 		if hook_profile == "screenshot-full" and hook_dir is None:
-			raise CacheRecordInvalid(
-				"crawl_run", run_id, "params.hook.directory", "screenshot-full 需要 hook 目录"
-			)
+			raise CacheRecordInvalid("crawl_run", run_id, "params.hook.directory", "screenshot-full 需要 hook 目录")
 
 		def _limit(key: str, default: int, *, minimum: int) -> int:
 			# 不能用 `value or default`：0 是损坏值，不能被静默替换成默认预算，
@@ -747,12 +756,16 @@ class CrawlService:
 			status = "budget_stopped"
 			error = str(exc)
 		except RequestBudgetExceeded as exc:
+			# REQUEST_BUDGET_EXHAUSTED 是本地共享请求预算的等待超时（另一个进程持有
+			# 租约、冷却未结束或等不到下一个请求间隔），run 自己的预算并没有耗尽：
+			# 落成 budget_stopped 会让入口提示「新建任务」，而等待后用 resume 就能
+			# 从断点继续（Issue #1556）。run 预算耗尽走 CrawlLimitExceeded。
 			status = (
 				"timeout_stopped"
 				if exc.code == "WORKFLOW_TIMEOUT"
 				else "workflow_stopped"
 				if exc.code == "WORKFLOW_STOPPED"
-				else "budget_stopped"
+				else "throttle_stopped"
 			)
 			error = str(exc)
 		except CrawlTimeoutRequested as exc:
@@ -949,6 +962,13 @@ class CrawlService:
 				row["detail_status"] = "cached"
 			else:
 				security_id = str(row.get("security_id", ""))
+				if not security_id:
+					# 列表项没有 securityId 时无法请求详情；保留 pending 让 resume
+					# 与 `crawl results --detail-status pending` 如实反映缺口，
+					# 不能伪造空卡片并标记完成（Issue #1584）。
+					row["detail_status"] = "missing-security-id"
+					self._cache.put_crawl_job(run_id, item["job_key"], int(item["page_no"]), row, detail_done=False)
+					continue
 
 				def fetch_detail() -> dict[str, Any]:
 					# 结构校验与请求共用有限重试；失败时条目仍保留在待补队列。
@@ -957,10 +977,10 @@ class CrawlService:
 				card = self._with_retry(fetch_detail, max_retries=settings.max_retries)
 				row.update(
 					{
-						"post_description": card.get("postDescription", ""),
-						"address": card.get("address", ""),
-						"boss_name": card.get("bossName", ""),
-						"boss_title": card.get("bossTitle", ""),
+						"post_description": field_text(card, "postDescription"),
+						"address": field_text(card, "address"),
+						"boss_name": field_text(card, "bossName"),
+						"boss_title": field_text(card, "bossTitle"),
 						"detail_status": "fetched",
 					}
 				)
@@ -1006,8 +1026,9 @@ class CrawlService:
 			if normalize_risk_code(payload.get("code")) is not None:
 				raise CrawlRiskError.from_response(payload)
 		self._raise_if_stop_requested(run_id)
-		if payload.get("code") not in (None, 0):
-			raise RuntimeError(f"第 {page_no} 页接口错误 code={payload.get('code')}: {payload.get('message', '')}")
+		code = payload.get("code")
+		if code is not None and not is_platform_success_code(code):
+			raise RuntimeError(f"第 {page_no} 页接口错误 code={code}: {payload.get('message', '')}")
 		data = payload.get("zpData")
 		if not isinstance(data, dict) or not isinstance(data.get("jobList"), list):
 			raise RuntimeError(f"第 {page_no} 页响应缺少有效的 zpData.jobList 列表")
@@ -1032,8 +1053,9 @@ class CrawlService:
 			if normalize_risk_code(payload.get("code")) is not None:
 				raise CrawlRiskError.from_response(payload)
 		self._raise_if_stop_requested(run_id)
-		if payload.get("code") not in (None, 0):
-			raise RuntimeError(f"职位详情接口错误 code={payload.get('code')}: {payload.get('message', '')}")
+		code = payload.get("code")
+		if code is not None and not is_platform_success_code(code):
+			raise RuntimeError(f"职位详情接口错误 code={code}: {payload.get('message', '')}")
 		return payload
 
 	def _raise_if_stop_requested(self, run_id: str) -> None:
@@ -1051,6 +1073,10 @@ class CrawlService:
 
 	@staticmethod
 	def _validate_settings(settings: CrawlSettings) -> None:
+		if not settings.query.strip():
+			# 各创建入口都在前面校验了关键词，这里是 service 层的最后一道防线：
+			# 空白关键词等于不筛选，会按城市默认列表抓取并放大风控面（Issue #1582）。
+			raise ValueError("搜索关键词不能为空")
 		if settings.pages < 1:
 			raise ValueError("pages 必须是正整数")
 		if settings.max_requests < 1:
@@ -1066,7 +1092,7 @@ class CrawlService:
 def _normalize_job(raw: dict[str, Any], query: str, page_no: int, rank: int) -> tuple[str, dict[str, Any]]:
 	job_id = str(raw.get("encryptJobId") or "")
 	security_id = str(raw.get("securityId") or "")
-	job_key = job_id or security_id or f"{page_no}:{rank}:{raw.get('jobName', '')}"
+	job_key = job_id or security_id or f"{page_no}:{rank}:{field_text(raw, 'jobName')}"
 	labels = raw.get("jobLabels", [])
 	benefits = raw.get("welfareList", [])
 	return job_key, {
@@ -1076,22 +1102,22 @@ def _normalize_job(raw: dict[str, Any], query: str, page_no: int, rank: int) -> 
 		"job_id": job_id,
 		"security_id": security_id,
 		"lid": str(raw.get("lid") or ""),
-		"title": raw.get("jobName", ""),
-		"salary": raw.get("salaryDesc", ""),
-		"city": raw.get("cityName", ""),
-		"district": raw.get("areaDistrict", ""),
-		"business_district": raw.get("businessDistrict", ""),
-		"company": raw.get("brandName", ""),
-		"company_scale": raw.get("brandScaleName", ""),
-		"industry": raw.get("brandIndustry", ""),
-		"education": raw.get("jobDegree", ""),
-		"experience": raw.get("jobExperience", ""),
+		"title": field_text(raw, "jobName"),
+		"salary": field_text(raw, "salaryDesc"),
+		"city": field_text(raw, "cityName"),
+		"district": field_text(raw, "areaDistrict"),
+		"business_district": field_text(raw, "businessDistrict"),
+		"company": field_text(raw, "brandName"),
+		"company_scale": field_text(raw, "brandScaleName"),
+		"industry": field_text(raw, "brandIndustry"),
+		"education": field_text(raw, "jobDegree"),
+		"experience": field_text(raw, "jobExperience"),
 		"labels": "、".join(str(item) for item in labels) if isinstance(labels, list) else str(labels or ""),
 		"benefits": "、".join(str(item) for item in benefits) if isinstance(benefits, list) else str(benefits or ""),
 		"post_description": "",
 		"address": "",
-		"boss_name": raw.get("bossName", ""),
-		"boss_title": raw.get("bossTitle", ""),
+		"boss_name": field_text(raw, "bossName"),
+		"boss_title": field_text(raw, "bossTitle"),
 		"detail_status": "not_requested",
 	}
 

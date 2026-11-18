@@ -56,6 +56,10 @@ def _parse_cached_result(raw: str) -> dict[str, Any] | None:
 	`JSONDecodeError`、`result["data"]` 会抛 `KeyError`，两者都会让
 	`boss search` 直接 traceback；重新搜索会覆盖同键的坏条目。
 	"""
+	if not isinstance(raw, (str, bytes, bytearray)):
+		# 缓存 response 列类型漂移时 json.loads 会抛 TypeError，把本地坏行
+		# 升级成 INTERNAL_ERROR；与坏 JSON 一样按未命中处理（Issue #1668）。
+		return None
 	try:
 		parsed = json.loads(raw)
 	# ValueError 覆盖 JSONDecodeError / UnicodeDecodeError 与 3.11+ 的超长整数
@@ -364,17 +368,20 @@ def search_cmd(
 			)
 			return
 		params = record["params"]
-		query = params.get("query") or query
-		city = city or params.get("city")
-		salary = salary or params.get("salary")
-		experience = experience or params.get("experience")
-		education = education or params.get("education")
-		industry = industry or params.get("industry")
-		scale = scale or params.get("scale")
-		stage = stage or params.get("stage")
-		job_type = job_type or params.get("job_type")
-		welfare = welfare or params.get("welfare")
-		active = active or params.get("active")
+		# 显式参数优先，preset 只补未提供的项（schema 的 --preset 描述）：
+		# 这里必须用 `is not None` 而不是真值判断——显式空串（如 `--city ""`）
+		# 表示「该项不筛选」，不能被预设值反向覆盖（Issue #1569、#1573）。
+		query = query if query is not None else params.get("query")
+		city = city if city is not None else params.get("city")
+		salary = salary if salary is not None else params.get("salary")
+		experience = experience if experience is not None else params.get("experience")
+		education = education if education is not None else params.get("education")
+		industry = industry if industry is not None else params.get("industry")
+		scale = scale if scale is not None else params.get("scale")
+		stage = stage if stage is not None else params.get("stage")
+		job_type = job_type if job_type is not None else params.get("job_type")
+		welfare = welfare if welfare is not None else params.get("welfare")
+		active = active if active is not None else params.get("active")
 
 	if search_url:
 		try:

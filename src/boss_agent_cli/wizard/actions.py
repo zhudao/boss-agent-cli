@@ -36,8 +36,11 @@ from boss_agent_cli.crawler.service import (
 	crawl_int_setting,
 	unused_local_port,
 )
+from boss_agent_cli.api.egress import EgressContradictionError
 from boss_agent_cli.crawler.controls import (
+	CrawlBrowserStartError,
 	CrawlExportError,
+	CrawlHookDirInvalid,
 	CrawlProfileBusy,
 	CrawlRuntimeUnavailable,
 	CrawlSessionAuthError,
@@ -46,7 +49,14 @@ from boss_agent_cli.crawler.hooks import HookRegistrationError, verify_hook_prof
 from boss_agent_cli.crawler.transport import DrissionCrawlerSession, ensure_crawl_runtime
 from boss_agent_cli.services.install_extras import extras_requirement
 from boss_agent_cli.digest import build_digest
-from boss_agent_cli.display import RISK_ERROR_CONTRACTS, boss_command, error_contract_for_code, risk_error_contract, risk_error_message, shell_argument
+from boss_agent_cli.display import (
+	RISK_ERROR_CONTRACTS,
+	boss_command,
+	error_contract_for_code,
+	risk_error_contract,
+	risk_error_message,
+	shell_argument,
+)
 from boss_agent_cli.output import Logger
 from boss_agent_cli.pipeline_state import build_pipeline_items, select_follow_up_candidates
 from boss_agent_cli.resume.models import resume_to_text
@@ -205,7 +215,9 @@ def execute_candidate_search(
 	try:
 		active = resolve_active_level(_optional_str(inputs.get("active")))
 	except ValueError as exc:
-		raise WorkflowActionError("INVALID_PARAM", str(exc), recoverable=True, recovery_action="修正 active 取值后重试") from exc
+		raise WorkflowActionError(
+			"INVALID_PARAM", str(exc), recoverable=True, recovery_action="修正 active 取值后重试"
+		) from exc
 	try:
 		_validate_search_filters(inputs)
 	except ValueError as exc:
@@ -213,8 +225,7 @@ def execute_candidate_search(
 			"INVALID_PARAM",
 			str(exc),
 			recovery_action=(
-				"修正搜索筛选后重试；支持的城市用 boss cities 查看，"
-				"薪资 / 经验 / 学历等可选值在错误信息里已列出"
+				"修正搜索筛选后重试；支持的城市用 boss cities 查看，薪资 / 经验 / 学历等可选值在错误信息里已列出"
 			),
 		) from exc
 	criteria = SearchFilterCriteria(
@@ -242,7 +253,11 @@ def execute_candidate_search(
 	if browser_detail:
 		# CDP 模式：详情只走浏览器、串行，并按 CrawlBudget 间隔（wizard 等调用方没传节流时补上）
 		extra["detail_channel"] = "browser"
-		if extra.get("before_detail_request") is None and isinstance(cache, CacheStore) and getattr(platform, "name", None) == "zhipin":
+		if (
+			extra.get("before_detail_request") is None
+			and isinstance(cache, CacheStore)
+			and getattr(platform, "name", None) == "zhipin"
+		):
 			budget = CrawlBudget(cache)
 			extra["before_detail_request"] = lambda: budget.wait("list")
 	return pipeline(
@@ -251,9 +266,7 @@ def execute_candidate_search(
 		logger,
 		criteria=criteria,
 		start_page=_int_input(inputs, "page", 1, minimum=1),
-		max_pages=_int_input(
-			inputs, "max_pages", detail_filter_max_pages(welfare_conditions, active), minimum=1
-		),
+		max_pages=_int_input(inputs, "max_pages", detail_filter_max_pages(welfare_conditions, active), minimum=1),
 		welfare_conditions=welfare_conditions,
 		before_list_request=inputs.get("before_list_request"),
 		**extra,
@@ -264,20 +277,23 @@ def execute_recruiter_candidate_search(platform: Any, inputs: Mapping[str, Any])
 	"""Shared recruiter search call used by the command and workflow action."""
 	# platform 按鸭子类型接收真实适配器与测试替身，返回的平台响应字典由调用方
 	# 按 API 响应契约读取；这里显式收敛 Any，避免整条调用链丢失类型。
-	return cast("dict[str, Any]", platform.search_geeks(
-		str(inputs.get("query") or ""),
-		city=_optional_str(inputs.get("city")),
-		page=_int_input(inputs, "page", 1, minimum=1),
-		job_id=_optional_str(inputs.get("job_id")),
-		experience=_optional_str(inputs.get("experience")),
-		degree=_optional_str(inputs.get("degree")),
-		age=_optional_str(inputs.get("age")),
-		school_level=_optional_str(inputs.get("school_level")),
-		activeness=_optional_str(inputs.get("activeness")),
-		source=_optional_str(inputs.get("source")),
-		select=_bool_input(inputs, "select"),
-		salary=_optional_str(inputs.get("salary")),
-	))
+	return cast(
+		"dict[str, Any]",
+		platform.search_geeks(
+			str(inputs.get("query") or ""),
+			city=_optional_str(inputs.get("city")),
+			page=_int_input(inputs, "page", 1, minimum=1),
+			job_id=_optional_str(inputs.get("job_id")),
+			experience=_optional_str(inputs.get("experience")),
+			degree=_optional_str(inputs.get("degree")),
+			age=_optional_str(inputs.get("age")),
+			school_level=_optional_str(inputs.get("school_level")),
+			activeness=_optional_str(inputs.get("activeness")),
+			source=_optional_str(inputs.get("source")),
+			select=_bool_input(inputs, "select"),
+			salary=_optional_str(inputs.get("salary")),
+		),
+	)
 
 
 def _extract_list_items(payload: Any, keys: tuple[str, ...] = ()) -> list[dict[str, Any]]:
@@ -501,13 +517,14 @@ def _classify_action_error(
 		"NETWORK_ERROR",
 		"TOKEN_REFRESH_FAILED",
 		"NOT_SUPPORTED",
-		"INVALID_PARAM",
+		"CONFIG_INVALID",
 	}
-	if code in {"AUTH_REQUIRED", "AUTH_EXPIRED", "TOKEN_REFRESH_FAILED"}:
+	if code in {"AUTH_REQUIRED", "AUTH_EXPIRED", "TOKEN_REFRESH_FAILED", "CONFIG_INVALID"}:
 		recovery = str(ERROR_CODES[code]["recovery_action"])
 	elif code == "NOT_SUPPORTED":
 		recovery = "切换平台或 workflow goal 后重试"
 	elif code == "INVALID_PARAM":
+		# 纯参数错误是确定性的：自动重试同一动作必然复现（Issue #1525）。
 		recovery = "换一条职位重试，或返回结果列表重新选择"
 	else:
 		recovery = "稍后重试，或返回主菜单选择其他事项"
@@ -878,11 +895,13 @@ def _candidate_friend(platform: Any, identifier: str, *, context: ActionContext 
 	except FriendLookupLimitExceeded as exc:
 		# 候选人无法「缩小沟通列表范围」：照抄旧指引只会把同一段超过分页上限的
 		# 遍历再跑一遍。find_friend 优先匹配稳定 uid，给出可执行的 uid 路径。
+		# recoverable 必须是 false：分页上限是确定性结果，标成可重试会让
+		# max_retries≥1 的向导自动重翻 50 页并消耗请求预算（Issue #1549）。
 		chat_hint = _hint_command(context, "chat") if context is not None else "boss chat"
 		raise WorkflowActionError(
 			"NETWORK_ERROR",
 			str(exc),
-			recoverable=True,
+			recoverable=False,
 			recovery_action=(
 				f"先用 {chat_hint} 确认联系人仍在沟通列表并取到 uid，再用 uid 重试；"
 				"按会轮换的 securityId 查询超过分页上限时，重试同样的查询不会改变结果"
@@ -942,7 +961,9 @@ def _candidate_mark(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 		label_id = None
 	if label_id is None:
 		shown = label if len(label) <= 40 else f"{label[:40]}…（共 {len(label)} 字符）"
-		raise WorkflowActionError("INVALID_PARAM", f"未知标签: {shown}（可选: 新招呼、沟通中、已约面、已获取简历、不合适、收藏）")
+		raise WorkflowActionError(
+			"INVALID_PARAM", f"未知标签: {shown}（可选: 新招呼、沟通中、已约面、已获取简历、不合适、收藏）"
+		)
 	with context.candidate_platform() as platform:
 		friend = _candidate_friend(platform, identifier, context=context)
 		uid = str(friend.get("uid") or "")
@@ -960,12 +981,14 @@ def _candidate_mark(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 			lambda: platform.friend_label(uid, label_id, friend_source, remove=remove),
 			"联系人标签更新失败",
 		)
-	return StepResult({
-		"uid": uid,
-		"security_id": str(friend.get("securityId") or friend.get("security_id") or ""),
-		"label": label,
-		"result": data,
-	})
+	return StepResult(
+		{
+			"uid": uid,
+			"security_id": str(friend.get("securityId") or friend.get("security_id") or ""),
+			"label": label,
+			"result": data,
+		}
+	)
 
 
 def _candidate_chat(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
@@ -1095,21 +1118,20 @@ def _ai_assist(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping
 			"AI_NOT_CONFIGURED",
 			"AI 服务未配置",
 			recoverable=True,
-			recovery_action=_hint_command(
-				context, "ai config --provider <provider> --model <model> --api-key <key>"
-			),
+			recovery_action=_hint_command(context, "ai config --provider <provider> --model <model> --api-key <key>"),
 		)
 	# 数值项与 ai 命令同口径校验：坏值不能原样发给服务商、只换回泛化的
-	# 平台错误；本地配置问题给 INVALID_PARAM 与修复命令（Issue #1209）。
+	# 平台错误；本地配置问题给 CONFIG_INVALID 与修复命令（Issue #1209、#1525）。
 	try:
 		temperature = ai_float_setting(config, "ai_temperature", 0.7)
 		max_tokens = ai_int_setting(config, "ai_max_tokens", 4096)
 	except ValueError as exc:
 		raise WorkflowActionError(
-			"INVALID_PARAM",
+			"CONFIG_INVALID",
 			f"本地 AI 配置损坏：{exc}",
 			recoverable=True,
 			recovery_action=_hint_command(context, "ai config --max-tokens 4096 --temperature 0.7"),
+			auto_retry=False,
 		) from exc
 	service = AIService(
 		str(base_url),
@@ -1276,9 +1298,7 @@ def _candidate_watch(context: ActionContext, inputs: Mapping[str, Any], prior: M
 		try:
 			_validate_search_filters(record["params"])
 		except ValueError as exc:
-			raise _saved_search_invalid_error(
-				context, name, f"watch {name!r} 的参数已失效：{exc}"
-			) from exc
+			raise _saved_search_invalid_error(context, name, f"watch {name!r} 的参数已失效：{exc}") from exc
 		account = account_scope(context.auth())
 		with context.candidate_platform() as platform:
 			result = execute_candidate_search(platform, cache, context.logger, {**record["params"], "account": account})
@@ -1320,15 +1340,29 @@ def _crawl_seed_session(context: ActionContext) -> tuple[dict[str, str], str]:
 	return cookies, user_agent
 
 
-def _crawl_service(context: ActionContext, cache: CacheStore) -> CrawlService:
+def _crawl_service(context: ActionContext, cache: CacheStore, *, lazy: bool = False) -> CrawlService:
+	"""构造 crawl service。
+
+	``lazy=True``（恢复路径）把登录态与运行时检查推迟到 ``preflight``：已完成的
+	run 不需要浏览器就能返回既有结果，若在构造时先跑 ``ensure_crawl_runtime`` /
+	取 Cookie，已完成 run 也会被要求登录或安装 crawl 依赖，与 CLI 的
+	``crawl resume`` 口径不一致（Issue #1412 / #1540）。新建任务仍立即预检：
+	依赖缺失时不能留下一个只会在执行阶段失败的 run（Issue #1050）。
+	"""
 	control = context.workflow_control
-	# 依赖先于登录态：没装 crawl 依赖时登录也无法采集，也不应创建内部任务。
-	ensure_crawl_runtime()
-	seed_cookies, user_agent = _crawl_seed_session(context)
-	return CrawlService(
-		cache,
-		data_dir=context.data_dir,
-		transport_factory=lambda settings: DrissionCrawlerSession(
+
+	def load_session() -> tuple[dict[str, str], str]:
+		# 依赖先于登录态：没装 crawl 依赖时登录也无法采集，也不应创建内部任务。
+		ensure_crawl_runtime()
+		return _crawl_seed_session(context)
+
+	session: list[tuple[dict[str, str], str]] = []
+
+	def transport(settings: Any) -> DrissionCrawlerSession:
+		if not session:
+			session.append(load_session())
+		seed_cookies, user_agent = session[0]
+		return DrissionCrawlerSession(
 			profile_path=settings.profile_path,
 			chrome_path=settings.chrome_path,
 			cdp_port=settings.cdp_port,
@@ -1336,9 +1370,21 @@ def _crawl_service(context: ActionContext, cache: CacheStore) -> CrawlService:
 			hook_dir=settings.hook_dir,
 			seed_cookies=seed_cookies,
 			user_agent=user_agent,
-		),
+		)
+
+	def preflight() -> None:
+		if not session:
+			session.append(load_session())
+
+	if not lazy:
+		preflight()
+	return CrawlService(
+		cache,
+		data_dir=context.data_dir,
+		transport_factory=transport,
 		control_probe=control.poll if control is not None else None,
 		on_run_created=control.bind_inner_run if control is not None else None,
+		preflight=preflight,
 	)
 
 
@@ -1391,14 +1437,23 @@ def _crawl_outcome_result(outcome: Any, cache: CacheStore | None = None) -> Step
 			recoverable=True,
 			recovery_action=resume_command,
 		)
-	if outcome.status == "workflow_stopped" or (
-		outcome.status == "stopped" and _is_stop_error(outcome.error)
-	):
+	if outcome.status == "workflow_stopped" or (outcome.status == "stopped" and _is_stop_error(outcome.error)):
 		raise WorkflowActionError(
 			"WORKFLOW_STOPPED",
 			outcome.error or "crawl 已停止",
 			recoverable=False,
 			recovery_action=status_command,
+		)
+	if outcome.status == "throttle_stopped":
+		# 本地共享请求预算等待超时：run 预算没有耗尽，等待后 resume 从断点继续
+		# （Issue #1556）。
+		raise WorkflowActionError(
+			"REQUEST_BUDGET_EXHAUSTED",
+			outcome.error or "本地请求节流等待超时，请求未发出",
+			recoverable=True,
+			recovery_action=resume_command,
+			# 立即重试仍可能撞上同一个冷却 / 占用者，交给操作者稍后恢复。
+			auto_retry=False,
 		)
 	if outcome.status in {"risk_stopped", "budget_stopped"}:
 		# 风控停止时 service 会 keep Chrome；把标记写入结果供向导文案使用。
@@ -1479,11 +1534,29 @@ def _crawl_export_error(exc: CrawlExportError) -> WorkflowActionError:
 		"LOCAL_IO_ERROR",
 		str(exc),
 		recoverable=recoverable,
+		recovery_action=("确认输出目录可写（不是同名的已有文件）、目录权限与磁盘空间正常，修正后重新执行 crawl resume"),
+		replay_safe=False,
+	)
+
+
+def _crawl_hook_dir_error(exc: CrawlHookDirInvalid) -> WorkflowActionError:
+	"""断点 Hook 目录坏是本地状态错误，和 CLI `crawl resume` 同口径（Issue #1586）。
+
+	resume 没有 --hook-dir 可改，不能落到可重试的 INVALID_PARAM；重试同一断点
+	只会复现。必须在 `except ValueError` 之前捕获，因为它是 ValueError 子类。
+	"""
+	recoverable, _ = error_contract_for_code("LOCAL_IO_ERROR")
+	hook_dir = f" {exc.hook_dir}" if exc.hook_dir is not None else ""
+	return WorkflowActionError(
+		"LOCAL_IO_ERROR",
+		str(exc),
+		recoverable=recoverable,
 		recovery_action=(
-			"确认输出目录可写（不是同名的已有文件）、目录权限与磁盘空间正常，"
-			"修正后重新执行 crawl resume"
+			f"停止自动重试：核对 Hook 目录{hook_dir}中的 7 个脚本与 SHA256SUMS，"
+			"修复后重新执行 crawl resume；目录已迁移时用新的 --hook-dir 重新创建任务"
 		),
 		replay_safe=False,
+		auto_retry=False,
 	)
 
 
@@ -1523,6 +1596,50 @@ def _crawl_unavailable_error(context: ActionContext, exc: CrawlRuntimeUnavailabl
 		str(exc),
 		recoverable=bool(ERROR_CODES["CRAWL_UNAVAILABLE"]["recoverable"]),
 		recovery_action=f"安装 {extras_requirement('crawl')} 并执行 {configure_command}",
+		# 可选依赖没装，重试同一动作必然复现；浏览器从未启动，无平台副作用
+		# （Issue #1543）。
+		auto_retry=False,
+	)
+
+
+def _crawl_browser_start_error(context: ActionContext, exc: CrawlBrowserStartError) -> WorkflowActionError:
+	"""采集浏览器没能启动或附着：本次没有发出请求，指引检查 Chrome / 端口 / 路径。"""
+	configure_command = _hint_command(context, "crawl configure")
+	if exc.attached:
+		recovery = (
+			"上次保留的采集 Chrome 可能已关闭：重新执行同一动作即可新起浏览器；"
+			f"仍失败时用 {configure_command} 核对 chrome_path，并确认调试端口 {exc.cdp_port} 未被其他程序占用"
+		)
+	else:
+		recovery = (
+			f"确认本机已安装 Chrome 并用 {configure_command} 设置 chrome_path，"
+			f"确认调试端口 {exc.cdp_port} 未被其他程序占用、数据目录可写后重试；"
+			f"依赖缺失时安装 {extras_requirement('crawl')}"
+		)
+	return WorkflowActionError(
+		"CRAWL_UNAVAILABLE",
+		str(exc),
+		recoverable=True,
+		recovery_action=recovery,
+		# 新起浏览器失败时同一动作会再次撞上同一个本地原因；附着失败则可能只是
+		# 上次保留的窗口已关闭，允许自动重试来新起浏览器（本次没有发出请求，
+		# 重试安全，Issue #1553）。
+		auto_retry=exc.attached,
+	)
+
+
+def _crawl_egress_error(exc: EgressContradictionError) -> WorkflowActionError:
+	"""出口与声明的语言/时区矛盾：刻意拒绝启动，重试不会改变出口（Issue #1555）。"""
+	return WorkflowActionError(
+		"EGRESS_CONTRADICTION",
+		str(exc),
+		recoverable=False,
+		recovery_action=(
+			"保持客户端声明的语言/时区不变，换回与之一致的出口后重试；"
+			"不需要出口一致性检查时撤销 BOSS_EGRESS_PROBE_URL。程序不会自动改写语言或时区"
+		),
+		details={"egress": exc.verdict.as_dict()},
+		auto_retry=False,
 	)
 
 
@@ -1547,25 +1664,42 @@ def _crawl_start(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 		# dict() / .get() 抛出的 TypeError / AttributeError 会被 runner 兜成可重试的
 		# NETWORK_ERROR，而重试同一条 run_id 永远复现（Issue #1330）。
 		raise WorkflowActionError(
-			"INVALID_PARAM",
+			"CONFIG_INVALID",
 			f"本地配置必须是 JSON 对象，收到 {type(context.config).__name__}",
+			recoverable=True,
 			recovery_action=f"修正或删除 {context.data_dir / 'config.json'} 后重试",
+			auto_retry=False,
 		)
 	crawl_value = context.config.get("crawl") if context.config is not None else None
 	if crawl_value is not None and not isinstance(crawl_value, Mapping):
 		raise WorkflowActionError(
-			"INVALID_PARAM",
+			"CONFIG_INVALID",
 			f"配置项 crawl 必须是 JSON 对象，收到 {type(crawl_value).__name__}",
+			recoverable=True,
 			recovery_action=(
 				f"{_hint_command(context, 'config reset crawl')}；"
 				f"或直接修正 {context.data_dir / 'config.json'} 的 crawl 段"
 			),
+			auto_retry=False,
 		)
 	crawl_config = dict(crawl_value or {})
+	raw_query = inputs.get("query")
 	city = str(_required(inputs, "city"))
 	city_code = CITY_CODES.get(city, city if city.isascii() and city.isdigit() else None)
 	if city_code is None:
 		raise WorkflowActionError("INVALID_PARAM", f"未知城市: {city}")
+	if raw_query is None or (isinstance(raw_query, str) and not raw_query.strip()):
+		# CLI `crawl run` 对空 / 纯空白关键词一律拒绝：wizard 必须在写 crawl_runs
+		# 与打开浏览器之前同口径收口（Issue #1582）。城市校验先行，保留既有
+		# 「未知城市」错误码与文案（无 query 的旧调用也要先报城市问题）。
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			"搜索关键词不能为空",
+			recoverable=True,
+			recovery_action="在 inputs 中提供非空白的 query 后重试",
+		)
+	if not isinstance(raw_query, str):
+		raise WorkflowActionError("INVALID_PARAM", "搜索关键词必须是字符串")
 	hook_profile = str(inputs.get("hook_profile") or "none")
 	if hook_profile != "none":
 		# 向导没有 hook-dir 输入，screenshot-full 在这里必然失败；提前按参数错误返回，
@@ -1584,7 +1718,7 @@ def _crawl_start(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 	raw_port = crawl_config.get("cdp_port")
 	try:
 		settings = CrawlSettings(
-			query=str(_required(inputs, "query")),
+			query=raw_query,
 			city_code=city_code,
 			pages=pages,
 			with_detail=with_detail,
@@ -1601,9 +1735,11 @@ def _crawl_start(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 		# 手工编辑 config.json 写坏 crawl 段时不能落成可重试的 NETWORK_ERROR：
 		# 重试同一个 run_id 永远修不好配置。与 CLI 路径一致，指向 config reset。
 		raise WorkflowActionError(
-			"INVALID_PARAM",
+			"CONFIG_INVALID",
 			f"crawl 配置无效: {exc}",
+			recoverable=True,
 			recovery_action=_hint_command(context, "config reset crawl"),
+			auto_retry=False,
 		) from exc
 	try:
 		# 当前向导只允许 hook_profile=none，这里与 CLI 创建入口共用同一道只读
@@ -1625,6 +1761,10 @@ def _crawl_start(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 			raise _crawl_busy_error(context, exc) from exc
 		except CrawlProfileBusy as exc:
 			raise _crawl_profile_busy_error(context, exc) from exc
+		except CrawlBrowserStartError as exc:
+			raise _crawl_browser_start_error(context, exc) from exc
+		except EgressContradictionError as exc:
+			raise _crawl_egress_error(exc) from exc
 		except CrawlRuntimeUnavailable as exc:
 			raise _crawl_unavailable_error(context, exc) from exc
 		except CrawlExportError as exc:
@@ -1637,7 +1777,18 @@ def _crawl_start(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 
 
 def _positive_int(value: Any, *, name: str) -> int:
-	"""解析 workflow 输入的正整数；非法值按参数错误返回，不落成可重试的网络错误。"""
+	"""解析 workflow 输入的正整数；非法值按参数错误返回，不落成可重试的网络错误。
+
+	输入来自 ``--input-json`` / MCP，bool 与小数不是页数：`int(True)` 是 1、
+	`int(2.9)` 是 2。与同文件 `_coerce_int` 同口径拒绝，避免非法输入变成真实
+	采集请求（Issue #1601）。整数字符串仍按既有兼容口径接受。
+	"""
+	if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			f"{name} 必须是整数: {value!r}",
+			recovery_action=f"传入 1 以上的整数 {name}",
+		)
 	try:
 		parsed = int(value)
 	# OverflowError：`1e400` 解析成 inf，`int(inf)` 抛错；调用方改输入即可修复，
@@ -1675,7 +1826,7 @@ def _crawl_resume(context: ActionContext, inputs: Mapping[str, Any], prior: Mapp
 	with_detail = _bool_input(inputs, "with_detail")
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		try:
-			outcome = _crawl_service(context, cache).resume(
+			outcome = _crawl_service(context, cache, lazy=True).resume(
 				run_id,
 				pages=pages,
 				with_detail=with_detail,
@@ -1687,18 +1838,25 @@ def _crawl_resume(context: ActionContext, inputs: Mapping[str, Any], prior: Mapp
 			# 断点记录损坏由 runner 统一按 CACHE_RECORD_INVALID 回报；它也是
 			# ValueError 子类，不能下面的 Hook 参数分支吞掉。
 			raise
+		except CrawlHookDirInvalid as exc:
+			# 断点里的 Hook 目录是本地状态，CLI 路径按 LOCAL_IO_ERROR 收口；
+			# 必须排在 ValueError 分支之前（Issue #1586）。
+			raise _crawl_hook_dir_error(exc) from exc
 		except ValueError as exc:
-			# 断点里的 Hook 目录在恢复前会被重新校验（Issue #1408）；坏目录是
-			# 确定性本地参数失败，不能兜成可重试的 NETWORK_ERROR。
+			# 其他确定性输入错误按参数错误返回，不落成可重试的 NETWORK_ERROR。
 			raise WorkflowActionError(
 				"INVALID_PARAM",
 				str(exc),
-				recovery_action="修正断点中的 Hook 目录（7 个脚本与 SHA256SUMS）后重试，或重新创建采集任务",
+				recovery_action="修正参数后重试，或重新创建采集任务",
 			) from exc
 		except CrawlBusyError as exc:
 			raise _crawl_busy_error(context, exc) from exc
 		except CrawlProfileBusy as exc:
 			raise _crawl_profile_busy_error(context, exc) from exc
+		except CrawlBrowserStartError as exc:
+			raise _crawl_browser_start_error(context, exc) from exc
+		except EgressContradictionError as exc:
+			raise _crawl_egress_error(exc) from exc
 		except CrawlRuntimeUnavailable as exc:
 			raise _crawl_unavailable_error(context, exc) from exc
 		except CrawlExportError as exc:
@@ -1780,16 +1938,18 @@ def _recruiter_chat(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 
 def _recruiter_last_messages(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	with context.recruiter_platform() as platform:
-		friend_data = platform_data_dict(_unwrap(
-			platform,
-			platform.friend_list(
-				page=_int_input(inputs, "page", 1, minimum=1),
-				label_id=_int_input(inputs, "label_id", 0),
-				job_id=_optional_str(inputs.get("job_id")),
-			),
-			"沟通列表获取失败",
-			context=context,
-		))
+		friend_data = platform_data_dict(
+			_unwrap(
+				platform,
+				platform.friend_list(
+					page=_int_input(inputs, "page", 1, minimum=1),
+					label_id=_int_input(inputs, "label_id", 0),
+					job_id=_optional_str(inputs.get("job_id")),
+				),
+				"沟通列表获取失败",
+				context=context,
+			)
+		)
 		friend_items = next(
 			(value for key in ("friendList", "result", "list") if isinstance((value := friend_data.get(key)), list)),
 			[],

@@ -124,6 +124,11 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"recoverable": False,
 		"recovery_action": "在原会话的 BOSS 官方目标业务页确认风险解除后，由用户执行 boss clean --risk-lock 并显式恢复任务；令牌变化不会自动解锁",
 	},
+	"EGRESS_CONTRADICTION": {
+		"message": "出口地区与客户端声明的语言/时区矛盾，采集未启动",
+		"recoverable": False,
+		"recovery_action": "保持声明的语言/时区不变，换回与之一致的出口后重试；不需要出口一致性检查时撤销 BOSS_EGRESS_PROBE_URL。程序不会自动改写语言或时区",
+	},
 	"LOGIN_TIMEOUT": {
 		"message": "登录等待超时（扫码未完成或网络缓慢）",
 		"recoverable": True,
@@ -199,6 +204,11 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"message": "候选池中没有该职位，无法标注",
 		"recoverable": False,
 		"recovery_action": "boss shortlist add <security_id> <job_id>（先加入候选池），或 boss shortlist list 核对已有条目",
+	},
+	"WORKFLOW_ALREADY_FINISHED": {
+		"message": "workflow 任务已结束，停止请求没有生效",
+		"recoverable": False,
+		"recovery_action": "boss wizard --status <run_id> 查看最终状态与结果，或 boss wizard 新建 workflow",
 	},
 	"WORKFLOW_NOT_FOUND": {
 		"message": "本地 workflow 任务不存在或 run_id 有误",
@@ -302,10 +312,20 @@ ERROR_CODES: dict[str, dict[str, Any]] = {
 		"recoverable": True,
 		"recovery_action": "处理浏览器验证后执行 boss crawl resume <run_id>",
 	},
+	"CRAWL_RUN_FINISHED": {
+		"message": "crawl 任务已结束，停止请求没有生效",
+		"recoverable": False,
+		"recovery_action": "用 boss crawl status <run_id> 查看最终状态，或 boss crawl results <run_id> 读取已采集结果；需要重新采集时新建 crawl 任务",
+	},
 	"INVALID_PARAM": {
 		"message": "参数校验失败",
 		"recoverable": False,
 		"recovery_action": "修正参数",
+	},
+	"CONFIG_INVALID": {
+		"message": "本地配置损坏或取值无效",
+		"recoverable": True,
+		"recovery_action": "按提示修正本地配置后重试，例如 boss ai config 或 boss config reset automation",
 	},
 	"ENDPOINT_DEPRECATED": {
 		"message": "服务端端点已迁移，CLI 当前实现无法直接发送",

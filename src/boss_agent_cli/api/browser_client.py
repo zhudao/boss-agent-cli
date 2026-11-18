@@ -14,6 +14,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse, urlsplit
 from types import TracebackType
 from typing import Any, Callable, Mapping, cast
 from patchright.sync_api import sync_playwright
@@ -88,6 +89,19 @@ class BrowserNavigationError(RuntimeError):
 		if cause_text:
 			payload["cause"] = cause_text
 		return payload
+
+
+def safe_cdp_endpoint(url: str) -> str:
+	"""日志与错误文案只保留调试端点的 scheme / host / port。"""
+	try:
+		parsed = urlparse(url)
+		host = parsed.hostname
+		if not host:
+			return "<cdp-endpoint>"
+		port = f":{parsed.port}" if parsed.port is not None else ""
+		return f"{parsed.scheme}://{host}{port}"
+	except ValueError:
+		return "<cdp-endpoint>"
 
 
 class ChatTabCdpUnreachable(RuntimeError):
@@ -274,6 +288,8 @@ class BrowserSession:
 		self._identity = dict(identity or {})
 		self._started = False
 		self._cdp_url = cdp_url
+		# 自动发现（DevToolsActivePort / /json/version）成功时记录实际端点，供裸 CDP 使用。
+		self._connected_cdp_http_url: str | None = None
 		self._is_cdp = False
 		self._own_context = False  # 是否由我们创建的 context（需要在 close 时清理）
 		self._own_page = True  # 是否由我们新建的 page（复用用户已开页签时为 False，close 不关它）
@@ -559,6 +575,7 @@ class BrowserSession:
 		self._home_nav_error = None
 		try:
 			self._browser = self._pw.chromium.connect_over_cdp(url)
+			self._connected_cdp_http_url = _cdp_http_endpoint(url)
 			contexts = self._browser.contexts
 
 			if contexts:
@@ -578,7 +595,7 @@ class BrowserSession:
 				# （凭据暴露 + 会话竞争）。`explicit` 守卫另挡一种情况：自动探测到的
 				# 端点可能是任何在 9222 上监听的 Chromium（其他 Electron 应用、
 				# 用户自己起的隔离 profile），不该被当成用户会话注入 wt2/at。
-				self._log(f"[boss] CDP ({url}) 无可复用 context，按 browser-source={self._policy.name} 拒绝新建")
+				self._log(f"[boss] CDP ({safe_cdp_endpoint(url)}) 无可复用 context，按 browser-source={self._policy.name} 拒绝新建")
 				self._close_browser_quietly()
 				return False
 			else:
@@ -603,7 +620,7 @@ class BrowserSession:
 				# existing-browser 不读取本地凭据，也不得在用户 context 里新建页面
 				# 再导航到目标站点。没有已打开的 zhipin 页签就视为该候选不可用，
 				# 继续策略表中的下一个通道，最终按 policy fail-closed。
-				self._log(f"[boss] CDP ({url}) 未找到已打开的 zhipin 页签，拒绝导航用户浏览器")
+				self._log(f"[boss] CDP ({safe_cdp_endpoint(url)}) 未找到已打开的 zhipin 页签，拒绝导航用户浏览器")
 				self._close_browser_quietly()
 				return False
 			else:
@@ -625,7 +642,7 @@ class BrowserSession:
 			self._started = True
 			self._is_cdp = True
 			reuse_label = "复用用户 context" if not self._own_context else "新建 context"
-			self._log(f"[boss] CDP 连接成功 ({url})，{reuse_label} + {page_label}")
+			self._log(f"[boss] CDP 连接成功 ({safe_cdp_endpoint(url)})，{reuse_label} + {page_label}")
 			return True
 		except Exception as error:
 			self._close_browser_quietly()
@@ -935,7 +952,7 @@ class BrowserSession:
 		仅通过已有 CDP 浏览器及其招聘者聊天页执行；headless 实例无法访问用户的 Vue 运行时。
 		"""
 		self._require_cdp_source("evaluate_js")
-		cdp_url = self._cdp_url or DEFAULT_CDP_URL
+		cdp_url = self._cdp_url or self._connected_cdp_http_url or DEFAULT_CDP_URL
 		return _cdp_evaluate_in_chat_tab(cdp_url, script, arg)
 
 	def evaluate_js_with_chat_events(self, script: str, arg: Any = None, *, listen_ms: int = 3000) -> dict[str, Any]:
@@ -945,7 +962,7 @@ class BrowserSession:
 		from UI-only draft mutation or suggestion traffic.
 		"""
 		self._require_cdp_source("evaluate_js_with_chat_events")
-		cdp_url = self._cdp_url or DEFAULT_CDP_URL
+		cdp_url = self._cdp_url or self._connected_cdp_http_url or DEFAULT_CDP_URL
 		return _cdp_evaluate_with_chat_events_in_chat_tab(cdp_url, script, arg, listen_ms=listen_ms)
 
 	def _require_cdp_source(self, api: str) -> None:
@@ -1044,7 +1061,7 @@ def _pick_chat_target_ws(cdp_http_url: str) -> str:
 		with urllib.request.urlopen(list_url, timeout=3) as resp:
 			tabs = _json.load(resp)
 	except Exception as exc:
-		raise ChatTabCdpUnreachable(f"cannot reach CDP at {list_url}: {exc}") from exc
+		raise ChatTabCdpUnreachable(f"cannot reach CDP at {safe_cdp_endpoint(list_url)}: {exc}") from exc
 
 	# /json 的容器漂移（对象而非数组、数组混入非对象元素）必须在打开
 	# WebSocket 之前收口：AttributeError 会被聊天动作执行器的宽泛捕获当成
@@ -1390,3 +1407,15 @@ def _cdp_evaluate_with_chat_events_in_chat_tab(
 					"utf8_bits": _carve_utf8_bits(bs)[:10],
 				}
 			)
+
+
+def _cdp_http_endpoint(endpoint: str) -> str | None:
+	"""Convert a connected CDP endpoint to the HTTP base used by raw CDP calls."""
+	if endpoint.startswith("http://") or endpoint.startswith("https://"):
+		return endpoint.rstrip("/")
+	parsed = urlsplit(endpoint)
+	if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
+		return None
+	scheme = "https" if parsed.scheme == "wss" else "http"
+	port = f":{parsed.port}" if parsed.port is not None else ""
+	return f"{scheme}://{parsed.hostname}{port}"

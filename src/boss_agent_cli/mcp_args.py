@@ -159,6 +159,14 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 	"""根据 tool name 和参数构建 CLI 参数列表。"""
 	name = tool_name.replace("boss_", "")
 
+	if name == "schema":
+		# 能力真源对 MCP-only Agent 同样可读；只读本地数据，不发平台请求。
+		args = ["schema"]
+		output_format = arguments.get("format")
+		if output_format is not None:
+			args.extend(["--format", str(output_format)])
+		return args
+
 	if name == "wizard":
 		# 未识别的 action 不能落进 run 分支（Issue #1002）：把 `resume` 拼错成
 		# `resum` 会静默新建一次 workflow run，调用方以为控制请求已生效。
@@ -193,7 +201,13 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		return args
 
 	if name == "search":
-		args = [name, arguments["query"]]
+		# query / url / preset 至少一个；没有 query 时先放占位，最后按 CLI 的
+		# 位置参数语义清理，避免把 --url 误当成关键词（Issue #1648）。
+		args = [name]
+		if arguments.get("query") is not None:
+			args.append(str(arguments["query"]))
+		_optional(args, "--url", "url", arguments)
+		_optional(args, "--preset", "preset", arguments)
 		for opt in ("city", "salary", "experience", "education", "industry", "scale", "stage", "welfare", "active"):
 			_optional(args, f"--{opt}", opt, arguments)
 		_optional(args, "--job-type", "job_type", arguments)
@@ -204,7 +218,7 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		if arguments.get("with_score"):
 			args.append("--with-score")
 		_optional(args, "--sort", "sort", arguments)
-		return _literal_positionals(args)
+		return _literal_positionals(args, count=1 if arguments.get("query") is not None else 0)
 
 	if name == "crawl_status":
 		return _literal_positionals(["crawl", "status", str(arguments["run_id"])], start=2)
@@ -324,6 +338,14 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		return _literal_positionals([name, str(arguments["number"])])
 
 	if name == "agent_run":
+		# 预览模式不能解除操作者停止闩锁：MCP 默认 dry_run=true，若这里直接
+		# 生成 `--dry-run --resume`，CLI 虽会拒绝，但 Agent 只看到一次无谓调用；
+		# 更危险的是将来 CLI 放宽该组合时预览就会静默解锁（Issue #1591）。
+		if arguments.get("resume", False) and arguments.get("dry_run", True):
+			raise ValueError(
+				"boss_agent_run 的 --dry-run 与 --resume 不能同时为真："
+				"恢复必须显式设置 dry_run=false 并真实执行一轮；仅预览时去掉 resume"
+			)
 		args = ["agent", "run"]
 		if arguments.get("dry_run", True):
 			args.append("--dry-run")
@@ -557,7 +579,9 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 
 	if name == "shortlist_compare":
 		args = ["shortlist", "compare"]
-		if arguments.get("tag"):
+		# 显式空串必须原样下发：CLI 统一按 INVALID_PARAM 拒绝，真值判断会把它
+		# 化装成「没传」并比较全部条目（Issue #1565）。
+		if arguments.get("tag") is not None:
 			args.extend(["--tag", str(arguments["tag"])])
 		return args
 

@@ -81,9 +81,12 @@ ERROR_LABELS = {
 	"CACHE_BUSY": "本地缓存正被另一个进程写入",
 	"CACHE_DATABASE_INVALID": "本地缓存数据库已损坏",
 	"CACHE_RECORD_INVALID": "本地任务记录已损坏",
-	"CRAWL_UNAVAILABLE": "采集所需的可选依赖没有安装",
+	"CRAWL_UNAVAILABLE": "采集运行环境不可用（可选依赖或浏览器未就绪）",
+	"EGRESS_CONTRADICTION": "出口地区与客户端声明的语言/时区矛盾",
+	"REQUEST_BUDGET_EXHAUSTED": "本地请求节流等待超时，请求未发出",
 	"WORKFLOW_PLAN_MISMATCH": "任务信息与已有记录不一致",
 	"INVALID_PARAM": "请求参数无效",
+	"CONFIG_INVALID": "本地配置损坏或取值无效",
 	"AUTH_EXPIRED": "登录状态已过期",
 	"AI_API_ERROR": "AI 服务调用失败",
 	"AI_NOT_CONFIGURED": "AI 服务尚未配置",
@@ -122,6 +125,7 @@ RECOVERY_LABELS = {
 	"WORKFLOW_TIMEOUT": "请选择“恢复已有任务”继续。",
 	"WORKFLOW_PLAN_MISMATCH": "请使用原任务恢复，或新建任务。",
 	"INVALID_PARAM": "请换一条结果重试，或返回结果列表重新选择。",
+	"CONFIG_INVALID": "按提示修正本地配置（boss config reset <项> 或 boss ai config）后重新执行；修复前重跑会复现。",
 	"AUTH_EXPIRED": "请重新登录当前平台，然后选择“恢复已有任务”。",
 	"AI_API_ERROR": "检查网络连接与 AI 密钥配置后重试。",
 	"AI_NOT_CONFIGURED": "先执行 boss ai config --provider <provider> --model <model> --api-key <key> 完成配置。",
@@ -141,11 +145,13 @@ RECOVERY_LABELS = {
 	"WORKFLOW_BUSY": "请等它结束，或选择“查看任务状态”确认进度后再恢复。",
 	# 具体安装命令由 recovery_message 按当前已有的依赖组动态拼出（Issue #1068）。
 	"CRAWL_UNAVAILABLE": "这不是网络问题，重试不会有帮助。请退出向导，补上 crawl 可选依赖后重新执行。",
+	"EGRESS_CONTRADICTION": "保持声明的语言/时区不变，换回与之一致的出口后重新执行；不需要出口一致性检查时撤销 BOSS_EGRESS_PROBE_URL。程序不会自动改写语言或时区。",
 	"CRAWL_BUSY": "请等它结束；需要确认进度时执行 boss crawl status <run_id>，不要并发恢复同一个任务。",
 	"CRAWL_PROFILE_BUSY": "请等正在运行的采集结束；需要确认进度时执行 boss crawl status <run_id>，不要删除 profile 目录里的 SingletonLock，也不要并发使用同一数据目录的采集浏览器。",
 	"CACHE_BUSY": "请等正在运行的 boss 命令结束后选择“恢复已有任务”继续；库文件本身完好，不需要删除。",
 	"CACHE_DATABASE_INVALID": "先备份 cache/boss_agent.db（--data-dir 指定时在对应目录下），再删除该文件后重新执行；命令会自动重建空库。",
 	"CACHE_RECORD_INVALID": "请返回并重新创建任务；同一条损坏记录重试无法恢复。",
+	"REQUEST_BUDGET_EXHAUSTED": "等待片刻后选择“恢复已有任务”继续；这次请求没有发出，不需要新建任务。",
 }
 
 #: 风控恢复动作里由 runner / actions 注入的真实解锁命令（Issue #978 / #976）。
@@ -163,6 +169,7 @@ _CONTEXT_AWARE_COMMAND = re.compile(r"""boss(?: --platform \S+)? --data-dir """)
 #: 的命令（Issue #1090）。
 _RECOVERY_COMMANDS: dict[str, tuple[str, ...]] = {
 	"boss ai config": ("ai config",),
+	"boss config reset": ("config reset",),
 	"boss me --section deliver": ("me --section deliver",),
 	"boss chat": ("chat",),
 	"boss preset remove": ("preset remove",),
@@ -251,6 +258,11 @@ def recovery_message(
 			f"{command or patchright_install_command()} 安装浏览器内核后重新执行命令。"
 		)
 	if code == "CRAWL_UNAVAILABLE":
+		# 浏览器启动失败与依赖缺失共用该码：动作层给出的动态指引（Chrome /
+		# chrome_path / 调试端口）比静态安装文案更准确（Issue #1553）。
+		action_text = str(recovery_action or "")
+		if any(keyword in action_text for keyword in ("chrome_path", "Chrome", "调试端口")):
+			return action_text
 		# 安装命令要带上已经可用的依赖组：uv tool install 会重建环境（Issue #1068）。
 		from boss_agent_cli.services.install_extras import extras_install_hint
 
@@ -1355,7 +1367,7 @@ def _render_crawl_summary(run: Mapping[str, Any], *, with_preview: bool = True) 
 	border = "green" if success else (
 		"yellow"
 		if str(run.get("status")) == "waiting_input"
-		or str(crawl_status) in {"risk_stopped", "budget_stopped", "stopped"}
+		or str(crawl_status) in {"risk_stopped", "budget_stopped", "throttle_stopped", "stopped"}
 		else "cyan"
 	)
 	panel_title = "采集已完成" if success else "采集任务状态"

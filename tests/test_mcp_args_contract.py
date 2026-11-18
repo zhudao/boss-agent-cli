@@ -270,10 +270,9 @@ def test_hr_tool_schema_lists_every_cli_parameter(tool_name: str, command: click
 _CORE_SINGLE_COMMAND_TOOLS = {
 	"boss_search": (
 		search_cmd_module.search_cmd,
-		{"sort_mode": "sort"},
-		# 二者与 query 是互斥输入源，而工具 schema 把 query 标为必填；
-		# 要暴露需先设计 oneOf，本次不改契约。
-		{"search_url", "preset"},
+		{"sort_mode": "sort", "search_url": "url"},
+		# query / url / preset 由 anyOf 保证至少提供一个（Issue #1648）。
+		set(),
 	),
 	"boss_recommend": (recommend_cmd_module.recommend_cmd, {}, set()),
 	"boss_batch_greet": (greet_cmd_module.batch_greet_cmd, {"count": "limit"}, set()),
@@ -375,7 +374,7 @@ def test_read_tool_schema_lists_every_cli_parameter(
 _MAINTENANCE_SINGLE_COMMAND_TOOLS = {
 	"boss_clean": (clean_cmd_module.clean_cmd, {"clean_all": "all"}, {"privacy", "risk_lock"}),
 	"boss_agent_run": (agent_cmd_module.run_cmd, {}, set()),
-	"boss_agent_train": (agent_cmd_module.train_cmd, {}, {"dry_run"}),
+	"boss_agent_train": (agent_cmd_module.train_cmd, {}, {"dry_run", "live"}),
 }
 
 
@@ -575,8 +574,9 @@ def test_every_enum_schema_property_is_covered_by_the_empty_value_rule() -> None
 	# 以下枚举键不走 `_optional`：
 	# - `active`：`resolve_active_level("")` 返回 None，空值本来就等于未传；
 	# - `action` / `role`：位置参数语义（wizard / config / hr jobs 的命令路由），
-	#   不是 `--flag value`；空串由各自的 KeyError / 路由分支处理。
-	assert enum_keys - {"active", "action", "role"} <= set(mcp_args._ENUM_KEYS), (
+	#   不是 `--flag value`；空串由各自的 KeyError / 路由分支处理；
+	# - `tag`：mark 的映射无条件下发 `--label`，空串本来就到达 CLI 并被拒绝。
+	assert enum_keys - {"active", "action", "role", "tag"} <= set(mcp_args._ENUM_KEYS), (
 		f"schema 声明了枚举但映射层未登记：{sorted(enum_keys - set(mcp_args._ENUM_KEYS))}"
 	)
 	# 这些筛选键在 preset / watch / batch-greet 上是 Click Choice，schema 只声明

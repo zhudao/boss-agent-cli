@@ -22,6 +22,7 @@ from boss_agent_cli.api.request_budget import (
 	retry_after_seconds,
 )
 from boss_agent_cli.crawler.controls import (
+	CrawlBrowserStartError,
 	CrawlProfileBusy,
 	CrawlProfilePathInvalid,
 	CrawlRuntimeUnavailable,
@@ -63,6 +64,7 @@ def packet_page_no(packet: Any) -> int | None:
 	except (TypeError, ValueError):
 		return None
 	return page_no if page_no >= 1 else None
+
 
 _CRAWL_FETCH_SCRIPT = """
 async function (path, params, timeoutMs) {
@@ -256,7 +258,19 @@ class DrissionCrawlerSession:
 			options.set_local_port(self._cdp_port)
 			options.set_user_data_path(str(self._profile_path))
 		# 采集浏览器与日常 Chrome 隔离；必须注入 boss login 的 Cookie，否则首页是登录 HTML。
-		self._page = ChromiumPage(options)
+		try:
+			self._page = ChromiumPage(options)
+		except Exception as exc:
+			# 这里是唯一知道「浏览器没起来」的位置。原样上抛会被 service 的通用
+			# except Exception 记成 stopped 并返回 ok:true（Issue #1553）：Chrome 未
+			# 安装 / chrome_path 配错 / 调试端口被别的程序占用 / 附着窗口已关闭，
+			# 都不是可恢复的采集中断，且本次没有发出任何平台请求。
+			action = "附着到已有的采集浏览器" if port_busy else "启动采集浏览器"
+			raise CrawlBrowserStartError(
+				f"无法{action}（调试端口 {self._cdp_port}）：{type(exc).__name__}: {exc}",
+				cdp_port=self._cdp_port,
+				attached=port_busy,
+			) from exc
 		self._raise_if_platform_risk_page()
 		# 注入 boss login 的 Cookie（附着已有窗口时也刷新，方便用户刚完成登录/验证）。
 		# 注入结果的失败信号必须在进入业务页之前消费：原来的 `pass`/`continue`
@@ -362,9 +376,7 @@ class DrissionCrawlerSession:
 				try:
 					position = self._page_no
 					if position is None or target_page <= position:
-						self._page.get(
-							f"https://www.zhipin.com/web/geek/jobs?city={city_code}&query={quote(query)}"
-						)
+						self._page.get(f"https://www.zhipin.com/web/geek/jobs?city={city_code}&query={quote(query)}")
 						position = 1
 					while position < target_page:
 						self._trigger_next_page()
@@ -530,7 +542,9 @@ class DrissionCrawlerSession:
 	def fetch_detail(self, security_id: str) -> dict[str, Any]:
 		"""在采集页签里取 job_card（同源请求，不把浏览器 Cookie / stoken 拷给 httpx）。"""
 		if not security_id:
-			return {"code": 0, "zpData": {"jobCard": {}}}
+			# 空 ID 无法构造详情请求；伪造成功会让缺字段的条目永久标记完成
+			# （Issue #1584）。调用方应保留 pending 状态。
+			raise ValueError("security_id 不能为空，无法抓取职位详情")
 		if self._page is None:
 			raise RuntimeError("Drission crawler session is not open")
 		payload = self._fetch_json_in_page(JOB_CARD_PATH, {"securityId": security_id})
@@ -688,7 +702,9 @@ class DrissionCrawlerSession:
 			return None
 		try:
 			os.kill(pid, 0)
-		except ProcessLookupError:
+		except (ProcessLookupError, OverflowError):
+			# 超大 pid 无法转成 C long：符号链接格式不认识，按陈旧锁处理
+			# （Issue #1583），不能让确定性本地失败被记成可重试的 stopped。
 			return None
 		except PermissionError:
 			return pid

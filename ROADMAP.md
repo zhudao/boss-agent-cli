@@ -4,6 +4,22 @@
 
 ## 已发布
 
+- ✅ v3.4.103（2026-11-18）：`hr download-resume` 在取凭据与平台请求前校验 `--output` 的空值和扩展名，空值不再被当成当前目录（Issue #1672）。
+
+- ✅ v3.4.102（2026-11-18）：自动化统计与搜索缓存统一按校验后的状态计数与解析，坏队列与列类型漂移不再伪装成正常结果（Issue #1667–#1668）。
+
+- ✅ v3.4.101（2026-11-18）：自由文本与 TTY 真人提示的脱敏口径统一，中文紧邻凭据键与所有 Authorization 方案不再泄漏密钥（Issue #1662–#1664）。
+
+- ✅ v3.4.100（2026-11-18）：第七轮导出与渲染审计——导出产物的非有限数与非法字符、跨页去重、安全页域名、stoken Cookie 域名、CDP 端点复用、在途标记与简历 PDF 外部请求均已收口（Issue #1653–#1659）。
+- ✅ v3.4.99（2026-11-18）：第六轮子系统审计——`stop.json` 缺少 `open` 与平台 `code=false` 不再被误判为「未停止 / 成功」，automation 整数预算与向导 `pages` 拒绝小数和布尔值（Issue #1598–#1601）。
+- ✅ v3.4.91（2026-11-18）：第五轮子系统审计——`agent run --dry-run --resume` 不再解除操作者停止闩锁；wizard 错误元数据漂移在读取边界 fail-closed；MCP 校验条件必填字符串、数值上下界与数组元素长度，并封顶 wizard 宿主等待（Issue #1591–#1595）。
+- ✅ v3.4.90（2026-11-18）：第四轮子系统审计——automation 按勾选项扫描并独立限制每个 tab 的会话数（Issue #1581）；wizard 与 CLI 同口径拒绝空白采集关键词（Issue #1582）；超大锁 pid 与空 `securityId` 不再伪造成功或可重试状态（Issue #1583、#1584）；`wizard --stop` 区分已完成与不存在，坏 Hook 目录统一按本地状态错误收口（Issue #1585、#1586）。
+- ✅ v3.4.88（2026-11-17）：显式参数与 schema 说明继续收口——候选池 `compare --tag ""` 与 `annotate` 的空标签、空操作在读取缓存之前返回 `INVALID_PARAM`（Issue #1565）；`watch run` / `crawl` / `agent crawl` 的 schema 补上互斥、必填与空串约束（Issue #1566）；`agent train` 的 `--dry-run` 与 `--live` 改为独立标志并拒绝同时给出（Issue #1568）；`search` 的显式关键词不再被预设覆盖（Issue #1569）；`clean` / `export` / `search` / `hr resume` / `resume init` / `crawl configure` 的六处描述按实现修正（Issue #1570）。
+- ✅ v3.4.87（2026-11-17）：显式参数不再被静默丢弃——`agent crawl --run-id` 拒绝只对新采集有意义的 `--city` / `--pages` / `--with-detail` 与显式空值（Issue #1558）；`crawl run` / `start` 的 `--hook-dir` 缺 `screenshot-full` 或为空时在创建任务之前拒绝（Issue #1559）；`--chrome-path ""` 不再被归一成当前目录写入配置（Issue #1560）；`watch run` 的点名与 `--all` 互斥，不再静默运行全部（Issue #1561）。
+- ✅ v3.4.86（2026-11-17）：采集运行环境与本地并发的错误分类——采集浏览器启动失败按确定性本地失败返回 `CRAWL_UNAVAILABLE` 并保存断点（Issue #1553）；登录态刷新锁改用内核文件锁，等待超时不再误删他人的锁、按可重试的共享等待超时返回（Issue #1554）；出口与声明的语言/时区矛盾统一返回 `EGRESS_CONTRADICTION`（Issue #1555）；共享请求预算等待超时落成 `throttle_stopped`，不再提示新建任务（Issue #1556）。
+- ✅ v3.4.85（2026-11-17）：`stats` / `digest` 的 `-o` 在默认 json 下被静默忽略，现在返回 `INVALID_PARAM`，工具 schema 同步声明格式约束（Issue #1546）；`clean` 把 SQLite 锁冲突与只读 / 磁盘错误分别归为 `CACHE_BUSY` / `LOCAL_IO_ERROR`，不再误导删库（Issue #1547）；`clean --risk-lock` 不再被损坏的缓存库阻断（Issue #1548）；联系人分页上限按不可重试上报（Issue #1549）；`detail` 的未识别响应按只读归一为可重试 `NETWORK_ERROR`（Issue #1550）。
+- ✅ v3.4.84（2026-11-17）：wizard 的 crawl 恢复改为惰性预检——已完成任务与写错的 `run_id` 不再先要求登录或安装采集依赖，与 CLI `crawl resume` 口径一致（Issue #1540）；`resume export` 的显式空 `-o` 返回 `INVALID_PARAM`、默认 html/pdf 输出名与存储层共用文件名清洗（Issue #1541 / #1542）；`BROWSER_KERNEL_MISSING` 与 `CRAWL_UNAVAILABLE` 不再进入 wizard 自动重试（Issue #1543）。
+- ✅ v3.4.83（2026-11-17）：配置损坏改用独立错误码 `CONFIG_INVALID` 并不在同一轮自动重试（Issue #1525）；工具契约与 native schema 对齐——MCP 工具补枚举取值域、条件必填、required 字符串 `minLength` 与 CLI 默认值，`ai cover-letter` / `resume-optimize` 同时传 `--jd` 与 `--job-id` 不再静默覆盖，`agent` 的 availability 说明适配器键语义，新增只读工具 `boss_schema`（Issue #1528–#1536）。
 - ✅ v3.4.82（2026-11-17）：招聘自动化的队列与扫描路径共享 `state.json` 在途标记，成功先落盘再推进队列，未通知的熔断标记下一轮重开（Issue #1514–#1517）；错误码契约审计——只读命令的未识别响应归一为可重试的 `NETWORK_ERROR`、`agent run` 熔断改报 `CIRCUIT_BREAKER_OPEN`、wizard 缺失联系人不再自动重试（Issue #1519–#1521）；风控 hint 按 Agent 命令与真人指引分通道输出，MCP 只读白名单补齐，agent 恢复命令保留角色（Issue #1522–#1524）。
 - ✅ v3.4.81（2026-11-17）：清理与体检的文件系统边界收紧——`clean` 跳过目录符号链接并在失败时带回部分结果、`doctor` 写探针改用独占临时文件（Issue #1497 #1498）；AI / 聊天 / 导出拒绝显式空值与不安全文件名，新增 `--clear-api-key`（Issue #1499–#1507）；SQLite 写入与旧库迁移并发安全，`watch` 命中写入幂等（Issue #1509 #1510）；求职者 greet/apply 发送前原子预约、automation 派发前落盘在途标记，未知结果不再重发（Issue #1508 #1511）。
 - ✅ v3.4.80（2026-11-17）：`batch-greet` 拒绝空查询并收紧数量上限（Issue #1490 #1494）；MCP 子进程超时按 argv 估算，批打招呼中断输出已完成的部分结果（Issue #1491 #1492）；MCP action 条件参数按允许键矩阵校验，不再静默丢弃（Issue #1493）。

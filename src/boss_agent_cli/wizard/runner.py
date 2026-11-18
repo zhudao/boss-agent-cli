@@ -51,6 +51,7 @@ class WorkflowActionError(Exception):
 		recovery_action: str | None = None,
 		details: dict[str, Any] | None = None,
 		replay_safe: bool = True,
+		auto_retry: bool = True,
 	) -> None:
 		super().__init__(message)
 		self.code = code
@@ -59,6 +60,9 @@ class WorkflowActionError(Exception):
 		self.details = details
 		# replay_safe=False 表示动作可能已经生效：--resume 不得重跑该步骤。
 		self.replay_safe = replay_safe
+		# recoverable 表示修正后可重新执行；auto_retry=False 的确定性失败
+		# （如本地配置损坏）不进入同一次运行的自动重试循环（Issue #1525）。
+		self.auto_retry = auto_retry
 
 	def to_dict(self) -> dict[str, Any]:
 		result: dict[str, Any] = {
@@ -95,6 +99,9 @@ def _browser_kernel_missing_error(
 		"BROWSER_KERNEL_MISSING",
 		"patchright 浏览器内核缺失或与所需修订版不匹配",
 		recoverable=recoverable,
+		# 内核没装好时重试同一动作只会再起一次浏览器、得到同一结果；浏览器未启动
+		# 也没有发出平台写请求，因此 replay_safe 保持 True（Issue #1543）。
+		auto_retry=False,
 		# 与命令层同一份可执行指引：裸 `patchright install chromium` 在
 		# `uv tool install` 环境下不在 PATH 上（Issue #1060）。
 		recovery_action=patchright_install_command(),
@@ -433,7 +440,7 @@ class WorkflowRunner:
 							result = action(action_context, plan.inputs, action_prior)
 						break
 					except WorkflowActionError as exc:
-						if not exc.recoverable or not exc.replay_safe or attempt >= max_retries:
+						if not exc.recoverable or not exc.auto_retry or not exc.replay_safe or attempt >= max_retries:
 							raise
 						attempt += 1
 						control.raise_if_requested()
@@ -487,31 +494,43 @@ class WorkflowRunner:
 					recovery_action=recovery,
 				)
 			except RequestBudgetExceeded as exc:
-				recoverable, recovery = error_contract_for_code(exc.code)
-				error = WorkflowActionError(exc.code, str(exc), recoverable=recoverable, recovery_action=recovery, details=exc.details)
+				# 若写请求发出前已落盘「结果未知」标记，异常只改变错误原因，不能把
+				# replay_safe 改回 True：否则 --resume 会重放可能已生效的写操作（Issue #1604）。
+				write_marker = self._persisted_write_marker(run_id, step_name)
+				if write_marker is not None:
+					error = self._unconfirmed_error(exc.code, write_marker)
+				else:
+					recoverable, recovery = error_contract_for_code(exc.code)
+					error = WorkflowActionError(exc.code, str(exc), recoverable=recoverable, recovery_action=recovery, details=exc.details)
 			except KeyboardInterrupt:
 				# 写请求已经发出时，``begin_write`` 已在步骤上落盘结果未知标记；用普通的
 				# WORKFLOW_STOPPED 覆盖它会让 checkpoint 丢掉 replay_safe=false 与该动作的
 				# 核对命令，``--resume`` 就会把结果未知的写操作再发一次（Issue #1478）。
 				error = self._interrupt_error(run_id, step_name)
 			except PlatformRiskError as exc:
-				# 风控：终止语义不能被下面的 NETWORK_ERROR 兜底反转成「重试当前 run_id」。
-				# checkpoint 照常落盘（下方 update_step/update_run），恢复只能由用户在
-				# 处理完账号/安全页后显式发起（Issue #419）。解锁命令必须指向本次
-				# workflow 的数据目录，否则 clean --risk-lock 会去默认目录空转（Issue #978）。
-				recovery_action, _ = risk_error_contract(
-					exc.code,
-					clean_command=boss_command(
-						"clean --risk-lock", platform_name=plan.platform, data_dir=data_dir
-					),
-					doctor_command=boss_command("doctor", platform_name=plan.platform, data_dir=data_dir),
-				)
-				error = WorkflowActionError(
-					exc.code,
-					risk_error_message(exc.code),
-					recoverable=False,
-					recovery_action=recovery_action,
-				)
+				# 写请求在途时命中风控：保留预写的「结果未知」标记与核对命令，
+				# 只让风控原因覆盖消息；否则 --resume 会重放结果未知的写操作（Issue #1604）。
+				write_marker = self._persisted_write_marker(run_id, step_name)
+				if write_marker is not None:
+					error = self._unconfirmed_error(exc.code, write_marker)
+				else:
+					# 风控：终止语义不能被下面的 NETWORK_ERROR 兜底反转成「重试当前 run_id」。
+					# checkpoint 照常落盘（下方 update_step/update_run），恢复只能由用户在
+					# 处理完账号/安全页后显式发起（Issue #419）。解锁命令必须指向本次
+					# workflow 的数据目录，否则 clean --risk-lock 会去默认目录空转（Issue #978）。
+					recovery_action, _ = risk_error_contract(
+						exc.code,
+						clean_command=boss_command(
+							"clean --risk-lock", platform_name=plan.platform, data_dir=data_dir
+						),
+						doctor_command=boss_command("doctor", platform_name=plan.platform, data_dir=data_dir),
+					)
+					error = WorkflowActionError(
+						exc.code,
+						risk_error_message(exc.code),
+						recoverable=False,
+						recovery_action=recovery_action,
+					)
 			except SearchPipelinePlatformError as exc:
 				# 搜索管线把平台错误包成自己的异常：保留原始错误码与契约，
 				# 不能兜成 NETWORK_ERROR（Issue #1384）。
@@ -570,7 +589,11 @@ class WorkflowRunner:
 			except OSError as exc:
 				# 本地文件读写失败（导出路径不可写、磁盘满）重试同一 run_id 也不会成功；
 				# 套接字层的 ConnectionError / TimeoutError 仍是网络问题，保持可重试语义。
-				if is_browser_kernel_missing(str(exc)):
+				# 但写请求发出后已落盘的结果未知标记不能被 NETWORK_ERROR 覆盖（Issue #1639）。
+				write_marker = self._persisted_write_marker(run_id, step_name)
+				if write_marker is not None:
+					error = self._unconfirmed_error("NETWORK_ERROR", write_marker)
+				elif is_browser_kernel_missing(str(exc)):
 					# Playwright 的「内核缺失」也是 OSError 子类：重试只会再起一个浏览器。
 					error = _browser_kernel_missing_error(exc, plan, data_dir)
 				elif is_local_io_error(exc):
@@ -586,9 +609,14 @@ class WorkflowRunner:
 						"NETWORK_ERROR", str(exc), recoverable=True, recovery_action="重试当前 run_id"
 					)
 			except Exception as exc:
+				# 写请求已发出后无论什么异常都不能把结果未知标记覆盖成「可重试」；
+				# 分类照常记在错误码里，恢复时由标记强制禁止重放（Issue #1639）。
+				write_marker = self._persisted_write_marker(run_id, step_name)
+				if write_marker is not None:
+					error = self._unconfirmed_error("NETWORK_ERROR", write_marker)
 				# 代理环境变量非法是确定性配置错误：重试或恢复同一 run_id 只会
 				# 复现，不能兜成 NETWORK_ERROR +「重试当前 run_id」（Issue #1423）。
-				if isinstance(exc, ProxyConfigurationError):
+				elif isinstance(exc, ProxyConfigurationError):
 					invalid_recoverable, invalid_recovery = error_contract_for_code("INVALID_PARAM")
 					error = WorkflowActionError(
 						"INVALID_PARAM",
@@ -768,6 +796,20 @@ class WorkflowRunner:
 			replay_safe=False,
 		)
 
+	def _unconfirmed_error(self, code: str, marker: dict[str, Any]) -> WorkflowActionError:
+		"""把已落盘的在途写标记转成带原错误码的「结果未知」失败（Issue #1604）。"""
+		message = marker.get("message")
+		text = message if isinstance(message, str) and message else _UNCONFIRMED_WRITE_FALLBACK["message"]
+		recovery = marker.get("recovery_action")
+		return WorkflowActionError(
+			code,
+			text,
+			recoverable=False,
+			recovery_action=recovery if isinstance(recovery, str) and recovery else _UNCONFIRMED_WRITE_FALLBACK["recovery_action"],
+			details=dict(marker["details"]) if isinstance(marker.get("details"), Mapping) else None,
+			replay_safe=False,
+		)
+
 	def _persisted_write_marker(self, run_id: str, step_name: str) -> dict[str, Any] | None:
 		"""读取本步骤已落盘的写前标记；返回 None 表示没有写请求在途的记录。
 
@@ -808,28 +850,32 @@ class WorkflowRunner:
 		这次写操作可能已经生效，也可能没有——不重放，交给操作者核对（Issue #1019）。
 		没有这条记录的 running 步骤（只读、内部任务续跑、尚未走到写请求）照常重跑。
 		"""
-		interrupted = [
-			step
-			for step in stored_run["steps"]
-			if step["status"] == WorkflowStatus.RUNNING.value and (step.get("error") or {}).get("replay_safe") is False
-		]
+		interrupted: list[tuple[dict[str, Any], dict[str, Any]]] = []
+		for step in stored_run["steps"]:
+			if step["status"] != WorkflowStatus.RUNNING.value:
+				continue
+			# _persisted_write_marker 可能把缺失 / 漂移的 replay_safe 规范化成
+			# 后备标记；结算时也用规范化结果，不能把不完整的记录原样写回。
+			marker = self._persisted_write_marker(run_id, step["step_name"])
+			if marker is not None:
+				interrupted.append((step, marker))
 		if not interrupted:
 			return stored_run
-		for step in interrupted:
+		for step, marker in interrupted:
 			self._store.update_step(
 				run_id,
 				step["step_name"],
 				status=WorkflowStatus.FAILED.value,
 				result=step["result"],
-				error={**step["error"], "message": _INTERRUPTED_WRITE_MESSAGE},
+				error={**marker, "message": _INTERRUPTED_WRITE_MESSAGE, "replay_safe": False},
 			)
 		# 步骤按顺序执行，正常情况下只有一个；run 指向最先该执行的那一步。
-		first = interrupted[0]
+		first, first_marker = interrupted[0]
 		self._store.update_run(
 			run_id,
 			status=WorkflowStatus.FAILED.value,
 			current_step=first["step_name"],
-			error={**first["error"], "message": _INTERRUPTED_WRITE_MESSAGE},
+			error={**first_marker, "message": _INTERRUPTED_WRITE_MESSAGE, "replay_safe": False},
 		)
 		return self._store.get_checkpoint(run_id) or stored_run
 

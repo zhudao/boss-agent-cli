@@ -4,6 +4,7 @@
 """
 
 import json
+import math
 from pathlib import Path
 from typing import Any, cast
 
@@ -102,13 +103,14 @@ def _require_ai_service(ctx: click.Context) -> AIService | None:
 	try:
 		svc = _create_ai_service(ctx)
 	except ValueError as exc:
-		# 本地配置坏值：重试同一条命令必然复现，给 INVALID_PARAM 与修复命令，
-		# 不能落成可重试的 NETWORK_ERROR（Issue #1209）。字符串项自带更贴题的
-		# 修复子命令（Issue #1428、#1431），数值项沿用冒烟提示。
+		# 本地配置坏值：重试同一条命令必然复现，给 CONFIG_INVALID 与修复命令，
+		# 不能落成可重试的 NETWORK_ERROR（Issue #1209）；独立错误码避免把
+		# 「配置修好后可重试」混入纯参数错误的 INVALID_PARAM（Issue #1525）。
+		# 字符串项自带更贴题的修复子命令（Issue #1428、#1431），数值项沿用冒烟提示。
 		hint = getattr(exc, "recovery_hint", None) or "ai config --max-tokens 4096 --temperature 0.7"
 		handle_error_output(
 			ctx, "ai",
-			code="INVALID_PARAM",
+			code="CONFIG_INVALID",
 			message=f"本地 AI 配置损坏：{exc}",
 			recoverable=True,
 			recovery_action=_hint_command(ctx, hint),
@@ -488,6 +490,18 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 			ctx.exit(1)
 			return
 	if temperature is not None:
+		# click.FloatRange 只比较大小：NaN / ±Inf / 1e400 会穿过参数校验，
+		# 由 json.dump 写成裸 NaN / Infinity，后续严格解析器读不回来（Issue #1623）。
+		if not math.isfinite(temperature):
+			handle_error_output(
+				ctx, "ai-config",
+				code="INVALID_PARAM",
+				message="--temperature 必须是有限数字",
+				recovery_action="传入 0 以上的有限数字后重试",
+				hints={"next_actions": [_hint_command(ctx, "ai config --temperature 0.7")]},
+			)
+			ctx.exit(1)
+			return
 		updates["ai_temperature"] = temperature
 	if max_tokens is not None:
 		updates["ai_max_tokens"] = max_tokens
@@ -932,6 +946,18 @@ def ai_suggest_keywords_cmd(ctx: click.Context, limit: int) -> None:
 @click.pass_context
 def ai_resume_optimize_cmd(ctx: click.Context, resume_name: str, jd_text: str | None, job_id: str | None) -> None:
 	"""基于目标岗位优化简历措辞（仅建议，不修改简历）"""
+	if jd_text is not None and job_id is not None:
+		# 两者同时给时旧实现静默用缓存 JD 覆盖显式 JD（Issue #1529）。
+		handle_error_output(
+			ctx,
+			"ai",
+			code="INVALID_PARAM",
+			message="--jd 与 --job-id 只能二选一，不能同时提供",
+			recovery_action="只保留 --jd <职位描述> 或 --job-id <编号> 后重新执行",
+		)
+		ctx.exit(1)
+		return
+
 	svc = _require_ai_service(ctx)
 	if svc is None:
 		return
@@ -949,7 +975,7 @@ def ai_resume_optimize_cmd(ctx: click.Context, resume_name: str, jd_text: str | 
 		ctx.exit(1)
 		return
 
-	# 从缓存加载 JD
+	# 从缓存加载 JD；缓存内容按原文使用，@file 语法只适用于显式 --jd（Issue #1637）。
 	if job_id:
 		with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 			jd_text = cache.get_job_desc(job_id)
@@ -963,10 +989,8 @@ def ai_resume_optimize_cmd(ctx: click.Context, resume_name: str, jd_text: str | 
 			)
 			ctx.exit(1)
 			return
-
-	# 支持 @file 语法
-	if jd_text:
-		resolved = _read_text_argument(ctx, jd_text)
+	else:
+		resolved = _read_text_argument(ctx, jd_text or "")
 		if resolved is None:
 			return
 		jd_text = resolved
@@ -1003,6 +1027,18 @@ def ai_cover_letter_cmd(
 	ctx: click.Context, resume_name: str, jd_text: str | None, job_id: str | None, tone: str, lang: str
 ) -> None:
 	"""基于本地简历与目标岗位起草求职信/自我介绍（仅草稿，不发送）"""
+	if jd_text is not None and job_id is not None:
+		# 两者同时给时旧实现静默用缓存 JD 覆盖显式 JD（Issue #1529）。
+		handle_error_output(
+			ctx,
+			"ai",
+			code="INVALID_PARAM",
+			message="--jd 与 --job-id 只能二选一，不能同时提供",
+			recovery_action="只保留 --jd <职位描述> 或 --job-id <编号> 后重新执行",
+		)
+		ctx.exit(1)
+		return
+
 	svc = _require_ai_service(ctx)
 	if svc is None:
 		return
@@ -1020,7 +1056,7 @@ def ai_cover_letter_cmd(
 		ctx.exit(1)
 		return
 
-	# 从缓存加载 JD（键为 encryptJobId）
+	# 从缓存加载 JD（键为 encryptJobId）；缓存内容不展开 @file（Issue #1637）。
 	if job_id:
 		with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 			jd_text = cache.get_job_desc(job_id)
@@ -1034,10 +1070,8 @@ def ai_cover_letter_cmd(
 			)
 			ctx.exit(1)
 			return
-
-	# 支持 @file 语法
-	if jd_text:
-		resolved = _read_text_argument(ctx, jd_text)
+	else:
+		resolved = _read_text_argument(ctx, jd_text or "")
 		if resolved is None:
 			return
 		jd_text = resolved
