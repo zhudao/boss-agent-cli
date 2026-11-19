@@ -11,6 +11,7 @@ import contextvars
 import math
 import os
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -318,6 +319,19 @@ class RequestBudget:
 		self._check(check)
 		self.root.mkdir(parents=True, exist_ok=True)
 		path = self.root / "request-budget.lease"
+		# 租约文件与 SQLite 库一样属于本地调度元数据：符号链接会让锁落到数据目录
+		# 之外的目标，悬空链接会在目标处建文件，FIFO 会在 open("a+b") 永久阻塞
+		# （Issue #1753）。与 services/file_lock 的锁文件同口径，直接 lstat。
+		try:
+			mode = path.lstat().st_mode
+		except FileNotFoundError:
+			mode = None
+		except (OSError, ValueError) as exc:
+			raise sqlite3.OperationalError(f"无法读取请求租约文件 {path} 的路径状态（{exc}）") from exc
+		if mode is not None and stat.S_ISLNK(mode):
+			raise sqlite3.OperationalError(f"{path} 是符号链接，请求租约拒绝写穿链接目标")
+		if mode is not None and not stat.S_ISREG(mode):
+			raise sqlite3.OperationalError(f"{path} 不是普通文件（FIFO / 目录 / 设备），请求租约拒绝打开")
 		with path.open("a+b") as handle:
 			if path.stat().st_size == 0:
 				handle.write(b"\0")
@@ -346,6 +360,17 @@ class RequestBudget:
 
 	def _connect(self) -> sqlite3.Connection:
 		path = self.root / "request-budget.sqlite3"
+		# 符号链接会让 SQLite 把库写进目标文件（可能落在数据目录之外），目录 /
+		# FIFO / 设备只会得到 "unable to open"；与 CacheStore / clean 同口径
+		# 先按 lstat 判定（Issue #1739）。
+		from boss_agent_cli.cache.store import database_path_problem
+
+		problem = database_path_problem(path)
+		if problem is not None:
+			raise sqlite3.DatabaseError(
+				f"{path} 不是可用的 SQLite 数据库（{problem}）；"
+				"该文件只保存请求节流元数据，确认后移除该路径即可自动重建"
+			)
 		try:
 			connection = sqlite3.connect(path, timeout=0.1)
 			connection.executescript("""
@@ -359,13 +384,16 @@ class RequestBudget:
 				);
 			""")
 		except sqlite3.DatabaseError as exc:
-			# 锁冲突保持原有语义（等锁释放即可）；其余是文件损坏 / 被同名目录
-			# 占位，属于确定性本地失败。带上路径与自愈方式，命令层统一报
-			# LOCAL_IO_ERROR，而不是 NETWORK_ERROR +「重试」让 Agent 反复打平台
-			# （Issue #1336）。
-			if isinstance(exc, sqlite3.OperationalError) and any(
-				word in str(exc).lower() for word in ("locked", "busy")
-			):
+			# 锁冲突保持原有语义（等锁释放即可）；本地文件 / 磁盘错误——只读库、
+			# 只读目录、磁盘满、设备 I/O 故障——与库内容无关，删库既修不好又会
+			# 丢掉冷却时间与节流历史，必须保留原始 OperationalError，让命令层
+			# 报 LOCAL_IO_ERROR 的通用指引（Issue #1721，与 #1467/#1718 同口径）。
+			# 其余才是文件损坏 / 被同名目录占位：带上路径与自愈方式，命令层统一
+			# 报 LOCAL_IO_ERROR，而不是 NETWORK_ERROR +「重试」让 Agent 反复打
+			# 平台（Issue #1336）。
+			from boss_agent_cli.cache.store import is_cache_busy_error, is_cache_local_io_error
+
+			if is_cache_busy_error(exc) or is_cache_local_io_error(exc):
 				raise
 			raise sqlite3.DatabaseError(
 				f"{path} 不是可用的 SQLite 数据库（{exc}）；"

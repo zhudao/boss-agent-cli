@@ -15,7 +15,7 @@ from boss_agent_cli.crawler.service import crawl_cdp_port, crawl_chrome_path, cr
 from boss_agent_cli.display import boss_command_for_ctx, handle_output, render_action_result, render_simple_list
 from boss_agent_cli.output import LOG_LEVELS
 from boss_agent_cli.platforms import list_platforms
-from boss_agent_cli.services.json_files import write_json_atomic
+from boss_agent_cli.services.json_files import read_bytes_if_regular, write_json_atomic
 
 _CONFIG_CHOICES = {
 	"operating_mode": ("assisted", "research"),
@@ -119,7 +119,10 @@ def config_list_cmd(ctx: click.Context) -> None:
 	for key in sorted(_PUBLIC_CONFIG_KEYS):
 		default_val = DEFAULTS[key]
 		current_val = cfg.get(key, default_val)
-		is_custom = key in _load_user_overrides(config_path)
+		overrides = _load_user_overrides(config_path)
+		# 旧版的 low_risk_mode 会派生 operating_mode，只看新键会把非默认值
+		# 标成「默认值」（Issue #1823）。
+		is_custom = key in overrides or (key == "operating_mode" and "low_risk_mode" in overrides)
 		items.append(
 			{
 				"key": key,
@@ -291,6 +294,10 @@ def config_reset_cmd(ctx: click.Context, key: str) -> None:
 	config_path = ctx.obj["data_dir"] / "config.json"
 	user_cfg = _load_user_overrides(config_path)
 	user_cfg.pop(key, None)
+	if key == "operating_mode":
+		# 只删新键时旧版 low_risk_mode 会让生效值继续保持 research：
+		# reset 报成功、下一步 config get 却证伪（Issue #1823）。
+		user_cfg.pop("low_risk_mode", None)
 	try:
 		_save_user_overrides(config_path, user_cfg)
 	except OSError as exc:
@@ -312,16 +319,22 @@ def config_reset_cmd(ctx: click.Context, key: str) -> None:
 
 
 def _load_user_overrides(config_path: Path) -> dict[str, Any]:
-	"""加载用户自定义配置（不含默认值）。"""
-	if config_path.exists():
-		try:
-			with open(config_path, encoding="utf-8") as f:
-				result: dict[str, Any] = json.load(f)
-				return result
-		# 超长整数（3.11+）与深嵌套同样按配置损坏降级，不影响 config 子命令。
-		except (ValueError, OSError, RecursionError):
+	"""加载用户自定义配置（不含默认值）。
+
+	只有文件确实不存在或 JSON 语法损坏才返回空配置。路径状态读不出来时
+	上抛 ``OSError``：否则随后的整文件写回会丢掉其他配置项（Issue #1695）。
+	"""
+	try:
+		raw = read_bytes_if_regular(config_path)
+		if raw is None:
 			return {}
-	return {}
+		result = json.loads(raw)
+	# 超长整数（3.11+）与深嵌套同样按配置损坏降级，不影响 config 子命令。
+	except (ValueError, RecursionError):
+		return {}
+	if not isinstance(result, dict):
+		return {}
+	return result
 
 
 def _save_user_overrides(config_path: Path, user_cfg: dict[str, Any]) -> None:

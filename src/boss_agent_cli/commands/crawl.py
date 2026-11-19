@@ -42,7 +42,7 @@ from boss_agent_cli.crawler.controls import (
 from boss_agent_cli.crawler.hooks import HookRegistrationError, verify_hook_profile
 from boss_agent_cli.crawler.transport import DrissionCrawlerSession, ensure_crawl_runtime
 from boss_agent_cli.services.install_extras import extras_install_hint, extras_requirement
-from boss_agent_cli.services.json_files import write_json_atomic
+from boss_agent_cli.services.json_files import read_bytes_if_regular, write_json_atomic
 from boss_agent_cli.display import (
 	auth_required_hints,
 	boss_command_for_ctx,
@@ -117,13 +117,15 @@ def _crawl_config(ctx: click.Context) -> dict[str, Any]:
 def _save_crawl_config(data_dir: Path, updates: dict[str, Any]) -> dict[str, Any]:
 	config_path = data_dir / "config.json"
 	user_cfg: dict[str, Any] = {}
-	if config_path.exists():
+	# 路径状态读不出来时上抛，不能带着空配置整文件覆盖（Issue #1695）。
+	raw = read_bytes_if_regular(config_path)
+	if raw is not None:
 		try:
-			loaded = json.loads(config_path.read_text(encoding="utf-8"))
+			loaded = json.loads(raw)
 			if isinstance(loaded, dict):
 				user_cfg = loaded
 		# 超长整数（3.11+）与深嵌套同样按配置损坏降级，不能挡住 crawl 配置写入。
-		except (ValueError, OSError, RecursionError):
+		except (ValueError, RecursionError):
 			pass
 	crawl_cfg = user_cfg.get("crawl", {})
 	if not isinstance(crawl_cfg, dict):
@@ -316,17 +318,22 @@ class _LazySeededTransportFactory:
 		return self._ensure()(settings)
 
 
-def _report_corrupt_run(ctx: click.Context, command: str, run_id: str, exc: CacheRecordInvalid) -> None:
-	"""本地 run 记录写坏：断点读不出来，给「重新创建任务」指引而不是 traceback。"""
+def _report_corrupt_run(ctx: click.Context, command: str, run_id: str | None, exc: CacheRecordInvalid) -> None:
+	"""本地 run 记录写坏：断点读不出来，给「重新创建任务」指引而不是 traceback。
+
+	``run_id`` 未知（损坏的是结果行而调用方不知道所属任务）时不给 status 指引：
+	异常里的 ``record_id`` 可能是 job_key，拼进 `crawl status` 只会得到
+	``CRAWL_RUN_NOT_FOUND``（Issue #1773）。
+	"""
+	next_actions = [boss_command_for_ctx(ctx, "crawl start <关键词>", include_data_dir=True)]
+	if run_id is not None:
+		next_actions.append(boss_command_for_ctx(ctx, f"crawl status {shell_argument(run_id)}", include_data_dir=True))
 	handle_error_output(
 		ctx,
 		command,
 		code="CACHE_RECORD_INVALID",
 		message=str(exc),
-		hints={"next_actions": [
-			boss_command_for_ctx(ctx, "crawl start <关键词>", include_data_dir=True),
-			boss_command_for_ctx(ctx, f"crawl status {shell_argument(run_id)}", include_data_dir=True),
-		]},
+		hints={"next_actions": next_actions},
 	)
 
 
@@ -418,11 +425,20 @@ def _run_service(
 	*,
 	on_error: Callable[[str, str], None] | None = None,
 	defer_transport_preflight: bool = False,
+	run_id: str | None = None,
 ) -> None:
 	def note(code: str, message: str) -> None:
 		# 错误出口会直接结束进程：后台 worker 要在那之前留下原因（Issue #1042）。
 		if on_error is not None:
 			on_error(code, message)
+
+	# 新建采集在导出前就已把 run 落库：导出失败时要把 run_id 交回调用方，
+	# 否则只能重建任务、重复采集（Issue #1835）。
+	created: dict[str, str] = {}
+
+	def capture_created(inner_run_id: str) -> None:
+		if isinstance(inner_run_id, str) and inner_run_id.strip():
+			created.setdefault("run_id", inner_run_id.strip())
 
 	try:
 		raise_if_locked(Path(ctx.obj["data_dir"]))
@@ -437,6 +453,7 @@ def _run_service(
 				cache,
 				data_dir=Path(ctx.obj["data_dir"]),
 				transport_factory=transports,
+				on_run_created=capture_created,
 				preflight=transports.preflight,
 			)
 			outcome = service_call(service)
@@ -444,7 +461,9 @@ def _run_service(
 		handle_error_output(ctx, "crawl", code="CRAWL_RUN_NOT_FOUND", message=f"未找到 crawl run: {exc.args[0]}", hints=_run_not_found_hints(ctx))
 		return
 	except CacheRecordInvalid as exc:
-		_report_corrupt_run(ctx, "crawl", exc.record_id, exc)
+		# 结果行损坏时 record_id 是 job_key，不是 run_id（Issue #1773）。
+		known_run_id = run_id if run_id is not None else (exc.record_id if exc.kind == "crawl_run" else None)
+		_report_corrupt_run(ctx, "crawl", known_run_id, exc)
 		return
 	except CrawlBusyError as exc:
 		note("CRAWL_BUSY", str(exc))
@@ -494,6 +513,30 @@ def _run_service(
 		# 导出失败是本地目录 / 权限问题：CrawlExportError 是 RuntimeError 子类，
 		# 不单独捕获会被兜成 CRAWL_UNAVAILABLE 并让人去安装 crawl 依赖（Issue #1238）。
 		note("LOCAL_IO_ERROR", str(exc))
+		known_run_id = run_id if run_id is not None else created.get("run_id")
+		if known_run_id:
+			# 采集结果已按 run 落库：给出可直接续跑的恢复命令，别让人重建任务
+			# 重复采集（Issue #1835）。
+			resume_command = boss_command_for_ctx(
+				ctx, f"crawl resume {shell_argument(known_run_id)}", include_data_dir=True
+			)
+			status_command = boss_command_for_ctx(
+				ctx, f"crawl status {shell_argument(known_run_id)}", include_data_dir=True
+			)
+			handle_error_output(
+				ctx,
+				"crawl",
+				code="LOCAL_IO_ERROR",
+				message=str(exc),
+				recoverable=False,
+				recovery_action=(
+					f"本次采集记录已保存在 crawl run {known_run_id}：确认输出目录可写（不是同名的已有文件）、"
+					f"目录权限与磁盘空间正常，然后执行 {resume_command} 从断点继续；进度可用 {status_command} 查看"
+				),
+				details={"run_id": known_run_id},
+				hints={"next_actions": [status_command]},
+			)
+			return
 		handle_error_output(
 			ctx,
 			"crawl",
@@ -727,9 +770,10 @@ def _prepare_background_resume(
 				if clear_stop and previous_stop:
 					cache.restore_crawl_stop_request(run_id, updated_at=previous_updated_at)
 				raise
-			if clear_stop:
-				# 重新给 worker 留足交接窗口（Issue #1045），只刷新时间而不清新 stop。
-				cache.touch_crawl_run(run_id)
+			# 信封报 queued，库里也要是 queued（Issue #1771）：否则 worker 接手前
+			# `crawl stop` 按旧终态被拒、重复的后台恢复会再拉起一个 worker。同时
+			# 刷新时间给 worker 留足交接窗口（Issue #1045），不清新到达的 stop。
+			cache.mark_crawl_run_active(run_id, "queued")
 		return "queued", True
 
 
@@ -1146,6 +1190,8 @@ def _resume(
 					with_detail=with_detail,
 				)
 			except OSError as exc:
+				# 状态已落成 queued：worker 没能拉起时把原因写回，不留无人执行的排队。
+				_settle_unstarted_worker(Path(ctx.obj["data_dir"]), run_id, f"无法启动后台任务: {exc}")
 				resume_command = boss_command_for_ctx(ctx, f"crawl resume {shell_argument(run_id)}", include_data_dir=True)
 				handle_error_output(
 					ctx,
@@ -1186,6 +1232,7 @@ def _resume(
 			clear_stop=not from_queue,
 		),
 		on_error=on_error,
+		run_id=run_id,
 		# 登录 / transport 预检延后到 CrawlService 确认 has_resume_work 之后：
 		# 已完成且无待补详情的 run 直接返回既有结果（Issue #1412）。
 		defer_transport_preflight=True,

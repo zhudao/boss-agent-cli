@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import errno
 import html
 import sqlite3
+import stat
 import sys
 import time
 from pathlib import Path
@@ -17,7 +19,8 @@ import click
 from rich.table import Table
 
 from boss_agent_cli import display
-from boss_agent_cli.cache.store import CacheDatabaseInvalid
+from boss_agent_cli.cache.store import CacheDatabaseInvalid, is_cache_busy_error, is_cache_local_io_error
+from boss_agent_cli.commands._output_path import validate_output_path_or_emit
 from boss_agent_cli.display import (
 	boss_command_for_ctx,
 	handle_error_output,
@@ -30,22 +33,23 @@ from boss_agent_cli.services.output_path import prepare_output_path
 from boss_agent_cli.services.text_files import write_text_atomic
 
 
-def _safe_count(conn: sqlite3.Connection, table: str) -> int:
+def _count_records(
+	conn: sqlite3.Connection, table: str, *, window: tuple[str, float] | None = None
+) -> int:
+	"""统计指定表的记录。旧库缺表时返回零，其余查询失败交给调用方处理。"""
+	query = f"SELECT COUNT(*) FROM {table}"
+	parameters: tuple[float, ...] = ()
+	if window is not None:
+		column, cutoff = window
+		query += f" WHERE {column} >= ?"
+		parameters = (cutoff,)
 	try:
-		result: int = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-		return result
-	except sqlite3.OperationalError:
-		return 0
-
-
-def _count_since(conn: sqlite3.Connection, table: str, column: str, since: float) -> int:
-	try:
-		result: int = conn.execute(
-			f"SELECT COUNT(*) FROM {table} WHERE {column} >= ?", (since,)
-		).fetchone()[0]
-		return result
-	except sqlite3.OperationalError:
-		return 0
+		result: int = conn.execute(query, parameters).fetchone()[0]
+	except sqlite3.OperationalError as exc:
+		if str(exc) == f"no such table: {table}":
+			return 0
+		raise
+	return result
 
 
 def _ratio(numer: int, denom: int) -> float:
@@ -55,30 +59,56 @@ def _ratio(numer: int, denom: int) -> float:
 
 
 def _collect_stats(db_path: Path, days: int) -> dict[str, Any]:
-	"""从 SQLite 收集漏斗数据，返回结构化 dict。"""
-	if not db_path.exists():
+	"""从 SQLite 收集漏斗数据，返回结构化 dict。
+
+	只有 ``FileNotFoundError`` 才算缓存尚未建立：3.14 的 ``exists()`` 会把
+	权限等 ``OSError`` 吞成 ``False``，把「读不出来」报成「没有数据」
+	（Issue #1716）。符号链接必须直接拒绝（Issue #1743）：``path_mode`` 会
+	解析链接目标，SQLite 随后会跟随链接读取外部库，并在目标旁创建 / 改写
+	WAL 的 ``-shm`` / ``-wal``。
+	"""
+	try:
+		mode: int | None = db_path.lstat().st_mode
+	except FileNotFoundError:
+		mode = None
+	except OSError as exc:
+		if exc.filename is None:
+			exc.filename = str(db_path)
+		raise
+	except ValueError as exc:
+		error = OSError(f"无法读取缓存库路径状态：{exc}")
+		error.filename = str(db_path)
+		raise error from exc
+	if mode is None:
 		return {
 			"funnel": {"greeted": 0, "applied": 0, "shortlist": 0, "watch_hits": 0},
 			"conversion": {"apply_rate": 0.0, "shortlist_rate": 0.0},
 			"window_days": days,
 			"note": "缓存尚未建立，先跑一次 search/greet/apply 再查看",
 		}
+	# 符号链接会让 SQLite 读写数据目录之外的目标文件；目录、FIFO / 设备与
+	# 悬空链接也不是可读的 SQLite 库。与 clean / CacheStore 同口径拒绝。
+	if stat.S_ISLNK(mode):
+		raise OSError(errno.EINVAL, "缓存库是符号链接，拒绝打开", str(db_path))
+	if not stat.S_ISREG(mode):
+		raise OSError(errno.EINVAL, "缓存库不是普通文件", str(db_path))
 
 	since = time.time() - days * 86400
 	conn = sqlite3.connect(str(db_path))
 	try:
 		try:
-			greeted_total = _safe_count(conn, "greet_records")
-			applied_total = _safe_count(conn, "apply_records")
-			shortlist_total = _safe_count(conn, "shortlist_records")
+			greeted_total = _count_records(conn, "greet_records")
+			applied_total = _count_records(conn, "apply_records")
+			shortlist_total = _count_records(conn, "shortlist_records")
 
-			greeted_window = _count_since(conn, "greet_records", "greeted_at", since)
-			applied_window = _count_since(conn, "apply_records", "applied_at", since)
-			shortlist_window = _count_since(conn, "shortlist_records", "created_at", since)
-			watch_window = _count_since(conn, "watch_hits", "first_seen_at", since)
+			greeted_window = _count_records(conn, "greet_records", window=("greeted_at", since))
+			applied_window = _count_records(conn, "apply_records", window=("applied_at", since))
+			shortlist_window = _count_records(conn, "shortlist_records", window=("created_at", since))
+			watch_window = _count_records(conn, "watch_hits", window=("first_seen_at", since))
 		except sqlite3.DatabaseError as exc:
-			# 只读聚合直接开 SQLite，不经过 CacheStore 的启动校验；库文件损坏时
-			# 交给 main.py 统一出 CACHE_DATABASE_INVALID 信封，而不是 traceback。
+			# 锁冲突和磁盘错误交给 CLI 分流，避免给出删库指引（Issue #1718）。
+			if is_cache_busy_error(exc) or is_cache_local_io_error(exc):
+				raise
 			raise CacheDatabaseInvalid(db_path, str(exc)) from exc
 	finally:
 		conn.close()
@@ -358,7 +388,8 @@ def _percent(value: Any) -> str:
 	"""把 0~1 的比率渲染成百分比；非数值返回占位符。"""
 	try:
 		return f"{round(float(value) * 100, 1)}%"
-	except (TypeError, ValueError):
+	except (TypeError, ValueError, OverflowError):
+		# 合法大整数（如 10**400）转 float 抛 OverflowError，按非数值处理。
 		return "-"
 
 
@@ -383,7 +414,8 @@ def stats_cmd(ctx: click.Context, days: int, output_format: str, output_path: Pa
 	"""投递转化漏斗统计（只读聚合）"""
 	# 空 -o 经 click.Path 落成 Path(".")（`-o .` 已被 click 按目录拒绝），
 	# 继续走会把它当路径去建目录，报成 LOCAL_IO_ERROR（Issue #1546）。
-	if output_path is not None and str(output_path) == ".":
+	# 纯空白值不是文件名：照写会在当前目录落一个几乎不可见的文件（Issue #1788）。
+	if output_path is not None and (str(output_path) == "." or not str(output_path).strip()):
 		html_cmd = _hint_command(ctx, "stats --format html -o <文件路径>")
 		handle_error_output(
 			ctx,
@@ -409,6 +441,14 @@ def stats_cmd(ctx: click.Context, days: int, output_format: str, output_path: Pa
 		)
 		ctx.exit(1)
 		return
+	# FIFO / 设备 / 悬空链接不能被 write_text_atomic 的 os.replace 悄悄替换成
+	# 普通文件；目录与不可用父路径也在这里提前按参数错误暴露（Issue #1723）。
+	if output_path is not None:
+		validated = validate_output_path_or_emit(ctx, "stats", output_path)
+		if validated is None:
+			ctx.exit(1)
+			return
+		output_path = Path(validated)
 	data_dir: Path = ctx.obj["data_dir"]
 	db_path = data_dir / "cache" / "boss_agent.db"
 

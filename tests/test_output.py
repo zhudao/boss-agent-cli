@@ -17,6 +17,7 @@ from boss_agent_cli.output import (
 	Logger,
 	_MAX_REDACTION_DEPTH,
 	redact_sensitive,
+	redact_sensitive_text,
 )
 from boss_agent_cli.schema.error_codes import ERROR_CODES
 
@@ -266,6 +267,24 @@ def test_redaction_stops_at_cjk_punctuation() -> None:
 	assert redact_sensitive_text("token=abc.def。") == "token=[REDACTED]。"
 	assert redact_sensitive_text("Authorization: Bearer eyJ.payload.sig，然后") == "Authorization: [REDACTED]，然后"
 	assert redact_sensitive_text("cookie: sessionid=xyz；继续") == "cookie: [REDACTED]；继续"
+
+
+def test_redaction_covers_composite_credential_keys() -> None:
+	"""复合键里的凭据段不能因为前面有 `_` / `-` 就漏掉（Issue #1765）。"""
+	from boss_agent_cli.output import envelope_error, redact_sensitive, redact_sensitive_text
+
+	for key in ("access_token", "refresh_token", "auth_token", "session_token", "x-api-key", "client_secret"):
+		assert redact_sensitive_text(f"{key}=SUPERSECRET") == f"{key}=[REDACTED]"
+
+	assert redact_sensitive({"x-api-key": "SUPERSECRET", "client_secret": "SUPERSECRET"}) == {
+		"x-api-key": "[REDACTED]",
+		"client_secret": "[REDACTED]",
+	}
+	message = json.loads(
+		envelope_error("config", code="INVALID_PARAM", message="必须是整数，收到 'access_token=SUPERSECRET'")
+	)["error"]["message"]
+	assert "SUPERSECRET" not in message
+	assert "access_token=[REDACTED]" in message
 
 
 def test_logger_filters_by_level(capsys):
@@ -795,3 +814,25 @@ def test_redact_sensitive_truncates_deep_list_and_tuple(wrap) -> None:
 	redacted = redact_sensitive(value)
 
 	assert "deep-secret" not in json.dumps(redacted)
+
+
+@pytest.mark.parametrize(
+	("text", "expected"),
+	[
+		("https://alice:s3cretPass@proxy.example/v1", "https://alice:[REDACTED]@proxy.example/v1"),
+		("连接 http://:pw@127.0.0.1:8080 失败", "连接 http://:[REDACTED]@127.0.0.1:8080 失败"),
+		("socks5://u:p@h:1080，然后重试", "socks5://u:[REDACTED]@h:1080，然后重试"),
+	],
+)
+def test_redaction_masks_url_userinfo_password(text, expected):
+	"""URL 里的 Basic Auth 口令没有 key=value 形态，也要遮掉（Issue #1779）。"""
+	assert redact_sensitive_text(text) == expected
+	assert redact_sensitive({"ai_base_url": text, "nested": [text]}) == {"ai_base_url": expected, "nested": [expected]}
+
+
+@pytest.mark.parametrize(
+	"text",
+	["http://host:8080/a@b", "https://example.com/users/@me", "mailto:someone@example.com", "http://[::1]:9222/json", "邮箱 a:b@c 不是 URL"],
+)
+def test_redaction_leaves_urls_without_userinfo_password(text):
+	assert redact_sensitive_text(text) == text

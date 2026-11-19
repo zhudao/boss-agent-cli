@@ -3,6 +3,7 @@ import json
 import math
 import secrets
 import sqlite3
+import stat
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -240,6 +241,25 @@ class CacheBusyError(Exception):
 		self.detail = detail
 
 
+def database_path_problem(path: Path) -> str | None:
+	"""SQLite 打开前的路径类型判定，返回问题描述；``None`` 表示可以打开。
+
+	``sqlite3.connect`` 会跟随符号链接：链接指向空文件时数据库会直接写进目标
+	（数据目录之外），悬空链接会新建目标。目录 / FIFO / 设备只会得到
+	"unable to open database file"。``clean`` 已按同一口径拒绝符号链接库
+	（#1712），所有打开入口必须一致（Issue #1739）。
+	"""
+	try:
+		mode = path.lstat().st_mode
+	except FileNotFoundError:
+		return None
+	if stat.S_ISLNK(mode):
+		return "数据库路径是符号链接；SQLite 会跟随链接把数据库写进目标文件"
+	if not stat.S_ISREG(mode):
+		return "数据库路径不是普通文件（目录 / FIFO / 设备）"
+	return None
+
+
 def is_cache_busy_error(exc: BaseException) -> bool:
 	"""SQLite 写锁冲突的判定：busy timeout 内拿不到锁，等锁释放后可重试。"""
 	if not isinstance(exc, sqlite3.OperationalError):
@@ -457,6 +477,11 @@ class CacheStore:
 		self._db_path = db_path
 		self._search_ttl = search_ttl_seconds
 		db_path.parent.mkdir(parents=True, exist_ok=True)
+		# 符号链接 / 特殊文件不能作为缓存库：连接会在链接目标处创建或改写数据库
+		# （Issue #1739，与 clean 的 #1712 同口径）。
+		problem = database_path_problem(db_path)
+		if problem is not None:
+			raise CacheDatabaseInvalid(db_path, problem)
 		try:
 			self._conn = sqlite3.connect(
 				str(db_path),
@@ -929,6 +954,18 @@ class CacheStore:
 		)
 		self._conn.commit()
 
+	def mark_crawl_run_active(self, run_id: str, status: str) -> None:
+		"""恢复已取得执行权时把状态落成 queued / running（Issue #1771）。
+
+		只改状态、清掉上一轮的错误并刷新时间；断点游标与其他进程写入的停止标记
+		保持不动，这样恢复窗口内到达的 `crawl stop` 才会被接受。
+		"""
+		self._conn.execute(
+			"UPDATE crawl_runs SET status = ?, error = '', updated_at = ? WHERE run_id = ?",
+			(status, time.time(), run_id),
+		)
+		self._conn.commit()
+
 	def touch_crawl_run(self, run_id: str) -> None:
 		"""刷新排队交接时间，不改变其他进程写入的停止标记。"""
 		self._conn.execute("UPDATE crawl_runs SET updated_at = ? WHERE run_id = ?", (time.time(), run_id))
@@ -1248,9 +1285,16 @@ class CacheStore:
 		return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
 
 	@classmethod
-	def _deserialize_shortlist_tags(cls, raw: str | None) -> list[str]:
+	def _deserialize_shortlist_tags(cls, raw: str | bytes | bytearray | None) -> list[str]:
 		if not raw:
 			return []
+		if isinstance(raw, (bytes, bytearray)):
+			# SQLite TEXT 列不强制类型：值被写成 BLOB 时不能在 str.split(",") 上
+			# 抛 TypeError 让整池条目落成 INTERNAL_ERROR（Issue #1799）。
+			try:
+				raw = raw.decode("utf-8")
+			except UnicodeDecodeError:
+				return []
 		try:
 			parsed = json.loads(raw)
 		# 超长整数 / 深嵌套与语法损坏等价：退回旧的逗号分隔写法。
@@ -1420,8 +1464,12 @@ class CacheStore:
 	# 不要在 welfare 详情线程池的 worker 内访问。
 
 	def get_job_desc(self, job_id: str) -> str | None:
-		"""返回缓存的职位描述（命中且未过期），否则 None。"""
-		if not job_id:
+		"""返回缓存的职位描述（命中且未过期），否则 None。
+
+		``encryptJobId`` 漂移成 dict / 数字时按未命中处理：直接当 sqlite
+		参数会抛 ProgrammingError 并穿出整条 ``--welfare`` 管线（Issue #1890）。
+		"""
+		if not isinstance(job_id, str) or not job_id:
 			return None
 		row = self._conn.execute(
 			"SELECT description, created_at FROM job_desc_cache WHERE job_id = ?",
@@ -1436,8 +1484,11 @@ class CacheStore:
 		return cast("str", row[0])
 
 	def put_job_desc(self, job_id: str, description: str) -> None:
-		"""缓存非空职位描述，超过容量时淘汰保存时间最早的条目。"""
-		if not job_id or not description:
+		"""缓存非空职位描述，超过容量时淘汰保存时间最早的条目。
+
+		非字符串键 / 描述同样按「没有可缓存内容」跳过（Issue #1890）。
+		"""
+		if not isinstance(job_id, str) or not job_id or not isinstance(description, str) or not description:
 			return
 		self._conn.execute(
 			"INSERT OR REPLACE INTO job_desc_cache (job_id, description, created_at) VALUES (?, ?, ?)",

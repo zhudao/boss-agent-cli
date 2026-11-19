@@ -28,6 +28,7 @@ from boss_agent_cli.display import (
 	render_message_panel,
 	risk_error_contract,
 	risk_error_message,
+	positional_hint,
 	shell_argument,
 )
 from boss_agent_cli.search_filters import (
@@ -94,8 +95,18 @@ def greet_cmd(ctx: click.Context, security_id: str, job_id: str, message: str) -
 	if not require_compliance_allowed(ctx, "greet"):
 		return
 
-	# 空 ID 无法定位任何职位或招聘者：继续下去只会先查一次本地缓存、再带着空参数
-	# 发平台请求，错误看起来像网络或登录问题，真正的原因（argv 拼错）被掩盖。
+	if message and not message.strip():
+		# 拒绝会被平台当成招呼正文的纯空白内容（Issue #1817）。
+		handle_error_output(
+			ctx,
+			"greet",
+			code="INVALID_PARAM",
+			message="--message 不能只有空白字符",
+			recovery_action="省略 --message 使用默认招呼语，或传入非空内容后重试",
+		)
+		return
+
+	# 在读缓存或联系平台前报告缺失的职位标识。
 	if not security_id.strip() or not job_id.strip():
 		search_cmd = _hint_command(ctx, "search <关键词>")
 		handle_error_output(
@@ -270,7 +281,12 @@ def _batch_greet_dry_run_rerun(ctx: click.Context, query: str) -> str:
 	"""dry-run 之后真正要执行的那条命令：与本次调用同参数，只去掉 --dry-run。"""
 	params = ctx.params or {}
 	argv = boss_command_for_ctx(ctx, "batch-greet").split(" ")
-	argv = [*argv[:-1], *_explicit_global_options(ctx), argv[-1], query]
+	# 以 `-` 开头的关键词必须排在全部选项之后并用 `--` 隔开，否则照抄执行会被
+	# 当成选项（Issue #1815）；普通关键词保持「关键词在前」的写法。
+	dashed = query.startswith("-")
+	argv = [*argv[:-1], *_explicit_global_options(ctx), argv[-1]]
+	if not dashed:
+		argv.append(query)
 	for flag, key in (
 		("--city", "city"),
 		("--salary", "salary"),
@@ -287,7 +303,8 @@ def _batch_greet_dry_run_rerun(ctx: click.Context, query: str) -> str:
 	count = params.get("count")
 	if count is not None:
 		argv.extend(["--count", str(count)])
-	return " ".join(shell_argument(part) for part in argv)
+	rendered = " ".join(shell_argument(part) for part in argv)
+	return f"{rendered} {positional_hint(query)}" if dashed else rendered
 
 
 @click.command("batch-greet")
@@ -377,8 +394,18 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 				job_type=job_type,
 			)
 
+			# 先校验写请求所需的标识，避免坏条目遮住随后同职位的有效条目（Issue #1816）。
+			valid_jobs = [
+				job
+				for job in job_list
+				if all(isinstance(job.get(key), str) and job[key].strip() for key in ("securityId", "encryptJobId"))
+			]
+			skipped_invalid = len(job_list) - len(valid_jobs)
+			if skipped_invalid:
+				logger.warning(f"跳过 {skipped_invalid} 个缺少有效 security_id / job_id 的搜索结果")
+
 			candidates: list[JobItem] = []
-			for raw_item in deduplicate_job_result(job_list):
+			for raw_item in deduplicate_job_result(valid_jobs):
 				# 上限必须在下一次收集之前判断：放在 append 之后时 --count 0 仍会
 				# 收进 1 个候选并真实发出招呼（写操作）。
 				if len(candidates) >= count:
@@ -421,7 +448,6 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 			try:
 				for idx, item in enumerate(candidates):
 					current_item = item
-					retry_count = 0
 					success = False
 
 					# 发送前先在本地原子预约：两个进程并发跑同名批次时，只有抢到
@@ -450,7 +476,7 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 						current_item = None
 						break
 
-					while retry_count <= 1:
+					for attempt in range(2):
 						try:
 							resp = platform.greet(item.security_id, item.job_id)
 							if not platform.is_success(resp):
@@ -491,31 +517,32 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 										f"招呼结果未确认（平台响应未识别），停止批量打招呼: {item.title} @ {item.company}"
 									)
 									break
-								# 其余平台错误码是明确失败、没有产生记录：撤销预约，
-								# 修正参数 / 等待后仍可重试该候选人。
-								release_candidate_action(cache, item.job_id, "greet", account=account)
-								raise RuntimeError(error_code)
-							entry: dict[str, Any] = {
-								"security_id": item.security_id,
-								"job_id": item.job_id,
-								"title": item.title,
-								"company": item.company,
-								"status": "success",
-							}
-							try:
-								settle_candidate_action(
-									cache, item.security_id, item.job_id, "greet", account=account
-								)
-							except Exception:
-								# 记账失败不能落进下面的通用失败分支：那会 sleep 后重发同一个招呼。
-								# 标记后停止批次，由收尾逻辑输出不可重试的本地状态错误。
-								entry["recorded"] = False
-								cache_write_failed = True
-								logger.warning(f"本地记账失败，停止批量打招呼: {item.title} @ {item.company}")
-							results.append(entry)
-							success = True
-							logger.info(f"打招呼成功: {item.title} @ {item.company}")
-							break
+								if error_code in {"RATE_LIMITED", "GREET_LIMIT"}:
+									release_candidate_action(cache, item.job_id, "greet", account=account)
+									stopped_reason = error_code
+									break
+								error_msg = error_code
+							else:
+								entry: dict[str, Any] = {
+									"security_id": item.security_id,
+									"job_id": item.job_id,
+									"title": item.title,
+									"company": item.company,
+									"status": "success",
+								}
+								try:
+									settle_candidate_action(
+										cache, item.security_id, item.job_id, "greet", account=account
+									)
+								except Exception:
+									# 平台已确认发送。记账失败交给批次收尾处理。
+									entry["recorded"] = False
+									cache_write_failed = True
+									logger.warning(f"本地记账失败，停止批量打招呼: {item.title} @ {item.company}")
+								results.append(entry)
+								success = True
+								logger.info(f"打招呼成功: {item.title} @ {item.company}")
+								break
 						except PlatformRiskError as exc:
 							# 风控：立即停批，不重试、不 sleep、不继续下一个候选人。
 							risk_error = exc
@@ -534,8 +561,8 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 								logger.warning(f"请求预算耗尽，停止批量打招呼: {item.title} @ {item.company}")
 								break
 							error_msg = str(e)
-							if "ACTION_UNCONFIRMED" in error_msg:
-								# 异常形态的未知结果（平台层直接 raise 时）同样不能重试（Issue #984）。
+							if not was_provably_unsent(e):
+								# 请求可能已发出。保留预约并停止，等待核对送达结果（Issue #1818）。
 								unconfirmed = {
 									**item.to_dict(),
 									"status": "unconfirmed",
@@ -546,30 +573,26 @@ def batch_greet_cmd(ctx: click.Context, query: str, city: str | None, salary: st
 								stopped_reason = "ACTION_UNCONFIRMED"
 								logger.warning(f"招呼结果未确认，停止批量打招呼: {item.title} @ {item.company}")
 								break
-							if "RATE_LIMITED" in error_msg or "频率" in error_msg:
-								# 平台明确限流、没有写入：撤销预约，冷却后可重试该候选人。
+							stop_code = getattr(e, "code", None)
+							if stop_code in ("RATE_LIMITED", "GREET_LIMIT"):
 								release_candidate_action(cache, item.job_id, "greet", account=account)
-								stopped_reason = "RATE_LIMITED"
+								stopped_reason = str(stop_code)
 								break
-							if "GREET_LIMIT" in error_msg or "上限" in error_msg:
-								# 配额上限是明确拒绝，同样没有写入。
-								release_candidate_action(cache, item.job_id, "greet", account=account)
-								stopped_reason = "GREET_LIMIT"
-								break
-							if retry_count == 0:
-								logger.warning(f"打招呼失败，重试中: {item.title}")
-								retry_count += 1
-								time.sleep(random.uniform(1.0, 2.0))
-							else:
-								results.append({
-									"security_id": item.security_id,
-									"job_id": item.job_id,
-									"title": item.title,
-									"company": item.company,
-									"status": "failed",
-									"error": error_msg,
-								})
-								break
+
+						# 明确失败后可重试一次。保留预约，避免另一进程在等待期间发送。
+						if attempt == 0:
+							logger.warning(f"打招呼失败，重试中: {item.title}")
+							time.sleep(random.uniform(1.0, 2.0))
+							continue
+						release_candidate_action(cache, item.job_id, "greet", account=account)
+						results.append({
+							"security_id": item.security_id,
+							"job_id": item.job_id,
+							"title": item.title,
+							"company": item.company,
+							"status": "failed",
+							"error": error_msg,
+						})
 
 					current_item = None
 					if stopped_reason:

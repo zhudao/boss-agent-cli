@@ -8,6 +8,7 @@ import json
 import math
 import os
 import sqlite3
+import stat
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from boss_agent_cli.automation.models import AutomationEvent, PendingAction, PlatformAction, ReviewItem
-from boss_agent_cli.cache.store import is_cache_busy_error
+from boss_agent_cli.cache.store import database_path_problem, is_cache_busy_error
 from boss_agent_cli.services.chat_utils import sanitize_csv_cell
 
 
@@ -47,11 +48,59 @@ class AutomationRunBusy(RuntimeError):
 	"""另一个 agent run 正在同一数据目录执行：本次调用没有发出任何请求。"""
 
 
+_AUTOMATION_DIR = "automation"
+_STOP_FILE = "stop.json"
+
+
+def _path_mode(path: Path) -> int | None:
+	"""仅对缺失路径返回 None，悬空链接保留链接自身的类型。"""
+	# 3.14 的 Path.exists() / is_file() 会吞掉权限等 OSError（Issue #1680）。
+	try:
+		mode = path.lstat().st_mode
+	except FileNotFoundError:
+		return None
+	if stat.S_ISLNK(mode):
+		try:
+			return path.stat().st_mode
+		except FileNotFoundError:
+			pass
+	return mode
+
+
+def _refuse_symlink_write(path: Path, label: str) -> None:
+	"""写入前拒绝符号链接与特殊文件。
+
+	读取侧允许沿「指向普通文件的符号链接」读取（Issue #1728），但写入侧不能
+	沿用同一判定：``open("a")`` 会写穿链接目标（数据落到数据目录之外），
+	临时文件 + ``os.replace`` 则会静默把链接替换成普通文件、让目标保留旧行；
+	恢复链接后旧的 pending / review 行会复活并可能被重放（Issue #1746）。
+	与 ``write_private_bytes`` 的符号链接拒绝（Issue #1355）同口径。
+	"""
+	try:
+		mode = path.lstat().st_mode
+	except FileNotFoundError:
+		return
+	except (OSError, ValueError) as exc:
+		raise AutomationStateError(path, f"{label} 无法读取路径状态（{exc}）") from exc
+	if stat.S_ISLNK(mode):
+		raise AutomationStateError(
+			path,
+			f"{label} 无法写入：路径是符号链接；请改用普通文件路径（先备份再移除链接），"
+			"自动化不会写穿链接或替换链接本身",
+		)
+	if not stat.S_ISREG(mode):
+		raise AutomationStateError(
+			path,
+			f"{label} 无法写入：路径不是普通文件（目录 / FIFO / 设备）；"
+			"请先检查该路径后重试",
+		)
+
+
 class AutomationStore:
 	"""Small JSONL-backed store for the recruiter automation engine."""
 
 	def __init__(self, data_dir: Path) -> None:
-		self.root = data_dir / "automation"
+		self.root = data_dir / _AUTOMATION_DIR
 		self.root.mkdir(parents=True, exist_ok=True)
 		(self.root / "archive").mkdir(exist_ok=True)
 
@@ -61,23 +110,31 @@ class AutomationStore:
 
 	@property
 	def stop_path(self) -> Path:
-		return self.root / "stop.json"
+		return self.root / _STOP_FILE
 
 	def read_stop(self) -> dict[str, Any]:
-		"""Read the independent stop latch; business snapshots cannot clear it.
+		"""读取独立停止标记，业务快照不能解除它。"""
+		return self.read_stop_for(self.root.parent)
 
-		熔断开关读不出来时按「已熔断」处理：状态未知时宁可停下等人工核对，
-		也不能让自动化继续向平台发送消息。
-		"""
-		if not self.stop_path.exists():
-			return {}
+	@staticmethod
+	def read_stop_for(data_dir: Path) -> dict[str, Any]:
+		"""只读停止标记，不创建目录；读取失败时保持熔断。"""
+		path = data_dir / _AUTOMATION_DIR / _STOP_FILE
 		try:
-			loaded = json.loads(self.stop_path.read_text(encoding="utf-8"))
+			mode = _path_mode(path)
+			if mode is None:
+				return {}
+			if stat.S_ISLNK(mode):
+				return {"open": True, "reason": "stop.json 是悬空符号链接，已按熔断处理", "corrupt": True}
+			# FIFO / 设备不能直接 read_text，否则会阻塞（Issue #1675）。
+			if not stat.S_ISREG(mode):
+				return {"open": True, "reason": "stop.json 不是普通文件，已按熔断处理", "corrupt": True}
+			loaded = json.loads(path.read_text(encoding="utf-8"))
 		# ValueError 覆盖 JSONDecodeError / UnicodeDecodeError 与 3.11+ 的超长整数
 		# 上限；RecursionError 覆盖深嵌套。熔断状态读不出来必须 fail-closed：
 		# 抛出去会让调用方按「未知状态」继续，只有 corrupt 标记能通知人工核对。
 		except (ValueError, OSError, RecursionError) as exc:
-			return {"open": True, "reason": f"stop.json 无法解析，已按熔断处理：{exc}", "corrupt": True}
+			return {"open": True, "reason": f"stop.json 无法读取或解析，已按熔断处理：{exc}", "corrupt": True}
 		if not isinstance(loaded, dict):
 			return {"open": True, "reason": "stop.json 顶层不是 JSON object，已按熔断处理", "corrupt": True}
 		if "open" not in loaded:
@@ -106,7 +163,16 @@ class AutomationStore:
 			self._set_stop(reason)
 
 	def _set_stop(self, reason: str) -> None:
-		self._write_json_atomic(self.stop_path, {
+		path = self.stop_path
+		try:
+			mode = _path_mode(path)
+		except (OSError, ValueError) as exc:
+			raise AutomationStateError(path, f"无法读取 stop.json 的路径状态（{exc}）") from exc
+		# 目录 / 指向目录的符号链接无法通过 os.replace 写入，先报状态损坏（Issue #1684）。
+		# 悬空链接本身可以被原子替换，仍允许写入。
+		if mode is not None and not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+			raise AutomationStateError(path, "stop.json 不是普通文件，请先检查该路径后重试")
+		self._write_json_atomic(path, {
 			"open": True,
 			"reason": reason,
 			"opened_at": datetime.now(timezone.utc).isoformat(),
@@ -115,9 +181,22 @@ class AutomationStore:
 	def resume(self) -> bool:
 		"""Explicit operator recovery; retain every confirmed business checkpoint."""
 		with self._control_lock():
+			path = self.stop_path
+			try:
+				mode = _path_mode(path)
+			except (OSError, ValueError) as exc:
+				raise AutomationStateError(path, f"无法读取 stop.json 的路径状态（{exc}）") from exc
+			# 先校验，避免同名目录导致第二次原子写失败（Issue #1678）。
+			# 其他现存非普通文件也需人工处理，悬空链接仍允许原子替换。
+			if mode is not None and not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+				raise AutomationStateError(path, "stop.json 不是普通文件，请先检查该路径后重试")
 			state = self.read_state()
 			if not state.get("autonomy", {}).get("circuit_breaker", {}).get("open"):
 				return False
+			# resume 直接走原子写、不经过 write_state：不在这里拒链接会静默替换
+			# state.json 链接，目标保留旧熔断 / checkpoint，恢复链接后旧状态复活
+			# （Issue #1751）。stop.json 的悬空链接仍允许原子替换。
+			_refuse_symlink_write(self.state_path, "state.json")
 			closed = {
 				"open": False,
 				"reason": "explicit-resume-after-verification",
@@ -141,8 +220,16 @@ class AutomationStore:
 		"""
 		connection: sqlite3.Connection | None = None
 		try:
+			lock_path = self.root / ".run-lock.sqlite3"
 			try:
-				connection = sqlite3.connect(self.root / ".run-lock.sqlite3", timeout=0.5)
+				problem = database_path_problem(lock_path)
+			except (OSError, ValueError) as exc:
+				raise AutomationStateError(lock_path, f"自动化执行锁无法读取路径状态（{exc}）") from exc
+			# SQLite 会跟随符号链接把库写进目标文件（Issue #1743，与 #1739 同口径）。
+			if problem is not None:
+				raise AutomationStateError(lock_path, f"自动化执行锁无法打开（{problem}）")
+			try:
+				connection = sqlite3.connect(lock_path, timeout=0.5)
 				connection.execute("BEGIN IMMEDIATE")
 			except sqlite3.DatabaseError as exc:
 				if isinstance(exc, sqlite3.OperationalError) and is_cache_busy_error(exc):
@@ -153,7 +240,7 @@ class AutomationStore:
 				# 会让命令丢掉整个信封，或在 agent run 里被兜成可重试的
 				# NETWORK_ERROR（Issue #1304）。
 				raise AutomationStateError(
-					self.root / ".run-lock.sqlite3",
+					lock_path,
 					f"自动化执行锁无法打开（{exc}）",
 				) from exc
 			yield
@@ -167,8 +254,16 @@ class AutomationStore:
 		"""Serialize tiny control updates across processes with a bounded wait."""
 		connection: sqlite3.Connection | None = None
 		try:
+			lock_path = self.root / ".control-lock.sqlite3"
 			try:
-				connection = sqlite3.connect(self.root / ".control-lock.sqlite3", timeout=1.0)
+				problem = database_path_problem(lock_path)
+			except (OSError, ValueError) as exc:
+				raise AutomationStateError(lock_path, f"自动化控制锁无法读取路径状态（{exc}）") from exc
+			# 同执行锁：符号链接会让 SQLite 把控制锁库写进链接目标（Issue #1743）。
+			if problem is not None:
+				raise AutomationStateError(lock_path, f"自动化控制锁无法打开（{problem}）")
+			try:
+				connection = sqlite3.connect(lock_path, timeout=1.0)
 				connection.execute("BEGIN IMMEDIATE")
 			except sqlite3.DatabaseError as exc:
 				# 锁冲突是 automation 自己的并发边界，不是缓存库问题：直接上抛会被
@@ -180,7 +275,7 @@ class AutomationStore:
 					) from exc
 				# 锁文件损坏 / 路径被同名目录占用：确定性本地状态问题（Issue #1304）。
 				raise AutomationStateError(
-					self.root / ".control-lock.sqlite3",
+					lock_path,
 					f"自动化控制锁无法打开（{exc}）",
 				) from exc
 			yield
@@ -190,13 +285,23 @@ class AutomationStore:
 				connection.close()
 
 	def read_state(self) -> dict[str, Any]:
-		if not self.state_path.exists():
+		path = self.state_path
+		try:
+			mode = _path_mode(path)
+		except (OSError, ValueError) as exc:
+			raise AutomationStateError(path, f"无法读取 state.json 的路径状态（{exc}）") from exc
+		if mode is None:
 			state: dict[str, Any] = {"conversations": {}, "autonomy": {}, "safety": {}}
 		else:
+			# 悬空链接 / 目录等路径给不出可信状态，不能静默当成空状态（Issue #1682）。
+			if stat.S_ISLNK(mode):
+				raise AutomationStateError(path, "state.json 是悬空符号链接，无法读取状态")
+			if not stat.S_ISREG(mode):
+				raise AutomationStateError(path, "state.json 不是普通文件")
 			try:
-				loaded = json.loads(self.state_path.read_text(encoding="utf-8"))
+				loaded = json.loads(path.read_text(encoding="utf-8"))
 			except (ValueError, OSError, RecursionError) as exc:
-				raise AutomationStateError(self.state_path, str(exc)) from exc
+				raise AutomationStateError(path, str(exc)) from exc
 			if not isinstance(loaded, dict):
 				raise AutomationStateError(self.state_path, "顶层必须是 JSON object")
 			state = cast("dict[str, Any]", loaded)
@@ -227,6 +332,7 @@ class AutomationStore:
 		# Preserve legacy callers that set the breaker through write_state. A stale
 		# snapshot lacking it can never remove the separate stop latch.
 		with self._control_lock():
+			_refuse_symlink_write(self.state_path, "state.json")
 			autonomy = state.get("autonomy", {})
 			if not isinstance(autonomy, dict):
 				raise AutomationStateError(self.state_path, "autonomy 必须是 JSON object")
@@ -388,10 +494,34 @@ class AutomationStore:
 		path = self.root / name
 		rows: list[dict[str, Any]] = []
 		try:
-			payload = path.read_bytes()
-		except FileNotFoundError:
+			mode = _path_mode(path)
+		except (OSError, ValueError) as exc:
+			raise AutomationStateError(path, f"队列文件无法读取路径状态（{exc}）") from exc
+		if mode is None:
 			# 只有「文件不存在」才是空队列。不能先用 path.exists() 预判：
 			# 预判与读取之间文件可能被删除，那个 TOCTOU 窗口会让删除变成失败。
+			return rows
+		# FIFO / 设备直接 read_bytes() 会永久阻塞在打开阶段，agent run /
+		# pending list / stats 都会挂死且没有任何信封（Issue #1728）。与
+		# read_state() / read_stop() 同口径：悬空链接与非普通文件 fail-closed。
+		# 指向普通文件的符号链接在 _path_mode 里已解析成目标类型，照常读取。
+		if stat.S_ISLNK(mode):
+			raise AutomationStateError(
+				path,
+				"队列文件无法读取：路径是悬空符号链接；请确认链接目标存在后重试，"
+				"文件损坏时先备份再修正或移除",
+			)
+		if not stat.S_ISREG(mode):
+			raise AutomationStateError(
+				path,
+				"队列文件无法读取：路径不是普通文件（目录 / FIFO / 设备）；"
+				"请确认文件可读（权限正常、路径不是目录）后重试，"
+				"文件损坏时先备份再修正或移除",
+			)
+		try:
+			payload = path.read_bytes()
+		except FileNotFoundError:
+			# lstat 与读取之间文件被删除：仍然只是「队列为空」。
 			return rows
 		except OSError as exc:
 			# 权限不足、路径被同名目录占用、磁盘错误都把队列读成空列表时，
@@ -424,6 +554,7 @@ class AutomationStore:
 
 	def write_jsonl(self, name: str, rows: list[dict[str, Any]]) -> None:
 		path = self.root / name
+		_refuse_symlink_write(path, "队列文件")
 		body = "".join(
 			f"{json.dumps(row, ensure_ascii=False, sort_keys=True)}\n"
 			for row in rows
@@ -453,8 +584,21 @@ class AutomationStore:
 		重新命中同一时间，重复行只会污染运维清单（Issue #889）。
 		"""
 		path = self.root / "interview-leads.csv"
+		_refuse_symlink_write(path, "面试线索表")
 		row = [sanitize_csv_cell(candidate_key), sanitize_csv_cell(interview_time), sanitize_csv_cell(reason)]
-		if path.exists():
+		try:
+			mode = _path_mode(path)
+		except (OSError, ValueError) as exc:
+			# 路径状态读不出来时不能当成「文件不存在」：紧接着的表头写入会
+			# 截断已有线索历史（Issue #1694）。
+			raise AutomationStateError(path, f"无法读取面试线索表的路径状态（{exc}）") from exc
+		if mode is not None and not stat.S_ISREG(mode):
+			# 目录 / FIFO / 设备 / 悬空链接都不能按 CSV 追加：FIFO 会阻塞，
+			# 其余路径写入会失败或丢掉链接目标之外的数据。
+			raise AutomationStateError(path, "interview-leads.csv 不是普通文件，请先检查该路径后重试")
+		if mode is None:
+			path.write_text("candidate_key,interview_time,reason\n", encoding="utf-8")
+		else:
 			try:
 				with path.open("r", encoding="utf-8", newline="") as handle:
 					if any(existing[:2] == row[:2] for existing in itertools.islice(csv.reader(handle), 1, None)):
@@ -463,8 +607,10 @@ class AutomationStore:
 				# 手工编辑或外部写入造成的坏文件不该让整轮自动化失败；无法判重时
 				# 继续追加，最坏只是多一行可见的重复记录。
 				pass
-		else:
-			path.write_text("candidate_key,interview_time,reason\n", encoding="utf-8")
+			except OSError as exc:
+				# 读不出来就无法判重，也无法确认不会覆盖历史：与队列读取同口径
+				# fail-closed，而不是让 PermissionError 冒成内部错误。
+				raise AutomationStateError(path, f"面试线索表无法读取（{exc}）") from exc
 		with path.open("a", encoding="utf-8", newline="") as handle:
 			csv.writer(handle).writerow(row)
 		return True
@@ -506,9 +652,19 @@ class AutomationStore:
 		}
 
 	def _append_jsonl(self, name: str, row: dict[str, Any]) -> None:
-		with (self.root / name).open("a", encoding="utf-8") as handle:
-			handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
-			handle.write("\n")
+		path = self.root / name
+		_refuse_symlink_write(path, "队列文件")
+		try:
+			with path.open("a", encoding="utf-8") as handle:
+				handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
+				handle.write("\n")
+		except OSError as exc:
+			# 只读文件 / 只读目录 / 磁盘满：动作已经发生，写不进日志同样必须
+			# 带着路径与原因停下，不能兜成可重试的通用错误。
+			raise AutomationStateError(
+				path,
+				f"队列文件无法写入（{exc}）；请确认文件可写（权限正常、路径不是目录）后重试",
+			) from exc
 
 
 def _row_confidence(row: dict[str, Any], path: Path) -> float:
@@ -531,17 +687,32 @@ def queued_action(item: ReviewItem | PendingAction, path: Path) -> PlatformActio
 		raise AutomationStateError(path, f"记录 {item.id!r} 的 action {item.action!r} 不是已知动作") from None
 
 
+def _row_text(row: dict[str, Any], key: str, path: Path, default: str = "") -> str:
+	"""读取队列记录的文本字段；类型漂移按状态损坏上报，不把 str(None) 当话术执行。
+
+	``message`` 会被真的发给候选人，``platform`` / ``candidate_key`` / ``reason``
+	参与匹配与审计；静默 ``str()`` 会把 ``null`` / 数字 / 容器变成 `"None"` /
+	`"123"` / `"{'text': 'hi'}"`（Issue #1867）。
+	"""
+	value = row.get(key, default)
+	if not isinstance(value, str):
+		raise AutomationStateError(
+			path, f"记录 {str(row.get('id', ''))!r} 的 {key} 不是字符串"
+		)
+	return value
+
+
 def _review_from_row(row: dict[str, Any], path: Path) -> ReviewItem:
 	return ReviewItem(
 		id=str(row.get("id", "")),
 		ts=str(row.get("ts", "")),
-		platform=str(row.get("platform", "")),
-		candidate_key=str(row.get("candidate_key", "")),
+		platform=_row_text(row, "platform", path),
+		candidate_key=_row_text(row, "candidate_key", path),
 		action=str(row.get("action", "")),
 		status=str(row.get("status", "review")),
 		confidence=_row_confidence(row, path),
-		reason=str(row.get("reason", "")),
-		message=str(row.get("message", "")),
+		reason=_row_text(row, "reason", path),
+		message=_row_text(row, "message", path),
 		reviewed_at=str(row.get("reviewed_at", "")),
 		rejection_reason=str(row.get("rejection_reason", "")),
 	)
@@ -566,13 +737,13 @@ def _pending_from_row(row: dict[str, Any], path: Path) -> PendingAction:
 	return PendingAction(
 		id=str(row.get("id", "")),
 		ts=str(row.get("ts", "")),
-		platform=str(row.get("platform", "")),
-		candidate_key=str(row.get("candidate_key", "")),
+		platform=_row_text(row, "platform", path),
+		candidate_key=_row_text(row, "candidate_key", path),
 		action=str(row.get("action", "")),
 		status=status,
 		confidence=_row_confidence(row, path),
-		reason=str(row.get("reason", "")),
-		message=str(row.get("message", "")),
+		reason=_row_text(row, "reason", path),
+		message=_row_text(row, "message", path),
 		approved_review_id=str(row.get("approved_review_id", "")),
 		updated_at=str(row.get("updated_at", "")),
 	)

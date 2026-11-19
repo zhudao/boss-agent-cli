@@ -18,11 +18,12 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-from boss_agent_cli.services.json_files import write_json_atomic
+from boss_agent_cli.services.json_files import read_bytes_if_regular, write_json_atomic
 from boss_agent_cli.services.private_files import (
 	DIRECTORY_MODE,
 	FILE_MODE,
 	chmod_best_effort,
+	load_or_create_private_salt,
 	write_private_bytes,
 )
 
@@ -72,6 +73,16 @@ def ai_int_setting(config: dict[str, Any], key: str, default: int, *, minimum: i
 	return value
 
 
+class AIConfigInvalidError(ValueError):
+	"""AI 配置文件损坏，写入方不得用默认值覆盖（Issue #1706）。"""
+
+	def __init__(self, path: Path, detail: str) -> None:
+		super().__init__(
+			f"{path} 无法作为 AI 配置读取（{detail}）；请备份并修正或删除该文件后重试"
+		)
+		self.path = path
+
+
 class AIConfigValueError(ValueError):
 	"""AI 本地配置项类型或取值错误（Issue #1428）。
 
@@ -111,8 +122,16 @@ def normalize_base_url(value: str) -> str:
 	必然复现。写入与解析端点时都走这里，报 ``INVALID_PARAM`` 级别的本地错误。
 	"""
 	text = value.strip()
-	parsed = urlsplit(text)
-	if not text or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+	try:
+		parsed = urlsplit(text)
+		# 端口是惰性解析的：`http://host:abc/v1` 要读一次才会报错；未闭合的 IPv6
+		# 括号则在 urlsplit 里直接抛。两者都是裸 ValueError，放过去会在写入时
+		# 崩成 traceback，或存进配置后让每条 AI 命令在 httpx 里崩（Issue #1778）。
+		_ = parsed.port
+		valid = bool(text) and parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+	except ValueError:
+		valid = False
+	if not valid:
 		raise AIConfigValueError(
 			f"AI 配置项 ai_base_url 必须是 http(s):// 开头的绝对地址，实际是 {value.strip()!r}",
 			recovery_hint="ai config --base-url https://api.example.com/v1",
@@ -185,16 +204,12 @@ class AIConfigStore:
 		return hashlib.sha256(fingerprint.encode()).hexdigest()
 
 	def _get_salt(self) -> bytes:
-		"""Reuse auth salt file, or create one if it doesn't exist."""
-		self._auth_dir.mkdir(parents=True, exist_ok=True, mode=DIRECTORY_MODE)
-		chmod_best_effort(self._auth_dir, DIRECTORY_MODE)
-		salt_path = self._auth_dir / "salt"
-		if salt_path.exists():
-			chmod_best_effort(salt_path, FILE_MODE)
-			return salt_path.read_bytes()
-		salt = os.urandom(16)
-		write_private_bytes(salt_path, salt)
-		return salt
+		"""Reuse the auth salt; create it only when it is really missing.
+
+		Shares the auth-side lifecycle so a failed existence check can never
+		replace the salt that decrypts session.enc / api_key.enc (Issue #1688).
+		"""
+		return load_or_create_private_salt(self._auth_dir)
 
 	def _derive_key(self) -> bytes:
 		"""Derive a Fernet key from machine ID and salt."""
@@ -216,12 +231,17 @@ class AIConfigStore:
 		write_private_bytes(self._key_path, encrypted)
 
 	def get_api_key(self) -> str | None:
-		"""Load and decrypt the API key. Returns None if not set or decryption fails."""
-		if not self._key_path.exists():
+		"""Load and decrypt the API key. Returns None if not set or decryption fails.
+
+		路径状态不可读或不是普通文件时上抛 ``OSError``：返回 None 会让调用方
+		报 ``AI_NOT_CONFIGURED`` 并引导用户重新填 key，覆盖原密文（Issue #1709）。
+		"""
+		encrypted = read_bytes_if_regular(self._key_path)
+		if encrypted is None:
 			return None
 		fernet = Fernet(self._derive_key())
 		try:
-			plaintext = fernet.decrypt(self._key_path.read_bytes())
+			plaintext = fernet.decrypt(encrypted)
 		except (InvalidToken, ValueError):
 			return None
 		return plaintext.decode("utf-8")
@@ -247,21 +267,46 @@ class AIConfigStore:
 			pass
 
 	def save_config(self, **kwargs: Any) -> None:
-		"""Save configuration, merging with existing values."""
-		current = self.load_config()
+		"""Save configuration, merging with existing values.
+
+		只有配置文件确实不存在才从默认值开始；JSON 损坏或顶层非对象时拒绝
+		写入，避免用「默认值 + 本次参数」清空其他设置（Issue #1706）。
+		"""
+		current = self._load_config_for_write()
 		current.update(kwargs)
 		write_json_atomic(self._config_path, current)
 
-	def load_config(self) -> dict[str, Any]:
-		"""Load configuration with defaults for missing keys."""
+	def _load_config_for_write(self) -> dict[str, Any]:
+		"""写入前严格读取；与只读接口的容错降级分开。"""
 		config = dict(_DEFAULT_CONFIG)
-		if self._config_path.exists():
+		raw = read_bytes_if_regular(self._config_path)
+		if raw is None:
+			return config
+		try:
+			saved = json.loads(raw)
+		# 超长整数（3.11+）与深嵌套同样按配置损坏处理，不能继续覆盖写回。
+		except (ValueError, RecursionError) as exc:
+			raise AIConfigInvalidError(self._config_path, f"JSON 无法解析：{exc}") from exc
+		if not isinstance(saved, dict):
+			raise AIConfigInvalidError(self._config_path, "顶层必须是 JSON object")
+		config.update(saved)
+		return config
+
+	def load_config(self) -> dict[str, Any]:
+		"""Load configuration with defaults for missing keys.
+
+		路径状态读不出来时上抛 ``OSError``，不能带着默认值整文件写回并
+		丢掉已保存的 AI 设置（Issue #1695）。
+		"""
+		config = dict(_DEFAULT_CONFIG)
+		raw = read_bytes_if_regular(self._config_path)
+		if raw is not None:
 			try:
-				saved = json.loads(self._config_path.read_text(encoding="utf-8"))
+				saved = json.loads(raw)
 				if isinstance(saved, dict):
 					config.update(saved)
 			# 超长整数（3.11+）与深嵌套同样按配置损坏处理，不让 AI 配置读取崩在解析上。
-			except (ValueError, OSError, RecursionError):
+			except (ValueError, RecursionError):
 				pass
 		return config
 

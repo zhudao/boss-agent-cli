@@ -2,15 +2,227 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
-## [3.4.92] - 2026-11-18
+## [Unreleased]
 
 ### Fixed
-- `stop.json` 只剩 `reason` 而缺少 `open` 时，`read_stop()` 原样返回，`SafetyGuard` 与 `hr location` 都认为没有停止，`resume()` 也无法解除；现在与字段类型漂移同口径 fail-closed，并允许显式恢复（Issue #1598）。
-- 平台响应的 `code=false` 在 Python 中等于 `0`，采集列表 / 详情会把错误响应当成功数据，自动化的写动作会被标为 `executed`；现在统一只允许整数或整数字符串零作为成功码，布尔按形状异常收口（Issue #1599）。
-- automation 配置的整数预算字段接受 `1.9`、`"3"` 等值并静默截断 / 转换，实际扫描与动作预算和操作者配置不一致；现在非整数 JSON 值一律按配置错误拒绝（Issue #1600）。
-- wizard 的 `pages` 输入接受 `true` / `2.9`，`int()` 会静默变成 1 / 2 并触发真实采集；现在与 `_coerce_int` 同口径拒绝 bool 与非整数浮点（Issue #1601）。
+- wizard 的 `crawl_start` 恢复时不再让 `plan.inputs` 里的 `run_id: null` 覆盖已绑定的内部 crawl run_id，中断后 `--resume` 能继续原任务（Issue #1903）。
+- wizard 的 `crawl_resume` 与 `crawl_start` 同口径校验断点 query / city：冲突或非字符串输入按 `INVALID_PARAM` 拒绝，不再静默续跑旧任务并导出旧数据（Issue #1904）。
+- 联系人标签名称与平台 ID 收敛到 `services/labels.py` 单一真源：wizard 接受 CLI 的全部 9 个标签，数字 ID 必须是已知成员，`label: "999"` 不再向平台发出写请求（Issue #1905）。
+- wizard 的 message / label 等自由文本输入只接受字符串：容器不再以 Python repr 发给真人，`0` / `false` 不再被吞成平台默认招呼（Issue #1906）。
+- `WorkflowActionError` 未显式给出 `recovery_action` 时按错误码登记表兜底，信封不再返回 null；`crawl_status` 缺任务的消息不再回显 `'run_id'`（Issue #1907）。
+- wizard 的 `run_id` 与 `crawl_run_id` 同时给出且指向不同任务时报 `INVALID_PARAM`，不再静默取第一个（Issue #1908）。
+- wizard 输入类型错误消息统一截断超长原始值，信封与 checkpoint 不再随输入规模膨胀（Issue #1909）。
+- `--salary` 搜索遇到超长数字串的 `salaryDesc`（>4300 位）按「无法解析」处理，不再让整条搜索崩成 `INTERNAL_ERROR`（Issue #1889）。
+- 职位描述缓存只接受字符串 `encryptJobId` / 描述：类型漂移按未命中处理，`--welfare` 管线不再因 sqlite 绑定 dict 抛 `ProgrammingError`（Issue #1890）。
+- `write_json_atomic` / `strict_json_text` 把深嵌套与超长整数引发的 `RecursionError` / `ValueError` 归成本地 IO 错误，CLI 输出 `LOCAL_IO_ERROR` 信封而不是空 stdout 加 traceback（Issue #1891）。
+- 沟通列表整页元素全是 null / 数字 / 字符串时继续翻页，不再据此宣称列表完整或联系人不存在（Issue #1878）。
+- 职位去重按可用性选择 `job_id` / `encryptJobId`，非字符串 `job_id` 不再遮蔽合法标识（Issue #1879）。
+- 分页信封对回退的请求页应用与平台回显页相同的上限，`page + 1` 的下一页提示不再可能撞上整数转换上限（Issue #1880）。
+- wizard 的 `INTERNAL_ERROR` 分支（含 `PlatformResponseInvalid`）先读本步骤写前标记，写请求发出后的响应解析失败按「结果未知」上报，`--resume` 不再重放（Issue #1881）。
+- 自定义 action 返回 `StepResult(status=FAILED)` 等非 COMPLETED / WAITING_INPUT 状态时，workflow 按失败 / 停止终止，不再继续执行后续步骤并落成 `completed`、`error=None`；写前标记存在时按结果未知处理（Issue #1882）。
+- `WizardInput` 入口递归拒绝 NaN / Infinity；含 NaN 的旧断点恢复时改按规范化 JSON 值比较，不再永久命中不可恢复的 `WORKFLOW_PLAN_MISMATCH`（Issue #1883）。
 
-## [Unreleased]
+## [3.4.123] - 2026-11-19
+
+### Fixed
+- `config set request_budget_dir` 拒绝已存在但不是目录的路径；启动期因此失败时恢复建议改为可直接执行的 `config reset request_budget_dir`（Issue #1822）。
+- `config reset operating_mode` 同时清除旧版 `low_risk_mode`，`config list` 把由旧键派生的模式标为用户配置（Issue #1823）。
+- 平台返回的页码超出合理范围时不再参与下一页提示，`me` / `chatmsg` 不会因超长整数被报成可重试的网络错误（Issue #1824）。
+- `agent crawl` 的简历删除后继命令对以 `-` 开头的简历名前置 `--`，`crawl resume` / `crawl results` 的位置参数统一走同一保护（Issue #1826）。
+- `agent crawl` 按标题回填 AI 结果的 selector 时只读取一次 title，空标题不参与匹配，不再因缺 title 抛 KeyError 落成 INTERNAL_ERROR（Issue #1827）。
+- `clean` 后继提示里的 `--data-dir` 使用解析后的绝对路径（Issue #1828）。
+- `clean --risk-lock` 删除锁路径上的符号链接本身（含悬空链接）；`local_lock_removed` 要求确实删过锁项且清理后读不到锁，不再报成功而锁仍生效，也不再给「无锁目录」误报 true（Issue #1829）。
+- `clean` 中途失败时信封带回已完成项与失败项；清锁之后才失败会明确说明锁已清除（Issue #1830 #1831）。
+- `search` 的预设重建 / 删除后继命令对以 `-` 开头的预设名前置 `--`（Issue #1832）。
+- wizard 的 `crawl_start` 只把缺键与 null 视为未提供 run_id：显式 `0` / `false` / 空数组 / 空串按 `INVALID_PARAM` 拒绝，不再静默新建采集并发出真实请求（Issue #1833）。
+- wizard 采集被限流 / 超时 / 停止时，错误详情带回 run_id、完成页数、jobs_seen 与已落盘输出路径（Issue #1834）。
+- `crawl resume` / `crawl run` 导出失败时信封带回已知 run_id 与可直接执行的恢复命令，不再只有 `data=null`（Issue #1835）。
+- wizard 的 `crawl_status` / `crawl_resume` / `crawl_stop` 只接受非空字符串 run_id，非字符串报 `INVALID_PARAM` 而不是「任务不存在」（Issue #1836）。
+- `hr chat` 的页面未读计数跳过 NaN / Infinity，不再整条命令崩溃并报成可重试的网络错误（Issue #1837）。
+- `hr location` 逐个尝试 `friendId` / `uid` 等标识键，`uid` 为 null 时仍能按 `friendId` 匹配会话，不再误报 `CONTACT_NOT_FOUND`（Issue #1838）。
+- `hr location` 的发送记录存在性判断改用 `stat()`，只把 `FileNotFoundError` 当没有记录，权限类错误不再吞成「未发送」（Issue #1839）。
+- `blank_option_names` 对非字符串取值不再直接 `.strip()`，按非法参数返回选项名（Issue #1841）。
+- `hr chat` 的时间与消息文本只接受字符串或数值，dict / list 不再被 `str()` 写进输出数据（Issue #1842）。
+- `hr request-resume` 在任何请求前检查 `boss agent stop` 停止开关；异常分支不能证明请求未发出时返回不可重试的 `ACTION_UNCONFIRMED`，能证明未发送的异常保持原有可重试契约（Issue #1840）。
+- `watch run` 按 `watch add` 同口径校验存量记录的 `active`：未知或非字符串取值报 `SAVED_SEARCH_INVALID`，不再被兜成可重试的 `NETWORK_ERROR` 并中止 `--all`（Issue #1847）。
+- 多位置参数的后继命令只前置一次 `--`（新增 `display.positional_args`），`shortlist remove` / `add` 提示不再出现第二个 `--` 而无法重放（Issue #1848）。
+- `chat --export json` 与本地 JSON 状态把非有限数归一为 `null`，不再写出裸 `Infinity` / `NaN`；`write_json_atomic` 同步禁止非标准常量（Issue #1851）。
+- `chat` 文本导出的容器字段序列化为 JSON 文本、`unread` 只认整数；`job` 的 HTML 导出不再渲染字面量 `None`，`write_export_file` 对未知格式抛错而不是静默不写（Issue #1853）。
+- `prepare_output_path` 与 `refuse_symlink_target` 按 lstat 拒绝符号链接 / 目录 / 特殊文件，`digest` / `stats` / `chat --export` 等直接调用方不再把链接目标替换成新文件；`is_symlink()` 不再吞权限错误（Issue #1849）。
+- 文件锁只把 `EAGAIN` / `EWOULDBLOCK` / `EDEADLK` 当锁冲突，errno 36 等其余 `OSError` 按本地 IO 错误上抛，不再误报「已被占用」（Issue #1850）。
+- `chat --export` 的快照旁车文件记录采集完整性：上一份基线不完整时不再把没翻到的联系人误报为新增，`data.diff` 带 `baseline_complete`，摘要注明「上次采集不完整，未判断新增」；旧快照无标记时按完整处理（Issue #1852）。
+- `history` 先把 jobList 里的容器字段收敛成空值、列表字段只保留字符串，`job_id` / `security_id` / `job_url` 不再写入 Python repr（Issue #1855）。
+- `favorites` 的 `cardList` 只有 `null` / 缺失按空列表处理：`{}` / `""` / `0` 等假值非列表与真值非列表同口径报可重试 `NETWORK_ERROR`（Issue #1856）。
+- `favorites` 页内全为非对象元素时立即报 `NETWORK_ERROR`，不再累计垃圾元素、翻满 50 页后误报 `RESULT_LIMIT_REACHED`（Issue #1857）。
+- `stats` 的 `_percent` 对合法大整数抛 `OverflowError` 时按非数值返回占位符（Issue #1858）。
+- MCP 的 `search --preset` 与 `watch run` 按详情筛选最坏情况估算超时（900 秒封顶），只读中断文案不再提示这两个命令没有的 limit/count（Issue #1860）。
+- MCP 的 `boss_hr_jobs` / `boss_hr_jobs_detail` 登记 `recruiter-jobs-*` 合规命令标识，`boss_hr_jobs` 随 action 选择 list / online / offline（Issue #1861）。
+- MCP 的 `boss_ai_chat_coach` 把显式空 `style` 原样下发，不再落回默认沟通风格（Issue #1862）。
+- MCP 同步入口拒绝含 NUL / 孤立代理项的参数时明确「子进程未启动、没有平台写入」，不再套用检查 checkpoint 的写中断指引（Issue #1863）。
+- MCP server 定位同目录 `boss` 入口时只把「不存在」当未找到，权限等其它错误不再静默回退 PATH 上的另一份 boss（Issue #1864）。
+- MCP 的 `hr applications` / `hr chat` / `hr last-messages` 把显式空 `job_id` 原样下发给 CLI，不再静默当作未传（Issue #1865）。
+- 自动化队列的 `message` / `platform` / `candidate_key` / `reason` 只接受字符串，类型漂移按状态损坏上报，不再把 `str(None)` 当话术发给候选人（Issue #1867）。
+- 自动化在途标记的 `notified` 只有布尔 `true` 才算已通知；`0` / `""` / `"false"` 按未通知处理并重开熔断，不再静默跳过（Issue #1868）。
+- Chromium 代理不再使用 `HTTP_PROXY`（平台是 https，httpx 的 https 请求本就直连），`NO_PROXY` 原样转发为 `bypass`，两个通道对同一域名同进同出（Issue #1869）。
+- 代理地址里的 IPv6 字面量保留方括号，`http://[::1]:8080` 不再被拼成无法解析的 `http://::1:8080`（Issue #1870）。
+- `RequestThrottle` 不再用 `0.0` 当单调时钟哨兵：刚开机时首条请求不会白等一个间隔，也不会误报 `REQUEST_BUDGET_EXHAUSTED`（Issue #1871）。
+- `crawl resume` 对已完成任务校验三份产物是否仍在，缺失时用本地缓存重新导出（不发平台请求），不再报成功却给出不存在的文件路径（Issue #1873）。
+- `crawl status` 的 `hooks.success` 与 resume 同口径只认真布尔，类型漂移按 `CACHE_RECORD_INVALID` 上报，不再原样透传（Issue #1874）。
+- 采集产物替换失败时清理已创建的 `.jobs.*` 备份临时文件，不再每次重试残留一个（Issue #1875）。
+
+## [3.4.122] - 2026-11-19
+
+### Fixed
+- `batch-greet` 遇到发送结果未知的异常时保留预约并停止批次，引导用户核对送达状态。确认未发送时，保留预约直至重试结束（Issue #1818）。
+- `exchange` 对类型漂移的联系人字段安全处理：`name` 只认非空字符串，`uid` / `securityId` 不再被转成 Python repr 发给平台，后继 `chatmsg` 命令对 `-` 开头的 uid 前置 `--`（Issue #1812）。
+- `show` 对索引缓存里非字符串的 `security_id` 报参数无效且不发请求，`lid` 与平台 `jobCard.lid` 只认字符串，不再误报「数据库无法打开」（Issue #1813）。
+- `batch-greet --dry-run` 的后继命令在关键词以 `-` 开头时把它排到选项之后并用 `--` 隔开（Issue #1815）。
+- `batch-greet` 跳过标识缺失或不是字符串的搜索结果：不再把 Python repr 发给写请求，也不再因一条无标识结果以「结果未确认」停掉整批（Issue #1816）。
+- `greet` 拒绝纯空白的 `--message`；`detail` 把纯空白的 `--job-id` 按没传处理，缓存里非字符串的 job_id 按未命中处理（Issue #1817）。
+
+## [3.4.121] - 2026-11-19
+
+### Fixed
+- `resume` 全族后继命令对以 `-` 开头的名字与 ID 前置 `--`，带选项的提示把选项挪到 `--` 之前，照抄执行不再报「没有选项」（Issue #1803）。
+- `resume edit --field` 拒绝系统托管的 `name` / `created_at` / `updated_at`：不再报成功却值不生效，或把任意字符串写进 `created_at`（Issue #1806）。
+- `favorites sync` 把类型漂移的 `securityId` / `encryptJobId` 视为缺主键计入跳过，文本字段与标签归一为字符串，不再把 Python repr 写进候选池（Issue #1807）。
+- 按清洗后同名的别名（如 `a_b` 之于 `a/b`）操作简历时，`resume edit` 不再把简历静默改名，`resume delete` 同时清理真实名称下的职位关联（Issue #1804）。
+- `resume delete` 在简历路径是目录时先拒绝并保留职位关联，不再 exit 1 却已清掉关联（Issue #1805）。
+- `parse_resume` 对类型漂移的文本字段归空串、证书只留字符串名、`zpData` 为 null 时回落 `data`、非对象输入返回空结构（Issue #1808）。
+
+## [3.4.120] - 2026-11-19
+
+### Fixed
+- `watch` / `shortlist` 的后继命令对以 `-` 开头的名字前置 `--`，照抄提示不再报「没有选项」（Issue #1797）。
+- 存量 watch 的 `query` 缺失或为 null 时 `watch run` 返回 `SAVED_SEARCH_INVALID`，不再把 `None` / 空串当关键词发给平台并报成功（Issue #1798）。
+- `shortlist` 的 `tags` 被写成 BLOB 时按损坏数据退化为空标签，一条坏行不再让 `list` / `compare` / `annotate` 全部落成 INTERNAL_ERROR（Issue #1799）。
+- `watch run` 对纯空白名字在入口返回 `INVALID_PARAM`，恢复提示不再指向一条必然再次失败的 `watch add`（Issue #1800）。
+
+### Fixed
+- `chat --export` 的完整采集直接替换当日快照：同一天重跑时已消失的联系人当次即被报出，不再留在快照里推迟到次日（Issue #1791）。
+- `chat --export md` 对漂移成列表 / 对象的单元格同样转义 `|`、换行与链接语法，表格不再被拆列（Issue #1792）。
+- `export --format csv` 与 `chat --export csv` 把缺失值写成空单元格而不是字面量 `None`；单独的占位符 `-` 不再被加上单引号前缀（Issue #1793）。
+- `chat --export` 的「我主动」小标题只把状态为未读的联系人计入未读，状态未知的不再算入（Issue #1794）。
+
+## [3.4.118] - 2026-11-19
+
+### Fixed
+- `stats` / `digest` 的 `-o` 拒绝纯空白路径并返回 `INVALID_PARAM`，不再在当前目录写出名为空格的文件；与 `chat --export`、`export`、`resume export` 口径一致（Issue #1788）。
+- wizard 的 `crawl_stop` 目标在任务已结束时返回 `CRAWL_RUN_FINISHED`，不再报告 `stop_requested` 并写入停止标记；与 `boss crawl stop` 口径一致（Issue #1786）。
+
+## [3.4.117] - 2026-11-19
+
+### Fixed
+- `ai config --base-url` 拒绝主机或端口无法解析的地址（如 `http://[::1/v1`、`http://127.0.0.1:abc/v1`），返回 `INVALID_PARAM`，不再在写入时崩成 traceback 或存进配置后让每条 AI 命令崩溃；手工改坏的地址在请求时落成 `AI_API_ERROR` 信封（Issue #1778）。
+- 信封与日志的自由文本脱敏覆盖 URL 的 userinfo 口令：`https://user:password@host` 形态的地址（如带 Basic Auth 的 AI 代理 `ai_base_url`）不再把口令原样回显（Issue #1779）。
+- AI 服务用 HTTP 200 带回错误对象时，错误信息带出服务商的说明，并按其中的状态码给出限流 / 鉴权的恢复建议；缺少 `choices` 时不再把 Python 异常文本当作错误信息（Issue #1780）。
+- `hr greet` 在开聊结果的 `chat` / `status` 漂移成字符串或浮点（`"0"`、`0.0`）时仍识别权益拦截页，不再报成已发送并把候选人永久记成已打招呼（Issue #1781）。
+- `hr greet` / `hr recommendations` / `hr resume` 的必填 ID 为空或纯空白时返回 `INVALID_PARAM`，不再向平台发请求，也不以空键写下招呼记录（Issue #1782）。
+- `hr jobs offline` / `online` / `detail` 的后继命令对职位 ID 加 shell 引用，以 `-` 开头的 ID 前置 `--`（Issue #1783）。
+
+## [3.4.116] - 2026-11-19
+
+### Fixed
+- 恢复终态 crawl 任务时状态先落库再执行：前台恢复在打开采集浏览器之前写 `running`，后台恢复在启动 worker 之前写 `queued`，这段时间到达的 `crawl stop` 不再按旧终态被拒而采集照常继续，重复的后台恢复也不再拉起第二个 worker；worker 启动失败时把原因写回，不留无人执行的 `queued`（Issue #1771）。
+- wizard `crawl_start` 显式带 `run_id` 且 `query` / `city` 与断点不一致时返回 `INVALID_PARAM`，不再静默按旧关键词续跑并把结果记到新关键词名下；输入一致时续跑行为不变（Issue #1772）。
+- `crawl resume` 读到损坏的结果行时，`CACHE_RECORD_INVALID` 的后继命令使用真实 run_id，不再把 job_key 拼进 `crawl status`（Issue #1773）。
+- `boss schema --format openai-tools` / `anthropic-tools` 导出的参数 schema 顶层不再带 `anyOf` / `allOf` / `not` / `if` / `then` / `else`：12 个工具的这些约束改为附在工具描述里（JSON Schema 片段，仍由 CLI 校验），避免整份工具定义被接口拒绝；`mcp-tools` 与运行时 `tools/list` 保持完整 schema（Issue #1774）。
+- `boss_wizard` 的 schema 声明 run（含省略 `action`）时 `role` / `platform` / `goal` 必填，与实际校验一致（Issue #1775）。
+
+## [3.4.115] - 2026-11-19
+
+### Fixed
+- 自由文本脱敏覆盖复合凭据键：`access_token=` / `refresh_token=` / `client_secret=` / `x-api-key=` 等不再因为凭据段前有 `_` / `-` 而把值原样留在错误信封与日志里；字典键 `x-api-key` / `api-key` 同步脱敏（Issue #1765）。
+- `--exit-codes` 预扫描在 `--` 处停止，并跳过其他带值全局选项的值：`boss -- --exit-codes sysexits` 不再把位置参数当成全局选项、让默认模式的失败退出码变成 78（Issue #1766）。
+- `digest` / `stats` 的「打开文件」后继命令对以 `-` 开头的相对路径加 `./` 前缀，`open` / `xdg-open` 不再把文件名当选项解析（Issue #1767）。
+- 简历名含 `* ? | < > "` 或控制字符时，新建简历与默认导出文件名改用可在 Windows 落盘的文件名，不再必然写盘失败并被报成磁盘 / 权限问题；旧版本按原字符写出的简历文件仍按原文件名读取、修改与删除（Issue #1768）。
+
+## [3.4.114] - 2026-11-19
+
+### Fixed
+- 文本 / JSON / 私有字节与简历 PDF 的原子写入器在准备临时文件和 `os.replace` 提交前都检查目标：FIFO / 设备等特殊文件不再被静默替换成普通文件，符号链接与目录明确拒绝；拒绝时保留目标、清理临时文件并携带路径供 `LOCAL_IO_ERROR` 分类（Issue #1762）。
+- `chat --export` 在认证和保存快照前检查默认导出目标。无效的父路径返回 `LOCAL_IO_ERROR`，非字符串且非 `null` 的 `export_dir` 返回 `CONFIG_INVALID`（Issue #1760）。
+
+## [3.4.113] - 2026-11-18
+
+### Fixed
+- `agent resume` 不再绕过 `state.json` 的符号链接保护：显式恢复时直接原子写状态文件会替换链接、留下目标中的旧熔断与 checkpoint（恢复链接后旧状态复活），现在同样报 `AUTOMATION_STATE_INVALID` 且不解除熔断；`stop.json` 的悬空链接原子替换仍按现有设计允许（Issue #1751）。
+- `request-budget.lease` 在打开前按 lstat 判定路径类型：符号链接（含悬空）不再把请求租约写进数据目录之外的目标，FIFO 不再让所有平台请求在打开租约时永久阻塞，目录 / 设备也明确拒绝；普通文件与缺失文件自动创建的行为不变（Issue #1753）。
+- `crawl` 三份导出产物（`jobs.json` / `jobs.csv` / `jobs.xlsx`）与输出目录在替换前按 lstat 判定：符号链接不再被备份机制移到临时文件后删除、目标也不再保留旧内容，FIFO / 设备不再被 `os.replace` 静默替换；同名目录仍保留既有 `IsADirectoryError` 回滚契约（Issue #1755）。
+- `resume export` 与 `chat --export` 检查省略 `-o` 时生成的默认导出文件。文件目标为 FIFO、设备或符号链接时返回 `INVALID_PARAM`，保留原目标（Issue #1757）。
+
+## [3.4.112] - 2026-11-18
+
+### Fixed
+- automation 写入侧统一拒绝符号链接与非普通文件：`_append_jsonl` 不再写穿指向普通文件的符号链接目标，`write_jsonl` / `write_state` 不再用 `os.replace` 静默把链接替换成普通文件（恢复链接后旧的 pending / review 行会复活并被重放），FIFO / 目录 / 设备也不再被整文件回写替换；统一报 `AUTOMATION_STATE_INVALID`，普通文件与缺失文件自动创建的行为不变，读取侧仍沿普通文件链接读取（Issue #1746）。
+- `append_interview_lead()` 不再沿符号链接把候选人面试线索写到数据目录之外：`interview-leads.csv` 是指向普通文件的链接时也直接拒绝并报 `AUTOMATION_STATE_INVALID`，链接与目标保持原样；普通文件与缺失文件自动建表的行为不变（Issue #1748）。
+
+## [3.4.111] - 2026-11-18
+
+### Fixed
+- 缓存库 `cache/boss_agent.db` 与请求节流库 `request-budget.sqlite3` 在打开前按 lstat 判定路径类型：路径是符号链接（含悬空链接）时报 `CACHE_DATABASE_INVALID` / `LOCAL_IO_ERROR` 并给出移除指引，不再让 SQLite 跟随链接把数据库创建或改写进数据目录之外的目标文件；目录 / FIFO / 设备等非普通文件同样明确拒绝，与 `clean` 的库预检（#1712）同口径（Issue #1739）。
+- automation 队列追加写入（`pending-actions.jsonl` / `action-log.jsonl` / `human-review-queue.jsonl`）在打开前按 lstat 判定路径类型：队列被换成 FIFO 时不再永久阻塞在 `open("a")`（`agent run` 会在动作已执行后挂死），悬空符号链接不再在目标处新建文件、把动作日志写到数据目录之外；FIFO / 目录 / 设备 / 悬空链接统一报 `AUTOMATION_STATE_INVALID`，指向普通文件的符号链接照常追加。`agent review reject` 的日志追加失败也改为返回信封而不是 traceback（Issue #1741）。
+- `stats` 读取缓存库前改为直接 lstat 判定：`cache/boss_agent.db` 是符号链接（含悬空链接）时不再跟随链接读取外部数据库、也不再在链接目标旁创建 / 改写 WAL 的 `-shm` / `-wal`，统一按 `LOCAL_IO_ERROR` 拒绝；只有文件确实不存在才返回「缓存尚未建立」（Issue #1743）。
+- automation 的 `.run-lock.sqlite3` / `.control-lock.sqlite3` 在 `sqlite3.connect` 前拒绝符号链接与非普通文件，SQLite 不再跟随链接把锁库写进数据目录之外的目标；普通库与缺失文件自动建库的行为不变（Issue #1743）。
+
+## [3.4.110] - 2026-11-18
+
+### Fixed
+- `hr download-resume` 的 `--output` 接入统一路径预检：FIFO / 设备 / 符号链接（含悬空链接）在取登录态与发出 `chat_history` / `friend_detail` / `preview-check` / 下载请求之前按 `INVALID_PARAM` 拒绝，父路径不可用按 `LOCAL_IO_ERROR` 拒绝；不再先花四个平台请求、再把特殊文件报成「输出文件已存在」（Issue #1726）。
+- `agent run` / `agent pending list` / `agent stats` 读取 `pending-actions.jsonl` / `action-log.jsonl` / `review-queue.jsonl` 时不再直接 `read_bytes()`：队列路径被换成 FIFO / 设备会永久阻塞在打开阶段，命令既不返回信封也不退出。现在与 `state.json` / `stop.json` 同口径按 lstat 判定，悬空链接与非普通文件报 `AUTOMATION_STATE_INVALID`；只有文件确实不存在才算空队列，指向普通文件的符号链接照常读取（Issue #1728）。
+- `chat --export` 读取上一份聊天快照时不再直接 `open()`：`chat-history/` 里按日期命名的 FIFO / 设备会永久阻塞在打开阶段，导出既不返回信封也不退出。现在与当天快照（#1698）同口径先按 lstat 判定类型，非普通文件与悬空链接按「快照不可用」告警并退化为首份快照；指向普通文件的符号链接照常读取（Issue #1730）。
+- `boss show` / `recommend` / `search` 读取索引缓存时不再用 `exists()` + `read_text()`：缓存文件被换成 FIFO / 设备会永久阻塞，元数据错误又被当成「没有缓存」并提示重跑搜索。现在按 lstat 判定，只有文件确实不存在才算没有缓存；非普通文件与悬空链接报 `LOCAL_IO_ERROR`，指向普通文件的符号链接照常读取，损坏 JSON 仍按没有缓存处理（Issue #1732）。
+- 独占文件锁 `_acquire()` 打开前按 lstat 判定：`refresh.lock` / `import.lock` 与 run 锁被换成 FIFO / 设备时不再永久阻塞登录态刷新、模型导入、聊天导出与 `crawl` / `wizard` 恢复；符号链接、目录与悬空链接按带 `filename` 的 `OSError` 拒绝，由命令层兜底为 `LOCAL_IO_ERROR`。只有文件确实不存在才创建新锁文件，普通锁文件的加锁与释放行为不变（Issue #1734）。
+- `crawl --hook-profile screenshot-full --hook-dir` 的 Hook 预检与运行期注入不再直接 `read_bytes()`：脚本被换成 FIFO / 设备时不再永久阻塞，改为按 lstat 判定并进入既有的逐项失败列表；`SHA256SUMS` 也只有文件确实不存在才报「缺少完整性清单」，权限错误与特殊文件给出明确原因（Issue #1736）。
+
+## [3.4.109] - 2026-11-18
+
+### Fixed
+- `stats` 把缓存库每次查询的 `sqlite3.OperationalError` 都吞成全零计数：遇到其他进程持有排他锁时返回 `ok:true` 的空漏斗，遇到磁盘 I/O 错误时报表不完整。现在只有旧库缺表返回 0；锁冲突报 `CACHE_BUSY`、磁盘与只读错误报 `LOCAL_IO_ERROR`，其余才按缓存库损坏处理（Issue #1718）。
+- `request-budget.sqlite3` 的只读库 / 只读目录 / 磁盘满 / 设备 I/O 错误不再被误判成「库损坏」并提示备份删除：这些失败与库内容无关，删库既修不好又会丢掉冷却时间与节流历史；现在保留原始 `OperationalError`，由命令层给出 `LOCAL_IO_ERROR` 通用指引，只有真正无法解析的库才提示删除重建（Issue #1721）。
+- `digest` 的 `-o` 在登录与平台请求之前接入统一路径预检：父路径不可用先报 `LOCAL_IO_ERROR`，不再先翻沟通列表、取面试数据后才失败；`digest` / `stats` / `resume export` 的 `-o` 遇到 FIFO / 设备 / 悬空链接按 `INVALID_PARAM` 拒绝，不再被原子写入替换成普通文件；`resume export -o <目录>` 与 `export` / `chat` 统一为 `INVALID_PARAM`（Issue #1723）。
+
+## [3.4.108] - 2026-11-18
+
+### Fixed
+- 非隐私 `clean` / `clean --all` / `--dry-run` 在搜索缓存库、索引缓存、聊天快照、导出目录或数据库表的路径元数据不可读时，不再把「状态未知」当成「没有可清理内容」并返回成功；现在只有 `FileNotFoundError` 才算缺失，其余错误报 `LOCAL_IO_ERROR`，不会静默跳过实际未执行的删除。缓存库为符号链接（含悬空链接）或非普通文件时拒绝打开，避免 SQLite 在链接目标处创建或改写数据目录之外的文件（Issue #1712）。
+- `ai @文件路径` 与 `resume import` 对 FIFO / 设备文件不再直接 `read_text()` 永久阻塞：路径类型改为 lstat 判定，非普通文件与悬空链接按 `INVALID_PARAM` 明确拒绝；路径元数据不可读时不再被 `exists()` 吞成「文件不存在」，改报 `LOCAL_IO_ERROR`（Issue #1714）。
+- `stats` 在缓存库路径元数据不可读时不再报「缓存尚未建立」并返回全 0：只有 `FileNotFoundError` 才算没有库，目录 / FIFO / 设备等非普通库文件明确报 `LOCAL_IO_ERROR`（Issue #1716）。
+- `-o` / `output` 的 `inspect_output_path` 预检改用 lstat 判断目标与每一级祖先：元数据错误不再被当成「路径不存在」而报告可写，避免 `export` / `chat --export` 在翻完平台分页后才失败；符号链接语义保持不变（Issue #1716）。
+
+## [3.4.107] - 2026-11-18
+
+### Fixed
+- 本地模型重导入不再先删除旧副本：复制先落同目录临时路径，成功后再替换目标，失败时旧模型与登记表原样保留；导入全程持有跨进程锁，目标为符号链接或源为 FIFO / 设备时拒绝，不会写穿数据目录或并发覆盖 `registry.json`（Issue #1705）。
+- AI 配置 JSON 损坏或顶层非对象时，`ai config` / `ai local configure` 不再用默认值整文件覆盖并静默清空其他设置；写入前严格读取，坏文件返回 `CONFIG_INVALID` 且文件字节不变（Issue #1706）。
+- `session.enc` / `api_key.enc` 的路径状态不可读、为目录 / FIFO / 悬空链接时不再被当成「未登录 / 未配置」：只有文件缺失才返回 `None`，其余情况报 `LOCAL_IO_ERROR`，避免引导用户重新登录或填 key 后覆盖原密文（Issue #1709）。
+
+## [3.4.106] - 2026-11-18
+
+### Fixed
+- `append_interview_lead()` 在 `interview-leads.csv` 的路径状态读取失败时会把它当成新文件并写入表头，截断已有面试线索记录；现在只有 `FileNotFoundError` 才创建表头，目录、FIFO、悬空链接与不可读文件都按 `AUTOMATION_STATE_INVALID` 失败且不改动历史数据（Issue #1694）。
+- 聊天快照在当天快照路径元数据不可读、被目录 / FIFO / 悬空链接占用或已有文件不可读时，不再把它当成「今天还没有快照」并用当前页覆盖已合并的分页结果；只有 `FileNotFoundError` 才从空历史开始，坏 JSON 仍按无历史处理（Issue #1698）。
+- 共享 salt 只接受 16 字节普通文件：创建改为完整写入后原子落位并在锁内读取，空文件、半截写入、目录 / FIFO / 悬空链接不再被静默接受，避免 PBKDF2 用错误 salt 派生密钥后旧密文永久解不开（Issue #1699）。
+- 本地模型登记表在路径元数据不可读、被目录 / FIFO / 悬空链接占用或文件不可读时，`strict=True` 的写入方不再返回空表并用空表覆盖已有登记；只有 `FileNotFoundError` 才算缺失（Issue #1700）。
+- `agent stop` 在 `automation/stop.json` 被目录或指向目录的符号链接占用时，不再落到泛化的 `LOCAL_IO_ERROR`；写入前按 `AUTOMATION_STATE_INVALID` 报出实际路径，悬空符号链接仍可写入（Issue #1684）。
+- 风险锁路径为悬空符号链接、目录或 FIFO 时，`read_lock()` 会把「锁状态未知」当成「没有锁」；Python 3.14 下路径元数据读取失败也会被 `exists()` 吞掉。现在这些情况统一按损坏锁 fail-closed，且不再直接读取非普通文件（Issue #1686）。
+- `AIConfigStore` 在 `auth/salt` 的存在性判断失败时会重新生成共享 salt，覆盖后已有的 `session.enc` 与 `api_key.enc` 永久无法解密；现在与 `TokenStore` 共用 `O_EXCL` + 刷新锁的 salt 生命周期，读取失败时上抛而不是覆盖（Issue #1688）。
+- `clean --privacy` 在缓存库路径元数据不可读时会把数据库当成不存在，跳过隐私预检并先删除登录态与简历；现在只有 `FileNotFoundError` 才视为没有库，其他读取失败在删除任何文件前以 `LOCAL_IO_ERROR` 中止（Issue #1690）。
+- 简历存在性判断改用 `lstat` / `stat`：路径元数据不可读时不再被 `Path.exists()` 当成「不存在」而绕过 `resume import` / `init` / `clone` 的同名覆盖保护；目录、FIFO、悬空链接按 `RESUME_FILE_INVALID` 报告，悬空链接仍可删除（Issue #1692）。
+- 配置文件路径状态不可读时，`config set/reset`、`crawl` 配置写入与 AI 配置不再把读不到当成空配置并整文件覆盖其他设置；新增共享的 `read_bytes_if_regular()`，只有 `FileNotFoundError` 才返回空/默认值，目录、FIFO、悬空链接与元数据错误均上抛（Issue #1695）。
+
+## [3.4.105] - 2026-11-18
+
+### Fixed
+- 目录权限等问题导致 `automation/stop.json` 的路径状态无法读取时，停止开关保持熔断；`hr location` 共用只读检查，`agent run --resume` 会在写入状态前报告 `AUTOMATION_STATE_INVALID`（Issue #1680）。
+- `automation/state.json` 的路径状态无法读取或被悬空符号链接占用时，不再静默返回空状态，避免丢失会话阶段与在途标记；现在按 `AUTOMATION_STATE_INVALID` 报告（Issue #1682）。
+
+## [3.4.104] - 2026-11-18
+
+### Fixed
+- `automation/stop.json` 为目录、指向目录的符号链接或悬空链接时，`read_stop()` 已按熔断 fail-closed，但 `hr location` 的 `is_file()` 预检把它当成「没有停止开关」，仍会预览 / 发送工作地点；现在两个读取器同口径拦截（Issue #1675）。
+- `CHANGELOG.md` 的 `[3.4.92]` 段落在 3.4.92 发版时被留在 `[Unreleased]` 上方，版本顺序倒置；现在移回 3.4.93 与 3.4.91 之间，并新增结构测试（Issue #1676）。
+- `agent run --resume` 在 `stop.json` 为目录或指向目录的符号链接时先改写 `state.json`、再抛 `IsADirectoryError`，最终只得到泛化的 `LOCAL_IO_ERROR`；现在写任何状态前按 `AUTOMATION_STATE_INVALID` 报出实际路径，悬空符号链接仍可恢复（Issue #1678）。
 
 ## [3.4.103] - 2026-11-18
 
@@ -100,6 +312,14 @@
 - MCP `boss_shortlist_annotate` 的 schema 允许三个修改参数全空并通过入口校验；现在至少提供一个修改，空 `note` 仍表示清空备注（Issue #1607）。
 - MCP 条件必填字符串（export / AI 工具的 JD 来源）漏掉 `minLength`，空串可穿过 schema 层；现在与顶层必填字符串统一边界（Issue #1608）。
 - MCP `boss_export` 的超大 `count` 在超时估算中触发 `OverflowError` 并漏出内部错误；现在用整数分页估算并封顶，异常路径安全停止子进程、返回标准失败信封（Issue #1609）。
+
+## [3.4.92] - 2026-11-18
+
+### Fixed
+- `stop.json` 只剩 `reason` 而缺少 `open` 时，`read_stop()` 原样返回，`SafetyGuard` 与 `hr location` 都认为没有停止，`resume()` 也无法解除；现在与字段类型漂移同口径 fail-closed，并允许显式恢复（Issue #1598）。
+- 平台响应的 `code=false` 在 Python 中等于 `0`，采集列表 / 详情会把错误响应当成功数据，自动化的写动作会被标为 `executed`；现在统一只允许整数或整数字符串零作为成功码，布尔按形状异常收口（Issue #1599）。
+- automation 配置的整数预算字段接受 `1.9`、`"3"` 等值并静默截断 / 转换，实际扫描与动作预算和操作者配置不一致；现在非整数 JSON 值一律按配置错误拒绝（Issue #1600）。
+- wizard 的 `pages` 输入接受 `true` / `2.9`，`int()` 会静默变成 1 / 2 并触发真实采集；现在与 `_coerce_int` 同口径拒绝 bool 与非整数浮点（Issue #1601）。
 
 ## [3.4.91] - 2026-11-18
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import errno
 import os
+import stat
 from enum import Enum
 from pathlib import Path
 
@@ -21,6 +22,45 @@ class OutputPathProblem(Enum):
 	PARENT_NOT_DIR = "parent_not_dir"
 
 
+def _lstat_mode(path: Path) -> int | None:
+	"""返回路径自身的 lstat 类型位；只有 ``FileNotFoundError`` 算缺失。
+
+	3.14 的 ``exists()`` / ``is_file()`` / ``is_symlink()`` 会把权限等
+	``OSError`` 吞成 ``False``，预检会据此报告「未发现问题」，把失败留给
+	平台请求之后的真正写入（Issue #1716）。
+	"""
+	try:
+		return path.lstat().st_mode
+	except (FileNotFoundError, NotADirectoryError):
+		# ENOTDIR 表示某一级父路径是文件：该路径不可能存在，交给父路径循环
+		# 报 PARENT_NOT_DIR，而不是把预检变成泛化 IO 错误。
+		return None
+	except ValueError as exc:
+		error = OSError(f"无法读取路径状态：{exc}")
+		error.filename = str(path)
+		raise error from exc
+	except OSError as exc:
+		if exc.filename is None:
+			exc.filename = str(path)
+		raise
+
+
+def _stat_mode(path: Path) -> int | None:
+	"""跟随符号链接取目标类型位；悬空链接返回 None，其余错误上抛。"""
+	try:
+		return path.stat().st_mode
+	except (FileNotFoundError, NotADirectoryError):
+		return None
+	except ValueError as exc:
+		error = OSError(f"无法读取路径状态：{exc}")
+		error.filename = str(path)
+		raise error from exc
+	except OSError as exc:
+		if exc.filename is None:
+			exc.filename = str(path)
+		raise
+
+
 def prepare_output_path(path: str | os.PathLike[str]) -> Path:
 	"""返回可直接写入的目标路径，必要时创建父目录。
 
@@ -30,6 +70,10 @@ def prepare_output_path(path: str | os.PathLike[str]) -> Path:
 	"""
 	target = Path(os.path.expanduser(os.fspath(path)))
 	target.parent.mkdir(parents=True, exist_ok=True)
+	# 原子写入的 ``os.replace`` 会替换符号链接本身，真实目标保持旧内容
+	# （Issue #1355）；目录 / FIFO / 设备也不能当文件写入。共享写入器统一在
+	# 准备阶段拒绝，不再依赖各命令是否先走 ``inspect_output_path``（Issue #1849）。
+	refuse_non_regular_target(target)
 	return target
 
 
@@ -51,30 +95,49 @@ def inspect_output_path(path: str | os.PathLike[str]) -> tuple[Path, OutputPathP
 	# 可写，而原子写入的 ``os.replace`` 替换的是链接本身，真实目标保持旧内容
 	# （Issue #1355）。悬空链接的 ``exists()`` 为 False，同样必须按非普通文件
 	# 拒绝，否则会被当成「尚不存在的新文件」。
-	if target.is_symlink():
+	target_mode = _lstat_mode(target)
+	if target_mode is not None and stat.S_ISLNK(target_mode):
 		return target, OutputPathProblem.NOT_REGULAR
-	if target.is_dir():
+	if target_mode is not None and stat.S_ISDIR(target_mode):
 		return target, OutputPathProblem.IS_DIRECTORY
-	if target.exists() and not target.is_file():
+	if target_mode is not None and not stat.S_ISREG(target_mode):
 		return target, OutputPathProblem.NOT_REGULAR
 	# 缺失的父目录可以创建，但创建链上任意一级被文件或悬空符号链接占用都不行。
 	for parent in target.parents:
-		if parent.is_dir():
-			break
-		if parent.exists() or parent.is_symlink():
+		parent_mode = _lstat_mode(parent)
+		if parent_mode is None:
+			continue
+		if stat.S_ISLNK(parent_mode):
+			target_parent_mode = _stat_mode(parent)
+			if target_parent_mode is not None and stat.S_ISDIR(target_parent_mode):
+				break
 			return target, OutputPathProblem.PARENT_NOT_DIR
+		if stat.S_ISDIR(parent_mode):
+			break
+		return target, OutputPathProblem.PARENT_NOT_DIR
 	return target, None
 
 
 def refuse_symlink_target(target: Path) -> None:
-	"""原子写入入口的兜底：目标本身是符号链接时拒绝写入。
-
-	``write_text_atomic`` / ``write_json_atomic`` / ``write_private_bytes`` 都靠
-	同目录临时文件 + ``os.replace`` 落盘，替换的是链接本身，不会写穿到真实目标。
-	命令层的 ``-o`` 预检已覆盖一部分调用方，其余内部状态写入也必须走这里，避免
-	静默破坏用户的链接布局（Issue #1355）。
-
-	抛出的 ``OSError`` 带 ``filename``，顶层网兜会把它归成 ``LOCAL_IO_ERROR``。
-	"""
-	if target.is_symlink():
+	"""允许替换目录的调用方仍须拒绝符号链接目标。"""
+	# ``Path.is_symlink()`` 会把权限等 OSError 吞成 False（Issue #1716）；
+	# 用 lstat 类型位判定，读不到状态时上抛而不是放行（Issue #1849）。
+	mode = _lstat_mode(target)
+	if mode is not None and stat.S_ISLNK(mode):
 		raise OSError(errno.EINVAL, "拒绝写入符号链接目标", str(target))
+
+
+def refuse_non_regular_target(target: Path) -> None:
+	"""文件写入器仅允许替换普通文件或创建缺失的文件。
+
+	临时文件写好后应在提交替换前复查，以保留在写入期间出现的特殊文件。
+	拒绝时携带目标路径，供命令层报告 ``LOCAL_IO_ERROR``。
+	"""
+	mode = _lstat_mode(target)
+	if mode is None or stat.S_ISREG(mode):
+		return
+	if stat.S_ISLNK(mode):
+		raise OSError(errno.EINVAL, "拒绝写入符号链接目标", str(target))
+	if stat.S_ISDIR(mode):
+		raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), str(target))
+	raise OSError(errno.EINVAL, "输出目标不是普通文件", str(target))

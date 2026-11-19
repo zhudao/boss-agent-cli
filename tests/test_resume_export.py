@@ -2,6 +2,8 @@
 
 import errno
 import json
+import os
+import stat
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -112,6 +114,19 @@ def test_export_pdf_mock_patchright(tmp_path):
 	mock_page.set_content.assert_called_once()
 	mock_page.pdf.assert_called_once()
 	mock_browser.close.assert_called_once()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="当前平台不支持 FIFO")
+def test_export_pdf_refuses_fifo_before_browser(tmp_path):
+	out = tmp_path / "resume.pdf"
+	os.mkfifo(out)
+	with patch("patchright.sync_api.sync_playwright") as playwright:
+		with pytest.raises(OSError) as raised:
+			export_pdf(_make_resume(), out)
+
+	assert raised.value.filename == str(out)
+	playwright.assert_not_called()
+	assert stat.S_ISFIFO(out.lstat().st_mode)
 
 
 def test_export_pdf_call_params(tmp_path):
@@ -296,11 +311,13 @@ def test_cli_export_pdf_kernel_missing_is_not_export_failed(tmp_path):
 	assert "chrome-headless-shell" not in parsed["error"]["message"]
 
 
-def test_cli_export_html_to_directory_is_local_io_not_export_failed(tmp_path):
-	"""HTML 导出写到目录时是路径问题，不能给「装浏览器内核」的指引。
+def test_cli_export_html_to_directory_is_invalid_param_not_export_failed(tmp_path):
+	"""HTML 导出写到目录时是参数错误，不能给「装浏览器内核」的指引。
 
 	HTML 导出只用本地模板渲染，完全不碰 patchright；此前所有异常都归成
 	``EXPORT_FAILED`` +「检查 patchright 安装」，把用户引向一个无关的方向。
+	目标本身是目录与 `export` / `chat` 的 `-o` 契约一致：`INVALID_PARAM`，
+	recoverable=false，提示给出完整文件名（Issue #1723 统一预检）。
 	"""
 	runner = CliRunner()
 	_invoke(runner, tmp_path, ["init", "--name", "htmldir", "--template", "default"])
@@ -309,10 +326,10 @@ def test_cli_export_html_to_directory_is_local_io_not_export_failed(tmp_path):
 
 	assert result.exit_code == 1
 	parsed = json.loads(result.output)
-	assert parsed["error"]["code"] == "LOCAL_IO_ERROR"
+	assert parsed["error"]["code"] == "INVALID_PARAM"
 	assert parsed["error"]["recoverable"] is False
 	assert "patchright" not in parsed["error"]["recovery_action"]
-	assert parsed["hints"]["operator_actions"]
+	assert "完整文件名" in parsed["error"]["recovery_action"]
 
 
 def test_cli_export_html_render_failure_guidance_is_not_about_browsers(tmp_path):

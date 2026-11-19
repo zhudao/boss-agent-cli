@@ -61,6 +61,10 @@ def open_file_command(path: str) -> str:
 		# 与 cmd 元字符。start 的第一个参数是窗口标题，保留空串占位。
 		windows_path = path.replace("^", "^^").replace("%", "%%").replace('"', '""')
 		return f'cmd /c start "" "{windows_path}"'
+	if path.startswith("-"):
+		# `open -report.md` / `xdg-open -report.md` 会把文件名当选项；相对路径
+		# 前置 `./` 后仍指向同一个文件，且不会被 getopt 识别为选项（Issue #1767）。
+		path = f"./{path}"
 	quoted = shell_argument(path)
 	if sys.platform == "darwin":
 		return f"open {quoted}"
@@ -82,6 +86,27 @@ def shell_argument(value: str) -> str:
 	if not any(ch.isspace() or ch in _SHELL_METACHARACTERS for ch in value) and not value.startswith("~"):
 		return value
 	return "'" + value.replace("'", "'\\''") + "'"
+
+
+def positional_hint(value: str) -> str:
+	"""把位置参数值安全地拼进后继命令（Issue #1783 #1797）。
+
+	加 shell 引用，避免空白 / 元字符拆开或改写命令；以 ``-`` 开头的值前置
+	``--``，否则重放时会被 click 当成选项。
+	"""
+	return positional_args(value)
+
+
+def positional_args(*values: str) -> str:
+	"""把多个位置参数值安全地拼进同一条后继命令（Issue #1848）。
+
+	任一值以 ``-`` 开头时，只在最前面加一次 ``--``：逐参数各加会让第二个
+	``--`` 变成普通参数，提示不可重放。
+	"""
+	quoted = " ".join(shell_argument(value) for value in values)
+	if any(value.startswith("-") for value in values):
+		return f"-- {quoted}"
+	return quoted
 
 
 def boss_command(command: str, *, platform_name: str = "zhipin", data_dir: Path | None = None, role: str | None = None) -> str:

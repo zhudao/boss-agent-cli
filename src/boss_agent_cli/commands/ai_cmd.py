@@ -5,12 +5,14 @@
 
 import json
 import math
+import stat
 from pathlib import Path
 from typing import Any, cast
 
 import click
 
 from boss_agent_cli.ai.config import (
+	AIConfigInvalidError,
 	AIConfigStore,
 	AIConfigValueError,
 	PROVIDER_BASE_URLS,
@@ -44,6 +46,7 @@ from boss_agent_cli.display import (
 )
 from boss_agent_cli.resume.models import resume_to_text
 from boss_agent_cli.resume.store import ResumeStore
+from boss_agent_cli.services.json_files import path_mode
 
 
 def _get_ai_config_store(ctx: click.Context) -> AIConfigStore:
@@ -200,7 +203,21 @@ def _read_text_argument(ctx: click.Context, value: str) -> str | None:
 	if not value.startswith("@"):
 		return value
 	file_path = Path(value[1:])
-	if not file_path.exists():
+	try:
+		mode = path_mode(file_path)
+	# 路径元数据读不出来时不能报「不存在」：会把权限 / 文件系统错误伪装成
+	# 参数错误（Issue #1714）。
+	except OSError as exc:
+		handle_error_output(
+			ctx,
+			"ai",
+			code="LOCAL_IO_ERROR",
+			message=f"读取 {file_path} 的路径状态失败: {exc}",
+			recovery_action="确认该路径可读后重试",
+		)
+		ctx.exit(1)
+		return None
+	if mode is None:
 		handle_error_output(
 			ctx,
 			"ai",
@@ -210,13 +227,24 @@ def _read_text_argument(ctx: click.Context, value: str) -> str | None:
 		)
 		ctx.exit(1)
 		return None
-	if file_path.is_dir():
+	if stat.S_ISDIR(mode):
 		handle_error_output(
 			ctx,
 			"ai",
 			code="INVALID_PARAM",
 			message=f"'{file_path}' 是目录，需要传入文件路径",
 			recovery_action="把 @ 后面的目录换成具体的 UTF-8 文本文件路径后重试",
+		)
+		ctx.exit(1)
+		return None
+	# FIFO / 设备 / 悬空链接不能直接 read_text：前者会永久阻塞，后两者没有内容。
+	if not stat.S_ISREG(mode):
+		handle_error_output(
+			ctx,
+			"ai",
+			code="INVALID_PARAM",
+			message=f"'{file_path}' 不是普通文件，无法作为文本读取",
+			recovery_action="把 @ 后面的路径换成 UTF-8 文本文件后重试",
 		)
 		ctx.exit(1)
 		return None
@@ -506,7 +534,20 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 	if max_tokens is not None:
 		updates["ai_max_tokens"] = max_tokens
 	if updates:
-		store.save_config(**updates)
+		try:
+			store.save_config(**updates)
+		except AIConfigInvalidError as exc:
+			# 写入方不能复用只读接口的容错：坏文件时用默认值覆盖会清空其他设置（Issue #1706）。
+			handle_error_output(
+				ctx,
+				"ai-config",
+				code="CONFIG_INVALID",
+				message=str(exc),
+				recoverable=True,
+				recovery_action=f"备份并修正或删除 {exc.path} 后重试",
+			)
+			ctx.exit(1)
+			return
 	if api_key is not None:
 		store.save_api_key(api_key)
 	elif clear_api_key:

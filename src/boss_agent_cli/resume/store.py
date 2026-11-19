@@ -1,10 +1,12 @@
+import errno
 import json
+import stat
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from boss_agent_cli.resume.models import ResumeData, ResumeFile, dict_to_resume, resume_to_dict
-from boss_agent_cli.services.json_files import write_json_atomic
+from boss_agent_cli.services.json_files import path_mode, write_json_atomic
 
 
 class ResumeImportError(ValueError):
@@ -24,6 +26,9 @@ _WINDOWS_RESERVED_DEVICE_NAMES = frozenset(
 	| {f"COM{index}" for index in range(1, 10)}
 	| {f"LPT{index}" for index in range(1, 10)}
 )
+#: Windows 文件名不允许的字符（除路径分隔符、NUL 与 ':' 外的通配符 / 重定向符），
+#: 以及所有控制字符。它们不能出现在 `save()` 生成的 `<name>.json` 里。
+_WINDOWS_ILLEGAL_FILENAME_CHARACTERS = frozenset('*?|<>"')
 
 
 def _is_windows_device_name(name: str) -> bool:
@@ -34,6 +39,11 @@ def _is_windows_device_name(name: str) -> bool:
 	"""
 	stem = name.split(".", 1)[0].rstrip(" \t").upper()
 	return stem in _WINDOWS_RESERVED_DEVICE_NAMES
+
+
+def _is_windows_illegal_filename_char(char: str) -> bool:
+	"""Windows 文件名非法字符：通配符 / 重定向符与所有控制字符。"""
+	return char in _WINDOWS_ILLEGAL_FILENAME_CHARACTERS or ord(char) < 32 or ord(char) == 127
 
 
 def _safe_filename(name: str) -> str:
@@ -53,6 +63,16 @@ def _safe_filename(name: str) -> str:
 	return safe
 
 
+def _portable_filename(name: str) -> str:
+	"""在 ``_safe_filename`` 之上再替换 Windows 无法落盘的字符（Issue #1768）。
+
+	``*?|<>"`` 与控制字符会让 Windows 的 ``open()`` / ``mkstemp()`` 直接失败。
+	新建的简历与默认导出名用这份文件名；旧版本在 macOS / Linux 上按原字符写出
+	的文件由 ``ResumeStore._path_for`` 继续按旧文件名找回。
+	"""
+	return "".join("_" if _is_windows_illegal_filename_char(char) else char for char in _safe_filename(name))
+
+
 def _unsafe_resume_name_reason(name: str) -> str | None:
 	"""名称不能安全落盘时返回给用户看的原因（Issue #1507）。
 
@@ -70,6 +90,23 @@ def _unsafe_resume_name_reason(name: str) -> str | None:
 	return None
 
 
+def _path_mode(path: Path) -> int | None:
+	"""仅对缺失路径返回 None；悬空链接保留链接自身的类型（Issue #1692）。"""
+	# 3.14 的 Path.exists() / is_file() 会把权限等 OSError 吞掉并返回 False，
+	# 同名覆盖保护会因此把「读不到」当成「不存在」而继续写入。
+	try:
+		mode = path.lstat().st_mode
+	except FileNotFoundError:
+		return None
+	if stat.S_ISLNK(mode):
+		try:
+			return path.stat().st_mode
+		except FileNotFoundError:
+			# 悬空链接仍是目录项：按存在处理，删除时只 unlink 链接本身。
+			pass
+	return mode
+
+
 class ResumeStore:
 	"""简历文件存储（JSON 文件），存储路径 ~/.boss-agent/resumes/"""
 
@@ -78,7 +115,19 @@ class ResumeStore:
 		self._dir.mkdir(parents=True, exist_ok=True)
 
 	def _path_for(self, name: str) -> Path:
-		return self._dir / f"{_safe_filename(name)}.json"
+		portable = self._dir / f"{_portable_filename(name)}.json"
+		legacy = self._dir / f"{_safe_filename(name)}.json"
+		if legacy == portable:
+			return portable
+		# 旧版本按原字符落盘的简历仍要能读、改、删；状态读不出来时也交给旧路径，
+		# 由调用方按既有口径报告，不能悄悄改去写另一个文件。
+		try:
+			legacy.lstat()
+		except FileNotFoundError:
+			return portable
+		except OSError:
+			return legacy
+		return legacy
 
 	def list_all(self) -> list[dict[str, Any]]:
 		"""列出所有简历摘要（name, title, updated_at）"""
@@ -121,8 +170,17 @@ class ResumeStore:
 		文件不存在返回 ``(None, None)``；语法/编码/权限问题与顶层不是对象都
 		返回错误说明，交给调用方报 ``RESUME_FILE_INVALID``。
 		"""
-		if not path.exists():
+		try:
+			mode = _path_mode(path)
+		except (OSError, ValueError) as exc:
+			# 路径状态读不出来与「文件不存在」不同：列表要把这份标成损坏，
+			# show/export 要报 RESUME_FILE_INVALID，不能误报 not found。
+			return None, f"路径状态读取失败：{exc}"
+		if mode is None:
 			return None, None
+		if not stat.S_ISREG(mode):
+			# 目录 / FIFO / 悬空链接不能直接 read_text：FIFO 会阻塞。
+			return None, "简历路径不是普通文件"
 		try:
 			raw = json.loads(path.read_text(encoding="utf-8"))
 		# ValueError 覆盖 JSONDecodeError / UnicodeDecodeError 与 3.11+ 的超长整数
@@ -158,17 +216,42 @@ class ResumeStore:
 		# 原子写：编辑到一半被中断不能把用户唯一一份简历写成半截 JSON。
 		write_json_atomic(self._path_for(resume.name), d)
 
+	def stored_name(self, name: str) -> str:
+		"""按 ``name`` 取到的那份文件里记录的真实名称；读不出来时返回 ``name``。
+
+		``a/b`` 与 ``a_b`` 清洗后落在同一个文件上：按别名取到的简历仍叫 ``a/b``，
+		编辑与清理关联都要用这个名字（Issue #1804）。文件里的名称指向另一个
+		文件时（手工复制出来的副本）不采信，仍按请求名处理。
+		"""
+		resume = self.get(name)
+		if resume is None or not isinstance(resume.name, str) or not resume.name:
+			return name
+		if self._path_for(resume.name) != self._path_for(name):
+			return name
+		return resume.name
+
+	def is_directory(self, name: str) -> bool:
+		"""简历路径本身是目录（不跟随链接）：``unlink`` 必然失败（Issue #1805）。"""
+		try:
+			return stat.S_ISDIR(self._path_for(name).lstat().st_mode)
+		except FileNotFoundError:
+			return False
+
 	def delete(self, name: str) -> bool:
-		"""删除简历，返回是否成功"""
+		"""删除简历，返回是否成功；悬空链接只删除链接本身。"""
 		path = self._path_for(name)
-		if not path.exists():
+		if not self.exists(name):
 			return False
 		path.unlink()
 		return True
 
 	def exists(self, name: str) -> bool:
-		"""检查简历是否存在"""
-		return self._path_for(name).exists()
+		"""检查简历是否存在。
+
+		路径状态无法读取时上抛 ``OSError``：同名覆盖保护必须拒绝写入，
+		不能把「读不到」当成「不存在」（Issue #1692）。
+		"""
+		return _path_mode(self._path_for(name)) is not None
 
 	def is_corrupt(self, name: str) -> bool:
 		"""文件存在但读不出来（JSON 语法损坏、字段类型写错）。"""
@@ -181,6 +264,12 @@ class ResumeStore:
 		`save()` 是整份覆盖，导入一份旧备份会静默丢掉本地已有的编辑（`resume init` /
 		`resume clone` 都拒绝同名）。只有调用方显式要求覆盖时才继续。
 		"""
+		mode = path_mode(file_path)
+		# 直接 read_text 会阻塞在 FIFO 上；目录 / 设备 / 悬空链接也没有可读文本。
+		if mode is None:
+			raise FileNotFoundError(errno.ENOENT, "简历文件不存在", str(file_path))
+		if not stat.S_ISREG(mode):
+			raise ResumeImportError("路径不是普通文件；请选择 UTF-8 编码的简历 JSON 文件")
 		try:
 			raw_text = file_path.read_text(encoding="utf-8")
 		except UnicodeDecodeError as exc:

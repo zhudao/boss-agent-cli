@@ -20,6 +20,7 @@ _REDACTED = "[REDACTED]"
 _MAX_REDACTION_DEPTH = 64
 _SENSITIVE_KEY_PARTS = (
 	"api_key",
+	"api-key",
 	"apikey",
 	"authorization",
 	"cookie",
@@ -46,10 +47,11 @@ _SCHEMA_VALUE_FIELDS = {"default", "example", "examples", "const", "enum"}
 # ASCII 分隔符时，`stoken=abc）` 会把右括号算进值里，`Bearer x，然后`
 # 连后续中文说明一起被替换成 [REDACTED]，诊断文案就此残缺。
 _TEXT_VALUE_TERMINATORS = r"\s,;，。、；：（）「」『』【】《》！？…—"
-# 边界用 ASCII 单词字符而非 `\b`：中文紧邻凭据键时没有英文单词边界，
-# `登录token=abc` 曾整段漏脱敏（Issue #1662）。下划线与连字符属于同一个键，
-# `auth_token`、`x-api-key` 不会被从中间截断。
-_ASCII_KEY_BOUNDARY = r"(?<![A-Za-z0-9_-])"
+# 边界用 ASCII 字母数字而非 `\b`：中文紧邻凭据键时没有英文单词边界，
+# `登录token=abc` 曾整段漏脱敏（Issue #1662）。下划线与连字符是复合键的分隔符，
+# `access_token` / `x-api-key` 从凭据段开始匹配，前缀原样保留，替换后仍是完整键名
+# （Issue #1765）。键名后必须紧跟 `:` / `=`，所以 `token_expires_in` 等配置名不会命中。
+_ASCII_KEY_BOUNDARY = r"(?<![A-Za-z0-9])"
 _SENSITIVE_TEXT_PATTERNS = tuple(
 	re.compile(pattern, re.IGNORECASE)
 	for pattern in (
@@ -142,9 +144,15 @@ def _redact_sensitive(
 	return value
 
 
+#: URL 的 userinfo 口令（`scheme://user:password@host`）：没有 `key=value` 形态，
+#: 键名规则与上面的文本规则都不命中，带 Basic Auth 的代理地址会把口令原样回显
+#: 进信封（Issue #1779）。口令段不含 `/`，所以 `http://host:8080/a@b` 不会误伤。
+_URL_USERINFO_PASSWORD = re.compile(r"(?P<prefix>[A-Za-z][A-Za-z0-9+.\-]*://[^\s/@:]*:)[^\s/@]+(?=@)")
+
+
 def redact_sensitive_text(message: str) -> str:
 	"""Redact credential-like values embedded in free-form text."""
-	redacted = message
+	redacted = _URL_USERINFO_PASSWORD.sub(rf"\g<prefix>{_REDACTED}", message)
 	for pattern in _SENSITIVE_TEXT_PATTERNS:
 		redacted = pattern.sub(r"\g<key>\g<sep>[REDACTED]", redacted)
 	return redacted

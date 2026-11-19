@@ -15,7 +15,12 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 
 from boss_agent_cli.services.file_lock import exclusive_file_lock
-from boss_agent_cli.services.private_files import chmod_best_effort, write_private_bytes
+from boss_agent_cli.services.json_files import read_bytes_if_regular
+from boss_agent_cli.services.private_files import (
+	chmod_best_effort,
+	load_or_create_private_salt,
+	write_private_bytes,
+)
 
 _LOCK_TIMEOUT = 30
 _LOCK_POLL_SECONDS = 0.05
@@ -83,24 +88,9 @@ class TokenStore:
 		return hashlib.sha256(fingerprint.encode()).hexdigest()
 
 	def _get_salt(self) -> bytes:
-		# salt 决定 session.enc 的派生密钥：两个进程首登时若各自生成一次，
-		# 后写盘的那份会让先保存的密文永久解不开（Issue #1633）。
-		# O_EXCL 保证只有一个创建者；随后在刷新锁内重读，后到者必须复用胜出值。
-		try:
-			fd = os.open(self._salt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-		except FileExistsError:
-			pass
-		else:
-			with os.fdopen(fd, "wb") as file:
-				file.write(os.urandom(16))
-		chmod_best_effort(self._salt_path, 0o600)
-		with exclusive_file_lock(self._lock_path) as acquired:
-			if acquired:
-				return self._salt_path.read_bytes()
-		# 锁超时也不能用新 salt 加密：读到什么就用什么；确实不存在才按错误处理。
-		if self._salt_path.exists():
-			return self._salt_path.read_bytes()
-		raise RuntimeError("登录态 salt 尚未创建，且无法获取跨进程锁")
+		# salt 决定 session.enc 的派生密钥；共享实现保证首个写入者获胜，
+		# 读取失败时不会用新 salt 覆盖旧密文（Issue #1633 / #1688）。
+		return load_or_create_private_salt(self._auth_dir)
 
 	def _derive_key(self) -> bytes:
 		salt = self._get_salt()
@@ -121,10 +111,16 @@ class TokenStore:
 		write_private_bytes(self._session_path, encrypted)
 
 	def load(self) -> dict[str, Any] | None:
-		if not self._session_path.exists():
+		"""读取登录态；只有文件缺失才按未登录处理。
+
+		路径元数据不可读、目录 / FIFO / 悬空链接与不可读文件必须上抛，
+		否则 status / doctor 会报「未登录」并引导用户重新登录，覆盖那份可能
+		仍然有效的密文（Issue #1709）。
+		"""
+		encrypted = read_bytes_if_regular(self._session_path)
+		if encrypted is None:
 			return None
 		fernet = Fernet(self._derive_key())
-		encrypted = self._session_path.read_bytes()
 		try:
 			plaintext = fernet.decrypt(encrypted)
 			decoded = json.loads(plaintext)

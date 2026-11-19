@@ -185,7 +185,7 @@ boss crawl stop <run_id>
 
 `boss chat --page N` 返回 `pagination`：`page` 是本次请求页；`has_more` 只在平台返回布尔 `hasMore` 时取 `true` 或 `false`，缺失或类型不明确时为 `null`，`has_more_source` 相应为 `platform_hasMore` 或 `unknown`；`total` 是本页经 `--from` / `--days` 筛选后的条数，`total_kind=returned_page_count`，不代表平台上的会话总数。只有 `has_more=true` 时 `hints.next_actions` 才附加下一页命令并保留筛选参数；`has_more=null` 时 `hints.operator_actions` 说明不能仅凭本页条数判断是否还有记录。
 
-`boss chat --export <格式>` 同时保存当日 `chat-history/YYYY-MM-DD.json` 快照并与上次快照对比。快照记录本次平台页面返回的全部联系人，`--from` / `--days` 只筛选导出正文与变化摘要；`data.diff.removed` 仅在本次覆盖完整列表（第 1 页且平台明确 `hasMore=false`）时才可能非空，否则为空且 `complete=false`，Markdown / HTML 摘要注明“本次采集不完整，未判断消失”。同日多次导出按稳定 `uid`（旧数据回退 `security_id`）合并为并集。
+`boss chat --export <格式>` 同时保存当日 `chat-history/YYYY-MM-DD.json` 快照并与上次快照对比。快照记录本次平台页面返回的全部联系人，`--from` / `--days` 只筛选导出正文与变化摘要；`data.diff.removed` 仅在本次覆盖完整列表（第 1 页且平台明确 `hasMore=false`）时才可能非空，否则为空且 `complete=false`，Markdown / HTML 摘要注明“本次采集不完整，未判断消失”。同日多次导出按稳定 `uid`（旧数据回退 `security_id`）合并为并集。采集完整性写在快照旁的 `YYYY-MM-DD.meta`（快照本身仍是 JSON 数组，旧快照无标记时按完整处理）；上一份快照不完整时 `data.diff.added` 为空且 `baseline_complete=false`，摘要注明“上次采集不完整，未判断新增”，不把当时没翻到的联系人误报为新增。
 
 `history` 的详情、投递、打招呼与下一页提示保留本次 `--data-dir` 与平台：`hints.next_actions` 与终端表尾的 `more:` 命令都携带按 shell 参数转义的绝对目录，换工作目录照抄提示时仍读取同一登录态与浏览记录。目录中的空格、引号与 Rich 标签按字面显示。
 
@@ -215,7 +215,7 @@ boss crawl stop <run_id>
 
 `boss shortlist annotate` 至少需要一个非空 `--add-tag` / `--remove-tag` 或 `--note`；空标签与空 `--tag` 会返回 `INVALID_PARAM`，不会静默变成「没有过滤」或 `updated: true`。`--note ""` 仍表示清空备注。
 
-`history` / `favorites list` 的 `pagination.has_more` 与 `recommend` / `chat` 同一口径：只有平台返回布尔 `hasMore` 时才是 `true` / `false`；缺失或类型不明确时为 `null`、`has_more_source=unknown`，不会默认成 `false`，也不提示下一页。`total` 始终是本页返回条数（`total_kind=returned_page_count`）。
+`history` / `favorites list` 的 `pagination.has_more` 与 `recommend` / `chat` 同一口径：只有平台返回布尔 `hasMore` 时才是 `true` / `false`；缺失或类型不明确时为 `null`、`has_more_source=unknown`，不会默认成 `false`，也不提示下一页。`total` 始终是本页返回条数（`total_kind=returned_page_count`）。`favorites` 的成功包络里 `cardList` 只有 `null` / 缺失才按空列表处理；`{}` / `""` / `0` 这类假值非列表、以及页内全为非对象元素同样按可重试 `NETWORK_ERROR` 上报，不会伪装成「没有收藏」或翻满上限后的数量超限。
 
 ## 招聘者模式
 
@@ -263,7 +263,7 @@ boss hr location 10001 --dry-run
 boss hr location 10001 --yes
 ```
 
-`request-resume` 与 `resume --exchange` 在聊天页里调用官方组件完成动作，只点击本次动作新弹出的确认框。成功需要动作后回读聊天记录看到自己新发出的已知请求文案或已识别类型的动作卡片。只有 outgoing WS 帧、页面调用返回成功或未知手机号动作编号时不能确认发送；这些情况返回 `ACTION_UNCONFIRMED`（`recoverable=false`），`error.details` 附带页面日志、确认按钮状态、WS 统计与历史回读核对结果（`history_checked` / `history_matched_count` / `history_attempts` / `history_new_count` / `history_self_count` / `history_recipient_count`）。此时动作可能已经生效，先用 `boss hr chatmsg <friend_id>` 核实，不要直接重试。聊天记录证据也不证明接收方已收到或已读。换手机或微信时如果同时看到了求简历消息，成功结果会带 `side_effects: ["resume_request_detected"]`。动作前或回读时首次命中风险立即停止，不继续轮询；禁用或仍在加载的编辑器不会被强制开启，目标好友必须唯一匹配。
+`request-resume` 与 `resume --exchange` 在聊天页里调用官方组件完成动作，只点击本次动作新弹出的确认框。成功需要动作后回读聊天记录看到自己新发出的已知请求文案或已识别类型的动作卡片。只有 outgoing WS 帧、页面调用返回成功或未知手机号动作编号时不能确认发送；这些情况返回 `ACTION_UNCONFIRMED`（`recoverable=false`），`error.details` 附带页面日志、确认按钮状态、WS 统计与历史回读核对结果（`history_checked` / `history_matched_count` / `history_attempts` / `history_new_count` / `history_self_count` / `history_recipient_count`）。此时动作可能已经生效，先用 `boss hr chatmsg <friend_id>` 核实，不要直接重试。聊天记录证据也不证明接收方已收到或已读。换手机或微信时如果同时看到了求简历消息，成功结果会带 `side_effects: ["resume_request_detected"]`。`boss agent stop` 打开的 `automation/stop.json` 会在任何请求之前拒绝本次请求；请求抛出异常且无法证明未发出时返回不可重试的 `ACTION_UNCONFIRMED`，能证明未发出的异常保留原有可重试契约。动作前或回读时首次命中风险立即停止，不继续轮询；禁用或仍在加载的编辑器不会被强制开启，目标好友必须唯一匹配。
 
 ### 自动化停止与显式恢复
 
