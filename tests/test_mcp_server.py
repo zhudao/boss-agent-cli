@@ -844,10 +844,10 @@ def test_build_args_search_forwards_cache_and_score_flags():
 	assert args == ["search", "python", "--no-cache", "--with-score"]
 
 
-def test_build_args_search_ignores_empty_options():
-	"""空选项不应出现在参数中。"""
+def test_build_args_search_forwards_empty_filter_and_drops_null():
+	"""显式空串是「关闭该项筛选」信号，null 仍等价于未传（Issue #2023）。"""
 	args = _build_args("boss_search", {"query": "java", "city": "", "salary": None})
-	assert "--city" not in args
+	assert args == ["search", "java", "--city", ""]
 	assert "--salary" not in args
 
 
@@ -1100,8 +1100,11 @@ def test_build_args_clean_forwards_days():
 
 
 @patch("server.subprocess.run")
-def test_run_boss_parses_json_output(mock_run):
+def test_run_boss_parses_json_output(mock_run, monkeypatch):
 	"""正常 JSON 输出应被正确解析。"""
+	# 默认入口在模块加载时解析成安装路径（Issue #2088）；这里固定裸名字，
+	# 断言的是 subprocess 收到什么，而不是入口探测结果。
+	monkeypatch.setattr(server._impl, "_BOSS_BIN", "boss")
 	mock_run.return_value = MagicMock(
 		stdout='{"ok": true, "data": {"status": "logged_in"}}',
 		stderr="",
@@ -1133,8 +1136,9 @@ def test_run_boss_handles_empty_output(mock_run):
 
 
 @patch("server.subprocess.run")
-def test_run_boss_passes_args(mock_run):
+def test_run_boss_passes_args(mock_run, monkeypatch):
 	"""参数应正确传递给 subprocess。"""
+	monkeypatch.setattr(server._impl, "_BOSS_BIN", "boss")
 	mock_run.return_value = MagicMock(stdout='{"ok": true}', stderr="")
 	_run_boss("search", "python", "--city", "北京")
 	cmd = mock_run.call_args[0][0]
@@ -1142,12 +1146,13 @@ def test_run_boss_passes_args(mock_run):
 
 
 @patch("server.subprocess.run")
-def test_run_boss_export_empty_url_reaches_cli_dedicated_error(mock_run):
+def test_run_boss_export_empty_url_reaches_cli_dedicated_error(mock_run, monkeypatch):
 	"""`boss_export {"url": ""}` 要把 CLI 的专门诊断原样带回（Issue #958）。
 
 	CLI 对 `export --url ""` 报「--url 的值不能为空」；映射层若用真值判断把
 	空串吞掉，Agent 收到的是误导性的「未提供 query，请传入搜索关键词或 --url」。
 	"""
+	monkeypatch.setattr(server._impl, "_BOSS_BIN", "boss")
 	empty_url_envelope = json.dumps(
 		{
 			"ok": False,
@@ -1291,10 +1296,11 @@ def test_run_boss_timeout(mock_run):
 		(("hr", "chat", "--summary-limit", "300"), 400, 600),
 		(("hr", "last-messages"), 120, 300),
 		(("hr", "last-messages", "--limit", "300"), 300, 600),
-		# 好友列表聚合按 5 页估算。
-		(("pipeline",), 300, 500),
-		(("follow-up",), 300, 500),
-		(("digest",), 300, 500),
+		# 好友列表聚合按 collector 上限（50 页）+ 面试请求估算，超时封顶 900s
+		# （Issue #2024）。
+		(("pipeline",), 900, 900),
+		(("follow-up",), 900, 900),
+		(("digest",), 900, 900),
 	],
 )
 def test_cli_timeout_estimates_from_arguments(argv, minimum, maximum):
@@ -1595,8 +1601,9 @@ def test_read_only_tools_with_action_dimension_are_explicitly_classified():
 		& mcp_server._ACTION_DIMENSION_TOOL_NAMES
 	) - mcp_server._TOOL_WRITE_MODES.keys()
 	assert unclassified == set()
-	# 当前唯一带 action 维度的只读工具；新增这类工具时必须同步核实写模式。
-	assert "boss_hr_jobs" in mcp_server._ACTION_DIMENSION_TOOL_NAMES
+	# 带 action 维度的只读工具（hr_jobs 的 online/offline、config 的 set/reset）
+	# 都必须在 _TOOL_WRITE_MODES 登记写模式（Issue #968、#2177）。
+	assert {"boss_hr_jobs", "boss_config"} <= mcp_server._ACTION_DIMENSION_TOOL_NAMES
 
 
 def test_unregistered_action_dimension_defaults_to_write(monkeypatch):

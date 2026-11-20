@@ -62,7 +62,9 @@ def write_json_atomic(
 	path.parent.mkdir(parents=True, exist_ok=True)
 	temporary: Path | None = None
 	try:
-		fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+		# 临时名不含目标文件名：NAME_MAX=255 时「.<完整名称>.<随机>」会让 241–255
+		# 字节的合法目标名在这里 ENAMETOOLONG（Issue #1985）。
+		fd, temporary_name = tempfile.mkstemp(prefix=".boss-json-", dir=path.parent)
 		temporary = Path(temporary_name)
 		# 孤立代理字符（如 argv 里的非法 UTF-8 字节解码出的 U+DCFF）无法按 UTF-8
 		# 编码，严格模式会让整条命令在写盘时抛 UnicodeEncodeError、stdout 无信封
@@ -99,7 +101,10 @@ def _serialize_into(handle: Any, value: Any, *, indent: int | None) -> None:
 	"""
 	try:
 		json.dump(_json_safe_value(value), handle, ensure_ascii=False, indent=indent, allow_nan=False)
-	except (RecursionError, ValueError) as exc:
+	# TypeError 覆盖不可序列化的值（元组键、bytes、set 等）：不归成本地 IO
+	# 错误就会裸穿出命令层，stdout 无信封、stderr 裸 traceback（Issue #2220，
+	# 与 #1891 的深嵌套 / 超长整数同类）。
+	except (RecursionError, ValueError, TypeError) as exc:
 		raise OSError(errno.EINVAL, f"本地状态无法序列化（{exc}）") from exc
 
 
@@ -130,5 +135,5 @@ def strict_json_text(value: Any, *, indent: int | None = 2) -> str:
 	"""
 	try:
 		return json.dumps(_json_safe_value(value), ensure_ascii=False, allow_nan=False, indent=indent)
-	except (RecursionError, ValueError) as exc:
+	except (RecursionError, ValueError, TypeError) as exc:
 		raise OSError(errno.EINVAL, f"本地状态无法序列化（{exc}）") from exc

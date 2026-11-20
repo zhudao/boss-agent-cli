@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 import re
 import stat
@@ -26,7 +27,13 @@ _FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
 def _csv_cell(value: Any) -> str:
-	"""CSV 没有类型：一律按共享规则清洗后落盘，防止公式注入。"""
+	"""CSV 没有类型：一律按共享规则清洗后落盘，防止公式注入。
+
+	非有限浮点与 JSON 分支同口径归一成空值：``nan`` / ``inf`` 不是可移植的
+	文本值，也不该在产物里与合法数字混在一起（Issue #2107）。
+	"""
+	if isinstance(value, float) and not math.isfinite(value):
+		value = None
 	return sanitize_csv_cell(str(value if value is not None else ""))
 
 
@@ -38,6 +45,9 @@ _ILLEGAL_XLSX_CHARACTERS = re.compile(r"[\000-\010]|[\013-\014]|[\016-\037]|[\ud
 def _xlsx_cell(value: Any) -> Any:
 	# 单条平台字段漂移成 dict/list 时 openpyxl 会抛 ValueError，让整套产物无法
 	# 替换且 run 永远停在 stopped（Issue #1646）。这里兜成文本，保留原始信息。
+	if isinstance(value, float) and not math.isfinite(value):
+		# openpyxl 会为非有限数写出空的 <v></v> 数值单元格（Issue #2107）。
+		return None
 	if isinstance(value, str):
 		return _ILLEGAL_XLSX_CHARACTERS.sub("", value)
 	if isinstance(value, (int, float, bool)) or value is None:
@@ -74,6 +84,9 @@ def write_run_outputs(output_dir: Path, rows: list[dict[str, Any]]) -> dict[str,
 	# 避免失败后磁盘上留着不同批次的产物（Issue #1617）。
 	current_target: Path | None = None
 	replaced: list[tuple[Path, Path | None]] = []
+	# 回滚也失败时，备份是旧产物的唯一副本：清理临时文件必须跳过它，
+	# 并把路径写进错误消息（Issue #1924）。
+	retained: set[Path] = set()
 	try:
 		# mkdir 也必须在 try 内：输出目录被同名文件占用时 FileExistsError /
 		# NotADirectoryError 会原样上抛，被 _run 兜成 ok:true 的 stopped 并提示
@@ -85,6 +98,10 @@ def write_run_outputs(output_dir: Path, rows: list[dict[str, Any]]) -> dict[str,
 		_dir_mode = output_dir.lstat().st_mode
 		if not stat.S_ISDIR(_dir_mode):
 			raise CrawlExportError(f"采集结果目录 {output_dir} 不是普通目录（符号链接或特殊文件）")
+		# 预检结果同时决定是否备份：替换阶段不再用 is_file() 判一次，3.14 起
+		# 它把权限等 OSError 吞成 False，跳过备份后替换失败时回滚只能删除新
+		# 产物，旧产物没有副本（Issue #2085）。
+		existing_regular: set[Path] = set()
 		for target in (json_path, csv_path, xlsx_path):
 			try:
 				mode = target.lstat().st_mode
@@ -98,6 +115,7 @@ def write_run_outputs(output_dir: Path, rows: list[dict[str, Any]]) -> dict[str,
 				continue
 			if not stat.S_ISREG(mode):
 				raise CrawlExportError(f"采集产物 {target} 不是普通文件（FIFO / 设备），拒绝替换")
+			existing_regular.add(target)
 		json_tmp = _temporary_for(json_path)
 		temporaries.append(json_tmp)
 		with json_tmp.open("w", encoding="utf-8", errors="backslashreplace") as file:
@@ -116,7 +134,7 @@ def write_run_outputs(output_dir: Path, rows: list[dict[str, Any]]) -> dict[str,
 		# 且 `.jobs.*` 临时文件残留（Issue #1346）。
 		for temporary, current_target in ((json_tmp, json_path), (csv_tmp, csv_path), (xlsx_tmp, xlsx_path)):
 			backup: Path | None = None
-			if current_target.is_file():
+			if current_target in existing_regular:
 				backup = _temporary_for(current_target)
 				# 备份由 mkstemp 先创建：若随后的搬运失败，它必须和序列化临时
 				# 文件一起被清理，否则每次重试都残留一个 `.jobs.*`（Issue #1875）。
@@ -126,34 +144,54 @@ def write_run_outputs(output_dir: Path, rows: list[dict[str, Any]]) -> dict[str,
 				os.replace(temporary, current_target)
 			except OSError:
 				if backup is not None:
-					os.replace(backup, current_target)
+					try:
+						os.replace(backup, current_target)
+					except OSError:
+						# 回滚失败：保留备份供人工恢复，不能让清理循环删掉它。
+						retained.add(backup)
 				raise
 			replaced.append((current_target, backup))
 	except CrawlRuntimeUnavailable:
-		_rollback_replacements(replaced)
-		for temporary in temporaries:
-			temporary.unlink(missing_ok=True)
+		_rollback_replacements(replaced, retained)
+		_discard(temporaries, retained)
 		raise
 	except OSError as exc:
-		_rollback_replacements(replaced)
-		for temporary in temporaries:
-			temporary.unlink(missing_ok=True)
+		_rollback_replacements(replaced, retained)
+		_discard(temporaries, retained)
 		raise CrawlExportError(
-			f"采集结果无法写出到 {current_target or output_dir}：{type(exc).__name__}: {exc}"
+			f"采集结果无法写出到 {current_target or output_dir}：{type(exc).__name__}: {exc}{_retained_hint(retained)}"
 		) from exc
 	except Exception as exc:
-		_rollback_replacements(replaced)
-		for temporary in temporaries:
-			temporary.unlink(missing_ok=True)
-		raise CrawlExportError(f"采集结果无法写出到 {output_dir}：{type(exc).__name__}: {exc}") from exc
+		_rollback_replacements(replaced, retained)
+		_discard(temporaries, retained)
+		raise CrawlExportError(
+			f"采集结果无法写出到 {output_dir}：{type(exc).__name__}: {exc}{_retained_hint(retained)}"
+		) from exc
 	# 全部替换成功后才清理备份：三份产物要么都是新批次，要么保持旧批次。
-	for _, backup in replaced:
-		if backup is not None:
-			backup.unlink(missing_ok=True)
+	# 清理失败不能把已成功的导出报成失败（Issue #1926）。
+	_discard([backup for _, backup in replaced if backup is not None], retained)
 	return {"json": str(json_path), "csv": str(csv_path), "xlsx": str(xlsx_path)}
 
 
-def _rollback_replacements(replaced: list[tuple[Path, Path | None]]) -> None:
+def _discard(temporaries: list[Path], retained: set[Path]) -> None:
+	"""best-effort 清理临时文件：失败只跳过，绝不覆盖正在传播的原始异常（Issue #1925）。"""
+	for temporary in temporaries:
+		if temporary in retained:
+			continue
+		try:
+			temporary.unlink(missing_ok=True)
+		except OSError:
+			continue
+
+
+def _retained_hint(retained: set[Path]) -> str:
+	if not retained:
+		return ""
+	paths = "、".join(str(path) for path in sorted(retained))
+	return f"；旧产物备份保留在 {paths}"
+
+
+def _rollback_replacements(replaced: list[tuple[Path, Path | None]], retained: set[Path]) -> None:
 	"""把本次导出已经替换的目标恢复到旧内容，失败不吞掉原始异常。"""
 	for target, backup in reversed(replaced):
 		try:
@@ -163,11 +201,16 @@ def _rollback_replacements(replaced: list[tuple[Path, Path | None]]) -> None:
 				target.unlink(missing_ok=True)
 		except OSError:
 			# 回滚失败时保留备份文件，操作者可据此恢复；原始错误仍然上抛。
+			if backup is not None:
+				retained.add(backup)
 			continue
 
 
 def _temporary_for(target: Path) -> Path:
-	fd, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+	# 前缀只用截断后的目标名（最多 32 字符）：导出目标名可能接近 NAME_MAX，
+	# 拼完整名会让 mkstemp 直接 ENAMETOOLONG（Issue #2080）。截断仍让残留的
+	# 临时 / 备份文件能看出属于哪份产物。
+	fd, name = tempfile.mkstemp(prefix=f".{target.name[:32]}.", dir=target.parent)
 	os.close(fd)
 	return Path(name)
 

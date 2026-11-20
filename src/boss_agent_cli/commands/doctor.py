@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from boss_agent_cli.auth.cookie_extract import extract_cookies
 from boss_agent_cli.auth.health import assess_auth_health, auth_config_for_platform
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.commands._doctor_checks import _add_live_probe_checks, _add_quality_baseline_checks, _doctor_command
+from boss_agent_cli.output import is_local_io_error
 from boss_agent_cli.display import (
 	boss_command_for_ctx,
 	handle_error_output,
@@ -32,7 +34,9 @@ from boss_agent_cli.services.browser_runtime import (
 	patchright_chromium_revision,
 	patchright_importable,
 	patchright_install_command,
+	unreadable_browser_cache_dirs,
 )
+from boss_agent_cli.services.json_files import path_mode
 
 
 #: 实测：15 秒间隔连续 3 次 search 会在第 3 次命中 code 37，90 秒间隔 3/3 通过。
@@ -61,7 +65,7 @@ def _risk_lock_check_payload(risk_lock: dict[str, Any], *, clean_command: str = 
 
 
 @click.command("doctor")
-@click.option("--live-probe", is_flag=True, default=False, help="执行低频只读平台探测（默认仅做本地诊断）")
+@click.option("--live-probe", is_flag=True, default=False, help="执行低频只读平台接口探测（默认只做本地诊断与一次站点连通性检查）")
 @click.option("--probe-cookies", is_flag=True, default=False, help="显式从本地浏览器提取 Cookie。macOS 可能弹出钥匙串授权，默认不读取")
 @click.pass_context
 def doctor_cmd(ctx: click.Context, live_probe: bool, probe_cookies: bool) -> None:
@@ -126,9 +130,19 @@ def doctor_cmd(ctx: click.Context, live_probe: bool, probe_cookies: bool) -> Non
 	)
 
 	chromium_candidates = installed_browser_dirs()
+	unreadable_caches = unreadable_browser_cache_dirs()
 	chromium_status, chromium_detail = evaluate_patchright_chromium(
 		patchright_chromium_revision(), chromium_candidates
 	)
+	if unreadable_caches and chromium_status != "ok":
+		# 缓存根存在但读不出来（权限等）：不是「未安装」，重装解决不了问题，
+		# 也不能让 doctor 整份失败（Issue #2103）。
+		chromium_status = "warn"
+		chromium_detail = (
+			f"{chromium_detail}；另有缓存目录无法读取："
+			+ "、".join(str(path) for path in unreadable_caches)
+			+ "（权限问题？无法确认内核是否已安装）"
+		)
 	add_check(
 		"patchright_chromium",
 		chromium_status,
@@ -166,24 +180,70 @@ def doctor_cmd(ctx: click.Context, live_probe: bool, probe_cookies: bool) -> Non
 	source_root = _add_quality_baseline_checks(checks)
 
 	# 2) Auth storage
-	token = auth.check_status()
-	auth_health = assess_auth_health(
-		data_dir,
-		platform=platform_name,
-		token=token,
-		login_action=login_action_for_ctx(ctx),
-		logout_action=boss_command_for_ctx(ctx, "logout", include_data_dir=True),
-		status_action=boss_command_for_ctx(ctx, "status", include_data_dir=True),
-	)
+	try:
+		token = auth.check_status()
+		auth_health = assess_auth_health(
+			data_dir,
+			platform=platform_name,
+			token=token,
+			login_action=login_action_for_ctx(ctx),
+			logout_action=boss_command_for_ctx(ctx, "logout", include_data_dir=True),
+			status_action=boss_command_for_ctx(ctx, "status", include_data_dir=True),
+		)
+	except OSError as e:
+		# salt / session.enc 的路径状态异常是确定性本地失败：裸异常逃出命令会
+		# 变成 traceback（doctor 没有 auth 装饰器），不能静默当成未登录（Issue #1996）。
+		if not is_local_io_error(e):
+			raise
+		handle_error_output(
+			ctx,
+			"doctor",
+			code="LOCAL_IO_ERROR",
+			message=f"doctor 无法读取登录态: {e}",
+			data={
+				"summary": "broken",
+				"data_dir": str(data_dir),
+				"live_probe": live_probe,
+				"check_count": len(checks),
+				"checks": checks,
+				"failed_check": "auth_storage",
+			},
+			hints={
+				"operator_actions": [
+					f"确认 {data_dir / 'auth'} 下的 salt 与 session.enc 是普通文件后重试；"
+					"备份后重建 salt 会让已有登录态与 AI 密钥失效",
+				]
+			},
+		)
+		return
 	has_token = auth_health.token_present
 	checks.extend(auth_health.checks_as_dicts())
 
-	add_check(
-		"auth_salt",
-		"ok" if auth_health.salt_path.exists() else "warn",
-		f"salt 文件{'存在' if auth_health.salt_path.exists() else '不存在'}: {auth_health.salt_path}",
-		"首次保存登录态后会自动生成，可忽略",
-	)
+	# salt 按登录路径同口径判定：path_mode 跟随符号链接到普通文件，悬空链接
+	# 保留链接自身类型。裸 lstat 会把「链接到普通文件」也报成异常，并提示删除
+	# 一个登录路径实际在用的 salt——那会让 session.enc 与 AI 密钥永久不可解密
+	# （Issue #1998、#2104）。
+	salt_path = auth_health.salt_path
+	salt_mode: int | None = None
+	salt_problem: str | None = None
+	try:
+		salt_mode = path_mode(salt_path)
+	except OSError as e:
+		salt_problem = f"salt 路径状态无法读取: {e}"
+	if salt_problem is not None:
+		add_check("auth_salt", "error", salt_problem, "确认数据目录权限后重试；登录会 fail-closed")
+	elif salt_mode is None:
+		add_check("auth_salt", "warn", f"salt 文件不存在: {salt_path}", "首次保存登录态后会自动生成，可忽略")
+	elif not stat.S_ISREG(salt_mode):
+		kind = "符号链接（目标缺失或不是普通文件）" if stat.S_ISLNK(salt_mode) else "目录 / FIFO 等非普通文件"
+		add_check(
+			"auth_salt",
+			"error",
+			f"salt 路径是{kind}，登录会 fail-closed: {salt_path}",
+			f"备份后删除 {salt_path} 并重新登录 / 重新配置 AI 密钥",
+		)
+	else:
+		add_check("auth_salt", "ok", f"salt 文件存在: {salt_path}", "首次保存登录态后会自动生成，可忽略")
 
 	# 3) Cookie extraction support. Default doctor stays local and does not touch
 	# the browser cookie store; on macOS that read can raise a Keychain prompt.

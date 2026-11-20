@@ -7,6 +7,7 @@
 
 import argparse
 import asyncio
+import errno
 import json
 import math
 import os
@@ -32,6 +33,7 @@ from boss_agent_cli.api.browser_source import POLICIES as BROWSER_SOURCES
 from boss_agent_cli.mcp_args import _build_args
 from boss_agent_cli.mcp_tools import TOOLS
 from boss_agent_cli.output import envelope_error, json_safe_value, serialization_failure_envelope
+from boss_agent_cli.services.friend_list_pages import MAX_FRIEND_LIST_PAGES
 from boss_agent_cli.search_filters import detail_filter_max_pages
 
 # 向后兼容的再导出：这些符号在拆分前属于本模块，`mcp-server/server.py` wrapper
@@ -95,6 +97,7 @@ DEFAULT_HTTP_PATH = "/mcp"
 DEFAULT_SSE_PATH = "/sse"
 DEFAULT_MESSAGE_PATH = "/messages/"
 DEFAULT_BOSS_BIN = "boss"
+#: 初始值只是回退；模块加载末尾会用 `_default_boss_bin()` 解析成与 run() 相同的入口。
 _BOSS_BIN = DEFAULT_BOSS_BIN
 _BOSS_GLOBAL_ARGS: list[str] = []
 _CLI_TIMEOUT_SECONDS = 120.0
@@ -113,8 +116,9 @@ _MAX_CLI_TIMEOUT_SECONDS = 900.0
 _SEARCH_PAGE_SIZE = 15
 #: 招聘者聊天摘要 / 最近消息按每批 50 条请求估算。
 _HR_BATCH_SIZE = 50
-#: pipeline / follow-up / digest 聚合好友列表的估算页数上限。
-_FRIEND_LIST_ESTIMATE_PAGES = 5
+#: pipeline / follow-up / digest 聚合好友列表的估算页数上限：与 collector
+#: 的真实翻页上限一致；按 5 页估算会让 8 页以上的账号被提前掐断（Issue #2024）。
+_FRIEND_LIST_ESTIMATE_PAGES = MAX_FRIEND_LIST_PAGES
 #: batch-greet 的 CLI 默认值与上限（命令内会把 --count 截断到 10）。
 _BATCH_GREET_DEFAULT_COUNT = 10
 _BATCH_GREET_MAX_COUNT = 10
@@ -151,6 +155,12 @@ def _default_boss_bin(*, executable: str | None = None, windows: bool | None = N
 		if stat.S_ISREG(mode):
 			return str(candidate)
 	return DEFAULT_BOSS_BIN
+
+
+# 直接调用 `_run_boss()` / handler 而不经 run() 的嵌入方与测试也走同安装入口：
+# 默认值停留在裸名字会从 PATH 找 boss，PATH 上另一份旧安装（或坏 shim）会被
+# 静默驱动（Issue #1066 / #2088）。run() 的显式 --boss-bin 仍会覆盖这里。
+_BOSS_BIN = _default_boss_bin()
 
 
 def _configure_boss_invocation(
@@ -214,6 +224,7 @@ _READ_ONLY_TOOL_NAMES = frozenset({
 	"boss_agent_stats",
 	"boss_agent_pending",
 	"boss_agent_review",
+	"boss_config",
 	"boss_hr_whoami",
 	"boss_hr_applications",
 	"boss_hr_candidates",
@@ -231,6 +242,8 @@ _READ_ONLY_TOOL_NAMES = frozenset({
 #: 告诉 Agent「可直接重试」，就会在状态未知时重发一次状态变更（Issue #869）。
 _TOOL_WRITE_MODES: dict[str, frozenset[str]] = {
 	"boss_hr_jobs": frozenset({"online", "offline"}),
+	# config 的 list / get 只读本地配置；set / reset 才写本地文件，按写处理。
+	"boss_config": frozenset({"set", "reset"}),
 }
 
 #: schema 里带 action 维度的工具。只读白名单中的这类工具读写取决于参数，必须在
@@ -259,6 +272,9 @@ _SPAWN_FAILURE_RECOVERY = (
 	"底层 boss CLI 未能启动，未产生任何平台操作；确认 boss-agent-cli 已安装且 boss 在 "
 	"MCP server 进程的 PATH 中，或用 boss-mcp --boss-bin 指定可执行文件路径后重新调用"
 )
+_ARGV_TOO_LONG_RECOVERY = (
+	"底层 boss CLI 未启动，未产生任何平台操作；缩短文本参数或拆分成多次调用后重试"
+)
 _READ_UNPARSEABLE_RECOVERY = (
 	"只读命令未返回 JSON 信封，不产生平台写入；按 error.message 排查，"
 	"升级 boss-agent-cli 后重新调用，仍出现时附上 error.message 提交 issue"
@@ -266,6 +282,12 @@ _READ_UNPARSEABLE_RECOVERY = (
 
 
 def _tool_may_write(tool_name: str, arguments: dict[str, Any] | None = None) -> bool:
+	arguments = arguments or {}
+	# --dry-run 的契约是只预览、不产生平台写入（batch-greet / clean / agent run /
+	# hr greet / hr location / hr accept-resume）。按工具名整体归为写会让超时 /
+	# 取消返回 outcome_unknown 并要求核对并不存在的平台写入（Issue #2177）。
+	if arguments.get("dry_run") is True:
+		return False
 	if tool_name not in _READ_ONLY_TOOL_NAMES:
 		return True
 	write_modes = _TOOL_WRITE_MODES.get(tool_name)
@@ -274,16 +296,29 @@ def _tool_may_write(tool_name: str, arguments: dict[str, Any] | None = None) -> 
 		# （与「未列出的工具按写」同一保守原则）。守卫测试保证现有工具不会走到这里。
 		return tool_name in _ACTION_DIMENSION_TOOL_NAMES
 	# 缺省 action 与 schema 默认值一致（list）：只有显式声明写模式才算写。
-	action = (arguments or {}).get("action", "list")
+	action = arguments.get("action", "list")
 	return isinstance(action, str) and action in write_modes
+
+
+def _option_region(args: tuple[str, ...]) -> tuple[str, ...]:
+	"""返回 ``--`` 之前的选项区；``--`` 之后一律是位置参数（Issue #2176）。
+
+	位置参数可以合法地以连字符开头（`_literal_positionals` 把它们放到 ``--``
+	之后）；把整段 argv 当选项扫描会把关键词误读成开关或选项取值。
+	"""
+	try:
+		return args[: args.index("--")]
+	except ValueError:
+		return args
 
 
 def _option_value(args: tuple[str, ...], flag: str) -> str | None:
 	"""取 ``--flag value`` / ``--flag=value`` 的取值；未出现时返回 None。"""
 	prefix = f"{flag}="
-	for index, arg in enumerate(args):
+	region = _option_region(args)
+	for index, arg in enumerate(region):
 		if arg == flag:
-			return args[index + 1] if index + 1 < len(args) else None
+			return region[index + 1] if index + 1 < len(region) else None
 		if arg.startswith(prefix):
 			return arg[len(prefix):]
 	return None
@@ -307,7 +342,9 @@ def _estimated_requests(args: tuple[str, ...]) -> int | None:
 	"""
 	command = args[0]
 	if command == "batch-greet":
-		if "--dry-run" in args:
+		# 只看 ``--`` 之前的选项：关键词恰好是 "--dry-run" 时不能把预算当成预览
+		# （Issue #2176）。
+		if "--dry-run" in _option_region(args):
 			# 只做一次搜索，没有写请求。
 			return 1
 		count = _int_option(args, "--count", _BATCH_GREET_DEFAULT_COUNT)
@@ -353,7 +390,10 @@ def _estimated_requests(args: tuple[str, ...]) -> int | None:
 			if limit is None or limit < 1:
 				return None
 			# 与 summary-limit 分支同口径：整数分页并封顶（Issue #1612）。
-			return min(-(-limit // _HR_BATCH_SIZE), _MAX_ESTIMATED_REQUESTS)
+			batches = -(-limit // _HR_BATCH_SIZE)
+			# 无 --friend-id 时命令先取一页沟通列表再分批拉消息（Issue #2025）。
+			base = 0 if "--friend-id" in _option_region(args) else 1
+			return min(base + batches, _MAX_ESTIMATED_REQUESTS)
 		return None
 	if command == "watch" and len(args) > 1 and args[1] == "run":
 		# watch run 对保存的搜索应用福利 / 活跃度筛选，逐条查详情；
@@ -361,8 +401,8 @@ def _estimated_requests(args: tuple[str, ...]) -> int | None:
 		pages = detail_filter_max_pages("welfare", "today")
 		return pages * (_SEARCH_PAGE_SIZE + 1)
 	if command in {"pipeline", "follow-up", "digest"}:
-		# 好友列表逐页聚合，按 5 页上限估算。
-		return _FRIEND_LIST_ESTIMATE_PAGES
+		# 好友列表逐页聚合，再追加一次面试数据请求（Issue #2024）。
+		return _FRIEND_LIST_ESTIMATE_PAGES + 1
 	return None
 
 
@@ -381,9 +421,10 @@ def _cli_timeout(args: tuple[str, ...]) -> float:
 	#       按 900s 封顶；普通 search 只有 1 次列表请求 → 95s，仍取默认 120s。
 	# A wizard deadline belongs to the child. The host allows bounded extra
 	# time for that child to commit its result/checkpoint and emit the envelope.
-	if args and args[0] == "wizard" and "--timeout" in args:
+	if args and args[0] == "wizard" and "--timeout" in _option_region(args):
+		region = _option_region(args)
 		try:
-			requested = float(args[args.index("--timeout") + 1])
+			requested = float(region[region.index("--timeout") + 1])
 		except (IndexError, ValueError):
 			return _CLI_TIMEOUT_SECONDS
 		if math.isfinite(requested) and requested > 0:
@@ -425,6 +466,16 @@ def _cli_failure(
 
 
 def _spawn_failure(args: tuple[str, ...], exc: OSError) -> dict[str, Any]:
+	if exc.errno == errno.E2BIG:
+		# 参数超过系统 argv 上限：子进程从未启动，问题在入参而不是安装 / PATH
+		# （Issue #1943）。
+		return _cli_failure(
+			args,
+			"INVALID_PARAM",
+			"工具参数过长，超过系统命令行长度上限，底层 boss CLI 未启动",
+			recovery_action=_ARGV_TOO_LONG_RECOVERY,
+			outcome_unknown=False,
+		)
 	return _cli_failure(
 		args,
 		"CLI_ERROR",
@@ -439,7 +490,9 @@ def _parse_cli_output(
 ) -> dict[str, Any]:
 	try:
 		parsed = json.loads(stdout)
-	except json.JSONDecodeError:
+	except (ValueError, RecursionError):
+		# 超长整数抛裸 ValueError、超深嵌套抛 RecursionError，都不是
+		# JSONDecodeError；逃逸出去会让 handler 抛异常而不是返回信封（Issue #1942）。
 		parsed = None
 	if isinstance(parsed, dict):
 		return parsed
@@ -591,7 +644,8 @@ def _interrupted_failure(
 	# running-child path must surface that envelope (Issue #998).
 	try:
 		checkpoint_result = json.loads(stdout)
-	except (json.JSONDecodeError, UnicodeDecodeError):
+	except (ValueError, RecursionError):
+		# ValueError 已覆盖 JSONDecodeError / UnicodeDecodeError 与超长整数。
 		checkpoint_result = None
 	return _cli_failure(
 		args,
@@ -740,6 +794,43 @@ def _matches_json_type(value: Any, expected: str) -> bool:
 	return isinstance(value, _JSON_TYPE_CHECKS[expected]) and (expected == "boolean" or not isinstance(value, bool))
 
 
+def _is_integral_float(value: Any) -> bool:
+	"""JSON Schema 的 ``integer`` 包含小数部分为零的浮点数（如 1.0）。
+
+	``float('inf')`` / ``float('nan')`` 的 ``is_integer()`` 为 False，不会进入
+	归一化；``bool`` 已被 ``isinstance(value, float)`` 排除。
+	"""
+	return isinstance(value, float) and value.is_integer()
+
+
+def _normalize_integral_numbers(tool_name: str, arguments: dict[str, Any]) -> None:
+	"""把参数里小数部分为零的浮点整数就地归一成 ``int``（Issue #2175）。
+
+	JSON 数字 ``1.0`` 按 schema 语义是合法 ``integer``，Python 解码成 ``float``
+	后会被类型检查拒绝；即使放行，``str(1.0)`` 拼进 argv 也会变成选项值
+	``"1.0"``。这里在类型检查与映射之前统一归一，两处共用同一份数据。
+	"""
+	tool = next((item for item in TOOLS if item.name == tool_name), None)
+	if tool is None:
+		return
+	properties = tool.input_schema.get("properties", {})
+	for key, value in list(arguments.items()):
+		prop = properties.get(key)
+		if not isinstance(prop, dict):
+			continue
+		if prop.get("type") == "integer" and _is_integral_float(value):
+			arguments[key] = int(value)
+			continue
+		items = prop.get("items")
+		if (
+			prop.get("type") == "array"
+			and isinstance(items, dict)
+			and items.get("type") == "integer"
+			and isinstance(value, list)
+		):
+			arguments[key] = [int(item) if _is_integral_float(item) else item for item in value]
+
+
 def _argument_type_errors(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 	"""按 inputSchema 校验参数类型，返回人类可读的错误列表。
 
@@ -842,6 +933,7 @@ async def call_tool(ctx: Any, params: CallToolRequestParams) -> CallToolResult:
 	# 在类型检查与映射之前剔除；必填参数传 null 因此走缺参分支，而不是把
 	# ``str(None)`` 拼成 "None" 发给 CLI（Issue #1108）。
 	arguments = {key: value for key, value in arguments.items() if value is not None}
+	_normalize_integral_numbers(params.name, arguments)
 	try:
 		type_errors = _argument_type_errors(params.name, arguments)
 	except (ArithmeticError, TypeError, ValueError) as exc:

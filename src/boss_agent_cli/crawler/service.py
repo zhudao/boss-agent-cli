@@ -65,6 +65,24 @@ class CrawlBusyError(RuntimeError):
 		self.run_id = run_id
 
 
+def validate_pages_override(next_page: int, pages: int) -> None:
+	"""resume 的 ``--pages`` 不能缩到断点进度之前（Issue #2061）。
+
+	``pages`` 是采集范围的严格上限，断点的 ``next_page`` 最多是 ``pages + 1``
+	（与 cache 记录校验同一口径，Issue #2030）。把上限缩到断点进度之前会让
+	``params.pages`` 与 ``next_page`` 自相矛盾：先落盘、再被 ``_run`` 重读断点
+	时判成记录损坏，之后 ``status`` / ``results`` / ``resume`` 全部拒绝访问，
+	已采数据只能用 SQLite 手工取回。写盘之前按参数问题拒绝；不能静默 clamp
+	——缩小采集范围是调用方的显式意图，改写语义会误导。
+	"""
+	if next_page <= pages + 1:
+		return
+	raise ValueError(
+		f"--pages {pages} 小于断点进度：任务已推进到第 {next_page} 页，"
+		f"页数上限不能小于 {next_page - 1}；要按更小页数采集请用 crawl start 新建任务"
+	)
+
+
 @dataclass(frozen=True)
 class CrawlSettings:
 	query: str
@@ -236,8 +254,12 @@ class CrawlSettings:
 			value = raw.get(key)
 			if value is None:
 				value = limits.get(key, default)
-			if isinstance(value, bool):
-				raise CacheRecordInvalid("crawl_run", run_id, f"params.limits.{key}", "期望整数，实际是 bool")
+			# bool 是 int 子类；float 会静默截断（2.9 → 2）。两者都按记录损坏
+			# 处理，与 crawl_cdp_port / crawl_int_setting 同口径（Issue #1938）。
+			if isinstance(value, bool) or not isinstance(value, (int, str)):
+				raise CacheRecordInvalid(
+					"crawl_run", run_id, f"params.limits.{key}", f"期望整数，实际是 {type(value).__name__}"
+				)
 			try:
 				parsed = int(value)
 			except (TypeError, ValueError, OverflowError) as exc:
@@ -283,6 +305,10 @@ def crawl_int_setting(cfg: Mapping[str, Any], key: str, default: int, *, minimum
 	value = cfg.get(key)
 	if value is None:
 		return default
+	# bool 是 int 子类（true 会静默变成 1 秒预算）；float 会被 int() 静默截断。
+	# 只接受整数与数字字符串，与 crawl_cdp_port 同口径（Issue #1938）。
+	if isinstance(value, bool) or not isinstance(value, (int, str)):
+		raise ValueError(f"crawl 配置项 {key} 必须是整数")
 	try:
 		parsed = int(value)
 	# OverflowError：``1e400`` 解析成 inf，用户可修复，不能落成 INTERNAL_ERROR。
@@ -508,7 +534,15 @@ class CrawlService:
 		# 输出目录必须按当前工作目录解析成绝对路径再落盘：`--data-dir` 允许
 		# 相对路径，原样持久化会让换个 cwd 的 resume 把产物写到无关目录
 		# （Issue #1481）。
-		output_dir = (self._data_dir / "crawl" / "runs" / run_id).resolve()
+		try:
+			output_dir = (self._data_dir / "crawl" / "runs" / run_id).resolve()
+		except RuntimeError as exc:
+			# Path.resolve 在 3.11 / 3.12 遇到符号链接环抛 RuntimeError（3.13+ 不抛）：
+			# 确定性本地路径失败，落到入口兜底会被报成可重试的 NETWORK_ERROR（Issue #2169）。
+			raise CrawlProfilePathInvalid(
+				f"采集输出目录 {str(self._data_dir / 'crawl' / 'runs' / run_id)!r} 无法解析（{exc}）；"
+				"请检查数据目录下是否存在符号链接环，修正后重新创建任务"
+			) from exc
 		self._cache.create_crawl_run(run_id, settings.as_dict(), str(output_dir), status="queued")
 		if self._on_run_created is not None:
 			self._on_run_created(run_id)
@@ -592,25 +626,64 @@ class CrawlService:
 				# 产物被删除 / 清理后 completed 快速路径仍会报成功并指向不存在的
 				# 文件（Issue #1873）：用本地缓存重新导出，不发出任何平台请求；
 				# 导出失败会抛 CrawlExportError，不再返回假成功。
-				write_run_outputs(output_dir, [item["payload"] for item in self._cache.list_crawl_jobs(run_id)])
+				jobs = [item["payload"] for item in self._cache.list_crawl_jobs(run_id)]
+				# 并发 clean --privacy 可能已经删除断点：导出前后都重读 crawl_runs。
+				# 行已消失时不再写出隐私产物；导出期间被清理时删掉刚重建的文件，
+				# 不能复活已清理的数据（Issue #2241；clean 先删行再删文件，与本
+				# 检查同一时序契约）。
+				if self._cache.get_crawl_run(run_id) is None:
+					raise KeyError(run_id)
+				write_run_outputs(output_dir, jobs)
+				if self._cache.get_crawl_run(run_id) is None:
+					_remove_run_artifacts(output_dir)
+					raise KeyError(run_id)
 			return self._completed_outcome(run)
-		# Hook 目录是本地状态：resume 没有 --hook-dir 参数可以修复，必须在
-		# 打开浏览器之前用与 crawl run/start 相同的清单 / 摘要校验拒绝坏目录
-		# （Issue #1408）。已完成的 run 在上面直接返回，不因目录后来被删而失败。
-		try:
-			verify_hook_profile(settings.hook_profile, settings.hook_dir)
-		except ValueError as exc:
-			# 恢复路径没有参数可改：按确定性本地状态失败上报，不能落进命令层
-			# 的「修正 crawl 配置 / crawl configure --help」通用分支（Issue #1460）。
-			raise CrawlHookDirInvalid(str(exc), hook_dir=settings.hook_dir) from exc
-		if self._preflight is not None:
-			# 登录态与运行时预检放在断点修改与 clear_stop 之前：预检失败时本次
-			# 调用不改动任务（与后台恢复的既有约定一致）。
-			self._preflight()
-		self._check_risk_lock()
-		self._cache.update_crawl_run_params(run_id, settings.as_dict())
-		if clear_stop:
+		if pages is not None:
+			validate_pages_override(int(run["next_page"]), settings.pages)
+		# 旧 stop 必须在预检之前清掉：预检要探测可选依赖、读取登录态，可能
+		# 耗时；这期间到达的新 stop 不能被后面的清理当成上一轮残留一起清掉
+		# （与后台恢复同构，Issue #1115 / #2209）。预检失败时还原旧 stop 与
+		# 时间戳，保持「失败的调用不改动任务」的既有约定（Issue #1042）；
+		# 失败且无旧 stop 时不写库。
+		previous_stop = bool(run.get("stop_requested"))
+		previous_updated_at = float(run.get("updated_at") or 0.0)
+		previous_status = str(run.get("status") or "")
+		previous_error = str(run.get("error") or "")
+		if clear_stop and previous_stop:
 			self._cache.clear_crawl_stop_request(run_id)
+		# 标记本身也可能失败（本地 IO）：此时没有写入时间，还原按旧口径处理。
+		marked_at: float | None = None
+		try:
+			# 取得执行权后、慢预检之前先把状态落成 running：预检（依赖探测、读取
+			# 登录态）期间到达的 `crawl stop` 不能被终态拒绝，否则停止请求丢失、
+			# 恢复照常发出平台请求（Issue #2240）。预检失败时在下方还原原状态 /
+			# 错误 / 时间戳，保持「失败的调用不改动任务」。
+			marked_at = self._cache.mark_crawl_run_active(run_id, "running")
+			# Hook 目录是本地状态：resume 没有 --hook-dir 参数可以修复，必须在
+			# 打开浏览器之前用与 crawl run/start 相同的清单 / 摘要校验拒绝坏目录
+			# （Issue #1408）。已完成的 run 在上面直接返回，不因目录后来被删而失败。
+			try:
+				verify_hook_profile(settings.hook_profile, settings.hook_dir)
+			except ValueError as exc:
+				# 恢复路径没有参数可改：按确定性本地状态失败上报，不能落进命令层
+				# 的「修正 crawl 配置 / crawl configure --help」通用分支（Issue #1460）。
+				raise CrawlHookDirInvalid(str(exc), hook_dir=settings.hook_dir) from exc
+			if self._preflight is not None:
+				self._preflight()
+			self._check_risk_lock()
+			self._cache.update_crawl_run_params(run_id, settings.as_dict())
+		except BaseException:
+			if clear_stop and previous_stop:
+				# 预检 / 参数落库失败：放回清除前的 stop，失败的调用不改动任务。
+				self._cache.restore_crawl_stop_request(run_id, updated_at=previous_updated_at)
+			self._cache.restore_crawl_run_state(
+				run_id,
+				status=previous_status,
+				error=previous_error,
+				updated_at=previous_updated_at,
+				marked_at=marked_at,
+			)
+			raise
 		return self._run(
 			run_id,
 			settings,
@@ -666,7 +739,12 @@ class CrawlService:
 			),
 		)
 		hooks: tuple[HookInjection, ...] = ()
+		# 只有 transport.open() 返回（或 HookRegistrationError 带回了注入结果）
+		# 之后 hook_results 才可信；否则 finally 必须传 None 保留断点里的上一份
+		# 记录，不能把打开浏览器前的失败清成空列表（Issue #1983）。
+		hooks_recorded = False
 		detail_checks = 0
+		failed_detail_keys: set[str] = set()
 		status = "completed"
 		error = ""
 		# 成功路径在 completed 落库前导出并覆盖这里；异常路径保持空，错误信封
@@ -694,6 +772,7 @@ class CrawlService:
 			self._cache.mark_crawl_run_active(run_id, "running")
 			self._raise_if_stop_requested(run_id)
 			hooks = tuple(transport.open())
+			hooks_recorded = True
 			self._raise_if_stop_requested(run_id)
 			self._cache.update_crawl_run(
 				run_id,
@@ -702,7 +781,9 @@ class CrawlService:
 				list_finished=list_finished,
 				hook_results=_hook_metadata(hooks),
 			)
-			detail_checks += self._complete_pending_details(run_id, settings, transport, budget, run_budget)
+			detail_checks += self._complete_pending_details(
+				run_id, settings, transport, budget, run_budget, failed_keys=failed_detail_keys
+			)
 			while not list_finished and current_page <= settings.pages:
 				self._raise_if_stop_requested(run_id)
 				body = self._with_retry(
@@ -720,7 +801,7 @@ class CrawlService:
 					if existing is not None:
 						continue
 					# 原始列表项必须先落库：详情的风险码或第二次超时不会丢失待补队列。
-					self._cache.put_crawl_job(run_id, job_key, current_page, row, detail_done=False)
+					self._put_crawl_job(run_id, job_key, current_page, row, detail_done=False)
 
 				current_page += 1
 				# 只有平台显式返回布尔 false 才算列表结束。`not bool(None)` 为真，
@@ -735,13 +816,18 @@ class CrawlService:
 					list_finished=list_finished,
 					hook_results=_hook_metadata(hooks),
 				)
-				detail_checks += self._complete_pending_details(run_id, settings, transport, budget, run_budget)
+				detail_checks += self._complete_pending_details(
+					run_id, settings, transport, budget, run_budget, failed_keys=failed_detail_keys
+				)
 				write_run_outputs(output_dir, [item["payload"] for item in self._cache.list_crawl_jobs(run_id)])
 				if list_finished:
 					break
 			# 最后一页的导出必须在 completed 落库之前（Issue #1238）：第二次 resume
 			# 时页循环不执行，若导出留在 finally 之后，completed 会先写进数据库，
 			# 导出失败后再也无法重试，后续 resume 会报成功但产物不存在。
+			# 最后一页之后断点可能已被清理：导出前再确认一次，不能重建已删除的
+			# 产物目录并把 run 报成 completed（Issue #2208）。
+			self._raise_if_stop_requested(run_id)
 			rows = [item["payload"] for item in self._cache.list_crawl_jobs(run_id)]
 			paths = write_run_outputs(output_dir, rows)
 		except HookRegistrationError as exc:
@@ -749,6 +835,7 @@ class CrawlService:
 			# LOCAL_IO_ERROR 回报并给出具体目录。落成普通 stopped 会让调用方拿到
 			# ok:true 和会无限重复的 resume 指引（Issue #1408）。
 			hooks = exc.injections
+			hooks_recorded = True
 			status = "stopped"
 			error = str(exc)
 			raise
@@ -862,7 +949,7 @@ class CrawlService:
 					next_page=current_page,
 					error=error,
 					list_finished=list_finished,
-					hook_results=_hook_metadata(hooks),
+					hook_results=_hook_metadata(hooks) if hooks_recorded else None,
 				)
 			except Exception as exc:
 				cleanup_errors.append(exc)
@@ -956,6 +1043,8 @@ class CrawlService:
 		transport: CrawlTransport,
 		budget: CrawlBudget,
 		run_budget: CrawlRunBudget,
+		*,
+		failed_keys: set[str] | None = None,
 	) -> int:
 		if not settings.with_detail:
 			return 0
@@ -963,6 +1052,10 @@ class CrawlService:
 		for item in self._cache.list_crawl_jobs(run_id):
 			self._raise_if_stop_requested(run_id)
 			if item["detail_done"]:
+				continue
+			if failed_keys is not None and item["job_key"] in failed_keys:
+				# 本轮已经失败过的条目不再每翻一页重试，避免持续消耗详情预算；
+				# 下次 resume 会重新尝试（Issue #1981）。
 				continue
 			checks += 1
 			row = item["payload"]
@@ -978,14 +1071,35 @@ class CrawlService:
 					# 与 `crawl results --detail-status pending` 如实反映缺口，
 					# 不能伪造空卡片并标记完成（Issue #1584）。
 					row["detail_status"] = "missing-security-id"
-					self._cache.put_crawl_job(run_id, item["job_key"], int(item["page_no"]), row, detail_done=False)
+					self._put_crawl_job(run_id, item["job_key"], int(item["page_no"]), row, detail_done=False)
 					continue
 
 				def fetch_detail() -> dict[str, Any]:
 					# 结构校验与请求共用有限重试；失败时条目仍保留在待补队列。
 					return _unwrap_card(self._fetch_detail(run_id, transport, budget, run_budget, security_id))
 
-				card = self._with_retry(fetch_detail, max_retries=settings.max_retries)
+				try:
+					card = self._with_retry(fetch_detail, max_retries=settings.max_retries)
+				except Exception as exc:
+					if is_request_stop(exc) or isinstance(
+						exc,
+						(
+							PlatformRiskError,
+							CrawlRiskError,
+							CrawlRuntimeUnavailable,
+							CrawlSessionAuthError,
+							sqlite3.DatabaseError,
+						),
+					):
+						raise
+					# 平台对已下架 / 无权限职位返回空 jobCard 或单条业务错误码很常见：
+					# 单个条目失败不能让列表翻页与导出永久卡死（Issue #1981）。保留
+					# 待补状态继续处理其余条目，下次 resume 再试。
+					row["detail_status"] = "detail-error"
+					self._put_crawl_job(run_id, item["job_key"], int(item["page_no"]), row, detail_done=False)
+					if failed_keys is not None:
+						failed_keys.add(item["job_key"])
+					continue
 				row.update(
 					{
 						"post_description": field_text(card, "postDescription"),
@@ -996,7 +1110,7 @@ class CrawlService:
 					}
 				)
 				self._cache.put_job_desc(job_id, str(row["post_description"]))
-			self._cache.put_crawl_job(run_id, item["job_key"], int(item["page_no"]), row, detail_done=True)
+			self._put_crawl_job(run_id, item["job_key"], int(item["page_no"]), row, detail_done=True)
 		return checks
 
 	@staticmethod
@@ -1079,8 +1193,29 @@ class CrawlService:
 				self._cache.request_crawl_stop(run_id)
 				raise CrawlWorkflowStopRequested("workflow stop requested")
 		run = self._cache.get_crawl_run(run_id)
-		if run is not None and run["stop_requested"]:
+		if run is None:
+			# 取得执行权后断点行消失：`clean --privacy` 会删除 crawl_runs /
+			# crawl_jobs。继续采集会复活已清理的职位行、重建导出目录，而且
+			# `crawl stop` 已按 CRAWL_RUN_NOT_FOUND 无法再停止它（Issue #2208）。
+			# 控制路径按「已停止」fail-closed，不再向平台发请求。
+			raise CrawlStopRequested("采集断点已被删除（可能执行了 clean --privacy），停止本次采集")
+		if run["stop_requested"]:
 			raise CrawlStopRequested("stop requested")
+
+	def _put_crawl_job(
+		self,
+		run_id: str,
+		job_key: str,
+		page_no: int,
+		payload: dict[str, Any],
+		*,
+		detail_done: bool,
+	) -> None:
+		"""写入职位行；断点已消失时按停止结算，不复活已清理的数据（Issue #2208）。"""
+		if not self._cache.put_crawl_job(
+			run_id, job_key, page_no, payload, detail_done=detail_done, require_existing_run=True
+		):
+			raise CrawlStopRequested("采集断点已被删除（可能执行了 clean --privacy），停止本次采集")
 
 	@staticmethod
 	def _validate_settings(settings: CrawlSettings) -> None:
@@ -1099,11 +1234,28 @@ class CrawlService:
 		if settings.max_retries < 0:
 			raise ValueError("max_retries 不能为负数")
 
+	def validate_resume_settings(self, settings: CrawlSettings) -> None:
+		"""后台父进程的本地校验：与执行器同口径拒绝坏设置与坏 Hook 目录（Issue #2242）。
+
+		worker 的错误信封写进空设备：hook 目录损坏、关键词为空白这类确定性本地
+		失败必须在父进程返回 queued 之前报出来，不能先报成功再让任务停在无人
+		执行的状态。
+		"""
+		self._validate_settings(settings)
+		try:
+			verify_hook_profile(settings.hook_profile, settings.hook_dir)
+		except ValueError as exc:
+			raise CrawlHookDirInvalid(str(exc), hook_dir=settings.hook_dir) from exc
+
 
 def _normalize_job(raw: dict[str, Any], query: str, page_no: int, rank: int) -> tuple[str, dict[str, Any]]:
 	job_id = str(raw.get("encryptJobId") or "")
 	security_id = str(raw.get("securityId") or "")
-	job_key = job_id or security_id or f"{page_no}:{rank}:{field_text(raw, 'jobName')}"
+	# securityId 每次搜索请求都会轮换（operations.import_shortlist 同样不拿它做
+	# 跨 run 去重）：页内崩溃后 resume 重抓同一页会拿到新值，用它当身份会让同一
+	# 职位以新键再插一行。无稳定 job_id 时按「页 + 名次 + 标题」兜底，它们在
+	# 同一页的重复抓取之间保持不变（Issue #2029）。
+	job_key = job_id or f"{page_no}:{rank}:{field_text(raw, 'jobName')}"
 	labels = raw.get("jobLabels", [])
 	benefits = raw.get("welfareList", [])
 	return job_key, {
@@ -1176,12 +1328,27 @@ def _output_paths(output_dir: Path) -> dict[str, str]:
 	return {extension: str(output_dir / f"jobs.{extension}") for extension in ("json", "csv", "xlsx")}
 
 
+def _remove_run_artifacts(output_dir: Path) -> None:
+	"""删掉三份确定性产物；缺失 / 无法删除的文件忽略（Issue #2241）。
+
+	清理失败不能把「断点已被清理」的确定性错误盖成 INTERNAL_ERROR：调用方
+	需要的结论是任务已不存在，而不是某个已失效文件删不掉。
+	"""
+	for extension in ("json", "csv", "xlsx"):
+		try:
+			(output_dir / f"jobs.{extension}").unlink(missing_ok=True)
+		except (OSError, ValueError):
+			pass
+
+
 def _artifacts_present(output_dir: Path) -> bool:
 	"""三份产物是否都还是普通文件；任何 stat 错误按缺失处理，交给导出路径报确定性错误。"""
 	for extension in ("json", "csv", "xlsx"):
 		try:
 			mode = (output_dir / f"jobs.{extension}").lstat().st_mode
-		except OSError:
+		except (OSError, ValueError):
+			# ValueError 来自路径里的 NUL 等控制字符；读取边界已经拒绝这类
+			# 断点（Issue #2194），这里再兜一层，避免字符错误逃成参数错误。
 			return False
 		if not stat.S_ISREG(mode):
 			return False

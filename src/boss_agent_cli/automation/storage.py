@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from boss_agent_cli.automation.models import AutomationEvent, PendingAction, PlatformAction, ReviewItem
-from boss_agent_cli.cache.store import database_path_problem, is_cache_busy_error
+from boss_agent_cli.cache.store import database_path_problem, is_cache_busy_error, is_cache_local_io_error
 from boss_agent_cli.services.chat_utils import sanitize_csv_cell
 
 
@@ -94,6 +94,31 @@ def _refuse_symlink_write(path: Path, label: str) -> None:
 			f"{label} 无法写入：路径不是普通文件（目录 / FIFO / 设备）；"
 			"请先检查该路径后重试",
 		)
+
+
+def _unparsed_jsonl_lines(payload: bytes) -> list[bytes]:
+	"""返回读取路径会跳过的原始行：坏编码 / 坏 JSON / 非 object（Issue #2172）。
+
+	判定必须与 ``AutomationStore.read_jsonl`` 的容错口径保持一致：这里多留一行
+	无害，少留一行就是整文件回写时的静默数据丢失。
+	"""
+	unparsed: list[bytes] = []
+	for raw_line in payload.splitlines():
+		try:
+			line = raw_line.decode("utf-8")
+		except UnicodeDecodeError:
+			unparsed.append(raw_line)
+			continue
+		if not line.strip():
+			continue
+		try:
+			parsed = json.loads(line)
+		except (ValueError, RecursionError):
+			unparsed.append(raw_line)
+			continue
+		if not isinstance(parsed, dict):
+			unparsed.append(raw_line)
+	return unparsed
 
 
 class AutomationStore:
@@ -236,6 +261,10 @@ class AutomationStore:
 					raise AutomationRunBusy(
 						"另一个 boss agent run 正在执行，本次没有发出任何请求"
 					) from exc
+				# 目录不可写 / 磁盘满等本地 IO 错误不是锁文件损坏：原样上抛交给
+				# main 的 LOCAL_IO_ERROR 分支（Issue #1930）。
+				if is_cache_local_io_error(exc):
+					raise
 				# 锁文件损坏或路径被同名目录占用是确定性本地状态问题：原样上抛
 				# 会让命令丢掉整个信封，或在 agent run 里被兜成可重试的
 				# NETWORK_ERROR（Issue #1304）。
@@ -273,6 +302,9 @@ class AutomationStore:
 					raise AutomationControlBusy(
 						"automation 控制锁正被其他进程占用，本次操作没有生效"
 					) from exc
+				# 与执行锁同口径：本地 IO 错误交给 main 的 LOCAL_IO_ERROR 分支（Issue #1930）。
+				if is_cache_local_io_error(exc):
+					raise
 				# 锁文件损坏 / 路径被同名目录占用：确定性本地状态问题（Issue #1304）。
 				raise AutomationStateError(
 					lock_path,
@@ -323,6 +355,15 @@ class AutomationStore:
 			errors = state.get("safety", {}).get("consecutive_errors", 0)
 			if isinstance(errors, bool) or not isinstance(errors, int):
 				raise AutomationStateError(self.state_path, "safety.consecutive_errors 必须是整数")
+			if errors < 0:
+				# 失败计数只递增、归零；负值（外部编辑 / 迁移）会让连续失败熔断
+				# 需要更多次失败才打开，削弱安全闩锁，按状态损坏 fail-closed
+				# （Issue #1242、#1330、#2173）。
+				raise AutomationStateError(
+					self.state_path,
+					"safety.consecutive_errors 必须是非负整数；连续失败熔断按该计数判断，"
+					"负值会让熔断不按预期打开。请先备份 state.json，再修正该字段或移除它",
+				)
 		stop = self.read_stop()
 		if "open" in stop:
 			state.setdefault("autonomy", {})["circuit_breaker"] = stop
@@ -353,7 +394,14 @@ class AutomationStore:
 		fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=self.root)
 		try:
 			with os.fdopen(fd, "w", encoding="utf-8") as handle:
-				json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+				try:
+					json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+				except (ValueError, RecursionError) as exc:
+					# 深嵌套 / 循环引用的状态读得进来却写不回去：必须报本地状态
+					# 不可写，不能兜成可重试的 NETWORK_ERROR（Issue #1929）。
+					raise AutomationStateError(
+						path, f"状态文件无法序列化（{type(exc).__name__}: {exc}）"
+					) from exc
 				handle.flush()
 				os.fsync(handle.fileno())
 			os.replace(temporary, path)
@@ -487,6 +535,29 @@ class AutomationStore:
 				updated_reviews.append(item)
 		if rejected is None:
 			return None
+		# approve 的「先入队、再写复核队列」可能在中途失败，留下携带
+		# approved_review_id 的 pending 行（Issue #1248）。人工拒绝后它不能再被
+		# 下一轮派发：尚未派发的行就地移除；已在执行 / 结果未知的行拒绝本次
+		# reject，先让操作者核对，绝不静默删除可能已生效的写操作（Issue #2124）。
+		pending_rows = self.read_pending()
+		linked = [row for row in pending_rows if row.approved_review_id == review_id]
+		inflight = [row for row in linked if row.status in {"executing", "verification-required"}]
+		if inflight:
+			raise AutomationStateError(
+				self.pending_path,
+				f"复核项 {review_id!r} 对应的动作已派发（状态 {inflight[0].status}），"
+				"结果未知；先核对平台与 action-log，再决定是否拒绝",
+			)
+		if any(row.status == "pending" for row in linked):
+			# 先移除队列行再改写复核：反过来失败会让 rejected 的复核仍留下可派发
+			# 的 pending 行。中断后复核仍是 review，可以再次 approve / reject。
+			self.write_pending(
+				[
+					row
+					for row in pending_rows
+					if not (row.approved_review_id == review_id and row.status == "pending")
+				]
+			)
 		self.write_reviews(updated_reviews)
 		return rejected
 
@@ -555,19 +626,54 @@ class AutomationStore:
 	def write_jsonl(self, name: str, rows: list[dict[str, Any]]) -> None:
 		path = self.root / name
 		_refuse_symlink_write(path, "队列文件")
-		body = "".join(
-			f"{json.dumps(row, ensure_ascii=False, sort_keys=True)}\n"
-			for row in rows
-		)
+		try:
+			body = "".join(
+				f"{json.dumps(row, ensure_ascii=False, sort_keys=True)}\n"
+				for row in rows
+			)
+		except (ValueError, RecursionError) as exc:
+			# 与 _write_json_atomic 同口径：序列化失败是本地状态问题（Issue #1929）。
+			raise AutomationStateError(
+				path, f"队列文件无法序列化（{type(exc).__name__}: {exc}）"
+			) from exc
+		# 读取路径会跳过坏行（Issue #1337），整文件回写不能因此把它们删掉：
+		# 一行可能是一条已批准但因崩溃截断的动作记录，静默删除后既不会执行、
+		# 也不会留下任何痕迹（Issue #2172）。坏行按原字节保留在文件末尾。
+		preserved = self._preserved_jsonl_lines(path)
 		fd, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=self.root)
 		try:
-			with os.fdopen(fd, "w", encoding="utf-8") as handle:
-				handle.write(body)
+			with os.fdopen(fd, "wb") as handle:
+				try:
+					handle.write(body.encode("utf-8"))
+				except UnicodeEncodeError as exc:
+					# JSON 解码允许转义的孤立代理字符，UTF-8 写入会拒绝（Issue #2073）。
+					raise AutomationStateError(path, f"队列文件无法编码为 UTF-8（{exc}）") from exc
+				for raw_line in preserved:
+					handle.write(raw_line)
+					handle.write(b"\n")
 				handle.flush()
 				os.fsync(handle.fileno())
 			os.replace(temporary, path)
 		finally:
 			Path(temporary).unlink(missing_ok=True)
+
+	def _preserved_jsonl_lines(self, path: Path) -> list[bytes]:
+		"""回写前读出读取路径会跳过的原始行，按原字节保留（Issue #2172）。
+
+		调用方已通过 ``_refuse_symlink_write`` 排除符号链接与特殊文件；这里
+		只需处理「文件不存在」与读取失败，读取失败按状态损坏 fail-closed。
+		"""
+		try:
+			payload = path.read_bytes()
+		except FileNotFoundError:
+			return []
+		except OSError as exc:
+			raise AutomationStateError(
+				path,
+				f"队列文件无法读取（{exc}）；回写会丢失无法解析的行，已停止。"
+				"请确认文件可读后重试，文件损坏时先备份再修正或移除",
+			) from exc
+		return _unparsed_jsonl_lines(payload)
 
 	def append_interview_lead(
 		self,
@@ -597,7 +703,10 @@ class AutomationStore:
 			# 其余路径写入会失败或丢掉链接目标之外的数据。
 			raise AutomationStateError(path, "interview-leads.csv 不是普通文件，请先检查该路径后重试")
 		if mode is None:
-			path.write_text("candidate_key,interview_time,reason\n", encoding="utf-8")
+			try:
+				path.write_text("candidate_key,interview_time,reason\n", encoding="utf-8")
+			except (OSError, UnicodeError) as exc:
+				raise AutomationStateError(path, f"面试线索表无法写入（{exc}）") from exc
 		else:
 			try:
 				with path.open("r", encoding="utf-8", newline="") as handle:
@@ -611,8 +720,13 @@ class AutomationStore:
 				# 读不出来就无法判重，也无法确认不会覆盖历史：与队列读取同口径
 				# fail-closed，而不是让 PermissionError 冒成内部错误。
 				raise AutomationStateError(path, f"面试线索表无法读取（{exc}）") from exc
-		with path.open("a", encoding="utf-8", newline="") as handle:
-			csv.writer(handle).writerow(row)
+		try:
+			with path.open("a", encoding="utf-8", newline="") as handle:
+				csv.writer(handle).writerow(row)
+		except (OSError, UnicodeError) as exc:
+			# 只读文件 / 磁盘满 / 孤立代理字符：带路径报状态不可写，与队列写入口径
+			# 一致（Issue #1933）。
+			raise AutomationStateError(path, f"面试线索表无法写入（{exc}）") from exc
 		return True
 
 	def stats(self) -> dict[str, Any]:
@@ -627,7 +741,10 @@ class AutomationStore:
 		recent_errors = [
 			item
 			for item in events[-20:]
-			if item.get("status")
+			# 数组 / 对象的 `in` 集合判断会抛 TypeError，把恢复入口兜成
+			# INTERNAL_ERROR：先做类型校验（Issue #1928）。
+			if isinstance(item.get("status"), str)
+			and item.get("status")
 			in {"STOPPED_BY_SAFETY", "CIRCUIT_BREAKER_OPEN", "PLATFORM_VERIFICATION_REQUIRED"}
 		]
 		return {
@@ -655,12 +772,24 @@ class AutomationStore:
 		path = self.root / name
 		_refuse_symlink_write(path, "队列文件")
 		try:
-			with path.open("a", encoding="utf-8") as handle:
-				handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True))
-				handle.write("\n")
-		except OSError as exc:
+			# 上一次写入的末行可能缺少换行。保留其分隔符，避免追加后两条记录
+			# 粘成一行并在读取时一起丢失（Issue #2072）。
+			record = (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+			with path.open("a+b") as handle:
+				handle.seek(0, os.SEEK_END)
+				if handle.tell() > 0:
+					handle.seek(-1, os.SEEK_END)
+					if handle.read(1) != b"\n":
+						record = b"\n" + record
+				handle.write(record)
+				# 追加的是「已批准动作」等关键记录：与 _write_json_atomic 同口径
+				# fsync，缩小崩溃 / 断电只落下半行的窗口（Issue #2172）。
+				handle.flush()
+				os.fsync(handle.fileno())
+		except (OSError, ValueError, RecursionError) as exc:
 			# 只读文件 / 只读目录 / 磁盘满：动作已经发生，写不进日志同样必须
-			# 带着路径与原因停下，不能兜成可重试的通用错误。
+			# 带着路径与原因停下，不能兜成可重试的通用错误。深嵌套 / 循环引用
+			# 的序列化失败同属本地状态问题（Issue #1929）。
 			raise AutomationStateError(
 				path,
 				f"队列文件无法写入（{exc}）；请确认文件可写（权限正常、路径不是目录）后重试",
@@ -703,13 +832,25 @@ def _row_text(row: dict[str, Any], key: str, path: Path, default: str = "") -> s
 
 
 def _review_from_row(row: dict[str, Any], path: Path) -> ReviewItem:
+	if "status" not in row:
+		# 与 pending 队列同口径（Issue #2022）：缺字段的复核项不能默认成
+		# 可等待 / 可批准的 review。
+		raise AutomationStateError(path, f"记录 {str(row.get('id', ''))!r} 缺少 status 字段")
+	status = row["status"]
+	if not isinstance(status, str) or status not in _REVIEW_STATUSES:
+		# 漂移值会让复核项永远不匹配 "review"，approve 报「不存在或已处理」，
+		# stats 也不再计数：与 pending 队列同口径 fail-closed（Issue #1931）。
+		raise AutomationStateError(
+			path, f"记录 {str(row.get('id', ''))!r} 的 status {status!r} 不是已知状态"
+		)
+	action = str(row.get("action", ""))
 	return ReviewItem(
 		id=str(row.get("id", "")),
 		ts=str(row.get("ts", "")),
 		platform=_row_text(row, "platform", path),
 		candidate_key=_row_text(row, "candidate_key", path),
-		action=str(row.get("action", "")),
-		status=str(row.get("status", "review")),
+		action=action,
+		status=status,
 		confidence=_row_confidence(row, path),
 		reason=_row_text(row, "reason", path),
 		message=_row_text(row, "message", path),
@@ -722,9 +863,17 @@ def _review_from_row(row: dict[str, Any], path: Path) -> ReviewItem:
 #: 动作可能已派发，必须跳过且不重发；executed 是终态。
 _PENDING_STATUSES = frozenset({"pending", "executing", "executed", "verification-required"})
 
+#: 复核队列的合法状态：review 等待人工处理；approved / rejected 是终态。
+_REVIEW_STATUSES = frozenset({"review", "approved", "rejected"})
+
 
 def _pending_from_row(row: dict[str, Any], path: Path) -> PendingAction:
-	status = row.get("status", "pending")
+	if "status" not in row:
+		# 缺字段不能默认成可执行的 pending：迁移 / 外部写入丢字段时该行实际
+		# 可能已是 executing / executed，默认 pending 会重复派发可能已生效的
+		# 写动作（Issue #2022）。
+		raise AutomationStateError(path, f"记录 {str(row.get('id', ''))!r} 缺少 status 字段")
+	status = row["status"]
 	if not isinstance(status, str) or status not in _PENDING_STATUSES:
 		# status 漂移（null / 数字 / 数组 / 对象 / 大小写不符 / 旧版 "dry-run"）会被
 		# process_pending 静默 continue：已批准的动作永远不执行，agent run
@@ -734,12 +883,13 @@ def _pending_from_row(row: dict[str, Any], path: Path) -> PendingAction:
 		raise AutomationStateError(
 			path, f"记录 {str(row.get('id', ''))!r} 的 status {status!r} 不是已知状态"
 		)
+	action = str(row.get("action", ""))
 	return PendingAction(
 		id=str(row.get("id", "")),
 		ts=str(row.get("ts", "")),
 		platform=_row_text(row, "platform", path),
 		candidate_key=_row_text(row, "candidate_key", path),
-		action=str(row.get("action", "")),
+		action=action,
 		status=status,
 		confidence=_row_confidence(row, path),
 		reason=_row_text(row, "reason", path),

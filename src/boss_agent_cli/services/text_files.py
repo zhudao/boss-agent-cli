@@ -17,6 +17,20 @@ from pathlib import Path
 from boss_agent_cli.services.output_path import refuse_non_regular_target
 
 
+def sanitize_surrogates(text: str) -> str:
+	"""孤立代理项按 backslashreplace 归一，stdout / 文件路径同口径（Issue #2017）。
+
+	Linux 上 argv 里的非 UTF-8 字节（如数据目录路径）经 surrogateescape 解码为
+	孤立代理字符；严格 UTF-8 编码会抛 ``UnicodeEncodeError``，把已经成功的
+	文件写出报成失败（Issue #2109）。HTML / JSON / CSV 等文本产物统一先过这里。
+	"""
+	try:
+		text.encode("utf-8")
+	except UnicodeEncodeError:
+		return text.encode("utf-8", "backslashreplace").decode("utf-8")
+	return text
+
+
 def write_text_atomic(
 	path: str | os.PathLike[str],
 	body: str,
@@ -30,7 +44,9 @@ def write_text_atomic(
 	target.parent.mkdir(parents=True, exist_ok=True)
 	temporary: Path | None = None
 	try:
-		fd, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+		# 与 json_files 同口径：临时名不含目标文件名，避免长文件名的 ENAMETOOLONG
+		# （Issue #1985）。
+		fd, temporary_name = tempfile.mkstemp(prefix=".boss-text-", dir=target.parent)
 		temporary = Path(temporary_name)
 		# 与 json_files 同口径：孤立代理字符无法按 UTF-8 编码，严格模式会让
 		# 导出在写盘时抛 UnicodeEncodeError、命令丢掉信封（Issue #1294）。

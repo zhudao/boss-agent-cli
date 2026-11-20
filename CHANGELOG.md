@@ -5,6 +5,251 @@
 ## [Unreleased]
 
 ### Fixed
+- 外部 eval 在评分前校验 runner 输出结构：`with_mcp` / `baseline` 缺失、不是对象，或 `tool_calls` / `envelopes` 缺失、不是对象数组时，该场景记为 `contract_error`，不再把缺失的基线算作「基线失败」而判定通过，也不再因类型错误、超长整数或非 UTF-8 输出中止整轮；其余场景照常评分并写入报告。场景夹具加载走同一校验，默认 runner 固定用 UTF-8 交换数据（Issue #2258）。
+
+## [3.4.141] - 2026-11-20
+
+### Fixed
+- Rich 外部文本转义改为自包含：相邻字段里的悬空方括号不再跨值组成标签，结尾反斜杠与 `\[` 按字面保留，职位详情不再因招聘者名称等字段组合而丢文本、泄漏样式或抛 `MarkupError`；统计恢复指引同走该入口（Issue #2251）。
+- TTY 渲染出口统一剥离非 Rich 控制段里的 C0 / C1 控制字符，覆盖向导的 `Text` 正文与表格；两种菜单驱动统一清洗外部标签与说明、菜单标题单行化，进度计数按字面转义，技能 / 标签字段按列表归一，形状漂移不再让向导崩溃（Issue #2252）。
+- 清除自定义 AI 端点后恢复服务商默认地址：`ai config --clear-base-url` 写回 `null`，服务构造同时兼容旧版本写入的空串，不再把官方清除命令产生的配置报成 `CONFIG_INVALID`（Issue #2253）。
+- AI 端点拒绝 query / fragment、不可见格式字符与超长地址；请求构造期的代理配置错误及 UTF-8 编码错误收口成确定性的 `INVALID_PARAM` 并给出修复指引，网络异常文本同步脱敏；自动回复读取损坏端点时降级模板话术，不中止整轮自动化（Issue #2254）。
+- 本地模型导入在复制前检查目标目录归属：不同模型名折叠到同一个目录（含大小写冲突）时拒绝导入，保留已有权重与登记表；`import.lock` 与登记表文件名同列保留名，同名重新导入仍可更新自己的权重（Issue #2255）。
+
+## [3.4.140] - 2026-11-20
+
+### Fixed
+- 自由文本脱敏识别 camelCase 凭据键：`accessToken` / `refreshToken` / `clientSecret` / `sessionId` 等键名中关键字前是小写字母，此前的「非字母数字」边界不成立，凭据会明文进入 `error.message` / `recovery_action` 与 MCP 子进程失败信息；新边界只在小写→大写转折处成立，`token_expires_in` / `max_tokens` 等配置名不被误伤（Issue #2231）。
+- 结构化与文本脱敏补上 `passwd` 凭据键：此前只认 `password`，`{"passwd": "..."}` 与 `passwd=...` 都原样输出（Issue #2232）。
+- 无请求预算的客户端也把 `Retry-After` 截断到本地冷却上限（1 小时）：Python API / MCP 子进程拿到 `429 + Retry-After: 86400`（或 HTTP-date 的远未来时间）时不再被 `cancellable_sleep` 挂起数小时到数天（Issue #2234）。
+- `probe_cdp` 把 `httpx.InvalidURL` 当作探测不可用：Python API 传畸形 `cdp-url` 时不再让裸异常打断登录降级链，继续按契约降级到 patchright 扫码（Issue #2235）。
+- Cookie 校验跟随重定向后按最终 URL / 正文做风控判定：平台以 302 送到 `403.html` / verify / security 页时不再被当成「Cookie 失效」，正确抛出风控异常并写入本地风险锁（Issue #2236）。
+- Cookie 校验把 429 与业务码 9（整数 / 字符串同口径）识别为限流而非登录态失效：`login` 不再报「Cookie 已失效」并降级 CDP / 扫码，`import_curl` 不再报「未通过验证」，统一报可重试的 `RATE_LIMITED` 并给出等待后重试的指引（Issue #2237）。
+- TTY 渲染统一剥离平台文本里的终端控制字符：`escape_markup` 在 Rich markup 转义前去掉 ESC / OSC / CSI 等 C0（保留 `\t` / `\n`）与 C1 控制字符，职位名、公司名、聊天内容与 AI 输出不再能把原始转义序列写进终端（改写标题、伪造可点击链接、清屏）；`display.py` 里直接 `escape(...)` 的外部文本调用点一并改走该入口（Issue #2245）。
+- 错误行的错误码按字面渲染：TTY 分支改用 `rich.text.Text` 组装整行，未注册错误码含未配对方括号时不再抛 `MarkupError` 把错误信息与退出码一起吞掉（Issue #2246）。
+- TTY 列表 / 详情渲染入口容忍形状漂移：`render_job_table` / `render_simple_list` 跳过非对象条目并按过滤后条目计数，`render_job_detail` 把字符串 `skills` 当单条、其余非列表按空处理，损坏缓存或平台字段变化不再兜成裸 `TypeError`（Issue #2247）。
+- 前台恢复在取得执行权后、慢预检之前先把状态落成 `running`：预检（依赖探测、读取登录态）期间到达的 `crawl stop` 不再因旧终态被拒、停止请求丢失，恢复会立即按停止结算；预检失败时原状态 / 错误 / 时间戳原样还原，预检窗口内新到达的 stop 及其时间戳保留（Issue #2240）。
+- `clean --privacy` 与 completed 快速路径并发时不再重建已清理的采集产物：快速路径导出前后重读断点，行已消失即放弃写出并删除刚重建的文件；清理改为先删数据库行、再删产物文件，两者共用同一时序契约（Issue #2241）。
+- `crawl resume --background` 的父进程与执行器同口径校验 Hook 目录与断点设置：hook 目录损坏、关键词为空白等确定性本地失败在返回 `queued` 之前报出（`LOCAL_IO_ERROR`），不再先报成功再让 worker 静默失败（Issue #2242）。
+- 后台恢复交接窗口内的显式 `--pages` / `--with-detail` 与刚到达的停止标记不再被静默忽略：无法生效时返回可重试的 `CRAWL_BUSY`，而不是假装参数已应用（Issue #2243）。
+
+## [3.4.139] - 2026-11-20
+
+### Fixed
+- 自动化决策的 `has_exchange` 只看候选人一侧文本：我方问卷 / 追问话术里出现「交换微信」「已交换」时不再判定「已交换」并把候选人静默跳过，与升级检测的 #1945 同口径；我方动作仍以 `exchange_contact_at` 为准（Issue #2227）。
+- 面试时间按最近消息优先提取：候选人改期（「明天下午 3 点」→「改到后天上午 10 点」）不再取到已作废的旧时间，历史里的时间也不再每轮命中；有方向信息时以 `ordered_messages` 顺序为准（Issue #2228）。
+- 转录没有任何我方消息锚点时不再把触发问卷的旧消息当成候选人回复：自动追问与交换联系方式不再由一条历史消息触发，保守按等待回复处理（Issue #2229）。
+- 缓存层的本地 JSON 列统一按 `ensure_ascii=True` 写入、搜索键按 `backslashreplace` 编码：平台 JSON 里的孤立代理字符（`\ud800`）不再让 `put_crawl_job` 抛 `UnicodeEncodeError` 把采集任务永久卡在 `stopped`，`search` / `shortlist` 也不再以 `LOCAL_IO_ERROR` 失败；读回值不变（Issue #2223）。
+- `shortlist list` 逐行容错：单条记录字段写坏（如 `created_at` 是 BLOB）不再让整个候选池不可见，坏行跳过并通过 `hints.corrupt` 与操作指引指名删除重建；新增 `list_shortlist_with_corrupt`，与 watch / preset 的 corrupt 名单同口径（Issue #2224）。
+- 残留事务不再被误判为缓存库损坏：`BEGIN IMMEDIATE` 前先回滚连接上未提交的隐式事务；`cannot start a transaction within a transaction` 按写入拒绝上报，不再引导用户备份并删除完好的缓存库（Issue #2225）。
+- 本地 JSON 序列化边界把 `TypeError` 也归成本地 IO 错误：写入不可序列化的值（元组键、`bytes`、`set`）时不再让裸 `TypeError` 穿出命令层（stdout 无信封、stderr 裸 traceback），按 `LOCAL_IO_ERROR` 报出且保留原文件与既有原子写语义（Issue #2220）。
+- 聊天快照服务边界过滤非对象条目：平台列表页混入 `null` / 字符串 / 数字时不再在 `contact_identity` 上抛 `AttributeError` 让整次快照与导出失败；丢弃过条目按不完整处理（不推断「已消失」、不写完整标记），与 `chat_export` 的渲染边界同口径（Issue #2221）。
+- 写请求只在「请求可能已发出」时落成 `ACTION_UNCONFIRMED`：`ConnectError` / `ConnectTimeout` / `PoolTimeout` / `ProxyError` / `UnsupportedProtocol` / `LocalProtocolError` 确定发生在连接建立或请求构造阶段，断网、DNS 失败或代理不可达时不再被报成不可恢复的「结果未知、禁止重试」，改为原样上抛、由命令出口按可重试的 `NETWORK_ERROR` 收口（Issue #2216）。
+- `job_card()` 在 `httpx-only` 策略下不再回退不存在的浏览器通道：httpx 失败时原样上抛真实错误，不再用 `BROWSER_DISABLED`「该能力需要页面通道」覆盖 5xx / 超时 / 解析失败的原因（Issue #2217）。
+- stoken 过期判断与其它业务码消费点同口径，字符串 `"37"` 与整数 `37` 一样触发刷新；平台码序列化类型漂移时不再漏刷新、把过期响应当普通结果返回（Issue #2218）。
+- 非 UTF-8 stdout（中文 Windows 的 cp936 重定向 / 自定义 `PYTHONIOENCODING`）下报表与信封不再因 emoji 编码失败：信封在无法按 stdout 编码写出时回退为 `\uXXXX` 转义的 ASCII（仍是合法 JSON，值不变）；`stats --format html` / `digest --format md` / `export --format html` 的直出分支重定向时写 UTF-8 字节、终端时按实际编码归一；报表模板去掉 emoji（`📊` / `⚠️` 改为纯文本），不再误报「确认目标路径可写」的 `LOCAL_IO_ERROR`（Issue #2213）。
+- `render_digest_markdown` 对 `new_matches` / `follow_ups` / `interviews` 里的非对象条目按缺失过滤，与 #2162 的导出服务边界同口径：库内直接调用或未来调用方传入 `null` / 字符串 / 数字时不再抛 `AttributeError`，计数与展示只包含对象条目（Issue #2214）。
+- 采集执行中断点被 `clean --privacy` 删除后按「已停止」fail-closed：执行器不再把「行不存在」当成「没有 stop」，后续页的职位行不会复活已清理的 `crawl_jobs`、导出目录不会被重建、信封也不再报 `completed` 指向不存在的 run；执行器写职位行改为以 `crawl_runs` 行存在为前提的原子插入（`require_existing_run`），最后一页之后导出前再确认一次断点（Issue #2208）。
+- 前台 `crawl resume` 在预检之前清除旧停止标记、失败时还原：预检（依赖探测、登录态读取）期间到达的新 `crawl stop` 不再被预检后的清理当成上一轮残留清掉，采集立即按停止结算；与后台恢复路径同构（Issue #2209）。
+- `job_desc_cache.description` 的 BLOB 存储类漂移在读取边界按 UTF-8 解码，解码失败或其它类型按「未命中」处理并重新取详情：漂移值不再进入 payload 让 `put_crawl_job` 的 `json.dumps` 抛 `TypeError`、把任务永久停在 `stopped` 却报 `ok:true`；`search_filters` / `ai` / `agent` 的详情缓存消费点同口径（Issue #2210）。
+- 自动化队列认领的会话不再交给扫描路径：本轮队列已尝试过（含被平台拒绝后退回 `pending`）以及仍有 `pending` / `executing` 队列行的候选人，扫描路径不会在同一轮用模板话术顶替、也不会跨轮把同一动作再发一次；同一动作已在会话中完成时（`questionnaire_sent_at` 等）遗留队列行标记为已执行而不是重发（Issue #2211）。
+- 登录态校验在任何请求之前先解析代理配置：`HTTPS_PROXY` / `ALL_PROXY` 是 `socks9://`、端口非数字这类坏值时，`login --cookie` 不再把 `ProxyConfigurationError` 当成 Cookie 失效、清掉刚保存的登录态并回退到扫码；按 `INVALID_PARAM` 报出代理配置错误（Issue #2203）。
+- AI 密钥派生与登录态侧同口径：`BOSS_AGENT_MACHINE_ID` 按 surrogateescape 解码出孤立代理字符时，AI 加密密钥改用 `surrogatepass` 编码，同一机器 ID 不再在 auth 侧可用、AI 侧抛 `UnicodeEncodeError`（Issue #2204）。
+- `ai_base_url` 的读取与写入走同一套校验：配置里缺 scheme 或含空白 / 控制字符的地址（`\t`、空格、DEL）按带修复指引的 `CONFIG_INVALID` 报本地配置错误（与 #1636 的持久化配置契约一致），不再让每条 AI 命令由 httpx 抛 `InvalidURL` / `UnsupportedProtocol` 并被兜成可重试的 `AI_API_ERROR`；`ai local status` 等无认证装饰器的命令路径也由 CLI 兜底出信封（Issue #2205）。
+- 收紧登录态与 AI 密钥文件权限时不跟随符号链接：`session.enc` / `salt` / `api_key.enc` 是指向别处的符号链接时不再 `chmod` 目标文件（此前可能改掉用户其它文件的权限），只对普通文件收紧到 0600（Issue #2206）。
+
+## [3.4.138] - 2026-11-20
+
+### Fixed
+- `salt` 创建不再硬依赖硬链接：exFAT / 部分 SMB / FUSE 等不支持硬链接的文件系统上回退为独占创建，首次登录不再在保存登录态时确定性失败；回退的半写窗口由读取端有界等待兜住，写入失败会清理半写文件（Issue #2200）。
+- 空 `wizard --input-json` 的恢复指引改为提示传入符合向导目录要求的 JSON 对象并查阅 `boss schema`，不再让调用方去补一个创建任务用不到的 `run_id`；其余空选择器仍提示补齐任务 ID（Issue #2190）。3.4.137 的构建不含此修复，条目从已发布段落移回。
+- 采集断点的 `updated_at` 是有限但远在未来的值时（时钟快进后校正、手工写坏的库），queued 任务不再被永远当成「刚排队」：后台恢复探测执行锁并拉起 worker，`crawl status` 给出 `crawl resume --background` 提示；轻微时钟偏斜仍按刚排队处理（Issue #2193）。
+- `crawl_runs.output_dir` 含控制字符时断点读取边界按 `CACHE_RECORD_INVALID` fail-closed，`crawl status` 与 `crawl resume` 对同一断点同口径，不再把路径字符错误报成 `INVALID_PARAM`（Issue #2194）。
+- 后台恢复把状态落成 queued 失败时还原已清除的旧停止标记，保持「失败的调用不改动任务」；不再出现 stop 已清、worker 未起、状态未变的半写结果（Issue #2195）。
+- `-o` 输出路径预检增加父目录可写性检查：只读目录下的合法路径不再先消耗一次平台请求、更新当日聊天快照才报 `PermissionError`，改为在任何请求与快照写入之前返回 `LOCAL_IO_ERROR`（Issue #2197）。
+- CSV/Markdown 清洗函数的非字符串兜底改为经 `safe_text` 转成字符串并走同一套清洗链：漂移值同样执行公式前缀与 Tab/回车过滤，超大整数不再抛 `ValueError`（Issue #2198）。
+
+## [3.4.137] - 2026-11-20
+
+### Fixed
+- wizard 断点里「状态是 pending、已落盘结果却是 completed」的矛盾不再被当成待执行步骤：恢复时按 `CACHE_RECORD_INVALID` 拒绝，可能已生效的写步骤不会被重放（Issue #2183）。
+- wizard 自定义动作返回非终态结果并声明写请求在途时，中断后留下的 `pending` 步骤与 `running` 同口径结算为「结果未知」，`--resume` 不再重发可能已生效的写请求（Issue #2184）。
+- wizard 恢复前核对断点的请求步骤与已落盘步骤行：`params.requested_steps` 漂移成子集时第一次恢复就拒绝，不再漏跑步骤却把 run 写成 `completed`（Issue #2185）。
+- `wizard --input-json` 的输入结构校验增加嵌套深度上限：深层嵌套不再让 `RecursionError` 逃出信封边界，按 `INVALID_PARAM` 返回确定诊断（Issue #2186）。
+- 失败 workflow 的顶层 `error` 漂移为空对象时，出口回退到断点步骤里已校验的错误：结果未知的写步骤不再被报成可重试的 `NETWORK_ERROR`，核对指引得以保留（Issue #2187）。
+- wizard 计划比较按 JSON 值类型进行：直接调用 `WorkflowRunner` 时 `False` 与 `0` 不再被当成同一份输入，同时保留 NaN 按同值处理的兼容（Issue #2188）。
+- 自动化队列的整文件回写保留读取路径会跳过的原始行：`pending-actions.jsonl` / `human-review-queue.jsonl` 里坏编码、坏 JSON 或非 object 的行不再在下一次 `write_pending` / `write_reviews` 时被静默删除（一行可能是一条已批准但因崩溃截断的动作记录，删除后既不执行也无痕迹）；旧文件读不出来时按 `AUTOMATION_STATE_INVALID` 停止回写；追加队列记录补 `flush` + `fsync`，缩小断电只落下半行的窗口（Issue #2172）。
+- `state.json` 的 `safety.consecutive_errors` 读取时要求非负整数：外部编辑写入的负值不再让连续失败熔断需要更多次失败才打开，按 `AUTOMATION_STATE_INVALID` 报状态损坏并提示修正方式（Issue #2173）。
+- MCP 入口落实 schema 里声明的条件约束：`boss_config` / `boss_hr_jobs` 的未知 `action`（如 `--`、`--help`）在映射层按 `INVALID_PARAM` 拒绝，不再被 CLI 当成默认 `list` 或帮助选项；`config set` 缺 `key` 时不再让 `value` 顶到 KEY 位置、报错误的「缺少 VALUE」；`crawl_shortlist` 同时给 `selectors` 与 `all` 时按互斥约束拒绝；JSON 数字 `1.0`（小数部分为零）按 JSON Schema 语义归一成整数，不再被入口误判为类型错误（Issue #2175）。
+- MCP 映射的三个 AI 工具把显式空 `resume` 原样下发，让 CLI 的 `INVALID_PARAM`「简历名称不能为空」诊断生效，不再静默生成无简历参考的结果；子进程超时估算只看 `--` 之前的选项，关键词恰好以 `--dry-run` / `--count=1` 开头时不再把长任务预算错误缩短（Issue #2176）。
+- MCP 的 schema 与只读分类对齐：`search.active` 的枚举补空字符串（清除 preset 保存的活跃度筛选）、`shortlist_annotate` 的标签数组要求至少一项；`dry_run` 调用与 `config list/get` 按只读回报中断恢复，不再要求核对不存在的平台写入（Issue #2177）。
+- 聊天快照会把混入非对象或缺失可用身份的沟通列表页视为不完整，并保留当天已观察到的联系人。历史快照过滤过条目时不推断联系人新增（Issue #2179）。
+- 聊天快照的负未读数按 0 比较，历史记录从 `-1` 恢复到 `0` 时不再误报新增未读（Issue #2180）。
+- 聊天导出在同一把日锁下读取历史快照及其完整性标记，跨日并发时不会把不同版本拼成一份基线（Issue #2181）。
+
+## [3.4.136] - 2026-11-20
+
+### Fixed
+- 采集注入 Cookie 的失败原因做值级脱敏：`_failure_reason` 先把所有 seed Cookie 值替换成 `[REDACTED]` 再截断，DrissionPage 的 `ValueError` 把整个 cookie 字典（含 `value`）拼进消息时，`AUTH_REQUIRED` 信封的 `error.message` 不再输出真实 Cookie 值，`SessionSeedResult` 恢复「不保留任何原值」的承诺（Issue #2168）。
+- crawl 的三处 `Path.resolve()` 把符号链接环的 `RuntimeError` 按确定性本地失败收口：Python 3.11 / 3.12 上配置目录解析失败不再落成 `ok:true, status=stopped` + 无限 `crawl resume`，`crawl start` 的数据目录解析报 `INVALID_PARAM`，输出目录解析报 `LOCAL_IO_ERROR`，不再被兜成可重试的 `NETWORK_ERROR` 或成功信封（Issue #2169）。
+- 导出服务的函数边界补上非对象条目与超大整数标量兜底：`chat --export` 的 MD / CSV / HTML 通道对超过 4300 位的整数标量不再抛 `ValueError`（与 `job_export` / `job_card` 同口径按缺失处理）；chat 导出与职位导出的渲染入口跳过非对象条目，`diff` 列表容忍 `null` / 非列表 / 坏元素；`build_job_from_card` 对非对象入参按空卡片处理。CLI 调用方目前都已过滤，这是公共边界的纵深防御，避免本地形状漂移被兜成可重试的 `NETWORK_ERROR` 或裸 traceback（Issue #2162）。
+- `saved_searches` 名称的 BLOB 存储类漂移不再让预设 / watch「看得到却运行或删除不了」：`get_saved_search` / `delete_saved_search` / `save_saved_search` 同时匹配 TEXT 与 BLOB 两种存储类，保存时把同内容的 BLOB 漂移行归一成单一 TEXT 行；`watch run --all` 对运行前已消失的记录输出显式条目，不再静默少跑一个 watch（Issue #2164）。
+- `favorites sync` 的去重键改用与展示路径同一套 `_decode_text_column` 解码：候选池 ID 以 BLOB 存储类落库时不再被 `str(bytes)` 误读成 `"b'…'"`，同一职位不会被重复插入也不会误报为新导入（Issue #2165）。
+- `handle_auth_errors` 补上缓存异常分支：`CacheRecordInvalid` 报 `CACHE_RECORD_INVALID`（登记表恢复动作），`CacheWriteRejected` 报 `INVALID_PARAM` 并明确库本身完好、无需删除，不再兜成可重试的 `NETWORK_ERROR` 诱导 Agent 反复重试（Issue #2166）。
+
+## [3.4.135] - 2026-11-20
+
+### Fixed
+- 预算目录解析把 `Path.resolve()` 的符号链接环错误归一成带 `filename` 的 `OSError`：Python 3.11 / 3.12 上 `--data-dir` / `request_budget_dir` 含符号链接环时，`status` / `doctor` 不再 traceback；登录与请求路径记录风控时，后备目录检查抛出的 `RuntimeError` 不再替换正在传播的 `PlatformRiskError`，风控详情与硬边界都保留（Issue #2155）。
+- 读请求的 HTTP 状态错误不再携带查询串：`__zp_stoken__` 由 `add_stoken_to_get_params` 注入每个 GET，httpx 的 `HTTPStatusError` 文本原本包含完整 URL，经 `handle_auth_errors` 兜底会把 stoken 写进 `error.message` 与 Agent 记录；现在按状态码、方法与路径重建异常，类型与 `NETWORK_ERROR` 分类不变，写路径的「结果未确认」契约不变；信封与日志的文本脱敏同时覆盖 `__zp_stoken__` 这个键名，此前通用 `stoken` 规则要求键后直接是分隔符，双下划线让它整体漏过（Issue #2157）。
+- 启动期组预算目录校验把 `Path.resolve()` 的符号链接环错误按配置错误拒绝：`request_budget_dir` 指向含符号链接环的路径时，Python 3.11 / 3.12 上不再冲出 traceback（没有信封），而是 `INVALID_PARAM` 并点名成员目录的 `config.json`，与同分支的 ValueError 同口径（Issue #2159）。
+- HTTP 客户端在同一次查询中最多自动刷新一次登录态。刷新后仍过期时返回现有的 `TOKEN_REFRESH_FAILED`，限流冷却继续按原有预算处理（Issue #2151）。
+- HTTP 写请求响应解码失败时报告 `ACTION_UNCONFIRMED`。调用方需先核对平台结果，`replay_safe=false`（Issue #2152）。
+
+## [3.4.134] - 2026-11-20
+
+### Fixed
+- 职位去重只把 strip 后非空的字符串 `job_id` / `encryptJobId` 当 ID：纯空白 `job_id` 不再让不同职位共用 `" "` 去重键而被误合并，也不再遮蔽合法的 `encryptJobId`；带空白的真实 ID 与干净值按同一去重键归一，不再分裂（Issue #2140）。
+- `digest --format md` 在渲染出口归一孤立代理字符：平台公司 / 职位文本含被截断的 emoji 等代理字符时，`-o` 不再出现「文件已写出却报 LOCAL_IO_ERROR」，`--json` 的 `data.content` 与 md 直写 stdout 也不再编码失败，转义口径与 `stats --format html` 一致（Issue #2142）。
+- login 错误分类的风控判定移到 CDP / `ConnectionError` 启发式之前：Playwright / CDP 异常文案同时含「chrome / cdp」与风控词时不再报成可重试的 `CDP_UNAVAILABLE` 并建议重新登录，按硬边界返回不可恢复的 `LOGIN_RISK_CONTROL`（Issue #2145）。
+- login 错误分类的限流关键词收窄为完整的 `too many requests`：本地 fd 耗尽的 strerror「Too many open files」不再被误判为不可恢复的平台风控并诱导联系平台客服，回到网络 / 本地失败通道（Issue #2144）。
+- cache 的三处读取边界补上类型漂移解码：`shortlist_records.created_at` 与 `resume_job_links.linked_at/updated_at` 的 BLOB / 文本漂移不再让整条 `shortlist list` / `resume applications` 落成固定 `INTERNAL_ERROR`，按 `CACHE_RECORD_INVALID` 确定性上报；`saved_searches.name` 的 BLOB 漂移按 UTF-8 还原，无效行计入 `corrupt` 并跳过，`preset list` / `watch list` 其余项照常返回（Issue #2147）。
+- wizard 空 `requested_steps` 的计划不再零步执行后写 `completed`：读取边界把历史断点缺失的字段归一成空元组的路径（#2033）此前会让步骤行全部停留在 `pending`，下一次 `--resume` 撞上 completed 自相矛盾检查后该 run 永久不可恢复；现在入口按 `CACHE_RECORD_INVALID` 确定性拒绝，不执行任何步骤也不改写状态（Issue #2149）。
+- `shortlist annotate` 不再忽略 UPDATE 的 rowcount：security_id 以 BLOB 落库（#1885 的读取兼容）或行在 SELECT 与 UPDATE 之间被并发删除时，未写入不再报 `updated: true`，按 `SHORTLIST_ENTRY_NOT_FOUND` 输出错误并指向 `shortlist list` 核对（Issue #2135）。
+- `favorites list` 在 `cardList` 非空但没有一个可识别对象时按 `NETWORK_ERROR`「元素不是对象」上报，与 `favorites sync` 的格式错误契约一致，不再静默伪装成空收藏（Issue #2136）。
+- favorites 的三处恢复动作改用当前数据目录的 doctor 命令（`boss --data-dir … doctor`），自定义 `--data-dir` 时不再引导去诊断默认目录（Issue #2137）。
+- `mark` 回显的 `security_id` 只认字符串并 strip：平台字段漂移成布尔 / 容器时不再把 Python repr（`True` / `{'a': 1}`）当令牌返回给 Agent（Issue #2138）。
+- egress 的语言地区解析只识别真正的地区子标签：`zh-Hans` / `sr-Latn` 等 script-only 标签不再被读成伪地区 `HANS` / `LATN` 把正常会话判成 mismatch 阻断启动，`en-US-u-ca-gregory` 等扩展标签取到 `US`；时区映射表的 `America/Honolulu` 纠正为有效的 `Pacific/Honolulu`，夏威夷出口的矛盾不再漏检成 unknown（Issue #2129）。
+- `status` / `doctor` 的 session 文件状态改为单次 lstat / stat：`stoken_freshness` 不再在 `exists()` 与 `stat()` 之间被并发 `logout` / 原子替换删除文件时把 `FileNotFoundError` 逃逸成 `LOCAL_IO_ERROR`；session 文件不可读时按 warn「无法读取 session 文件时间」报告而非「未提供时间」。`has_token=False` 分支不再连续三次 `exists()`（消除 `status=error` 却报「未检测到本地登录态」的自相矛盾），3.14 下权限错误也不会被吞成「没登录」（Issue #2131）。
+- automation 决策在转录里定位不到配置话术时不再退回 prior 标记判「已回复」：本地 AI 改写问卷 / 追问文本（#1511）或操作者中途改模板后，有方向信息的转录按我方最后一条消息判断候选人是否回复，候选人未回复时保持等待，不再真实自动发出追问与交换联系方式；转录不含我方消息或完全没有方向信息时保留 prior 兜底（Issue #2133）。
+- resume 的职位关联统一按文件真实名称落库：`resume link` 走 `stored_name`，`resume applications` 同时查请求名与真实名称并按职位去重，别名（`a/b` ↔ `a_b`）视角不再出现幽灵关联或查询不一致，按规范名删除能清掉别名方向建立的关联（Issue #1804、#2121）。
+- `resume import` 的输入路径与 `-o` 输出路径同口径展开 `~`：MCP 子进程 / argv 列表不经 shell 时，`~/cv.json` 不再被报成「文件不存在」（Issue #2122）。
+- `agent review reject` 清理 approve 中途失败遗留的 pending 行：尚未派发的关联行与复核状态一起收口，被人工拒绝的动作不再在下一轮被派发；已在执行 / 结果未知（executing、verification-required）的行反而阻断 reject 并提示先核对，不静默删除可能已生效的记录（Issue #2124）。
+- automation 的 `allowed_actions` 对数组 / 对象元素按配置错误上报：不再在 set 成员判断处抛裸 `TypeError: unhashable type`，非字符串元素与未知动作走同一条「未知动作」ValueError 文案（Issue #2125）。
+- crawl 的 `--hook-profile screenshot-full` 运行期注入读取 `SHA256SUMS` 失败时不再抛裸 `OSError`：清单被换成目录 / FIFO 或变得不可读统一收敛为 `HookRegistrationError`，命令层按 `LOCAL_IO_ERROR` 上报并给出 Hook 目录，不再被 service 兜成 stopped 成功信封与可重试 resume 指引；预检路径行为不变（Issue #2127）。
+- 职位导出的标量兜底改走 `safe_text`：超过 4300 位的整数不再在裸 `str()` 抛 `ValueError` 中止整份 CSV / HTML 导出，与容器分支和 job_card 同口径按缺失单元格处理（Issue #2114）。
+- job_card 的容器字段改用 `strict_json_text` 序列化：嵌套的 `NaN` / `Infinity` 归一为 JSON `null`，不再把非标准字面量带进列表文本与 wizard 导出产物；深嵌套 / 超大整数仍按缺失处理（Issue #2115）。
+- wizard 声明失败的步骤结果与写前标记一次落盘：action 在 `begin_write` 后返回非完成状态时，标记不再被通用 `update_step` 清空，此后任何中断都不会让 `--resume` 重放结果未知的写请求（Issue #2117）。
+- wizard 的 completed 终态检查对照 `requested_steps`：断点缺行的步骤不再被忽略，状态自相矛盾时按 `CACHE_RECORD_INVALID` 确定性拒绝，而不是 fail-open 返回 completed（Issue #2118）。
+- wizard 中断写结算保留 `run.last_result`：恢复列表 / `--status` 里的职位数与内部采集 run_id 不再因结算写 NULL 而丢失，与 blocked 恢复分支同口径（Issue #2119）。
+
+## [3.4.133] - 2026-11-20
+
+### Fixed
+- 登录态 salt 并发首次创建：抢锁失败方不再把「另一进程正在创建」当成损坏直接失败，在有界窗口内等待 salt 落位后复用；绝不生成第二份 salt 的契约不变，窗口耗尽仍缺失才报错并提示稍后重试（Issue #2099）。
+- `agent run --limit` 同时约束待执行队列的派发：已批准会话先占用本轮全局上限，剩余预算才用于扫描；预算用满后不再发起扫描请求，未派发的 pending 行保持原状态留待下一轮（Issue #2100）。
+- wizard 断点的 `error` 为非空对象时必须含非空字符串 `code`：外部漂移 / 旧数据缺 `code` 时按记录损坏拒绝，信封不再回退成可重试的 `NETWORK_ERROR` +「重试」指引（Issue #2101）。
+- doctor 的浏览器内核探测按 lstat 口径读取缓存根：权限错误不再让整份自检报告变成 `LOCAL_IO_ERROR`，改为对不可读缓存输出 `warn`「无法确认是否已安装」，不引导重装；默认缓存目录补上 Linux `XDG_CACHE_HOME` 与 Windows `~/AppData/Local` 回退，与 patchright 驱动同口径（Issue #2103）。
+- doctor 的 `auth_salt` 检查与登录路径同口径（`path_mode`）：指向普通文件的 salt 符号链接不再被报成 broken 并提示删除（那会作废已有 `session.enc` 与 AI 密钥）；悬空链接 / 目录 / FIFO 仍按损坏拒绝，悬空链接的提示改为说明目标缺失（Issue #2104）。
+- 请求租约的目录创建 / 打开失败不再泄漏裸 OSError：crawl 不再把它裹成 `ok:true` 的 stopped 并给出可重试 resume，入口按不可重试的 `LOCAL_IO_ERROR` 上报（Issue #2106）。
+- crawl 导出对非有限浮点使用同一归一规则：CSV 不再写 `nan` / `inf`、XLSX 不再落空数值单元格，与 JSON 的 null 口径一致（Issue #2107）。
+- `stats --format html` 的 HTML 产物先按 backslashreplace 归一孤立代理字符（与 #2017 导出口径一致）：数据目录路径含非 UTF-8 字节时 `-o` 不再出现「文件已写出却报失败」，`--json` 与 stdout 分支也不再编码失败，`bytes` 与实际写出一致（Issue #2109）。
+- chat 导出改用**原始**联系人字段计算身份（`contact_identity(raw_item)`）：`_text_cell` 的展示归一（布尔 → `"true"`、容器 → JSON 文本）不再让漂移的 `uid` 绕过 #2064 的 fail-closed，映射表 key 恢复回退 `security_id`，`is_new` 与 `added_ids` 重新对齐（Issue #2110）。
+- chat 快照 `load_snapshot` 的「零可用对象」守卫与合并路径同口径（`dict` 且带 identity）：`[{}]` 这类无身份数组不再被当作完整基线，下次完整采集不再全员误报「新增」；真正的空数组仍是合法空基线（Issue #2111）。
+
+## [3.4.132] - 2026-11-20
+
+### Fixed
+- stoken 刷新不再把刷新前的旧值当新令牌返回：headless 通道的 cookie jar 兜底值必须区别于注入的旧 stoken，`force_refresh` 对两条通道统一拒绝与当前 stoken 相同的返回值，按 `TOKEN_REFRESH_FAILED` 保留旧登录态（Issue #2091）。
+- 复用 CDP 登录态的只读探测把限流（码 9 / HTTP 429）按 `unverified` 处理：限流不再被判为登录失效并触发清空用户浏览器里仍有效 Cookie 的强制重登；其余非 0 码维持 #424 的既有契约（Issue #2092）。
+- 身份头探针页命中安全验证 / 访问受限页时按风控上抛并锁存，不再吞成空映射后继续完成登录；普通采集失败仍不阻断登录（Issue #2093）。
+- 扫码轮询不再吞掉 `cookies()` 异常：浏览器在等待扫码期间关闭时立即报真实连接错误，而不是空转到「扫码登录超时」（Issue #2095）。
+- crawl 顺序翻页（已在第 N 页取第 N+1 页）不再在没有导航请求时多记一次 `max_requests` 与节流等待：预算与共享租约只按真实滚动计一次，长翻页不会先于真实请求耗尽预算（Issue #2094）。
+
+## [3.4.131] - 2026-11-19
+
+### Fixed
+- MCP server 的默认 `boss` 入口在模块加载时就按运行解释器同目录解析（与 `run()` 启动配置同一口径）：直接调用 `_run_boss()` / handler 的嵌入方与测试不再从 PATH 找 boss，PATH 上缺失或存在旧安装时不会静默驱动错误入口（Issue #2088）。
+
+## [3.4.130] - 2026-11-19
+
+### Fixed
+- `hr download-resume` 的覆盖保护改按 `lstat` 判定目标路径：目标存在但元数据读不到时（权限等 `OSError` 被 `exists()` / `is_symlink()` 吞成 False）不再先发出四个平台请求才失败，客户端在发请求前 fail-closed，命令层按本地 IO 错误上报（Issue #2083）。
+- crawl 导出的备份判定复用预检的 `lstat` 结果：`is_file()` 吞错时仍会备份旧产物，替换中途失败的回滚不再丢失旧内容（Issue #2085）。
+
+## [3.4.129] - 2026-11-19
+
+### Fixed
+- 本地 JSON 序列化失败（深嵌套 / 超长整数）不再被报成可重试的 `NETWORK_ERROR`：无 `filename` 的 `EINVAL` 归为 `LOCAL_IO_ERROR`，Agent 不会反复重试同一份必然再次失败的数据（Issue #2078）。
+- 私有原子写（登录态、AI 密钥、salt）与 crawl 导出的临时名只使用截断到 32 字符的目标名作前缀，接近 `NAME_MAX` 的合法文件名不再触发 `ENAMETOOLONG`；残留的临时 / 备份文件仍可辨识归属（Issue #2080）。
+
+## [3.4.128] - 2026-11-19
+
+### Fixed
+- 联系人身份只认非空字符串或非 bool 整数 uid：布尔 / 容器 / 超大整数漂移不再让不同联系人共用同一身份或让翻页签名误判重复页；`job_card` 与职位字段的超大整数按缺失处理，容器序列化失败按空单元格降级（Issue #2063–#2065）。
+- 招聘者 `hr jobs` 的分页信封与后继提示限制在可信页码内，非法平台回显回退到钳制后的请求页；`hr candidates --select` 作为关键词时按位置参数重放；`hr resume` 按实际缺失的 `geek_id` / `--job-id` / `--security-id` 生成错误与指引（Issue #2067–#2069）。
+- automation 队列在派发前拒绝缺少 `candidate_key` 或发送类动作缺 `message` 的记录（错误带实际队列路径，行保持 pending）；JSONL 追加在旧行缺少结尾换行时先补分隔符，避免新旧记录粘成一行一起丢失；孤立代理字符让整文件回写失败时按本地状态错误上报并保留原文件（Issue #2071–#2073）。
+- `crawl resume --background` 在派发 worker 前校验 `--pages` 覆盖值与断点进度，矛盾参数直接返回 `INVALID_PARAM`，不再先回报 `queued` 再让 worker 静默失败；`next_page == pages + 1` 保持合法（Issue #2075）。
+
+## [3.4.127] - 2026-11-19
+
+### Fixed
+- 职位 / 聊天导出的单元格把 bool 写成 JSON 字面量、深嵌套容器序列化失败按空值、孤立代理字符按转义清洗；`chat --export` 当日快照数组非空但零个可用对象（手工改坏 / 旧格式漂移）时不再当作完整基线，避免下一次 diff 把所有未翻到的联系人误报为新增（Issue #2015–#2018）。
+- automation 队列的 pending 行派发前按当前 `allowed_actions` 与置信度阈值门控，收紧配置后不再直接派发遗留 pending（行保持 pending，放开配置后仍可执行）；缺 `status` 字段的队列 / 复核记录按状态损坏拒绝，不再默认成 pending；`--limit` 按整轮全局上限生效，默认两个 tab 时不再处理 2×limit 个会话（Issue #2020–#2022）。
+- `boss_search` 与 preset 同用时十个筛选项的显式空串原样下发，CLI 按「关闭该项筛选」覆盖 preset 值；pipeline / follow-up / digest 的估算页数与 collector 真实翻页上限一致并计入追加的面试数据请求，`hr last-messages` 无 `--friend-id` 时计入沟通列表请求；wizard 的 `role` / `platform` / `goal` 空串在 MCP 入口即被拒绝（Issue #2023–#2026）。
+- `watch` 命中的保存搜索记录损坏（时间戳列类型漂移等）按 `SAVED_SEARCH_INVALID` 确定性失败上报，不再兜成可重试的 `NETWORK_ERROR`；`history` 达到可信页码上限时不再生成越界 `--page` 后继提示，改为引导缩小筛选条件（Issue #2011–#2012）。
+- crawl 断点续跑不再用每次搜索都会轮换的 `securityId` 兜底去重，页内崩溃后 resume 不会把同一职位重复落库并重复导出；`next_page` 超出 `params.pages + 1` 与结果表负页码按记录损坏拒绝；`crawl resume --background` 的 completed 快速路径同样校验断点设置（Issue #2029–#2032）。
+- wizard 恢复对 `params.inputs: null` 与省略 `requested_steps` 的合法断点不再误报 `WORKFLOW_PLAN_MISMATCH`；步骤记录缺失时在派发动作前以 `CACHE_RECORD_INVALID` 终止（本次没有平台写入，`replay_safe` 保持 true）；`--stop` 对记录存在但读不出、SQL 判定 completed 的任务报 `WORKFLOW_ALREADY_FINISHED`，不再误导成核对 run_id（Issue #2033–#2035）。
+
+## [3.4.126] - 2026-11-19
+
+### Fixed
+- wizard 断点落盘失败不再掩盖原始风控 / 预算停止码；缓存时间戳列漂移成 BLOB / 文本时信封不再退化成固定 `INTERNAL_ERROR`；步骤记录缺失按本地状态损坏报 `LOCAL_STATE_WRITE_FAILED`，不再报可重试的 `NETWORK_ERROR`（Issue #1963–#1965）。
+- `ai config` 新增 `--clear-base-url`，`ai_base_url` 写入后可清除，切 provider 后密钥不再发往旧端点；漂移成布尔值的 `ai_base_url` 不再回显为地址；同时改配置与密钥时密钥写失败不再留下半截更新；空白文本参数不再照常发起计费请求（Issue #1967–#1969 #1975）。
+- `record_recruiter_greet` 更新 0 行改为报错，不再在本地记录丢失后重复发送招呼；watch 结果写入不再因孤立代理项抛 `UnicodeEncodeError` 并留下半截事务；watch 去重键在缺 `job_id` 时保留账号前缀；`stats` 的 `first_seen_at` 漂移值不再让窗口计数虚高（Issue #1971–#1974）。
+- 聊天与职位导出把非有限数按 JSON 分支同口径归一，不再写出 `inf` / `nan` / `Infinity`；`find_friend` 对「成功但无列表容器」的响应返回可恢复的 `NETWORK_ERROR`，不再据此判定联系人不存在（Issue #1976–#1978）。
+- `crawl resume` 单个职位详情反复失败不再卡死列表翻页与导出（记为 `detail-error` 并继续），同一轮不重复重试；恢复时的滚动翻页按次计入请求预算与租约；打开浏览器前失败保留断点里的 hook 注入记录（Issue #1981–#1983）。
+- `resume list` 以文件自身名称列出副本与缺 name 的信封，不再产生无法点名的幽灵行；原子写与 PDF 导出的临时名改用固定短前缀，合法长文件名不再 `ENAMETOOLONG`；导入时孤立低代理项名称按参数错误拒绝（Issue #1984–#1986）。
+- 请求租约异常路径不再用缺失的平台码重写已落盘风险锁（保留 31/32/38 等诊断字段与锁定时间）；共享租约竞争耗尽等待窗口时省略误导性的 50ms `retry_after_seconds`（Issue #1989–#1990）。
+- `chat --export` 的元素全坏页不再被当成完整空列表（不覆盖当日快照、不误报全部联系人已消失）；元素全非对象的基线快照按不可用处理；`detail` 的 httpx 通道与浏览器通道对 `skills` / `raw_job_type` 同口径归一（Issue #1992–#1994）。
+- `auth/salt` 路径异常时 `doctor` 不再输出 traceback、`status` 不再报可重试 `NETWORK_ERROR`；doctor 的 `auth_salt` 检查按 lstat 判定；`clean --risk-lock` 删除空目录 / FIFO 锁后正确报 `local_lock_removed`；`--privacy` 中途失败时 `remaining` 不漏 crawl；符号链接清理的字节数按链接本身统计；`--live-probe` help 与默认站点连通性检查一致（Issue #1996–#2001）。
+- `batch-greet` 限流停批改为 `ok:false` 错误信封（`RATE_LIMITED` / `GREET_LIMIT`），触发停批的候选人保留在 `failed`；`history --page` 加可信页码上限，超长整数不再把确定性本地错误报成可重试的 `NETWORK_ERROR`；坏元素页翻满页数上限时正确标记 `truncated`（Issue #2003–#2006）。
+- wizard 在 action 已声明失败后到达的超时 / 停止信号不再丢弃已落盘的写前标记，`--resume` 不再重放结果未知的写请求；`candidate_search` 的 `query` 非字符串（`false` / `0` / 容器）按 `INVALID_PARAM` 拒绝，不再静默执行空关键词或字面量搜索（Issue #2008–#2009）。
+
+## [3.4.125] - 2026-11-19
+
+### Fixed
+- automation 决策不再用 prior 时间戳压过会话转录：转录显示候选人未回复时不再自动发追问、也不再发交换联系方式请求；升级检测只读候选人一侧消息，自定义话术不再让候选人被静默跳过；面试时间越界（如「25点99」）不再写入线索；预算停止时队列还原写盘失败不再掩盖原始停止码（Issue #1944–#1947）。
+- MCP 参数映射把 `boss_search` 的显式空 `url` / `preset`、AI 工具的空 `jd_text` / `job_id` 原样下发，由 CLI 给出 `INVALID_PARAM` 诊断，不再静默按其余参数成功；子进程 stdout 含超长整数或超深嵌套时仍返回七键信封；参数超过系统 argv 上限（E2BIG）报 `INVALID_PARAM` 并指引缩短参数，不再误报成 CLI 未安装（Issue #1941–#1943）。
+- `ai` 命令在登录态 salt 路径状态异常时返回 `LOCAL_IO_ERROR` 信封而不是 traceback；`--resume ""` 返回 `INVALID_PARAM` 且不发起请求；`ai config --api-key` 去掉首尾空白并拒绝非 ASCII / 控制字符；服务商回显密钥时按当前密钥做字面量遮蔽，非 `sk-` 前缀或含点号的形态不再进入 `error.message`（Issue #1950–#1953）。
+- wizard 在写请求之后的停止 / 超时信号不再覆盖「结果未知」标记，`--resume` 不再重放可能已生效的写步骤；`stopped` 步骤带 `replay_safe:false` 时同样阻断重放；`bind_inner_run` 保留已落盘的写前标记；已完成步骤的 `result` 漂移成空值不重跑；断点的 `error.code` / `error.message` 类型漂移按记录损坏拒绝（Issue #1956–#1960）。
+
+## [3.4.124] - 2026-11-19
+
+### Fixed
+- 缓存文本列（候选池、crawl 任务与结果、workflow 任务与步骤、简历投递）在读取边界只接受文本：BLOB 按 UTF-8 还原、还原失败或其它类型按 `CACHE_RECORD_INVALID` 上报，不再让整个信封退化成固定 `INTERNAL_ERROR` 且 `exit 0` / `ok=false`（Issue #1885）。
+- 约束冲突 / 非法绑定值不再被当成缓存库损坏：新增 `CacheWriteRejected`，CLI 按 `INVALID_PARAM` 上报并说明库本身完好、无需删除；迁移期的冲突仍按 `CACHE_DATABASE_INVALID` 处理（Issue #1886）。
+- greet / apply 迁移不再丢弃 `job_id` 为空的旧去重记录，升级后仍可按 `security_id` 命中，不再重复打招呼 / 投递（Issue #1887）。
+- 超长整数作为 dict 键时脱敏 / 序列化阶段不再抛 `ValueError`，stdout 仍保留七键 `INTERNAL_ERROR` 信封（Issue #1897）。
+- `error.details.outcome_unknown` 非布尔漂移时 `replay_safe` 改为一律 `false`（fail-closed），结果未知的写操作不再被标成可重放（Issue #1898）。
+- 自由文本脱敏覆盖带引号的 JSON / dict-repr 形态（`{"token": "…"}`）与多段 Cookie 头，后续 `name=value` 段落不再明文残留（Issue #1899）。
+- `handle_platform_error_output` 的 `read_only_operation=True` 参与 `UNKNOWN` → `NETWORK_ERROR` 归一，只读分支不再产出「不可恢复 + 可重试」的自相矛盾信封（Issue #1900）。
+- 记录风控锁时非法 / 损坏的配置文件不再替换正在传播的 `ACCOUNT_RISK` / `ENVIRONMENT_RISK`：后备预算目录按 best-effort 处理，`risk_lock.details` 始终写入，信封保持风控契约（Issue #1892）。
+- 只有 `request_budget_dir` 后备位置写锁成功时 `risk_lock.persisted` 正确报 `true`，不再误报「锁只留在进程内」（Issue #1893）。
+- `ioreg` / `reg` 输出格式漂移时机器 ID 解析落到主机名指纹兜底，不再抛 `IndexError`（Issue #1894）。
+- `chat --export` 的完整性旁车文件只认显式 `true`：`0` / `"false"` / `null` / 缺键等漂移值按不完整基线处理，不再把上一份不完整快照当成完整并误报新增（Issue #1911）。
+- 当日快照解析失败时完整性标记保持 `false`；旁车文件先写保守值、再写快照、最后写真实值，进程在两次原子写之间被杀也不会让部分页快照成为完整基线（Issue #1912）。
+- `chat --export` 的「已消失」表格与活动联系人 / CSV 行同口径，容器字段序列化为 JSON 文本而不是 Python repr（Issue #1913）。
+- 沟通列表页缺少 `result` / `friendList` 容器时不当作完整空列表，`chat --export` 不再因此清空当日快照并把旧联系人全报为已消失（Issue #1914）。
+- `field_text` 对 dict / list / tuple 与非有限数按缺失处理，job_card 的 `job_id` / `title` / `salary` 不再变成 Python repr 并进入后继命令提示；job_card 的列表字段逐元素归一，`raw_job_type` 容器按 None 输出（Issue #1917）。
+- 职位导出的 CSV / HTML 单元格统一归一：列表里的 null 与 `nan` / `inf` 写成空值、容器序列化为 JSON 文本，不再出现字面量 `None` 与 Python repr（Issue #1916）。
+- 风控锁的 stoken 摘要对孤立代理字符改用 `surrogatepass` 编码，记录风控锁不再因 `UnicodeEncodeError` 替换正在传播的 `ACCOUNT_RISK` / `ENVIRONMENT_RISK`，锁文件与进程内锁都能落盘（Issue #1918）。
+- 请求租约在 POSIX 上同时锁住预算目录 inode：租约文件被外部删除 / 替换后仍保持跨进程互斥；加锁后复核 inode 身份并用 `fstat` 读取尺寸（Issue #1919）。
+- 代理解析对 scheme 做 http / https / socks4 / socks5 allowlist，并拒绝含空白 / 控制字符的 host；非法代理在解析阶段报 `INVALID_PARAM`，不再推迟到浏览器启动（Issue #1920）。
+- `record_risk` 只要主目录或共享目录任一处成功落盘即视为已持久化并清除进程内锁，`persisted` 元数据与磁盘事实一致；两处都失败才抛错（Issue #1921）。
+- `agent stats` 对 action-log 的 `status` 先做类型校验，数组 / 对象不再让熔断后的恢复入口抛 `TypeError` 变 `INTERNAL_ERROR`（Issue #1928）。
+- automation 状态 / 队列写回把深嵌套与循环引用引发的 `RecursionError` / `ValueError` 归成本地状态错误，不再报成可重试的 `NETWORK_ERROR`（Issue #1929）。
+- automation 执行锁 / 控制锁命中本地 IO（只读目录、磁盘满、打不开库）时按 `LOCAL_IO_ERROR` 上报，只有真正损坏才报 `AUTOMATION_STATE_INVALID`（Issue #1930）。
+- 复核队列 `status` 增加类型与取值域校验，漂移值不再让复核项永久卡死且不出现在统计中（Issue #1931）。
+- `automation_config_from_dict` 只对 `None` 回退默认配置，`[]` / `""` / `0` / `False` 一律按配置错误拒绝（Issue #1932）。
+- 面试线索表的表头与追加写入包装 `OSError` / `UnicodeError`，错误信封带 `interview-leads.csv` 路径与修复指引（Issue #1933）。
+- crawl 会话在 seed 导航（首个平台文档）之前注册用户 Hook，首页 anti-debug / CryptoJS Hook 从第一个文档起生效（Issue #1935）。
+- crawl 传输层 JSON 解析统一捕获裸 `ValueError` / `RecursionError`：超长整数字段不再让监听降级并追加一次页面内请求，也不再让详情路径按瞬时错误重试（Issue #1936）。
+- Hook 目录的 SHA256SUMS 非 ASCII 或缺失时按 `HookRegistrationError` 上报，预检与运行期注入同一异常契约（Issue #1937）。
+- crawl 整数配置拒绝 bool 与静默截断的 float，与 `crawl_port` 校验同口径（Issue #1938）。
+- crawl 导出在安装与回滚都失败时保留旧产物唯一的备份，并在 `CrawlExportError` 消息里给出路径，不再把旧文件删得无迹可寻（Issue #1924）。
+- crawl 导出失败路径的临时文件清理改为 best-effort：清理遇到权限 / 只读挂载错误不再替换原本正在传播的 `CrawlExportError` / `CrawlRuntimeUnavailable`（Issue #1925）。
+- crawl 导出成功后的备份清理失败不再把已完成的导出报成 `stopped`，三份新产物照常返回路径（Issue #1926）。
 - wizard 的 `crawl_start` 恢复时不再让 `plan.inputs` 里的 `run_id: null` 覆盖已绑定的内部 crawl run_id，中断后 `--resume` 能继续原任务（Issue #1903）。
 - wizard 的 `crawl_resume` 与 `crawl_start` 同口径校验断点 query / city：冲突或非字符串输入按 `INVALID_PARAM` 拒绝，不再静默续跑旧任务并导出旧数据（Issue #1904）。
 - 联系人标签名称与平台 ID 收敛到 `services/labels.py` 单一真源：wizard 接受 CLI 的全部 9 个标签，数字 ID 必须是已知成员，`label: "999"` 不再向平台发出写请求（Issue #1905）。

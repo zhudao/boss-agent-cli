@@ -1,19 +1,48 @@
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
 
 BOSS_INTERNSHIP_RESPONSE_JOB_TYPE = 4
 
+# 平台字段里超过 4300 位的整数会让 str() 抛 ValueError（Python 3.11+ 的安全
+# 上限）；与 output._MAX_SAFE_INT_BITS 同口径，超过即按缺失文本处理。
+_MAX_TEXT_INT_BITS = 14284
+
+
+def safe_text(value: Any) -> str:
+	"""``str(value)`` 的安全版本：超大整数 / 不可转换值返回空串（Issue #2065）。
+
+	平台字段漂移出超大整数时，裸 ``str()`` 抛 ValueError，从命令层穿出后
+	会被兜成 INTERNAL_ERROR 或可重试的 NETWORK_ERROR。展示字段按缺失处理。
+	"""
+	if isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > _MAX_TEXT_INT_BITS:
+		return ""
+	try:
+		return str(value)
+	except ValueError:
+		return ""
+
 
 # 平台响应里的字段可能是显式的 null（"welfareList": null、"bossInfo": null）。
 # dict.get(key, default) 只在键不存在时用默认值，值为 null 时照样返回 None，
 # 下游一 join / 遍历 / 取子字段就崩，所以平台数据在边界处统一归一化。
 def field_text(data: Any, key: str, default: str = "") -> str:
-	"""取文本字段：缺失或为 null 时用默认值，数字等标量转成字符串。"""
+	"""取文本字段：缺失 / null / 容器 / 非有限数用默认值，数字等标量转成字符串。
+
+	平台字段漂移成 dict / list 时，旧实现会 ``str()`` 出 Python repr 并当成
+	真实文本透传（job_id、title 还会进入后继命令提示，Issue #1917）；NaN /
+	Infinity 同样不是可展示文本。容器与非有限数按缺失处理，与
+	``field_list`` / ``field_dict`` 的归一口径一致。
+	"""
 	value = data.get(key) if isinstance(data, dict) else None
 	if value is None:
 		return default
-	return value if isinstance(value, str) else str(value)
+	if isinstance(value, (dict, list, tuple)):
+		return default
+	if isinstance(value, float) and not math.isfinite(value):
+		return default
+	return value if isinstance(value, str) else safe_text(value)
 
 
 def field_list(data: Any, key: str) -> list[Any]:
@@ -59,7 +88,7 @@ def job_public_url(job_id: str) -> str:
 
 def employment_type_from_raw(raw_job_type: Any) -> str:
 	"""Normalize verified BOSS response job types without guessing unknown codes."""
-	if str(raw_job_type) == str(BOSS_INTERNSHIP_RESPONSE_JOB_TYPE):
+	if safe_text(raw_job_type) == str(BOSS_INTERNSHIP_RESPONSE_JOB_TYPE):
 		return "实习"
 	return ""
 

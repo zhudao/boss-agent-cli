@@ -1,6 +1,7 @@
 from typing import Any
 
 from boss_agent_cli.api.models import dict_items
+from boss_agent_cli.services.chat_utils import stable_uid
 
 
 MAX_FRIEND_LIST_PAGES = 50
@@ -15,7 +16,21 @@ def friend_list_page_items(platform_data: dict[str, Any]) -> list[dict[str, Any]
 	``result`` 是 ``[None]`` / ``[5]`` 这类只含坏元素的非空列表时同理（Issue #1402）：
 	元素级漂移由 ``dict_items`` 跳过，跳过之后为空就回退 ``friendList``。
 	"""
-	return dict_items(platform_data.get("result")) or dict_items(platform_data.get("friendList"))
+	return friend_list_page_observation(platform_data)[0]
+
+
+def friend_list_page_observation(platform_data: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+	"""返回联系人及所用列表是否完整解析，保留原有的容器回退顺序。"""
+	for key in ("result", "friendList"):
+		raw = platform_data.get(key)
+		if isinstance(raw, list):
+			items = dict_items(raw)
+			if items:
+				return items, len(items) == len(raw)
+
+	# 至少有一个列表容器且整页无内容，才可认作平台明确返回的空页。
+	has_list = any(isinstance(platform_data.get(key), list) for key in ("result", "friendList"))
+	return [], has_list and not friend_list_page_has_content(platform_data)
 
 
 def friend_list_page_has_content(platform_data: dict[str, Any]) -> bool:
@@ -90,15 +105,20 @@ def collect_friend_list_page(
 		page_items = friend_list_page_items(platform_data)
 		if not page_items:
 			if platform_data.get("hasMore") is not False and friend_list_page_has_content(platform_data):
-				# 整页元素被跳过：不是空页，继续翻页（Issue #1878）。
+				# 整页元素被跳过：不是空页，继续翻页（Issue #1878）。翻满上限时
+				# 同样是截断，否则坏元素页会让调用方把前缀当完整结果（Issue #2006）。
+				if pages_scanned >= max_pages:
+					truncated = True
 				page += 1
 				continue
 			break
 
 		# securityId 在每次请求间都会轮换（见 services/contact_lookup.py），
 		# 只能作为 uid 缺失时的回退标识；签名全为空时无法判断是否重复，
-		# 继续聚合，避免把缺字段的新页面当成重复页丢掉。
-		identities = [str(item.get("uid") or item.get("securityId") or "") for item in page_items]
+		# 继续聚合，避免把缺字段的新页面当成重复页丢掉。uid 必须是非空
+		# 字符串：布尔 / 容器漂移会让各页签名相同，整页联系人被当成重复页
+		# 丢弃且 reported complete（Issue #2063）。
+		identities = [stable_uid(item.get("uid")) or stable_uid(item.get("securityId")) for item in page_items]
 		if any(identities):
 			signature = tuple(identities)
 			if signature in seen_signatures:

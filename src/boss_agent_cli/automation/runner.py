@@ -102,13 +102,40 @@ def _run_cycle_locked(
 		with request_control(check=guard.raise_if_stopped):
 			adapter.ensure_session()
 			if guard.stop_reason() is None:
-				events.extend(process_pending(adapter, store, guard, platform, dry_run, state=state, dispatched=dispatched))
+				pending_events, pending_conversations = process_pending(
+					adapter, store, guard, platform, dry_run, state=state, dispatched=dispatched, limit=limit
+				)
+				events.extend(pending_events)
 			if guard.stop_reason() is None:
-				# 用 is None 而不是 or：limit=0 表示「本轮不处理任何会话」，
-				# 而 `0 or max_per_tab` 会静默放大成默认的 20 个；负数在这里归一为 0，
-				# 否则 `items[:负数]` 会反转成「去掉最后 N 个」。
-				max_per_tab = config.max_per_tab if limit is None else max(0, limit)
-				refs = adapter.scan_conversations(list(config.tabs), max_per_tab)
+				# --limit 是「本轮最多处理多少个会话」的全局上限（Issue #2021）：
+				# 待执行队列先派发的会话占用预算，剩余部分再给扫描路径
+				# （Issue #2100）。用 is None 而不是 or：limit=0 表示「本轮不处理
+				# 任何会话」，而 `0 or max_per_tab` 会静默放大成默认的 20 个；
+				# 负数在这里归一为 0，否则 `items[:负数]` 会反转成「去掉最后 N 个」。
+				remaining = None if limit is None else max(0, limit - len(pending_conversations))
+				if remaining == 0:
+					# 预算已被待执行队列用满：不再发起扫描请求。
+					refs = []
+				else:
+					max_per_tab = config.max_per_tab if remaining is None else remaining
+					refs = adapter.scan_conversations(list(config.tabs), max_per_tab)
+					# 队列（含本轮被平台拒绝后退回 pending、以及排队等下一轮的）
+					# 拥有该会话的最高优先级：扫描路径跳过这些候选人，不能在同一
+					# 轮用模板话术顶替操作者批准的动作，也不能跨轮把同一动作再发
+					# 一次（Issue #2211）。verification-required 不在这里排除：
+					# 它交给扫描路径既有的在途门控处理，操作者才能看到「等待人工
+					# 核对，已跳过」的 SKIPPED 事件（Issue #1515）。
+					claimed = set(pending_conversations)
+					claimed.update(
+						row.candidate_key
+						for row in store.read_pending()
+						if row.platform == platform and row.status in {"pending", "executing"}
+					)
+					refs = [ref for ref in refs if ref.id not in claimed]
+					if remaining is not None:
+						# 每个 tab 各切一份会让默认两个 tab 时处理 2×limit 个会话；
+						# max_per_tab 只用于限制每 tab 的拉取量。
+						refs = refs[:remaining]
 				for ref in refs:
 					if guard.stop_reason() is not None:
 						break

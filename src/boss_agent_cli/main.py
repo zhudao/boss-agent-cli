@@ -9,7 +9,13 @@ import click
 
 from boss_agent_cli import __version__
 from boss_agent_cli.api.browser_source import POLICIES as BROWSER_SOURCES
-from boss_agent_cli.cache.store import CacheBusyError, CacheDatabaseInvalid, is_cache_busy_error
+from boss_agent_cli.cache.store import (
+	CacheBusyError,
+	CacheDatabaseInvalid,
+	CacheRecordInvalid,
+	CacheWriteRejected,
+	is_cache_busy_error,
+)
 from boss_agent_cli.commands.register import register_candidate_commands, register_recruiter_commands
 from boss_agent_cli.config import (
 	CDP_URL_REQUIREMENT,
@@ -118,7 +124,10 @@ def _validate_group_budget_config(data_dir: Path, cfg: dict[str, Any]) -> None:
 		return
 	try:
 		group_dir = expand_budget_directory(raw).resolve()
-	except ValueError as exc:
+	# RuntimeError：路径含符号链接环时 resolve() 在 3.11 / 3.12 抛错（3.13 起返回
+	# 原路径）。这是确定性的本地配置错误，与 ValueError 同口径拒绝；否则它会冲出
+	# BossCliGroup 的兜底链，连信封都没有（Issue #2159）。
+	except (ValueError, RuntimeError) as exc:
 		raise _StartupConfigBadParameter(
 			f"成员配置的 request_budget_dir 无效：{exc}",
 			recovery_action=f"修正 {data_dir / 'config.json'} 的 request_budget_dir 后重试",
@@ -903,6 +912,34 @@ class BossCliGroup(click.Group):
 				recovery_action=busy_recovery_action,
 			)
 			return None
+		except CacheRecordInvalid as exc:
+			# 本地任务 / 候选池记录损坏是确定性失败：重试同一条命令只会再失败
+			# 一次，不能兜成可重试的 NETWORK_ERROR（Issue #1885）。
+			if not standalone_mode:
+				raise
+			record_recoverable, record_recovery_action = error_contract_for_code("CACHE_RECORD_INVALID")
+			emit_error(
+				_invoked_command_name(args, self.name or "boss"),
+				code="CACHE_RECORD_INVALID",
+				message=str(exc),
+				recoverable=record_recoverable,
+				recovery_action=record_recovery_action,
+			)
+			return None
+		except CacheWriteRejected as exc:
+			# 约束冲突 / 绑定值非法是输入问题，缓存库本身健康：这里绝不能给出
+			# 「备份并删除缓存库」的指引（Issue #1886）。
+			if not standalone_mode:
+				raise
+			invalid_recoverable, _invalid_recovery = error_contract_for_code("INVALID_PARAM")
+			emit_error(
+				_invoked_command_name(args, self.name or "boss"),
+				code="INVALID_PARAM",
+				message=str(exc),
+				recoverable=invalid_recoverable,
+				recovery_action="本次写入被本地缓存库拒绝（约束冲突或非法绑定值），库本身完好、无需删除；修正调用参数后重试",
+			)
+			return None
 		except sqlite3.DatabaseError as exc:
 			# 锁冲突统一收口；其余的数据库错误（文件损坏、路径被同名目录占用）
 			# 是确定性本地失败：原样上抛会让命令丢掉整个信封，或在带装饰器的
@@ -1003,6 +1040,29 @@ class BossCliGroup(click.Group):
 				}
 				if code == "LOCAL_IO_ERROR"
 				else None,
+			)
+			return None
+		except ValueError as exc:
+			# AI 本地配置项的确定性错误（如手工编辑的 base_url）也是 ValueError：
+			# ai local 这类没有统一装饰器的命令以前会把 traceback 直接甩出去
+			# （Issue #2205）。本分支放在链尾是有意的：CacheRecordInvalid /
+			# CacheWriteRejected / ProxyConfigurationError / PlatformResponseInvalid
+			# 都是 ValueError 子类，各自的专用分支必须先有机会处理；只认
+			# AIConfigValueError 一种 typed error，其余 ValueError 维持既有行为。
+			# 持久化配置的问题按既有契约报 CONFIG_INVALID（Issue #1636），
+			# 与本命令自己的写入参数校验（INVALID_PARAM）分开。
+			from boss_agent_cli.ai.config import AIConfigValueError
+
+			if not isinstance(exc, AIConfigValueError) or not standalone_mode:
+				raise
+			command = _invoked_command_name(args, self.name or "boss")
+			invalid_recoverable, invalid_recovery = error_contract_for_code("CONFIG_INVALID")
+			emit_error(
+				command,
+				code="CONFIG_INVALID",
+				message=str(exc),
+				recoverable=invalid_recoverable,
+				recovery_action=f"{exc.recovery_hint} 修正后重试" if exc.recovery_hint else invalid_recovery,
 			)
 			return None
 

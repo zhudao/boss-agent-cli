@@ -111,7 +111,9 @@ def _config_text(data: dict[str, Any], key: str, default: str) -> str:
 
 def automation_config_from_dict(raw: dict[str, Any] | None) -> AutomationConfig:
 	"""Parse automation config from config.json-compatible data."""
-	data = raw or {}
+	# 只有 None 才回退到空配置：显式的假值（[] / "" / 0 / False）必须报错，
+	# 不能被 `raw or {}` 静默当成默认的 AUTONOMOUS 配置（Issue #1932）。
+	data: Any = {} if raw is None else raw
 	if not isinstance(data, dict):
 		# 手工编辑过的 config.json 可能把 automation 写成字符串；这里给出可读错误，
 		# 而不是在 .get() 上抛 AttributeError。
@@ -124,7 +126,11 @@ def automation_config_from_dict(raw: dict[str, Any] | None) -> AutomationConfig:
 	raw_actions = data.get("allowed_actions", default_actions)
 	if not isinstance(raw_actions, (list, tuple)):
 		raise ValueError(f"allowed_actions 必须是字符串数组，收到 {raw_actions!r}")
-	unknown_actions = [item for item in raw_actions if item not in allowed_action_values]
+	# 非字符串元素直接归入未知动作：set 的成员判断对 list / dict 会抛裸
+	# TypeError（unhashable），绕过本函数的 ValueError 契约（Issue #2125）。
+	unknown_actions = [
+		item for item in raw_actions if not isinstance(item, str) or item not in allowed_action_values
+	]
 	if unknown_actions:
 		raise ValueError(
 			f"allowed_actions 包含未知动作：{unknown_actions}；"

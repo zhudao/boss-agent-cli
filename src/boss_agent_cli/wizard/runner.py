@@ -17,7 +17,13 @@ from boss_agent_cli.api.client import PlatformRiskError
 from boss_agent_cli.api.proxy import ProxyConfigurationError
 from boss_agent_cli.api.request_budget import RequestBudgetExceeded, request_control
 from boss_agent_cli.auth.manager import AuthRequired, TokenRefreshFailed
-from boss_agent_cli.cache.store import CacheBusyError, CacheDatabaseInvalid, CacheRecordInvalid, is_cache_busy_error
+from boss_agent_cli.cache.store import (
+	CacheBusyError,
+	CacheDatabaseInvalid,
+	CacheRecordInvalid,
+	CacheWriteRejected,
+	is_cache_busy_error,
+)
 from boss_agent_cli.crawler.controls import CrawlProfilePathInvalid
 from boss_agent_cli.display import (
 	INTERNAL_ERROR_TYPES,
@@ -40,6 +46,18 @@ from boss_agent_cli.wizard.store import WorkflowStore
 
 Action = Callable[[Any, Mapping[str, Any], Mapping[str, Any]], StepResult]
 WorkflowEvent = Callable[[str, str, Mapping[str, Any] | None], None]
+
+
+#: 命中即停止、且不允许重试的账号 / 环境风控码。
+_RISK_CODES = frozenset({"ACCOUNT_RISK", "ENVIRONMENT_RISK"})
+
+#: 带 ``replay_safe: false`` 时必须阻断重放的步骤状态。
+_REPLAY_BLOCKING_STATUSES = frozenset({WorkflowStatus.FAILED.value, WorkflowStatus.STOPPED.value})
+
+#: 可能停在「写请求已声明、结算还没落盘」之间的步骤状态：running 的上一个
+#: 执行器没记录结果就消失了，pending 则是非终态结果已落盘但还没结算
+#: （Issue #2184）。两者只要带写前标记，--resume 都不得重放。
+_UNSETTLED_WRITE_STATUSES = frozenset({WorkflowStatus.RUNNING.value, WorkflowStatus.PENDING.value})
 
 
 class WorkflowActionError(Exception):
@@ -190,7 +208,7 @@ def has_blocked_step(run: Mapping[str, Any]) -> bool:
 	if not isinstance(steps, Sequence):
 		return False
 	for step in steps:
-		if not isinstance(step, Mapping) or str(step.get("status")) != WorkflowStatus.FAILED.value:
+		if not isinstance(step, Mapping) or str(step.get("status")) not in _REPLAY_BLOCKING_STATUSES:
 			continue
 		error = step.get("error")
 		if isinstance(error, Mapping) and error.get("replay_safe") is False:
@@ -219,11 +237,19 @@ class WorkflowControl:
 		return None
 
 	def bind_inner_run(self, inner_run_id: str) -> None:
+		# update_step 不带 error 会把它清空：已落盘的写前标记必须原样带回，否则
+		# 中断后 --resume 会重放结果未知的写操作（Issue #1958）。
+		try:
+			steps = self.store.cache.list_workflow_steps(self.run_id)
+		except CacheRecordInvalid:
+			steps = []
+		existing = next((step.get("error") for step in steps if step.get("step_name") == self.step_name), None)
 		self.store.update_step(
 			self.run_id,
 			self.step_name,
 			status=WorkflowStatus.RUNNING.value,
 			result={"inner_run_id": inner_run_id},
+			error=dict(existing) if isinstance(existing, Mapping) else None,
 		)
 
 	def begin_write(self, recovery_action: str) -> None:
@@ -244,7 +270,17 @@ class WorkflowControl:
 			replay_safe=False,
 		)
 		if not self.store.set_step_error(self.run_id, self.step_name, error.to_dict()):
-			raise RuntimeError(f"workflow step {self.step_name!r} of run {self.run_id!r} was not persisted")
+			# 记录缺失是确定性的状态损坏：报成可重试的 NETWORK_ERROR 会让每次恢复
+			# 都重跑前置步骤，而写请求永远发不出去（Issue #1965）。
+			_, recovery = error_contract_for_code("CACHE_RECORD_INVALID")
+			raise WorkflowActionError(
+				"CACHE_RECORD_INVALID",
+				f"workflow 步骤 {self.step_name!r}（run {self.run_id!r}）的记录不存在，写前标记无法落盘",
+				# 重试同一条命令必然复现：恢复方式是重建任务，不是「重试」。
+				recoverable=False,
+				recovery_action=recovery,
+				replay_safe=False,
+			)
 
 	def raise_if_requested(self) -> None:
 		signal = self.poll()
@@ -282,6 +318,18 @@ class WorkflowRunner:
 	) -> dict[str, Any]:
 		if max_retries < 0:
 			raise ValueError("max_retries must be >= 0")
+		if not plan.requested_steps:
+			# 读取边界会把历史断点缺失的 requested_steps 归一成空元组（#2033），
+			# 但空计划零步执行后无条件落 completed 会让步骤行仍是 pending：
+			# 下一次恢复撞上 #2118 的「completed 与未完成步骤自相矛盾」检查，
+			# 该 run 从此永久不可恢复（Issue #2149）。正常入口的 build_plan
+			# 永远给出非空步骤，空计划只可能来自脏断点或直接 API 误用。
+			raise WorkflowActionError(
+				"CACHE_RECORD_INVALID",
+				"workflow plan 没有任何步骤，无法执行或恢复",
+				recoverable=True,
+				auto_retry=False,
+			)
 		run_id = run_id or f"wrn_{secrets.token_urlsafe(12)}"
 		# 执行权必须先于执行快照取得：两次调用都读到旧快照时，后到者会把先到者已保存
 		# 的结果覆盖回 running，再把同一个写操作发一遍（Issue #1017）。
@@ -336,6 +384,32 @@ class WorkflowRunner:
 			self._assert_plan_matches(existing, plan)
 			if existing["status"] == WorkflowStatus.STOPPED.value:
 				return existing
+			if existing["status"] == WorkflowStatus.COMPLETED.value:
+				# 已完成的 run 是终态（Issue #2054）：此前 --resume 会先无条件写
+				# running 并清空 last_result / error，末次写回失败时完成结果永久丢失
+				# （--stop 还能把它改成 stopped，结果再也读不到）。重跑应新建 run_id。
+				unfinished = [
+					str(step.get("step_name"))
+					for step in existing.get("steps") or []
+					if step.get("status") != WorkflowStatus.COMPLETED.value
+				]
+				# 断点缺行同样是自相矛盾：只遍历现有步骤会让缺失的请求步骤既不算
+				# 完成也不算未完成，run 仍按 completed 返回（Issue #2118）。
+				present_steps = {str(step.get("step_name")) for step in existing.get("steps") or []}
+				unfinished.extend(name for name in plan.requested_steps if name not in present_steps)
+				if unfinished:
+					# completed 只应来自「所有步骤都 completed」；自相矛盾时无法判断
+					# 该不该重跑，按记录损坏确定性拒绝，不猜、不写。
+					raise WorkflowActionError(
+						"CACHE_RECORD_INVALID",
+						f"任务状态是 completed，但步骤 {', '.join(unfinished)} 未完成；"
+						"状态自相矛盾，无法判断是否重跑，请核对或新建 workflow",
+						recoverable=True,
+						replay_safe=True,
+						auto_retry=False,
+					)
+				return existing
+			self._assert_steps_match_plan(existing, plan)
 		prior_results: dict[str, Any] = {}
 		# waiting_input 步骤结果仍传给 action（如 crawl run_id），但不会跳过重跑。
 		waiting_priors: dict[str, Any] = {}
@@ -346,15 +420,18 @@ class WorkflowRunner:
 		blocked_steps: dict[str, dict[str, Any]] = {}
 		for step in stored_run["steps"]:
 			error = step.get("error") or {}
-			if step["status"] == WorkflowStatus.FAILED.value and error.get("replay_safe") is False:
-				# 动作可能已经生效：--resume 不得再执行一次。
+			if step["status"] in _REPLAY_BLOCKING_STATUSES and error.get("replay_safe") is False:
+				# 动作可能已经生效：--resume 不得再执行一次。步骤落成 stopped 而 run
+				# 还没写完就中断时同样要阻断（Issue #1957）。
 				blocked_steps[step["step_name"]] = error
+				continue
+			if step["status"] == WorkflowStatus.COMPLETED.value:
+				# 已完成步骤的 result 漂移成空值也不能重跑：它可能是写操作（Issue #1959）。
+				prior_results[step["step_name"]] = step["result"] or {}
 				continue
 			if not step["result"]:
 				continue
-			if step["status"] == WorkflowStatus.COMPLETED.value:
-				prior_results[step["step_name"]] = step["result"]
-			elif step["status"] in {
+			if step["status"] in {
 				WorkflowStatus.WAITING_INPUT.value,
 				WorkflowStatus.FAILED.value,
 				WorkflowStatus.RUNNING.value,
@@ -417,13 +494,39 @@ class WorkflowRunner:
 				status=WorkflowStatus.RUNNING.value,
 				current_step=step_name,
 			)
-			self._store.update_step(
+			step_running = self._store.update_step(
 				run_id,
 				step_name,
 				status=WorkflowStatus.RUNNING.value,
 				# 重跑前保留此前的 result（可能含内部 crawl 绑定），否则中断后再恢复就找不到原任务。
 				result=waiting_priors.get(step_name),
 			)
+			if not step_running:
+				# 步骤行缺失 / 被改名时不能在无记录的情况下派发动作：动作一旦
+				# 发出，结果无法记账，--resume 也无从判断是否重放（Issue #2034）。
+				# 本次没有平台写入，replay_safe 保持 True；确定性损坏不自动重试。
+				# 不进入通用失败落盘——步骤行本就不在，_persist_failure 只会把
+				# 错误改写成写入失败，淹没真正的损坏原因。
+				error = WorkflowActionError(
+					"CACHE_RECORD_INVALID",
+					f"步骤 {step_name} 的记录不存在，未执行任何动作",
+					recoverable=True,
+					replay_safe=True,
+					auto_retry=False,
+				)
+				try:
+					self._store.update_run(
+						run_id,
+						status=WorkflowStatus.FAILED.value,
+						current_step=step_name,
+						last_result=waiting_priors.get(step_name),
+						error=error.to_dict(),
+					)
+				except Exception:
+					# 记录已损坏：run 级写回失败不能替换原始诊断，resume 会再次
+					# 命中同一检查。
+					pass
+				raise error
 			control = WorkflowControl(run_id, step_name, self._store, deadline, resume_action=resume_action_for(run_id))
 			with_control = getattr(context, "with_workflow_control", None)
 			action_context = with_control(control) if callable(with_control) else context
@@ -488,6 +591,12 @@ class WorkflowRunner:
 					# action 的通用认证指引在写入 checkpoint 前补齐本次运行目录。
 					exc.recovery_action = login_action
 				error = exc
+				if exc.code in {"WORKFLOW_STOPPED", "WORKFLOW_TIMEOUT"} and exc.replay_safe:
+					# 写请求发出后的下一次控制检查抛出停止 / 超时：保留写前标记，
+					# 否则 --resume 会重放结果未知的写操作（Issue #1956）。
+					write_marker = self._persisted_write_marker(run_id, step_name)
+					if write_marker is not None:
+						error = self._unconfirmed_error(exc.code, write_marker)
 			except WorkflowInputError as exc:
 				# inputs 写错（类型不对）不是网络问题：落到下面的通用兜底会变成
 				# NETWORK_ERROR +「重试当前 run_id」，而重试同一条输入必然复现。
@@ -637,6 +746,17 @@ class WorkflowRunner:
 						recovery_action=invalid_recovery,
 						replay_safe=True,
 					)
+				# 约束冲突 / 绑定值非法是调用方输入问题，缓存库本身健康：
+				# 不能兜成可重试的 NETWORK_ERROR（Issue #1886）。
+				elif isinstance(exc, CacheWriteRejected):
+					invalid_recoverable, invalid_recovery = error_contract_for_code("INVALID_PARAM")
+					error = WorkflowActionError(
+						"INVALID_PARAM",
+						str(exc),
+						recoverable=invalid_recoverable,
+						recovery_action=invalid_recovery,
+						replay_safe=True,
+					)
 				# 本地缓存锁冲突不是网络问题（Issue #1118）：等锁释放后重试同一
 				# run_id 即可，不能兜成 NETWORK_ERROR。
 				elif isinstance(exc, CacheBusyError) or is_cache_busy_error(exc):
@@ -717,7 +837,29 @@ class WorkflowRunner:
 				)
 				# A returned result confirms the action's outcome. Persist it before
 				# checking controls, so a late deadline cannot replay that effect.
-				self._store.update_step(run_id, step_name, status=result.status.value, result=result_data)
+				# 落盘失败不能以可重试错误逃逸：步骤已成功而结果没写下去，重试会重发
+				# 一次平台请求（Issue #1963）。
+				try:
+					# 写前标记必须与步骤结果一次落盘：通用 update_step 的 error=None
+					# 会清空 begin_write 的记录，若随后 update_run / 结算补写之前
+					# 中断，--resume 会把结果未知的写请求再发一遍（Issue #2117）。
+					step_persisted = self._store.update_step(
+						run_id,
+						step_name,
+						status=result.status.value,
+						result=result_data,
+						error=declared_marker,
+					)
+				except Exception as exc:
+					raise self._write_failed_error(
+						{"code": "LOCAL_STATE_WRITE_FAILED", "message": f"步骤 {step_name} 的结果未能落盘"},
+						exc,
+					) from exc
+				if not step_persisted:
+					raise self._write_failed_error(
+						{"code": "CACHE_RECORD_INVALID", "message": f"步骤 {step_name} 的记录已不存在"},
+						CacheRecordInvalid("workflow_step", f"{run_id}/{step_name}", "step", "步骤记录不存在"),
+					)
 				signal = control.poll()
 				if signal == "timeout":
 					return self._fail_controlled(
@@ -727,20 +869,45 @@ class WorkflowRunner:
 						message=f"workflow 超过 {timeout_seconds:g} 秒未完成",
 						recovery_action=resume_action_for(run_id),
 						preserve_result=True,
+						marker=declared_marker,
 					)
-				self._store.update_run(
-					run_id,
-					status=WorkflowStatus.STOPPED.value
-					if signal == "stop"
-					else result.status.value
-					if result.status == WorkflowStatus.WAITING_INPUT
-					else WorkflowStatus.RUNNING.value,
-					current_step=step_name,
-					last_result=result_data,
-				)
+				try:
+					self._store.update_run(
+						run_id,
+						status=WorkflowStatus.STOPPED.value
+						if signal == "stop"
+						else result.status.value
+						if result.status == WorkflowStatus.WAITING_INPUT
+						else WorkflowStatus.RUNNING.value,
+						current_step=step_name,
+						last_result=result_data,
+					)
+				except Exception as exc:
+					raise self._write_failed_error(
+						{"code": "LOCAL_STATE_WRITE_FAILED", "message": f"run {run_id} 的状态未能落盘"},
+						exc,
+					) from exc
 				if on_event:
 					on_event("step_finished", step_name, result_data)
 				if signal == "stop":
+					if declared_marker is not None:
+						# 同 #1956：action 已声明失败且写请求在途时，用户停止不能抹掉
+						# 标记，否则 --resume 会重放结果未知的写操作（Issue #2008）。
+						error_data = self._unconfirmed_error("WORKFLOW_STOPPED", declared_marker).to_dict()
+						self._store.update_step(
+							run_id,
+							step_name,
+							status=WorkflowStatus.FAILED.value,
+							result=result_data,
+							error=error_data,
+						)
+						self._store.update_run(
+							run_id,
+							status=WorkflowStatus.STOPPED.value,
+							current_step=step_name,
+							last_result=result_data,
+							error=error_data,
+						)
 					return self._store.get_for_result(run_id) or {}
 				if result.status == WorkflowStatus.WAITING_INPUT:
 					return self._store.get_for_result(run_id) or {}
@@ -766,23 +933,24 @@ class WorkflowRunner:
 				(step.get("result") for step in persisted.get("steps", []) if step["step_name"] == step_name),
 				None,
 			)
-			self._store.update_step(run_id, step_name, status=failed_status, result=step_result, error=error_data)
-			self._store.update_run(
-				run_id,
-				status=failed_status,
-				current_step=step_name,
-				error=error_data,
+			self._persist_failure(
+				run_id, step_name, status=failed_status, result=step_result, error_data=error_data
 			)
 			if on_event:
 				on_event("step_failed", step_name, error_data)
 			return self._store.get_for_result(run_id) or {}
 
-		self._store.update_run(
-			run_id,
-			status=WorkflowStatus.COMPLETED.value,
-			current_step=None,
-			last_result=prior_results.get(plan.requested_steps[-1]) if plan.requested_steps else {},
-		)
+		try:
+			self._store.update_run(
+				run_id,
+				status=WorkflowStatus.COMPLETED.value,
+				current_step=None,
+				last_result=prior_results.get(plan.requested_steps[-1]) if plan.requested_steps else {},
+			)
+		except Exception as exc:
+			# 平台步骤都成功了，只是本地记账失败：按 LOCAL_STATE_WRITE_FAILED 上报，
+			# 让操作者核对页面而不是重跑整个 workflow（Issue #1963）。
+			raise self._write_failed_error({"code": WorkflowStatus.COMPLETED.value}, exc) from exc
 		return self._store.get_for_result(run_id) or {}
 
 	def _finish_declared_status(
@@ -816,15 +984,13 @@ class WorkflowRunner:
 				code, message, recoverable=recoverable, recovery_action=recovery
 			)
 		error_data = error.to_dict()
-		self._store.update_step(
-			run_id, step_name, status=failed_status, result=result_data, error=error_data
-		)
-		self._store.update_run(
+		self._persist_failure(
 			run_id,
+			step_name,
 			status=failed_status,
-			current_step=step_name,
+			result=result_data,
+			error_data=error_data,
 			last_result=result_data,
-			error=error_data,
 		)
 		return self._store.get_for_result(run_id) or {}
 
@@ -878,6 +1044,66 @@ class WorkflowRunner:
 			replay_safe=False,
 		)
 
+	def _persist_failure(
+		self,
+		run_id: str,
+		step_name: str,
+		*,
+		status: str,
+		result: dict[str, Any] | None,
+		error_data: dict[str, Any],
+		last_result: dict[str, Any] | None = None,
+	) -> None:
+		"""落盘失败步骤与 run 终态；本地写失败不能掩盖原始失败原因（Issue #1963）。
+
+		缓存库被其它进程持写锁时 ``update_step`` 会抛 ``CacheBusyError``：直接
+		冒泡会让风控 / 预算这类终止码变成「可重试的缓存忙」，Agent 会照着重试
+		一个本该停下来核对页面的动作。
+		"""
+		try:
+			persisted = self._store.update_step(
+				run_id, step_name, status=status, result=result, error=error_data
+			)
+			if not persisted:
+				raise CacheRecordInvalid(
+					"workflow_step",
+					f"{run_id}/{step_name}",
+					"step",
+					"步骤记录不存在，无法落盘执行结果",
+				)
+			self._store.update_run(
+				run_id, status=status, current_step=step_name, last_result=last_result, error=error_data
+			)
+		except Exception as exc:
+			raise self._write_failed_error(error_data, exc) from exc
+
+	def _write_failed_error(self, error_data: dict[str, Any], exc: Exception) -> WorkflowActionError:
+		"""把「原始失败 + 断点写失败」合成一条不可重试的终止错误。"""
+		code = error_data.get("code")
+		message = error_data.get("message")
+		detail = f"本地断点写入失败：{exc}"
+		already_closed = error_data.get("recoverable") is False and error_data.get("replay_safe") is False
+		no_effect = error_data.get("replay_safe") is False
+		if isinstance(code, str) and (code in _RISK_CODES or (already_closed and no_effect)):
+			# 风控是硬边界：原码与停止指引优先，只把写失败附在消息里。
+			recovery = error_data.get("recovery_action")
+			return WorkflowActionError(
+				code,
+				f"原始失败：{message if isinstance(message, str) and message else '未知失败'}；本地断点写入失败：{detail}",
+				recoverable=False,
+				recovery_action=recovery if isinstance(recovery, str) and recovery else None,
+				replay_safe=False,
+			)
+		recoverable, recovery = error_contract_for_code("LOCAL_STATE_WRITE_FAILED")
+		return WorkflowActionError(
+			"LOCAL_STATE_WRITE_FAILED",
+			f"{detail}；原始失败：{code if isinstance(code, str) else '未知'}",
+			recoverable=recoverable,
+			recovery_action=recovery,
+			details={"original_code": code, "original_message": message},
+			replay_safe=False,
+		)
+
 	def _persisted_write_marker(self, run_id: str, step_name: str) -> dict[str, Any] | None:
 		"""读取本步骤已落盘的写前标记；返回 None 表示没有写请求在途的记录。
 
@@ -920,7 +1146,11 @@ class WorkflowRunner:
 		"""
 		interrupted: list[tuple[dict[str, Any], dict[str, Any]]] = []
 		for step in stored_run["steps"]:
-			if step["status"] != WorkflowStatus.RUNNING.value:
+			# pending 也可能停在「结果已落盘、结算还没写」之间：自定义动作返回
+			# 非终态结果时先落盘 pending + 写前标记，随后才结算成失败
+			# （Issue #2184）。带写前标记的 pending 与 running 同口径结算，
+			# 否则 --resume 会把结果未知的写请求再发一次。
+			if step["status"] not in _UNSETTLED_WRITE_STATUSES:
 				continue
 			# _persisted_write_marker 可能把缺失 / 漂移的 replay_safe 规范化成
 			# 后备标记；结算时也用规范化结果，不能把不完整的记录原样写回。
@@ -943,9 +1173,34 @@ class WorkflowRunner:
 			run_id,
 			status=WorkflowStatus.FAILED.value,
 			current_step=first["step_name"],
+			# 与 blocked 恢复分支同口径保留展示信息：不传 last_result 会写 NULL，
+			# TTY 恢复列表里的职位数 / 内部采集 run_id 随之丢失（Issue #2119）。
+			last_result=stored_run.get("last_result"),
 			error={**first_marker, "message": _INTERRUPTED_WRITE_MESSAGE, "replay_safe": False},
 		)
 		return self._store.get_checkpoint(run_id) or stored_run
+
+	@staticmethod
+	def _assert_steps_match_plan(existing: Mapping[str, Any], plan: WorkflowPlan) -> None:
+		"""断点的步骤行必须与请求步骤逐一对应（Issue #2185）。
+
+		`--resume` 从断点的 ``params.requested_steps`` 重建计划，单看计划与 params
+		是自我核对。该字段漂移成合法的真子集时，runner 只执行计划里的步骤，
+		漏跑的步骤行仍是 pending，run 却写成 completed。步骤行是创建时按请求
+		步骤逐条落盘的，两者在顺序与数量上必须一致；不一致就没有可靠的执行
+		范围，按记录损坏拒绝，不猜、不写。
+		"""
+		step_names = [str(step.get("step_name")) for step in existing.get("steps") or []]
+		if step_names == list(plan.requested_steps):
+			return
+		raise WorkflowActionError(
+			"CACHE_RECORD_INVALID",
+			f"断点的步骤行 {step_names} 与请求步骤 {list(plan.requested_steps)} 不一致；"
+			"无法确定该执行哪些步骤，请核对或新建 workflow",
+			recoverable=True,
+			replay_safe=True,
+			auto_retry=False,
+		)
 
 	@staticmethod
 	def _assert_plan_matches(existing: Mapping[str, Any], plan: WorkflowPlan) -> None:
@@ -955,8 +1210,11 @@ class WorkflowRunner:
 			"platform": existing.get("platform"),
 			"goal": existing.get("goal"),
 			"mode": existing.get("mode"),
-			"inputs": params.get("inputs"),
-			"requested_steps": params.get("requested_steps"),
+			# 读取边界接受 `inputs: null` 与省略 `requested_steps`，`_plan_from_run`
+			# 会把它们归一成 `{}` / `()`；这里同样归一后再比较，否则合法断点会被
+			# 误报为 plan mismatch（Issue #2033）。
+			"inputs": dict(params.get("inputs") or {}),
+			"requested_steps": list(params.get("requested_steps") or ()),
 		}
 		requested = {
 			"role": plan.role,
@@ -976,15 +1234,14 @@ class WorkflowRunner:
 
 	@staticmethod
 	def _plans_equal(persisted: Any, requested: Any) -> bool:
-		"""比较落库参数与本次 plan，NaN 按同值处理（Issue #1883）。
+		"""按 JSON 值类型比较落库参数与本次 plan（Issue #1883 / #2188）。
 
-		``json.loads`` 接受 ``NaN``，而 ``nan != nan`` 恒真：直接 ``!=`` 会让同一个
-		含 NaN 的 plan 恢复时永远命中 ``WORKFLOW_PLAN_MISMATCH``（recoverable=False），
-		run 永久不可恢复。先按值比较，再退到规范化 JSON 文本比较——两侧对 NaN
-		都序列化成 ``NaN``。
+		Python 的 ``==`` 把 ``False`` 与 ``0``、``True`` 与 ``1`` 视为相同，而
+		JSON 里它们是不同的值：直接相等会让直接调用 runner 的调用方用整数替掉
+		断点里的布尔输入后继续执行，步骤看到的输入与断点记录不一致。规范化
+		JSON 文本比较区分数值类型，同时保留 NaN 按同值处理的既有兼容——
+		两侧都序列化成 ``NaN``。
 		"""
-		if persisted == requested:
-			return True
 		try:
 			return json.dumps(persisted, sort_keys=True) == json.dumps(requested, sort_keys=True)
 		except (TypeError, ValueError, RecursionError):
@@ -999,28 +1256,37 @@ class WorkflowRunner:
 		message: str,
 		recovery_action: str,
 		preserve_result: bool = False,
+		marker: dict[str, Any] | None = None,
 	) -> dict[str, Any]:
-		error = {
-			"code": code,
-			"message": message,
-			"recoverable": True,
-			"recovery_action": recovery_action,
-		}
+		if marker is not None:
+			# 写请求在途的证据不能因控制信号而消失：错误按「结果未知」落盘，
+			# 并在下面强制写回步骤，--resume 才能阻断重放（Issue #2008）。
+			error = self._unconfirmed_error(code, marker).to_dict()
+		else:
+			error = {
+				"code": code,
+				"message": message,
+				"recoverable": True,
+				"recovery_action": recovery_action,
+			}
 		stored_run = self._store.get_checkpoint(run_id) or {}
 		step_result = next(
 			(step.get("result") for step in stored_run.get("steps", []) if step["step_name"] == step_name),
 			None,
 		)
-		if not preserve_result:
-			# 超时/失败同样保留此前写入的结果（如 inner_run_id），恢复时才能续跑内部任务（Issue #882）。
-			self._store.update_step(
-				run_id, step_name, status=WorkflowStatus.FAILED.value, result=step_result, error=error
+		try:
+			if marker is not None or not preserve_result:
+				# 超时/失败同样保留此前写入的结果（如 inner_run_id），恢复时才能续跑内部任务（Issue #882）。
+				self._store.update_step(
+					run_id, step_name, status=WorkflowStatus.FAILED.value, result=step_result, error=error
+				)
+			self._store.update_run(
+				run_id,
+				status=WorkflowStatus.FAILED.value,
+				current_step=step_name,
+				last_result=step_result,
+				error=error,
 			)
-		self._store.update_run(
-			run_id,
-			status=WorkflowStatus.FAILED.value,
-			current_step=step_name,
-			last_result=step_result,
-			error=error,
-		)
+		except Exception as exc:
+			raise self._write_failed_error(error, exc) from exc
 		return self._store.get_for_result(run_id) or {}

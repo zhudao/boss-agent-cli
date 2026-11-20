@@ -62,6 +62,36 @@ def _hint_command(ctx: click.Context, command: str) -> str:
 	return boss_command_for_ctx(ctx, command, include_data_dir=True)
 
 
+def _ai_config_invalid(ctx: click.Context, exc: AIConfigValueError) -> None:
+	"""配置项类型漂移统一按 CONFIG_INVALID 上报并给修复命令。"""
+	handle_error_output(
+		ctx,
+		"ai-config",
+		code="CONFIG_INVALID",
+		message=str(exc),
+		recoverable=True,
+		recovery_action=f"{exc.recovery_hint or 'ai config'} 修正后重试",
+		hints={"next_actions": [_hint_command(ctx, exc.recovery_hint or "ai config")]},
+	)
+	ctx.exit(1)
+
+
+def _strict_resolved_base_url(ctx: click.Context, store: Any) -> str | None:
+	"""回显实际生效的端点；配置项类型漂移时按 CONFIG_INVALID 拒绝。
+
+	``load_config().get("ai_base_url")`` 拿到 ``true`` 这类漂移值会被
+	``provider_endpoint`` 原样当成地址回显（Issue #1967）。
+	"""
+	try:
+		config = store.load_config()
+		provider = ai_text_setting(config, "ai_provider")
+		base_url = ai_text_setting(config, "ai_base_url")
+	except AIConfigValueError as exc:
+		_ai_config_invalid(ctx, exc)
+		raise
+	return provider_endpoint(provider, base_url)
+
+
 def _create_ai_service(ctx: click.Context) -> AIService | None:
 	"""从配置创建 AIService 实例，未配置时返回 None。
 
@@ -86,7 +116,10 @@ def _create_ai_service(ctx: click.Context) -> AIService | None:
 		)
 	provider = ai_text_setting(config, "ai_provider")
 	raw_base_url = ai_text_setting(config, "ai_base_url")
-	base_url = normalize_base_url(raw_base_url) if raw_base_url is not None else None
+	# 空串与 None / 缺键同口径视为未设置，与 ``AIConfigStore.get_base_url`` 一致：
+	# 旧版本的 ``--clear-base-url`` 写入的是空串，按 ``is not None`` 判断会把它送进
+	# 校验并让每条 AI 命令报 CONFIG_INVALID（Issue #2253）。纯空白串仍按损坏拒绝。
+	base_url = normalize_base_url(raw_base_url) if raw_base_url else None
 	base_url = provider_endpoint(provider, base_url)
 	if not api_key or not base_url:
 		return None
@@ -193,6 +226,23 @@ def _load_resume_text(ctx: click.Context, resume_name: str) -> str | None:
 	return None
 
 
+def _ensure_text_not_blank(
+	ctx: click.Context, command: str, label: str, value: str, hint: str
+) -> None:
+	"""空白文本参数不得照常发起一次计费请求（Issue #1975）。"""
+	if value.strip():
+		return
+	handle_error_output(
+		ctx,
+		command,
+		code="INVALID_PARAM",
+		message=f"{label}不能为空或只包含空白字符",
+		recovery_action=f"传入{label}或 @文件路径 后重试",
+		hints={"next_actions": [_hint_command(ctx, hint)]},
+	)
+	ctx.exit(1)
+
+
 def _read_text_argument(ctx: click.Context, value: str) -> str | None:
 	"""展开 `@文件路径` 参数；读不出来时输出信封并返回 None。
 
@@ -280,9 +330,9 @@ def _call_ai(ctx: click.Context, svc: AIService, prompt: str) -> dict[str, Any] 
 	except AIServiceError as exc:
 		handle_error_output(
 			ctx, "ai",
-			code="AI_API_ERROR",
+			code=exc.code,
 			message=f"AI 服务调用失败: {exc}",
-			recoverable=True,
+			recoverable=exc.recoverable,
 			recovery_action=recovery_action_for(
 				exc,
 				"检查网络连接和密钥配置，重试",
@@ -379,10 +429,11 @@ def ai_group() -> None:
 @click.option("--api-key", default=None, help="API 密钥（将加密存储；空值会被拒绝，清除密钥请用 --clear-api-key）")
 @click.option("--clear-api-key", is_flag=True, default=False, help="删除已存储的 API 密钥（与 --api-key 互斥；没有密钥时也安全）")
 @click.option("--base-url", default=None, help="自定义 API 基础地址（provider=custom 或自建代理时使用）")
+@click.option("--clear-base-url", is_flag=True, default=False, help="清除已保存的自定义基础地址（与 --base-url 互斥），回到 provider 登记表里的默认端点")
 @click.option("--temperature", default=None, type=click.FloatRange(min=0), help="生成温度")
 @click.option("--max-tokens", default=None, type=click.IntRange(min=1), help="最大令牌数")
 @click.pass_context
-def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, api_key: str | None, clear_api_key: bool, base_url: str | None, temperature: float | None, max_tokens: int | None) -> None:
+def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, api_key: str | None, clear_api_key: bool, base_url: str | None, clear_base_url: bool, temperature: float | None, max_tokens: int | None) -> None:
 	"""查看或设置 AI 服务配置"""
 	store = _get_ai_config_store(ctx)
 
@@ -395,6 +446,7 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 		or api_key is not None
 		or clear_api_key
 		or base_url is not None
+		or clear_base_url
 		or temperature is not None
 		or max_tokens is not None
 	)
@@ -406,7 +458,7 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 		# 真正生效的地址来自 PROVIDER_BASE_URLS 查表，用户此前无从确认。
 		# provider 名相近时（如 openrouter / orcarouter）记混会把 API key 与
 		# 简历全文发到另一家，而界面上看不出任何差别。
-		config["resolved_base_url"] = store.get_base_url()
+		config["resolved_base_url"] = _strict_resolved_base_url(ctx, store)
 		handle_output(
 			ctx, "ai-config", config,
 			render=lambda d: render_action_result(
@@ -459,13 +511,33 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 		)
 		ctx.exit(1)
 		return
+	if api_key is not None:
+		# 密钥要进 HTTP 请求头：首尾空白 / 换行直接去掉；非 ASCII 或控制字符永远
+		# 发不出去，落盘后每条 AI 命令都会报成网络或本地 IO 错误（Issue #1952）。
+		api_key = api_key.strip()
+		if not api_key.isascii() or not api_key.isprintable():
+			handle_error_output(
+				ctx, "ai-config",
+				code="INVALID_PARAM",
+				message="--api-key 只能包含可打印的 ASCII 字符；请检查是否混入了换行、中文或全角字符",
+				recovery_action="从服务商控制台重新复制密钥后重试",
+				hints={"next_actions": [_hint_command(ctx, "ai config --api-key <key>")]},
+			)
+			ctx.exit(1)
+			return
 
 	# provider 写错（如 `openai-cn`）或 provider=custom 没给 base_url 时，端点解析为
 	# None：写进配置后每条 AI 命令都只会回「AI 服务未配置」，用户看不出是 provider
 	# 名的问题，而配置和 api_key 已经落盘。写入前先拒绝，并列出登记表里的取值。
 	if provider is not None:
-		stored_base_url = store.load_config().get("ai_base_url")
-		effective_base_url = base_url if base_url is not None else stored_base_url
+		try:
+			stored_base_url = ai_text_setting(store.load_config(), "ai_base_url")
+		except AIConfigValueError as exc:
+			_ai_config_invalid(ctx, exc)
+			return
+		# --clear-base-url 与 --provider 同时给出时，按清除后的状态判断端点能否解析：
+		# 否则 `--provider custom --clear-base-url` 会拿即将被清掉的旧地址通过检查。
+		effective_base_url = base_url if base_url is not None else (None if clear_base_url else stored_base_url)
 		if provider_endpoint(provider, effective_base_url) is None:
 			if provider == "custom":
 				message = "provider 'custom' 需要同时传 --base-url（自建 OpenAI 兼容端点）"
@@ -502,6 +574,20 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 			ctx.exit(1)
 			return
 		updates["ai_model"] = model
+	if base_url is not None and clear_base_url:
+		handle_error_output(
+			ctx, "ai-config",
+			code="INVALID_PARAM",
+			message="--base-url 与 --clear-base-url 只能二选一",
+			recovery_action="设置新地址用 --base-url，恢复默认端点用 --clear-base-url",
+			hints={"next_actions": [_hint_command(ctx, "ai config --clear-base-url")]},
+		)
+		ctx.exit(1)
+		return
+	if clear_base_url:
+		# 写回默认值 None（与全新配置一致）：provider_endpoint 按登记表解析
+		# （Issue #1967）。旧版本这里写空串，服务构造把它当成非法地址（Issue #2253）。
+		updates["ai_base_url"] = None
 	if base_url is not None:
 		try:
 			# 空白串 / 缺 scheme / 非 http(s) 地址会让之后每条 AI 命令抛
@@ -533,6 +619,12 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 		updates["ai_temperature"] = temperature
 	if max_tokens is not None:
 		updates["ai_max_tokens"] = max_tokens
+	# 先写密钥再写配置：反过来的话密钥写失败会留下「配置已改、密钥没变」的半截
+	# 更新，调用方按新配置继续用旧密钥（Issue #1967）。
+	if api_key is not None:
+		store.save_api_key(api_key)
+	elif clear_api_key:
+		store.clear_api_key()
 	if updates:
 		try:
 			store.save_config(**updates)
@@ -545,13 +637,10 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 				message=str(exc),
 				recoverable=True,
 				recovery_action=f"备份并修正或删除 {exc.path} 后重试",
+				details={"api_key_updated": api_key is not None or clear_api_key},
 			)
 			ctx.exit(1)
 			return
-	if api_key is not None:
-		store.save_api_key(api_key)
-	elif clear_api_key:
-		store.clear_api_key()
 
 	updated_fields = list(updates.keys())
 	if api_key is not None or clear_api_key:
@@ -564,7 +653,7 @@ def ai_config_cmd(ctx: click.Context, provider: str | None, model: str | None, a
 			"api_key_set": store.api_key_is_set(),
 			# 写入后立刻回显生效的端点，让「刚配的这个 provider 会把数据发去哪」
 			# 在同一屏内可确认，而不是要再跑一次 boss ai config 才看得到。
-			"resolved_base_url": store.get_base_url(),
+			"resolved_base_url": _strict_resolved_base_url(ctx, store),
 		},
 		render=lambda d: render_action_result(d, title="ai config", next_steps=[_hint_command(ctx, "ai config")]),
 		hints={"next_actions": [
@@ -594,6 +683,7 @@ def ai_analyze_jd_cmd(ctx: click.Context, jd_text: str, resume_name: str) -> Non
 		return
 	jd_text = resolved
 
+	_ensure_text_not_blank(ctx, "ai", "职位描述", jd_text, 'ai analyze-jd "<职位描述>" --resume <name>')
 	resume_text = _load_resume_text(ctx, resume_name)
 	if resume_text is None:
 		return
@@ -653,6 +743,7 @@ def ai_optimize_cmd(ctx: click.Context, resume_name: str, jd_text: str) -> None:
 		return
 	jd_text = resolved
 
+	_ensure_text_not_blank(ctx, "ai", "职位描述", jd_text, 'ai optimize <resume> --jd "<职位描述>"')
 	resume_text = _load_resume_text(ctx, resume_name)
 	if resume_text is None:
 		return
@@ -687,6 +778,7 @@ def ai_suggest_cmd(ctx: click.Context, resume_name: str, jd_text: str) -> None:
 		return
 	jd_text = resolved
 
+	_ensure_text_not_blank(ctx, "ai", "职位描述", jd_text, 'ai suggest <resume> "<职位描述>"')
 	resume_text = _load_resume_text(ctx, resume_name)
 	if resume_text is None:
 		return
@@ -805,10 +897,23 @@ def ai_reply_cmd(ctx: click.Context, recruiter_message: str, context: str, resum
 		return resolved
 
 	recruiter_message = _resolve_text(recruiter_message)
+	if not recruiter_message.strip():
+		# 空消息会照常发起一次计费请求，结果只是泛化的回复文本（Issue #1975）。
+		handle_error_output(
+			ctx, "ai-reply",
+			code="INVALID_PARAM",
+			message="招聘者消息不能为空或只包含空白字符",
+			recovery_action="传入要回复的招聘者消息文本或 @文件路径 后重试",
+			hints={"next_actions": [_hint_command(ctx, 'ai reply "<招聘者消息>" --resume <name>')]},
+		)
+		ctx.exit(1)
+		return
 	context_text = _resolve_text(context) if context else "（无）"
 
 	resume_text = "（未指定）"
-	if resume_name:
+	if resume_name is not None:
+		# 显式空串交给 _load_resume_text 报「简历名称不能为空」，不能静默当成未指定
+		# 后照常发起请求（Issue #1951）。
 		loaded = _load_resume_text(ctx, resume_name)
 		if loaded is None:
 			return
@@ -855,8 +960,11 @@ def ai_interview_prep_cmd(ctx: click.Context, jd_text: str, resume_name: str | N
 		return
 	jd_text = resolved
 
+	_ensure_text_not_blank(ctx, "ai", "职位描述", jd_text, 'ai interview-prep "<职位描述>"')
 	resume_text = "（未指定）"
-	if resume_name:
+	if resume_name is not None:
+		# 显式空串交给 _load_resume_text 报「简历名称不能为空」，不能静默当成未指定
+		# 后照常发起请求（Issue #1951）。
 		loaded = _load_resume_text(ctx, resume_name)
 		if loaded is None:
 			return
@@ -900,9 +1008,13 @@ def ai_chat_coach_cmd(ctx: click.Context, chat_text: str, resume_name: str | Non
 	if resolved is None:
 		return
 	chat_text = resolved
+	_ensure_text_not_blank(ctx, "ai", "聊天记录", chat_text, 'ai chat-coach "<聊天记录>"')
+	_ensure_text_not_blank(ctx, "ai", "沟通风格", style, "ai chat-coach <chat_text> --style 简洁专业")
 
 	resume_text = "（未指定）"
-	if resume_name:
+	if resume_name is not None:
+		# 显式空串交给 _load_resume_text 报「简历名称不能为空」，不能静默当成未指定
+		# 后照常发起请求（Issue #1951）。
 		loaded = _load_resume_text(ctx, resume_name)
 		if loaded is None:
 			return
@@ -1035,6 +1147,7 @@ def ai_resume_optimize_cmd(ctx: click.Context, resume_name: str, jd_text: str | 
 		if resolved is None:
 			return
 		jd_text = resolved
+		_ensure_text_not_blank(ctx, "ai", "职位描述", jd_text, 'ai resume-optimize <resume> --jd <职位描述>')
 
 	resume_text = _load_resume_text(ctx, resume_name)
 	if resume_text is None:
@@ -1116,6 +1229,7 @@ def ai_cover_letter_cmd(
 		if resolved is None:
 			return
 		jd_text = resolved
+		_ensure_text_not_blank(ctx, "ai", "职位描述", jd_text, 'ai cover-letter <resume> --jd <职位描述>')
 
 	resume_text = _load_resume_text(ctx, resume_name)
 	if resume_text is None:

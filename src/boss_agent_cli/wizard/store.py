@@ -38,11 +38,13 @@ def _validate_replay_markers(run: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_error_contract(run: dict[str, Any]) -> dict[str, Any]:
-	"""``error.recoverable`` / ``error.recovery_action`` 类型漂移按记录损坏拒绝。
+	"""``error.code`` / ``recoverable`` / ``recovery_action`` 类型漂移按记录损坏拒绝。
 
 	信封出口把 ``recoverable`` 转成布尔、把 ``recovery_action`` 原样透传：
 	持久化的 ``"false"`` 会变成 ``true``，数字 ``123`` 会进入 error.recovery_action
-	让用户去执行一个不存在的地址（Issue #1592）。标记没有可猜测的原值，读取边界
+	让用户去执行一个不存在的地址（Issue #1592）。非空 ``error`` 必须有非空字符串
+	``code``：出口对缺失值回退成 ``NETWORK_ERROR`` +「重试」，禁止重放的写步骤
+	会拿到误导性的重试指引（Issue #2101）。标记没有可猜测的原值，读取边界
 	按损坏拒绝，不改写断点。
 	"""
 	run_id = str(run.get("run_id") or "")
@@ -53,6 +55,18 @@ def _validate_error_contract(run: dict[str, Any]) -> dict[str, Any]:
 	for kind, record_id, error in records:
 		if not isinstance(error, dict):
 			continue
+		if error and not (isinstance(error.get("code"), str) and error["code"]):
+			# 信封出口会把缺失 / 空的 code 回退成 NETWORK_ERROR +「重试」：结果未知的
+			# 写步骤不能拿到一条重试指引。写入器总会带 code，缺失只可能来自外部
+			# 漂移或旧数据（Issue #1960、#2101）。
+			raise CacheRecordInvalid(
+				kind,
+				record_id,
+				"error.code",
+				"缺失时必须补全为非空字符串；无法据此判断失败原因，重建任务前先核对实际状态",
+			)
+		if "message" in error and error["message"] is not None and not isinstance(error["message"], str):
+			raise CacheRecordInvalid(kind, record_id, "error.message", "必须是字符串或 null")
 		if "recoverable" in error and not isinstance(error["recoverable"], bool):
 			raise CacheRecordInvalid(
 				kind,
@@ -101,6 +115,31 @@ def _validate_statuses(run: dict[str, Any]) -> dict[str, Any]:
 	return run
 
 
+def _validate_step_result_consistency(run: dict[str, Any]) -> dict[str, Any]:
+	"""``pending`` 步骤的已落盘结果不能声明 ``completed``（Issue #2183）。
+
+	执行器落盘步骤结果与状态是同一个原子写；``failed`` / ``stopped`` 步骤保留
+	完成结果是结算超时、停止时的既有语义。唯独 ``pending``（等待执行）带着
+	``result.status == "completed"`` 无法由本工具产生：它是状态被外部改回
+	``pending`` 的痕迹，恢复时会把可能已生效的写步骤重放一次。矛盾没有可猜测
+	的真相，读取边界按记录损坏拒绝，不改写断点。
+	"""
+	run_id = str(run.get("run_id") or "")
+	for step in run.get("steps") or []:
+		if step.get("status") != WorkflowStatus.PENDING.value:
+			continue
+		result = step.get("result")
+		if isinstance(result, dict) and result.get("status") == WorkflowStatus.COMPLETED.value:
+			raise CacheRecordInvalid(
+				"workflow_step",
+				f"{run_id}/{step.get('step_name')}",
+				"status",
+				"步骤是 pending，但已落盘结果是 completed；无法判断该步骤是否已生效，"
+				"禁止重放，请核对平台实际状态后新建 workflow",
+			)
+	return run
+
+
 class WorkflowStore:
 	def __init__(self, data_dir: Path) -> None:
 		self._cache = CacheStore(data_dir / "cache" / "boss_agent.db")
@@ -141,6 +180,7 @@ class WorkflowStore:
 				_validate_replay_markers(run)
 				_validate_error_contract(run)
 				_validate_statuses(run)
+				_validate_step_result_consistency(run)
 		return run
 
 	def get(self, run_id: str) -> dict[str, Any] | None:

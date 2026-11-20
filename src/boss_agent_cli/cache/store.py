@@ -81,7 +81,22 @@ _RECORD_LABELS = {
 	"crawl_job": "crawl 结果",
 	"workflow_run": "workflow 任务",
 	"workflow_step": "workflow 步骤",
+	"shortlist": "候选池记录",
+	"resume_link": "简历投递记录",
 }
+
+
+class CacheWriteRejected(ValueError):
+	"""SQLite 拒绝写入（约束冲突、绑定值非法），库本身完好（Issue #1886）。
+
+	唯一 / 非空约束冲突是输入或调用方问题，不是库损坏：不能落成
+	``CacheDatabaseInvalid``，否则 CLI 会引导用户备份并删除整个缓存库，
+	候选池、预设、watch 历史与任务断点全部作废。
+	"""
+
+	def __init__(self, db_path: Path, detail: str) -> None:
+		super().__init__(f"本地缓存库 {db_path} 拒绝了本次写入（{detail}）")
+		self.path = db_path
 
 
 class CacheRecordInvalid(ValueError):
@@ -120,6 +135,29 @@ def _decode_optional_record(
 	return None if not raw else _decode_record(kind, record_id, column, raw, expected=expected)
 
 
+def _decode_text_column(
+	kind: str, record_id: str, column: str, raw: Any, *, allow_none: bool = False
+) -> str | None:
+	"""TEXT 列的类型漂移在读取边界拦下（Issue #1885）。
+
+	SQLite 的 TEXT 亲和性不强制类型：值被写成 BLOB 时读取返回 ``bytes``，
+	进入信封后 ``_dumps_envelope`` 只能回退成不含结果、也不含修复指引的固定
+	INTERNAL_ERROR，且成功路径照常 exit 0（``ok=false`` 但退出码 0）。
+	BLOB 先按 UTF-8 还原（与 #1799 的 tags 同口径），还原失败或其它类型
+	按记录损坏上报。
+	"""
+	if raw is None and allow_none:
+		return None
+	if isinstance(raw, str):
+		return raw
+	if isinstance(raw, (bytes, bytearray)):
+		try:
+			return bytes(raw).decode("utf-8")
+		except UnicodeDecodeError as exc:
+			raise CacheRecordInvalid(kind, record_id, column, f"不是有效的 UTF-8 文本（{exc}）") from exc
+	raise CacheRecordInvalid(kind, record_id, column, f"期望文本，实际是 {type(raw).__name__}")
+
+
 def _decode_int_column(kind: str, record_id: str, column: str, raw: Any) -> int:
 	"""整数列的类型漂移在读取边界拦下并带上列名。
 
@@ -133,11 +171,39 @@ def _decode_int_column(kind: str, record_id: str, column: str, raw: Any) -> int:
 	raise CacheRecordInvalid(kind, record_id, column, f"期望整数，实际是 {type(raw).__name__}")
 
 
+def _decode_page_no(kind: str, record_id: str, raw: Any) -> int:
+	"""页码读取边界：与 ``crawl_runs.next_page`` 同口径拒绝非正数。
+
+	负页码会让导出与 ``crawl results`` 输出 ``"page": -3`` 这类不存在的位置，
+	计数也随之失真（Issue #2031）。
+	"""
+	page_no = _decode_int_column(kind, record_id, "page_no", raw)
+	if page_no < 1:
+		raise CacheRecordInvalid(kind, record_id, "page_no", f"必须从第 1 页开始，实际是 {page_no}")
+	return page_no
+
+
 def _decode_bool_column(kind: str, record_id: str, column: str, raw: Any) -> bool:
 	"""0/1 整数列；文本 ``"false"`` 被 ``bool()`` 当成 True 同样是类型漂移。"""
 	if isinstance(raw, int) and not isinstance(raw, bool) and raw in (0, 1):
 		return bool(raw)
 	raise CacheRecordInvalid(kind, record_id, column, f"期望 0 或 1，实际是 {type(raw).__name__}")
+
+
+def _decode_timestamp_column(
+	kind: str, record_id: str, column: str, raw: Any, *, allow_none: bool = False
+) -> float | None:
+	"""时间戳列的数值漂移在读取边界拦下（Issue #1964）。
+
+	REAL 列被写成 BLOB / 文本时，原样进入信封会让序列化兜底成固定
+	``INTERNAL_ERROR`` 且成功路径照常 exit 0（与 #1885 的文本列同口径）。
+	``inf`` / ``nan`` 仍按原样放行：输出层会把它们写成 null，不影响信封。
+	"""
+	if raw is None and allow_none:
+		return None
+	if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+		return float(raw)
+	raise CacheRecordInvalid(kind, record_id, column, f"期望数值时间戳，实际是 {type(raw).__name__}")
 
 
 def _tolerated_timestamp(raw: Any, *, default: float = 0.0) -> float:
@@ -391,6 +457,9 @@ class _GuardedConnection(sqlite3.Connection):
 	"""
 
 	db_path: Path
+	# 迁移事务进行中：此时的约束冲突说明旧数据自身不兼容（如重复 selector
+	# 建唯一索引失败），按库不可用处理，而不是调用方参数错误（Issue #1886）。
+	migrating: bool = False
 
 	def __init__(self, database: str, *args: Any, **kwargs: Any) -> None:
 		super().__init__(database, *args, **kwargs)
@@ -399,6 +468,12 @@ class _GuardedConnection(sqlite3.Connection):
 	def _translate(self, exc: sqlite3.DatabaseError) -> Exception | None:
 		if isinstance(exc, sqlite3.ProgrammingError):
 			return None
+		if isinstance(exc, (sqlite3.IntegrityError, sqlite3.InterfaceError, sqlite3.DataError)):
+			if getattr(self, "migrating", False):
+				return CacheDatabaseInvalid(self.db_path, str(exc))
+			# 约束冲突 / 绑定值非法是输入或调用方问题，库本身健康：
+			# 落成 CacheDatabaseInvalid 会让 CLI 引导用户删掉整个缓存库（Issue #1886）。
+			return CacheWriteRejected(self.db_path, str(exc))
 		if is_cache_busy_error(exc):
 			return CacheBusyError(self.db_path, str(exc))
 		if is_cache_local_io_error(exc):
@@ -406,6 +481,11 @@ class _GuardedConnection(sqlite3.Connection):
 			# 让 main/display 的本地 IO 分支输出 LOCAL_IO_ERROR，而不是误导用户
 			# 备份并删除完好的缓存库（Issue #1467）。
 			return None
+		if "cannot start a transaction within a transaction" in str(exc):
+			# 连接上残留未提交事务不是库损坏：落成 CacheDatabaseInvalid 会让 CLI
+			# 引导用户备份并删除完好的缓存库（Issue #2225）。按调用方可修正的
+			# 写入拒绝上报，不给删库指引。
+			return CacheWriteRejected(self.db_path, str(exc))
 		return CacheDatabaseInvalid(self.db_path, str(exc))
 
 	def _raise_translated(self, exc: sqlite3.DatabaseError) -> NoReturn:
@@ -413,6 +493,19 @@ class _GuardedConnection(sqlite3.Connection):
 		if translated is None:
 			raise exc
 		raise translated from exc
+
+	def begin_immediate(self) -> None:
+		"""开始写事务；先结束连接上残留的隐式事务。
+
+		上一笔写在中途失败（序列化错误、commit 失败）时，连接上可能留下未提交
+		事务；同一连接再执行 ``BEGIN IMMEDIATE`` 会报 “cannot start a transaction
+		within a transaction”，此前被 ``_translate`` 误判成缓存库损坏并引导用户
+		删库（Issue #2225）。残留事务只含未提交的本地改动，回滚不会丢失已提交
+		数据。
+		"""
+		if self.in_transaction:
+			self.rollback()
+		self.execute("BEGIN IMMEDIATE")
 
 	@overload
 	def cursor(self, factory: None = None) -> sqlite3.Cursor: ...
@@ -683,13 +776,18 @@ class CacheStore:
 		串行化；等锁超时仍按 ``CacheBusyError`` 上报，真实失败（列类型不符、
 		唯一索引冲突）原样上抛，不能吞成「无需迁移」。
 		"""
-		self._conn.execute("BEGIN IMMEDIATE")
+		conn = self._conn
+		conn.migrating = True
 		try:
-			yield
-		except BaseException:
-			self._conn.rollback()
-			raise
-		self._conn.commit()
+			self._conn.begin_immediate()
+			try:
+				yield
+			except BaseException:
+				self._conn.rollback()
+				raise
+			self._conn.commit()
+		finally:
+			conn.migrating = False
 
 	def _migrate_dedupe_keys(self) -> None:
 		"""把 greet/apply 记录的键换成「账号指纹 + 稳定 job_id」。
@@ -735,7 +833,7 @@ class CacheStore:
 				self._conn.execute(f"""
 					INSERT OR REPLACE INTO {table}_new (job_id, account, security_id, {time_column})
 						SELECT job_id, {account_select}, security_id, {time_column}
-						FROM {table} WHERE job_id != ''
+						FROM {table} WHERE job_id IS NOT NULL
 				""")
 				self._conn.execute(f"DROP TABLE {table}")
 				self._conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
@@ -849,7 +947,7 @@ class CacheStore:
 		self._conn.execute(
 			"INSERT INTO crawl_runs (run_id, params, status, next_page, output_dir, error, created_at, updated_at) "
 			"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-			(run_id, json.dumps(params, ensure_ascii=False, sort_keys=True), status, next_page, output_dir, "", now, now),
+			(run_id, json.dumps(params, ensure_ascii=True, sort_keys=True), status, next_page, output_dir, "", now, now),
 		)
 		self._conn.commit()
 
@@ -865,16 +963,21 @@ class CacheStore:
 		record = {
 			"run_id": row[0],
 			"params": _decode_record("crawl_run", run_id, "params", row[1], expected=dict),
-			"status": row[2],
+			"status": _decode_text_column("crawl_run", run_id, "status", row[2]),
 			"stop_requested": _decode_bool_column("crawl_run", run_id, "stop_requested", row[3]),
 			"requests_attempted": _decode_int_column("crawl_run", run_id, "requests_attempted", row[4]),
 			"detail_requests_attempted": _decode_int_column("crawl_run", run_id, "detail_requests_attempted", row[5]),
 			"elapsed_seconds": _decode_int_column("crawl_run", run_id, "elapsed_seconds", row[6]),
 			"next_page": _decode_int_column("crawl_run", run_id, "next_page", row[7]),
 			"list_finished": _decode_bool_column("crawl_run", run_id, "list_finished", row[8]),
-			"output_dir": row[9], "error": row[10],
+			"output_dir": _decode_text_column("crawl_run", run_id, "output_dir", row[9]),
+			"error": _decode_text_column("crawl_run", run_id, "error", row[10], allow_none=True),
 			"hook_results": _decode_record("crawl_run", run_id, "hook_results", row[11], expected=list),
-			"created_at": row[12], "updated_at": row[13],
+			# crawl 的 updated_at 不参与契约校验（Issue #1192）：后台恢复只拿它做
+			# 预检失败时的还原，漂移按 0 降级（Issue #1206），不能在这里报损坏而
+			# 打断恢复；归一成数值也保证信封可序列化。
+			"created_at": _tolerated_timestamp(row[12]),
+			"updated_at": _tolerated_timestamp(row[13]),
 		}
 		# 范围与文本校验：负的 next_page 会让 resume 反复抓第 1 页并把
 		# crawl_jobs.page_no 写成负数，负计数器会推迟预算触发；BLOB 的
@@ -882,6 +985,23 @@ class CacheStore:
 		if record["next_page"] < 1:
 			raise CacheRecordInvalid(
 				"crawl_run", run_id, "next_page", f"必须从第 1 页开始，实际是 {record['next_page']}"
+			)
+		# 上界校验：正常写入的 next_page 最多是 pages + 1（最后一页之后）。超大值
+		# 会让 resume 的页循环一次都不执行，随即把空结果报成 completed，status 也
+		# 会回显一个不存在的页数（Issue #2030）。params.pages 不合法时留给
+		# CrawlSettings 的校验，这里只做能做的交叉检查。
+		raw_pages = record["params"].get("pages")
+		if (
+			isinstance(raw_pages, int)
+			and not isinstance(raw_pages, bool)
+			and raw_pages >= 1
+			and record["next_page"] > raw_pages + 1
+		):
+			raise CacheRecordInvalid(
+				"crawl_run",
+				run_id,
+				"next_page",
+				f"超过页数上限 pages + 1（{raw_pages + 1}），实际是 {record['next_page']}",
 			)
 		for column in ("requests_attempted", "detail_requests_attempted", "elapsed_seconds"):
 			if record[column] < 0:
@@ -900,6 +1020,15 @@ class CacheStore:
 				"crawl_run", run_id, "output_dir",
 				"期望非空绝对路径，实际是空字符串；旧断点无法安全恢复，请重新执行 crawl start 创建任务",
 			)
+		# NUL 等控制字符能通过「非空绝对路径」检查，但会在 lstat / 导出时抛
+		# ValueError，被命令层兜成 INVALID_PARAM，与 status 的 ok:true 口径冲突
+		# （Issue #2194）。与 `params.browser.profile_path` 同口径 fail-closed
+		# （Issue #1482）：合法路径不可能包含这些字符。
+		if any(ord(char) < 0x20 for char in output_dir):
+			raise CacheRecordInvalid(
+				"crawl_run", run_id, "output_dir",
+				f"期望绝对路径，实际包含控制字符 {output_dir!r}；旧断点无法安全恢复，请重新执行 crawl start 创建任务",
+			)
 		if not Path(output_dir).is_absolute():
 			raise CacheRecordInvalid(
 				"crawl_run", run_id, "output_dir",
@@ -910,7 +1039,7 @@ class CacheStore:
 	def update_crawl_run_params(self, run_id: str, params: dict[str, Any]) -> None:
 		self._conn.execute(
 			"UPDATE crawl_runs SET params = ?, updated_at = ? WHERE run_id = ?",
-			(json.dumps(params, ensure_ascii=False, sort_keys=True), time.time(), run_id),
+			(json.dumps(params, ensure_ascii=True, sort_keys=True), time.time(), run_id),
 		)
 		self._conn.commit()
 
@@ -931,7 +1060,7 @@ class CacheStore:
 			values.append(int(list_finished))
 		if hook_results is not None:
 			assignments.append("hook_results = ?")
-			values.append(json.dumps(hook_results, ensure_ascii=False, sort_keys=True))
+			values.append(json.dumps(hook_results, ensure_ascii=True, sort_keys=True))
 		values.append(run_id)
 		self._conn.execute(
 			f"UPDATE crawl_runs SET {', '.join(assignments)} WHERE run_id = ?",
@@ -954,21 +1083,51 @@ class CacheStore:
 		)
 		self._conn.commit()
 
-	def mark_crawl_run_active(self, run_id: str, status: str) -> None:
+	def mark_crawl_run_active(self, run_id: str, status: str) -> float:
 		"""恢复已取得执行权时把状态落成 queued / running（Issue #1771）。
 
 		只改状态、清掉上一轮的错误并刷新时间；断点游标与其他进程写入的停止标记
 		保持不动，这样恢复窗口内到达的 `crawl stop` 才会被接受。
+
+		返回写入的 ``updated_at``：失败路径要区分「预检窗口内到达的新 stop」
+		与本次标记写入的时间，才能在不覆盖新 stop 的前提下完整还原（Issue #2240）。
 		"""
+		marked_at = time.time()
 		self._conn.execute(
 			"UPDATE crawl_runs SET status = ?, error = '', updated_at = ? WHERE run_id = ?",
-			(status, time.time(), run_id),
+			(status, marked_at, run_id),
 		)
 		self._conn.commit()
+		return marked_at
 
 	def touch_crawl_run(self, run_id: str) -> None:
 		"""刷新排队交接时间，不改变其他进程写入的停止标记。"""
 		self._conn.execute("UPDATE crawl_runs SET updated_at = ? WHERE run_id = ?", (time.time(), run_id))
+		self._conn.commit()
+
+	def restore_crawl_run_state(
+		self,
+		run_id: str,
+		*,
+		status: str,
+		error: str,
+		updated_at: float,
+		marked_at: float | None = None,
+	) -> None:
+		"""预检失败时还原恢复前的状态 / 错误 / 时间戳（Issue #2240）。
+
+		``mark_crawl_run_active`` 会在慢预检之前把状态改成 running / queued 并清空
+		错误；预检失败后任务仍是原来的终态，必须原样写回。预检窗口内到达的新
+		stop 会刷新 ``updated_at``：此时保留新时间，不能回拨（与
+		``restore_crawl_stop_request`` 同口径）。``marked_at`` 是本次
+		``mark_crawl_run_active`` 写入的时间；未提供时保持旧的「只增不减」口径。
+		"""
+		floor = updated_at if marked_at is None else marked_at
+		self._conn.execute(
+			"UPDATE crawl_runs SET status = ?, error = ?, "
+			"updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END WHERE run_id = ?",
+			(status, error, floor, updated_at, run_id),
+		)
 		self._conn.commit()
 
 	def restore_crawl_stop_request(self, run_id: str, *, updated_at: float) -> None:
@@ -1000,17 +1159,52 @@ class CacheStore:
 		)
 		self._conn.commit()
 
-	def put_crawl_job(self, run_id: str, job_key: str, page_no: int, payload: dict[str, Any], *, detail_done: bool) -> None:
+	def put_crawl_job(
+		self,
+		run_id: str,
+		job_key: str,
+		page_no: int,
+		payload: dict[str, Any],
+		*,
+		detail_done: bool,
+		require_existing_run: bool = False,
+	) -> bool:
+		"""写入职位行，返回是否真的落库。
+
+		``crawl_jobs`` 没有外键级联：断点被 ``clean --privacy`` 删除后，普通
+		INSERT 会复活一行没有归属的职位记录，导出目录也会被重建（Issue #2208）。
+		执行器传 ``require_existing_run=True``：插入改成单条
+		``INSERT ... SELECT ... WHERE EXISTS``，以 crawl_runs 行存在为前提原子
+		完成，断点消失时返回 ``False`` 且不落任何行。默认仍按普通写入，缓存层
+		本身不假设调用方一定先建 run（测试与离线工具会直接构造职位行）。
+		"""
 		existing = self._conn.execute(
 			"SELECT selector FROM crawl_jobs WHERE run_id = ? AND job_key = ?", (run_id, job_key)
 		).fetchone()
 		selector = str(existing[0]) if existing and existing[0] else self._new_crawl_selector()
-		self._conn.execute(
-			"INSERT OR REPLACE INTO crawl_jobs (run_id, job_key, selector, page_no, payload, detail_done, updated_at) "
-			"VALUES (?, ?, ?, ?, ?, ?, ?)",
-			(run_id, job_key, selector, page_no, json.dumps(payload, ensure_ascii=False, sort_keys=True), int(detail_done), time.time()),
+		values: tuple[Any, ...] = (
+			run_id,
+			job_key,
+			selector,
+			page_no,
+			json.dumps(payload, ensure_ascii=True, sort_keys=True),
+			int(detail_done),
+			time.time(),
 		)
+		if require_existing_run:
+			cursor = self._conn.execute(
+				"INSERT OR REPLACE INTO crawl_jobs (run_id, job_key, selector, page_no, payload, detail_done, updated_at) "
+				"SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM crawl_runs WHERE run_id = ?)",
+				(*values, run_id),
+			)
+		else:
+			cursor = self._conn.execute(
+				"INSERT OR REPLACE INTO crawl_jobs (run_id, job_key, selector, page_no, payload, detail_done, updated_at) "
+				"VALUES (?, ?, ?, ?, ?, ?, ?)",
+				values,
+			)
 		self._conn.commit()
+		return cursor.rowcount > 0
 
 	def get_crawl_job(self, run_id: str, job_key: str) -> dict[str, Any] | None:
 		row = self._conn.execute(
@@ -1020,7 +1214,8 @@ class CacheStore:
 		if row is None:
 			return None
 		return {
-			"selector": row[0], "page_no": _decode_int_column("crawl_job", job_key, "page_no", row[1]),
+			"selector": _decode_text_column("crawl_job", job_key, "selector", row[0]),
+			"page_no": _decode_page_no("crawl_job", job_key, row[1]),
 			"payload": _decode_record("crawl_job", job_key, "payload", row[2], expected=dict),
 			"detail_done": _decode_bool_column("crawl_job", job_key, "detail_done", row[3]),
 		}
@@ -1030,15 +1225,18 @@ class CacheStore:
 			"SELECT job_key, selector, page_no, payload, detail_done FROM crawl_jobs WHERE run_id = ? ORDER BY page_no, rowid",
 			(run_id,),
 		).fetchall()
-		return [
-			{
-				"job_key": row[0], "selector": row[1],
-				"page_no": _decode_int_column("crawl_job", str(row[0]), "page_no", row[2]),
-				"payload": _decode_record("crawl_job", str(row[0]), "payload", row[3], expected=dict),
-				"detail_done": _decode_bool_column("crawl_job", str(row[0]), "detail_done", row[4]),
-			}
-			for row in rows
-		]
+		records: list[dict[str, Any]] = []
+		for row in rows:
+			job_key = _decode_text_column("crawl_job", str(row[0]), "job_key", row[0])
+			assert isinstance(job_key, str)
+			records.append({
+				"job_key": job_key,
+				"selector": _decode_text_column("crawl_job", job_key, "selector", row[1]),
+				"page_no": _decode_page_no("crawl_job", job_key, row[2]),
+				"payload": _decode_record("crawl_job", job_key, "payload", row[3], expected=dict),
+				"detail_done": _decode_bool_column("crawl_job", job_key, "detail_done", row[4]),
+			})
+		return records
 
 	def get_crawl_budget(self, budget_key: str) -> float | None:
 		row = self._conn.execute("SELECT last_request_at FROM crawl_budget WHERE budget_key = ?", (budget_key,)).fetchone()
@@ -1062,7 +1260,7 @@ class CacheStore:
 		it represents an already-reserved request slot, not merely request history.
 		"""
 		try:
-			self._conn.execute("BEGIN IMMEDIATE")
+			self._conn.begin_immediate()
 			row = self._conn.execute(
 				"SELECT last_request_at FROM crawl_budget WHERE budget_key = ?",
 				(budget_key,),
@@ -1097,7 +1295,7 @@ class CacheStore:
 		steps: tuple[str, ...],
 	) -> None:
 		now = time.time()
-		params_json = json.dumps(params, ensure_ascii=False, sort_keys=True)
+		params_json = json.dumps(params, ensure_ascii=True, sort_keys=True)
 		with self._conn:
 			self._conn.execute(
 				"INSERT INTO workflow_runs "
@@ -1124,20 +1322,20 @@ class CacheStore:
 		if row is None:
 			return None
 		return {
-			"run_id": row[0],
-			"role": row[1],
-			"platform": row[2],
-			"goal": row[3],
-			"mode": row[4],
-			"status": row[5],
-			"current_step": row[6],
+			"run_id": _decode_text_column("workflow_run", run_id, "run_id", row[0]),
+			"role": _decode_text_column("workflow_run", run_id, "role", row[1]),
+			"platform": _decode_text_column("workflow_run", run_id, "platform", row[2]),
+			"goal": _decode_text_column("workflow_run", run_id, "goal", row[3]),
+			"mode": _decode_text_column("workflow_run", run_id, "mode", row[4]),
+			"status": _decode_text_column("workflow_run", run_id, "status", row[5]),
+			"current_step": _decode_text_column("workflow_run", run_id, "current_step", row[6], allow_none=True),
 			"params": _validate_workflow_params(
 				run_id, _decode_record("workflow_run", run_id, "params", row[7], expected=dict)
 			),
 			"last_result": _decode_optional_record("workflow_run", run_id, "last_result", row[8], expected=dict),
 			"error": _decode_optional_record("workflow_run", run_id, "error", row[9], expected=dict),
-			"created_at": row[10],
-			"updated_at": row[11],
+			"created_at": _decode_timestamp_column("workflow_run", run_id, "created_at", row[10]),
+			"updated_at": _decode_timestamp_column("workflow_run", run_id, "updated_at", row[11]),
 		}
 
 	def list_workflow_runs(self, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -1157,7 +1355,16 @@ class CacheStore:
 		runs: list[dict[str, Any]] = []
 		corrupt: list[str] = []
 		for row in rows:
-			run_id = str(row[0])
+			try:
+				run_id = _decode_text_column("workflow_run", str(row[0]), "run_id", row[0])
+			except CacheRecordInvalid:
+				# BLOB / NULL 的 run_id 此前被 str() 成 "b'...'" / "None"，按它查询
+				# 必然查不到，条目从 runs 与 corrupt 两个名单同时消失（Issue #2056）。
+				corrupt.append(str(row[0]))
+				continue
+			if run_id is None:  # allow_none=False 时不会发生；防御性兜底
+				corrupt.append(str(row[0]))
+				continue
 			try:
 				run = self.get_workflow_run(run_id)
 			except CacheRecordInvalid:
@@ -1165,6 +1372,11 @@ class CacheStore:
 				continue
 			if run is not None:
 				runs.append(run)
+			else:
+				# SELECT 出这一行、按 run_id 却查不到：run_id 是解码后的 BLOB（原值是
+				# "b'...'"，必然查不到），或行在两条语句之间被删除。无论如何都不能
+				# 让它从 runs 与 corrupt 两个名单同时消失（Issue #2056）。
+				corrupt.append(run_id)
 		return runs, corrupt
 
 	def list_workflow_steps(self, run_id: str) -> list[dict[str, Any]]:
@@ -1173,18 +1385,26 @@ class CacheStore:
 			"FROM workflow_steps WHERE run_id = ? ORDER BY ordinal",
 			(run_id,),
 		).fetchall()
-		return [
-			{
-				"step_name": row[0],
-				"ordinal": row[1],
-				"status": row[2],
-				"result": _decode_optional_record("workflow_step", f"{run_id}/{row[0]}", "result", row[3], expected=dict),
-				"error": _decode_optional_record("workflow_step", f"{run_id}/{row[0]}", "error", row[4], expected=dict),
-				"started_at": row[5],
-				"finished_at": row[6],
-			}
-			for row in rows
-		]
+		records: list[dict[str, Any]] = []
+		for row in rows:
+			record_id = f"{run_id}/{row[0]}"
+			step_name = _decode_text_column("workflow_step", record_id, "step_name", row[0])
+			records.append({
+				"step_name": step_name,
+				# ordinal 此前原样透传：BLOB / 文本漂移进入信封后只能退化成
+				# INTERNAL_ERROR，且成功路径 exit 0（Issue #2055）。与其余列同口径。
+				"ordinal": _decode_int_column("workflow_step", record_id, "ordinal", row[1]),
+				"status": _decode_text_column("workflow_step", record_id, "status", row[2]),
+				"result": _decode_optional_record("workflow_step", record_id, "result", row[3], expected=dict),
+				"error": _decode_optional_record("workflow_step", record_id, "error", row[4], expected=dict),
+				"started_at": _decode_timestamp_column(
+					"workflow_step", record_id, "started_at", row[5], allow_none=True
+				),
+				"finished_at": _decode_timestamp_column(
+					"workflow_step", record_id, "finished_at", row[6], allow_none=True
+				),
+			})
+		return records
 
 	def update_workflow_run(
 		self,
@@ -1204,8 +1424,8 @@ class CacheStore:
 				preserve_stopped,
 				status,
 				current_step,
-				json.dumps(last_result, ensure_ascii=False, sort_keys=True) if last_result is not None else None,
-				json.dumps(error, ensure_ascii=False, sort_keys=True) if error is not None else None,
+				json.dumps(last_result, ensure_ascii=True, sort_keys=True) if last_result is not None else None,
+				json.dumps(error, ensure_ascii=True, sort_keys=True) if error is not None else None,
 				time.time(),
 				run_id,
 			),
@@ -1231,8 +1451,8 @@ class CacheStore:
 			"WHERE run_id = ? AND step_name = ?",
 			(
 				status,
-				json.dumps(result, ensure_ascii=False, sort_keys=True) if result is not None else None,
-				json.dumps(error, ensure_ascii=False, sort_keys=True) if error is not None else None,
+				json.dumps(result, ensure_ascii=True, sort_keys=True) if result is not None else None,
+				json.dumps(error, ensure_ascii=True, sort_keys=True) if error is not None else None,
 				started_at,
 				finished_at,
 				run_id,
@@ -1247,7 +1467,7 @@ class CacheStore:
 		cursor = self._conn.execute(
 			"UPDATE workflow_steps SET error = ? WHERE run_id = ? AND step_name = ?",
 			(
-				json.dumps(error, ensure_ascii=False, sort_keys=True) if error is not None else None,
+				json.dumps(error, ensure_ascii=True, sort_keys=True) if error is not None else None,
 				run_id,
 				step_name,
 			),
@@ -1282,7 +1502,7 @@ class CacheStore:
 		normalized = cls._normalize_shortlist_tags(tags)
 		if not normalized:
 			return ""
-		return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+		return json.dumps(normalized, ensure_ascii=True, sort_keys=True)
 
 	@classmethod
 	def _deserialize_shortlist_tags(cls, raw: str | bytes | bytearray | None) -> list[str]:
@@ -1307,7 +1527,9 @@ class CacheStore:
 	@staticmethod
 	def _make_search_key(params: dict[str, Any]) -> str:
 		raw = json.dumps(params, sort_keys=True, ensure_ascii=False)
-		return hashlib.sha256(raw.encode()).hexdigest()
+		# 孤立代理字符（平台 JSON 里的 "\ud800"）无法按 UTF-8 编码：backslashreplace
+		# 对它写成转义字节，与其它值保持同一份键；普通文本的哈希不变（Issue #2223）。
+		return hashlib.sha256(raw.encode("utf-8", "backslashreplace")).hexdigest()
 
 	def is_greeted(self, security_id: str = "", *, job_id: str = "", account: str = "") -> bool:
 		"""查询招呼记录：有账号作用域和 job_id 时按两者查，否则按 security_id。
@@ -1350,11 +1572,19 @@ class CacheStore:
 			return str(row[0])
 
 	def record_recruiter_greet(self, geek_id: str, job_id: str, *, status: Literal["sent", "quota_limited"] = "sent") -> None:
+		"""把已确认发出的招呼记为 sent/quota_limited。
+
+		预约行被外部清理（如 boss clean --all）时 UPDATE 会命中 0 行：此时本地
+		没有任何已招呼记录，静默成功会让下一次 claim 再发一次真实招呼。按
+		record_location_send 的口径抛错，由命令层映射成 GREET_RESULT_UNKNOWN。
+		"""
 		with self._conn:
-			self._conn.execute(
+			cursor = self._conn.execute(
 				"UPDATE recruiter_greet_records SET status = ?, updated_at = ? WHERE geek_id = ? AND job_id = ?",
 				(status, time.time(), geek_id, job_id),
 			)
+			if cursor.rowcount != 1:
+				raise sqlite3.OperationalError("招聘者招呼记录不存在，无法标记发送结果")
 
 	def location_send_status(self, friend_id: int) -> str | None:
 		"""读取工作地点发送记录。没有记录时返回 None，不创建新行。"""
@@ -1468,6 +1698,12 @@ class CacheStore:
 
 		``encryptJobId`` 漂移成 dict / 数字时按未命中处理：直接当 sqlite
 		参数会抛 ProgrammingError 并穿出整条 ``--welfare`` 管线（Issue #1890）。
+
+		``description`` 是 BLOB / 其它类型时同样按未命中处理（Issue #2210）：
+		详情缓存是纯本地可重建缓存，漂移值进入 payload 会让 ``put_crawl_job``
+		的 ``json.dumps`` 抛 ``TypeError``，任务永久停在 ``stopped`` 却报
+		``ok:true``；重新取一次详情并覆盖是最小修复。BLOB 先按 UTF-8 还原
+		（与 #1885 / #2164 同口径）。
 		"""
 		if not isinstance(job_id, str) or not job_id:
 			return None
@@ -1481,7 +1717,15 @@ class CacheStore:
 			self._conn.execute("DELETE FROM job_desc_cache WHERE job_id = ?", (job_id,))
 			self._conn.commit()
 			return None
-		return cast("str", row[0])
+		raw = row[0]
+		if isinstance(raw, str):
+			return raw
+		if isinstance(raw, (bytes, bytearray)):
+			try:
+				return bytes(raw).decode("utf-8")
+			except UnicodeDecodeError:
+				return None
+		return None
 
 	def put_job_desc(self, job_id: str, description: str) -> None:
 		"""缓存非空职位描述，超过容量时淘汰保存时间最早的条目。
@@ -1521,6 +1765,11 @@ class CacheStore:
 
 	def save_saved_search(self, name: str, params: dict[str, Any]) -> None:
 		now = time.time()
+		# name 是 TEXT 亲和性主键，但 SQLite 不强制类型：同内容的 BLOB 存储类
+		# 与 TEXT 比较时永不相等，INSERT OR REPLACE 会留下一行 BLOB、再插一行
+		# TEXT（Issue #2164，与 #2147 的读取兼容同族）。保存时先清掉同内容的
+		# BLOB 漂移行，把记录归一成单一 TEXT 行。
+		self._conn.execute("DELETE FROM saved_searches WHERE name = CAST(? AS BLOB)", (name,))
 		existing = self._conn.execute(
 			"SELECT created_at FROM saved_searches WHERE name = ?",
 			(name,),
@@ -1528,22 +1777,28 @@ class CacheStore:
 		created_at = existing[0] if existing else now
 		self._conn.execute(
 			"INSERT OR REPLACE INTO saved_searches (name, params, created_at, updated_at) VALUES (?, ?, ?, ?)",
-			(name, json.dumps(params, ensure_ascii=False, sort_keys=True), created_at, now),
+			(name, json.dumps(params, ensure_ascii=True, sort_keys=True), created_at, now),
 		)
 		self._conn.commit()
 
 	def get_saved_search(self, name: str) -> dict[str, Any] | None:
 		row = self._conn.execute(
-			"SELECT name, params, created_at, updated_at FROM saved_searches WHERE name = ?",
-			(name,),
+			# 同时匹配 BLOB 存储类：#2147 的读取兼容把 BLOB 名称解码后展示，
+			# 但按键查找只用 `name = ?` 时永远找不到那一行，watch / preset
+			# 会「看得到却运行不了」（Issue #2164）。
+			"SELECT name, params, created_at, updated_at FROM saved_searches "
+			"WHERE name = ? OR name = CAST(? AS BLOB)",
+			(name, name),
 		).fetchone()
 		if row is None:
 			return None
+		decoded_name = _decode_text_column("saved_search", name, "name", row[0])
+		assert isinstance(decoded_name, str)
 		return {
-			"name": row[0],
-			"params": _decode_saved_params(str(row[0]), row[1]),
-			"created_at": row[2],
-			"updated_at": row[3],
+			"name": decoded_name,
+			"params": _decode_saved_params(decoded_name, row[1]),
+			"created_at": _decode_timestamp_column("saved_search", decoded_name, "created_at", row[2]),
+			"updated_at": _decode_timestamp_column("saved_search", decoded_name, "updated_at", row[3]),
 		}
 
 	def list_saved_searches(self) -> list[dict[str, Any]]:
@@ -1563,45 +1818,66 @@ class CacheStore:
 		corrupt: list[str] = []
 		for row in rows:
 			try:
-				params = _decode_saved_params(str(row[0]), row[1])
-			except SavedSearchParamsError:
+				# TEXT 亲和性不强制类型：name 列被写成 BLOB 时原样进信封会让
+				# 序列化兜成 INTERNAL_ERROR，且坏行不进 corrupt 名单
+				# （Issue #2147，与 #1885 / #2056 同口径）。
+				name = _decode_text_column("saved_search", str(row[0]), "name", row[0])
+				assert isinstance(name, str)
+				params = _decode_saved_params(name, row[1])
+				created_at = _decode_timestamp_column("saved_search", name, "created_at", row[2])
+				updated_at = _decode_timestamp_column("saved_search", name, "updated_at", row[3])
+			except (SavedSearchParamsError, CacheRecordInvalid):
 				corrupt.append(str(row[0]))
 				continue
 			items.append(
 				{
-					"name": row[0],
+					"name": name,
 					"params": params,
-					"created_at": row[2],
-					"updated_at": row[3],
+					"created_at": created_at,
+					"updated_at": updated_at,
 				}
 			)
 		return items, corrupt
 
 	def delete_saved_search(self, name: str) -> bool:
 		cursor = self._conn.execute(
-			"DELETE FROM saved_searches WHERE name = ?",
-			(name,),
+			# 与 get_saved_search 同口径：BLOB 存储类与 TEXT 永久不相等，只删
+			# `name = ?` 会让 `watch remove` 报 removed: false 且记录留下
+			# （Issue #2164）。
+			"DELETE FROM saved_searches WHERE name = ? OR name = CAST(? AS BLOB)",
+			(name, name),
 		)
 		self._conn.execute(
-			"DELETE FROM watch_hits WHERE search_name = ?",
-			(name,),
+			"DELETE FROM watch_hits WHERE search_name = ? OR search_name = CAST(? AS BLOB)",
+			(name, name),
 		)
 		self._conn.commit()
 		return cursor.rowcount > 0
 
 	@staticmethod
-	def _make_watch_job_key(item: dict[str, Any], *, account: str = "") -> str:
-		security_id = item.get("security_id") or item.get("securityId") or ""
-		job_id = item.get("job_id") or item.get("encryptJobId") or ""
+	def _watch_key_fragment(value: Any) -> str:
+		"""键片段消毒：孤立代理项无法绑定进 SQLite TEXT，统一转义成 ASCII 反斜杠序列。"""
+		text = value if isinstance(value, str) else str(value)
+		return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+	@classmethod
+	def _make_watch_job_key(cls, item: dict[str, Any], *, account: str = "") -> str:
+		security_id = cls._watch_key_fragment(item.get("security_id") or item.get("securityId") or "")
+		job_id = cls._watch_key_fragment(item.get("job_id") or item.get("encryptJobId") or "")
+		account = cls._watch_key_fragment(account)
 		# 有账号指纹时按稳定的 encryptJobId 去重：securityId 每次搜索都会轮换，
 		# 旧的复合键会让同一职位在每轮 watch 里反复算作新增。没有账号指纹时
 		# 保留旧复合键，避免把无归属的旧记录当成当前账号的已见记录。
+		# 账号指纹必须无条件入键：job_id 缺失时若丢掉账号，两个账号的已见记录
+		# 会互相串扰，第二个账号首次看到同一职位不会出现在 new_items。
 		if account and job_id:
 			return f"{account}:{job_id}"
 		if security_id or job_id:
-			return f"{security_id}:{job_id}"
-		raw = json.dumps(item, sort_keys=True, ensure_ascii=False)
-		return hashlib.sha256(raw.encode()).hexdigest()
+			composite = f"{security_id}:{job_id}"
+			return f"{account}:{composite}" if account else composite
+		raw = json.dumps(item, sort_keys=True, ensure_ascii=True)
+		digest = hashlib.sha256(raw.encode()).hexdigest()
+		return f"{account}:{digest}" if account else digest
 
 	def record_watch_results(self, search_name: str, items: list[dict[str, Any]], *, account: str = "") -> dict[str, Any]:
 		# 只去重本轮完整列表项；有账号指纹时跨 securityId 轮换按稳定 job_id 合并。
@@ -1609,27 +1885,31 @@ class CacheStore:
 		now = time.time()
 		new_items = []
 		seen_count = 0
-		for item in items:
-			job_key = self._make_watch_job_key(item, account=account)
-			payload = json.dumps(item, ensure_ascii=False, sort_keys=True)
-			# 先 SELECT 再 INSERT 时，两个进程对同一个 watch 同时写入会都看到
-			# 「不存在」，第二个 INSERT 撞主键抛 IntegrityError，被上层误判成
-			# 缓存库损坏（Issue #1509）。INSERT OR IGNORE + UPDATE 的每条语句
-			# 本身是原子的：抢到插入的一方记新增，另一方只刷新 payload / 时间。
-			cursor = self._conn.execute(
-				"INSERT OR IGNORE INTO watch_hits (search_name, job_key, payload, first_seen_at, last_seen_at) "
-				"VALUES (?, ?, ?, ?, ?)",
-				(search_name, job_key, payload, now, now),
-			)
-			if cursor.rowcount:
-				new_items.append(item)
-			else:
-				seen_count += 1
-				self._conn.execute(
-					"UPDATE watch_hits SET payload = ?, last_seen_at = ? WHERE search_name = ? AND job_key = ?",
-					(payload, now, search_name, job_key),
+		# payload 列只写不读，用 ensure_ascii=True 写入：平台 JSON 里的孤立代理项
+		#（如 "\ud800"）json.loads 会接受，ensure_ascii=True 保留原字符后 sqlite3
+		# 绑定抛 UnicodeEncodeError，整批 watch 结果丢弃。整轮包在事务里，中途
+		# 异常回滚，不会把半截结果留给同一连接上的后续写去提交。
+		with self._conn:
+			for item in items:
+				job_key = self._make_watch_job_key(item, account=account)
+				payload = json.dumps(item, ensure_ascii=True, sort_keys=True)
+				# 先 SELECT 再 INSERT 时，两个进程对同一个 watch 同时写入会都看到
+				# 「不存在」，第二个 INSERT 撞主键抛 IntegrityError，被上层误判成
+				# 缓存库损坏（Issue #1509）。INSERT OR IGNORE + UPDATE 的每条语句
+				# 本身是原子的：抢到插入的一方记新增，另一方只刷新 payload / 时间。
+				cursor = self._conn.execute(
+					"INSERT OR IGNORE INTO watch_hits (search_name, job_key, payload, first_seen_at, last_seen_at) "
+					"VALUES (?, ?, ?, ?, ?)",
+					(search_name, job_key, payload, now, now),
 				)
-		self._conn.commit()
+				if cursor.rowcount:
+					new_items.append(item)
+				else:
+					seen_count += 1
+					self._conn.execute(
+						"UPDATE watch_hits SET payload = ?, last_seen_at = ? WHERE search_name = ? AND job_key = ?",
+						(payload, now, search_name, job_key),
+					)
 		return {
 			"new_count": len(new_items),
 			"seen_count": seen_count,
@@ -1835,13 +2115,25 @@ class CacheStore:
 		existing_count = 0
 		skipped_count = 0
 		with self._conn:
-			existing_by_job_id: dict[str, tuple[str, str]] = {
-				str(row[1]): (str(row[0]), str(row[2]))
-				for row in self._conn.execute(
-					"SELECT security_id, job_id, source FROM shortlist_records WHERE job_id != '' "
-					"ORDER BY created_at ASC"
-				).fetchall()
-			}
+			existing_by_job_id: dict[str, tuple[str, str]] = {}
+			for row in self._conn.execute(
+				"SELECT security_id, job_id, source FROM shortlist_records WHERE job_id != '' "
+				"ORDER BY created_at ASC"
+			).fetchall():
+				# 去重键必须与读取展示路径同口径：BLOB 存储类经 str() 会变成
+				# "b'J'"，与平台返回的 "J" 永不相等，同一职位被重复插入
+				# （Issue #2165，与 #1885 / #2147 的 _decode_text_column 同源）。
+				try:
+					security_key = _decode_text_column("shortlist", str(row[0]), "security_id", row[0])
+					job_key = _decode_text_column("shortlist", str(row[1]), "job_id", row[1])
+					source_key = _decode_text_column("shortlist", str(row[2]), "source", row[2])
+				except CacheRecordInvalid:
+					# 无法解码的坏行不参与去重：它仍会出现在 list_shortlist 的
+					# corrupt 名单里，不能因此让整批导入失败。
+					continue
+				if not job_key:
+					continue
+				existing_by_job_id[job_key] = (security_key or "", source_key or "")
 			for item in items:
 				security_id = str(item.get("security_id") or "")
 				job_id = str(item.get("job_id") or "")
@@ -1906,25 +2198,51 @@ class CacheStore:
 		}
 
 	def list_shortlist(self) -> list[dict[str, Any]]:
+		items, _corrupt = self.list_shortlist_with_corrupt()
+		return items
+
+	def list_shortlist_with_corrupt(self) -> tuple[list[dict[str, Any]], list[str]]:
+		"""列出候选池；无法解码的行跳过并单独返回标识（Issue #2224）。
+
+		单条记录字段写坏（如 ``created_at`` 是 BLOB）不能让整池不可见，也不能
+		假装坏条目不存在：调用方据此提示删除重建（与
+		``list_saved_searches_with_corrupt`` / ``list_workflow_runs_with_corrupt``
+		同口径）。
+		"""
 		rows = self._conn.execute(
 			"SELECT security_id, job_id, title, company, city, salary, source, tags, note, created_at, lid "
 			"FROM shortlist_records ORDER BY created_at DESC"
 		).fetchall()
-		return [self._shortlist_row_to_dict(row) for row in rows]
+		items: list[dict[str, Any]] = []
+		corrupt: list[str] = []
+		for row in rows:
+			try:
+				items.append(self._shortlist_row_to_dict(row))
+			except CacheRecordInvalid as exc:
+				corrupt.append(exc.record_id)
+		return items, corrupt
 
 	def _shortlist_row_to_dict(self, row: Any) -> dict[str, Any]:
+		record_id = str(row[1] or row[0] or "")
+		security_id = _decode_text_column("shortlist", record_id, "security_id", row[0])
+		job_id = _decode_text_column("shortlist", record_id, "job_id", row[1])
+		source = _decode_text_column("shortlist", record_id, "source", row[6])
+		note = _decode_text_column("shortlist", record_id, "note", row[8], allow_none=True)
+		lid = _decode_text_column("shortlist", record_id, "lid", row[10], allow_none=True)
 		return {
-			"security_id": row[0],
-			"job_id": row[1],
-			"title": row[2],
-			"company": row[3],
-			"city": row[4],
-			"salary": row[5],
-			"source": row[6],
+			"security_id": security_id,
+			"job_id": job_id,
+			"title": _decode_text_column("shortlist", record_id, "title", row[2]),
+			"company": _decode_text_column("shortlist", record_id, "company", row[3]),
+			"city": _decode_text_column("shortlist", record_id, "city", row[4]),
+			"salary": _decode_text_column("shortlist", record_id, "salary", row[5]),
+			"source": source,
 			"tags": self._deserialize_shortlist_tags(row[7]),
-			"note": row[8] or "",
-			"created_at": row[9],
-			"lid": row[10] or self._crawl_shortlist_lid(str(row[0] or ""), str(row[1] or ""), str(row[6] or "")),
+			"note": note or "",
+			# REAL 列漂移成 BLOB 时不能原样进信封：序列化会兜成固定
+			# INTERNAL_ERROR，与 #1964 的时间戳列同口径（Issue #2147）。
+			"created_at": _decode_timestamp_column("shortlist", record_id, "created_at", row[9]),
+			"lid": lid or self._crawl_shortlist_lid(security_id or "", job_id or "", source or ""),
 		}
 
 	def _crawl_shortlist_lid(self, security_id: str, job_id: str, source: str) -> str:
@@ -2038,6 +2356,21 @@ class CacheStore:
 		self._conn.commit()
 		return cursor.rowcount > 0
 
+	def _resume_link_row_to_dict(self, row: Any) -> dict[str, Any]:
+		record_id = f"{row[0]}/{row[1]}/{row[2]}"
+		return {
+			"resume_name": _decode_text_column("resume_link", record_id, "resume_name", row[0]),
+			"security_id": _decode_text_column("resume_link", record_id, "security_id", row[1]),
+			"job_id": _decode_text_column("resume_link", record_id, "job_id", row[2]),
+			"job_title": _decode_text_column("resume_link", record_id, "job_title", row[3]),
+			"company": _decode_text_column("resume_link", record_id, "company", row[4]),
+			"status": _decode_text_column("resume_link", record_id, "status", row[5]),
+			"notes": _decode_text_column("resume_link", record_id, "notes", row[6], allow_none=True),
+			# 与 #1964 同口径：REAL 时间戳漂移不能以 bytes 进信封（Issue #2147）。
+			"linked_at": _decode_timestamp_column("resume_link", record_id, "linked_at", row[7]),
+			"updated_at": _decode_timestamp_column("resume_link", record_id, "updated_at", row[8]),
+		}
+
 	def get_resume_applications(self, resume_name: str) -> list[dict[str, Any]]:
 		"""查看某份简历投递的所有职位"""
 		rows = self._conn.execute(
@@ -2045,20 +2378,7 @@ class CacheStore:
 			"FROM resume_job_links WHERE resume_name = ? ORDER BY updated_at DESC",
 			(resume_name,),
 		).fetchall()
-		return [
-			{
-				"resume_name": row[0],
-				"security_id": row[1],
-				"job_id": row[2],
-				"job_title": row[3],
-				"company": row[4],
-				"status": row[5],
-				"notes": row[6],
-				"linked_at": row[7],
-				"updated_at": row[8],
-			}
-			for row in rows
-		]
+		return [self._resume_link_row_to_dict(row) for row in rows]
 
 	def get_job_resumes(self, security_id: str, job_id: str) -> list[dict[str, Any]]:
 		"""查看某职位关联的所有简历版本"""
@@ -2067,20 +2387,7 @@ class CacheStore:
 			"FROM resume_job_links WHERE security_id = ? AND job_id = ? ORDER BY updated_at DESC",
 			(security_id, job_id),
 		).fetchall()
-		return [
-			{
-				"resume_name": row[0],
-				"security_id": row[1],
-				"job_id": row[2],
-				"job_title": row[3],
-				"company": row[4],
-				"status": row[5],
-				"notes": row[6],
-				"linked_at": row[7],
-				"updated_at": row[8],
-			}
-			for row in rows
-		]
+		return [self._resume_link_row_to_dict(row) for row in rows]
 
 	def remove_job_link(self, resume_name: str, security_id: str, job_id: str) -> bool:
 		"""移除简历职位关联"""

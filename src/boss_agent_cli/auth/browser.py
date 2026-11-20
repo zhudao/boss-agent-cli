@@ -142,6 +142,8 @@ def _probe_reused_session(page: Any, *, platform: str) -> str:
 	- 只探测 zhipin：其他平台没有在本地核实过的只读探测端点，按 ``unverified`` 处理。
 	- fetch 自身失败（网络 / 超时，``code == -1``）视为 ``unverified``：无法证明失效就不
 	  阻断登录，但会在 stderr 提示；真失效的兜底是 ``boss login --force``。
+	- 限流（码 9 / HTTP 429）同样判 ``unverified``：以清空用户 Cookie 的强制重登来响应
+	  限流只会毁掉仍然有效的会话（Issue #2092）。其余非 0 码按 #424 契约判 ``stale``。
 	"""
 	if platform != "zhipin":
 		return "unverified"
@@ -175,6 +177,12 @@ def _probe_reused_session(page: Any, *, platform: str) -> str:
 	if is_platform_success_code(code):
 		return "valid"
 	if code == -1:
+		return "unverified"
+	# 限流不是会话失效的证据：码 9 / HTTP 429 判 unverified，避免 _cdp_login 改走
+	# reuse_existing=False，在打开登录页前清掉用户浏览器里仍然有效的 Cookie
+	# （Issue #2092）。其余非 0 码维持 #424 / #427 的既定契约——未知响应宁可重登，
+	# 也不把可能已失效的凭证当「复用成功」落盘。
+	if code in (endpoints.CODE_RATE_LIMITED, str(endpoints.CODE_RATE_LIMITED)) or data.get("__auth_response_status__") == 429:
 		return "unverified"
 	return "stale"
 
@@ -301,7 +309,9 @@ def probe_cdp(cdp_url: str | None = None) -> str | None:
 		return cast("str | None", payload.get("webSocketDebuggerUrl"))
 	# ValueError 覆盖 JSON 语法错误；深嵌套响应在 3.11–3.13 抛 RecursionError。
 	# 与解析失败一样按「响应无法解析」处理：拿不到调试端口即视为探测不可用（Issue #1378）。
-	except (httpx.HTTPError, ValueError, KeyError, RecursionError):
+	# httpx.InvalidURL 直接继承 Exception（不是 HTTPError / ValueError）：畸形 cdp-url
+	# 会让探测异常逃逸、打断登录降级链（Issue #2235）。
+	except (httpx.HTTPError, httpx.InvalidURL, ValueError, KeyError, RecursionError):
 		return None
 
 
@@ -356,25 +366,34 @@ def login_via_cdp(
 		with suppress(Exception):
 			pw.stop()
 		raise
-	if reuse_existing:
-		logged_in_ctx, ctx_index, ctx_account_fp = _find_logged_in_context(
-			all_contexts,
-			cookie_domain=cookie_domain,
-			success_cookie=success_cookie,
-		)
-	else:
-		logged_in_ctx, ctx_index, ctx_account_fp = None, -1, ""
-	already_logged_in = logged_in_ctx is not None
-	ctx = logged_in_ctx or (browser.contexts[0] if browser.contexts else browser.new_context())
-	if not reuse_existing:
-		# 强制重登：清掉当前 context 内目标平台域的 cookie。不清的话登录页会因残留
-		# 登录态直接跳回首页，轮询立刻命中旧 wt2，--force 形同虚设。
-		_clear_platform_cookies(ctx, cookie_domain=cookie_domain)
-		print(f"[boss] --force：跳过复用，已清除当前 context 的 {cookie_domain} 登录态，改为重新登录", file=sys.stderr)
-	page = _find_zhipin_page(ctx.pages) if already_logged_in and platform == "zhipin" else None
-	created_page = page is None
-	if page is None:
-		page = ctx.new_page()
+	try:
+		if reuse_existing:
+			logged_in_ctx, ctx_index, ctx_account_fp = _find_logged_in_context(
+				all_contexts,
+				cookie_domain=cookie_domain,
+				success_cookie=success_cookie,
+			)
+		else:
+			logged_in_ctx, ctx_index, ctx_account_fp = None, -1, ""
+		already_logged_in = logged_in_ctx is not None
+		ctx = logged_in_ctx or (browser.contexts[0] if browser.contexts else browser.new_context())
+		if not reuse_existing:
+			# 强制重登：清掉当前 context 内目标平台域的 cookie。不清的话登录页会因残留
+			# 登录态直接跳回首页，轮询立刻命中旧 wt2，--force 形同虚设。
+			_clear_platform_cookies(ctx, cookie_domain=cookie_domain)
+			print(f"[boss] --force：跳过复用，已清除当前 context 的 {cookie_domain} 登录态，改为重新登录", file=sys.stderr)
+		page = _find_zhipin_page(ctx.pages) if already_logged_in and platform == "zhipin" else None
+		created_page = page is None
+		if page is None:
+			page = ctx.new_page()
+	except Exception:
+		# connect 成功之后、主 try 之前的 context / 页面准备同样要收尾 driver：
+		# target 在握手后断开（clear_cookies / new_page 抛错）时异常直接穿透会
+		# 泄漏 Playwright driver 进程，普通登录随后还会降级再起一个 patchright
+		# （Issue #2043）。成功路径不在这里 stop，只由末尾 finally 统一收尾。
+		with suppress(Exception):
+			pw.stop()
+		raise
 
 	stage = "open_login"
 	try:
@@ -525,7 +544,12 @@ def _capture_identity_from_probe_page(ctx: Any, home_url: str, *, existing: Any 
 	The page's own bootstrap XHRs are the only reliable source for ``token`` and
 	``zp_token``; the CLI cannot recompute them. Returns an empty mapping on any
 	failure so a login never fails because identity capture did.
+
+	风控例外：首页被重定向到安全验证 / 访问受限页时必须上抛（硬边界），
+	身份头采集失败本身仍不阻断登录（Issue #2093）。
 	"""
+	from boss_agent_cli.api.client import PlatformRiskError
+
 	probe = None
 	capture = None
 	try:
@@ -536,8 +560,23 @@ def _capture_identity_from_probe_page(ctx: Any, home_url: str, *, existing: Any 
 		capture = PageIdentityCapture(probe)
 		# 首页常年在 domcontentloaded 上超时；commit 已足够，随后靠 wait_for_identity 驱动事件循环。
 		probe.goto(home_url, wait_until="commit", timeout=_NAV_TIMEOUT_MS)
-		return capture.wait_for_identity(_PAGE_IDENTITY_WAIT_MS)
+		# 首页可能直接落到安全验证 / 访问受限页：身份头可以采不到，风控信号不能吞。
+		_raise_if_security_page(probe, is_cdp=True)
+		identity = capture.wait_for_identity(_PAGE_IDENTITY_WAIT_MS)
+		# wait_for_identity 驱动事件循环期间页面可能才被重定向到风险页。
+		_raise_if_security_page(probe, is_cdp=True)
+		return identity
+	except PlatformRiskError:
+		raise
 	except Exception as exc:
+		# 导航 / 采集异常也可能由风险页重定向引起：吞掉之前先复查一次。
+		if probe is not None:
+			try:
+				_raise_if_security_page(probe, is_cdp=True)
+			except PlatformRiskError:
+				raise
+			except Exception:
+				pass
 		_logger.info("未能采集页面身份头（token/zp_token）：%s", exc)
 		return {}
 	finally:
@@ -637,17 +676,16 @@ def login_via_browser(*, timeout: int = 120, platform: str = "zhipin") -> dict[s
 				if response_risk is not None:
 					raise response_risk
 				_raise_if_security_page(page)
-				# 也通过 cookie 检测（覆盖 API 匹配不上的情况）
-				try:
-					cookies_list = context.cookies()
-					if any(
-						c["name"] == success_cookie and _is_cookie_domain(c.get("domain", ""), cookie_domain)
-						for c in cookies_list
-					):
-						login_detected = True
-						break
-				except Exception:
-					pass
+				# 也通过 cookie 检测（覆盖 API 匹配不上的情况）。与 CDP 路径同口径
+				# （Issue #2095）：cookies() 异常立即传播，浏览器已关闭时不能空转到
+				# 超时、误报「扫码登录超时」。
+				cookies_list = context.cookies()
+				if any(
+					c["name"] == success_cookie and _is_cookie_domain(c.get("domain", ""), cookie_domain)
+					for c in cookies_list
+				):
+					login_detected = True
+					break
 				time.sleep(1)
 
 			if response_risk is not None:
@@ -749,8 +787,22 @@ def refresh_stoken_via_cdp(cdp_url: str | None = None) -> str:
 	return stoken
 
 
+def _jar_stoken(context: Any) -> str:
+	"""读取 context cookie jar 里的 ``__zp_stoken__``；不存在或值不是字符串时返回空串。"""
+	for cookie in context.cookies():
+		if cookie.get("name") != "__zp_stoken__":
+			continue
+		if not _is_cookie_domain(str(cookie.get("domain", "")), "zhipin.com"):
+			continue
+		value = cookie.get("value")
+		return value if isinstance(value, str) else ""
+	return ""
+
+
 def refresh_stoken(cookies: dict[str, Any], user_agent: str) -> str:
 	"""通过 headless patchright 刷新 stoken（兜底方案）。"""
+	previous = cookies.get("__zp_stoken__")
+	previous_stoken = previous if isinstance(previous, str) else ""
 	with sync_playwright() as p:
 		browser = p.chromium.launch(
 			headless=True,
@@ -766,12 +818,11 @@ def refresh_stoken(cookies: dict[str, Any], user_agent: str) -> str:
 			home_loaded = _warm_home_for_runtime(page, HOME_URL, stage="刷新 stoken")
 			stoken = _extract_stoken(page) if home_loaded else ""
 			if not stoken:
-				for cookie in context.cookies():
-					if cookie.get("name") == "__zp_stoken__" and _is_cookie_domain(
-						str(cookie.get("domain", "")), "zhipin.com"
-					):
-						stoken = cookie.get("value", "")
-						break
+				candidate = _jar_stoken(context)
+				# 注入的旧 cookies 里本就有 __zp_stoken__：兜底读回同一个值说明页面
+				# 从未生成新令牌，不能当刷新结果返回（Issue #2091）。
+				if candidate and candidate != previous_stoken:
+					stoken = candidate
 		finally:
 			with suppress(Exception):
 				browser.close()

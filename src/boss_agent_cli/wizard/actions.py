@@ -22,7 +22,7 @@ from boss_agent_cli.services.candidate_actions import (
 	CandidateActionNotRecorded,
 	run_candidate_action,
 )
-from boss_agent_cli.services.contact_lookup import FriendLookupLimitExceeded, find_friend
+from boss_agent_cli.services.contact_lookup import FriendListShapeError, FriendLookupLimitExceeded, find_friend
 from boss_agent_cli.services.friend_list_pages import collect_friend_list_page
 from boss_agent_cli.services.output_path import OutputPathProblem, inspect_output_path, prepare_output_path
 from boss_agent_cli.crawler.operations import crawl_status
@@ -203,6 +203,9 @@ def execute_candidate_search(
 	pipeline: Callable[..., Any] = run_search_pipeline,
 ) -> Any:
 	"""Shared platform search call used by the command and workflow action."""
+	# query 类型错误不能经 str() 静默变成空关键词或容器的 repr 文本：
+	# false / 0 会变成无关键词搜索，对象会按字面去搜（Issue #2009）。
+	query = _optional_str_strict(inputs, "query") or ""
 	welfare_conditions = inputs.get("welfare_conditions")
 	if welfare_conditions is None and inputs.get("welfare"):
 		raw_welfare = inputs["welfare"]
@@ -231,7 +234,7 @@ def execute_candidate_search(
 			),
 		) from exc
 	criteria = SearchFilterCriteria(
-		query=str(inputs.get("query") or ""),
+		query=query,
 		city=_optional_str(inputs.get("city")),
 		salary=_optional_str(inputs.get("salary")),
 		experience=_optional_str(inputs.get("experience")),
@@ -787,7 +790,7 @@ def _auth_status(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 
 
 def _candidate_search(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	_required(inputs, "query")
+	_required_str(inputs, "query")
 	account = account_scope(context.auth())
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		with context.candidate_platform() as platform:
@@ -942,6 +945,16 @@ def _candidate_greet(context: ActionContext, inputs: Mapping[str, Any], prior: M
 def _candidate_friend(platform: Any, identifier: str, *, context: ActionContext | None = None) -> dict[str, Any]:
 	try:
 		friend, error_response = find_friend(platform, identifier)
+	except FriendListShapeError as exc:
+		# 列表容器缺失是可恢复的读取异常：刷新列表后可重试，但不能把不可
+		# 判定的响应当成招聘者不存在（Issue #1978）。
+		chat_hint = _hint_command(context, "chat") if context is not None else "boss chat"
+		raise WorkflowActionError(
+			"NETWORK_ERROR",
+			str(exc),
+			recoverable=True,
+			recovery_action=f"先用 {chat_hint} 刷新沟通列表，确认列表可读后再重试；响应缺少列表容器时不能判定招聘者是否存在",
+		) from exc
 	except FriendLookupLimitExceeded as exc:
 		# 候选人无法「缩小沟通列表范围」：照抄旧指引只会把同一段超过分页上限的
 		# 遍历再跑一遍。find_friend 优先匹配稳定 uid，给出可执行的 uid 路径。
@@ -1195,9 +1208,9 @@ def _ai_assist(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping
 		)
 	except AIServiceError as exc:
 		raise WorkflowActionError(
-			"AI_API_ERROR",
+			exc.code,
 			str(exc),
-			recoverable=True,
+			recoverable=exc.recoverable,
 			recovery_action=recovery_action_for(
 				exc,
 				"检查 AI 配置后重试",

@@ -136,7 +136,20 @@ def shortlist_add_cmd(
 def shortlist_list_cmd(ctx: click.Context) -> None:
 	"""列出本地候选池中的全部职位。"""
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
-		items = cache.list_shortlist()
+		items, corrupt = cache.list_shortlist_with_corrupt()
+	hints: dict[str, Any] = {
+		"next_actions": [_hint_command(ctx, "shortlist add <security_id> <job_id>")]
+		if not items
+		else [_hint_command(ctx, "detail <security_id> --job-id <job_id>")]
+	}
+	if corrupt:
+		# 坏条目不能假装不存在：可用项照常返回，同时指明该删哪些（Issue #2224，
+		# 与 watch / preset 的 corrupt 名单同口径）。
+		hints["corrupt"] = corrupt
+		hints["operator_actions"] = [
+			"以下候选记录的字段已损坏、无法读取，先执行 "
+			f"{_hint_command(ctx, 'shortlist remove <security_id> <job_id>')} 再重新 shortlist add：{', '.join(corrupt)}"
+		]
 	handle_output(
 		ctx,
 		"shortlist",
@@ -154,9 +167,7 @@ def shortlist_list_cmd(ctx: click.Context) -> None:
 				("source", "source", "magenta"),
 			],
 		),
-		hints={"next_actions": [_hint_command(ctx, "shortlist add <security_id> <job_id>")]
-		if not items
-		else [_hint_command(ctx, "detail <security_id> --job-id <job_id>")]},
+		hints=hints,
 	)
 
 
@@ -235,9 +246,25 @@ def shortlist_annotate_cmd(
 			)
 			return
 		tags = _merge_tags(current.get("tags", []), add_tag, remove_tag)
-		cache.set_shortlist_tags(security_id, job_id, tags)
+		tags_updated = cache.set_shortlist_tags(security_id, job_id, tags)
+		note_updated = True
 		if note is not None:
-			cache.set_shortlist_note(security_id, job_id, note)
+			note_updated = cache.set_shortlist_note(security_id, job_id, note)
+		if not (tags_updated and note_updated):
+			# UPDATE 的 rowcount 是「有没有写进去」的唯一信号：security_id 以
+			# BLOB 落库（#1885 的读取兼容）或行在 SELECT 与 UPDATE 之间被并发
+			# 删除时，TEXT 参数匹配不到存储值，旧实现照样回 updated:true，正是
+			# #1565 要消灭的「没写进去却报成功」（Issue #2135）。
+			list_cmd = _hint_command(ctx, "shortlist list")
+			handle_error_output(
+				ctx,
+				"shortlist",
+				code="SHORTLIST_ENTRY_NOT_FOUND",
+				message=f"候选池记录未能写入（可能已被删除或标识存储不一致）: {security_id} / {job_id}",
+				recovery_action=f"先用 {list_cmd} 核对条目是否仍在候选池，再决定是否重新 add",
+				hints={"next_actions": [list_cmd]},
+			)
+			return
 		current = _find_shortlist_item(cache.list_shortlist(), security_id, job_id)
 	handle_output(
 		ctx,

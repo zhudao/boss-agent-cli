@@ -6,6 +6,7 @@ from boss_agent_cli.api.models import dict_items, JobItem, field_list
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.commands._platform import get_platform_instance
 from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_not_supported, handle_output, handle_platform_error_output, render_job_table
+from boss_agent_cli.services.pagination import MAX_TRUSTED_PAGE
 
 
 _HISTORY_ID_KEYS = ("encryptJobId", "securityId", "lid")
@@ -53,7 +54,10 @@ def _hint_command(ctx: click.Context, command: str) -> str:
 
 
 @click.command("history")
-@click.option("--page", default=1, type=click.IntRange(min=1), help="页码")
+@click.option(
+	"--page", default=1, type=click.IntRange(min=1, max=MAX_TRUSTED_PAGE),
+	help="页码",
+)
 @click.pass_context
 @handle_auth_errors("history")
 def history_cmd(ctx: click.Context, page: int) -> None:
@@ -101,11 +105,19 @@ def history_cmd(ctx: click.Context, page: int) -> None:
 	]
 	# 没有下一页时不能建议 --page N+1：Agent 照着执行只会拿到空页，
 	# 与 TTY 的 hint_next 守卫（hasMore 为假时不显示 more）保持一致。
-	if pagination["has_more"] is True:
+	at_page_limit = page >= MAX_TRUSTED_PAGE
+	if pagination["has_more"] is True and not at_page_limit:
 		next_actions.append(_hint_command(ctx, f"history --page {page + 1}"))
 	hints = {"next_actions": next_actions}
 	if has_more is None:
 		hints["operator_actions"] = ["平台未提供可靠的下一页标记，不能仅凭本页数量判断是否还有记录"]
+	elif at_page_limit:
+		# 上限页再 +1 的提示自己就过不了 --page 校验（Issue #2012）：
+		# 告诉 Agent 已到可信上限，而不是给一条不可执行的命令。
+		hints["operator_actions"] = [
+			f"已达可信页码上限（--page {MAX_TRUSTED_PAGE}），平台仍报告有更多记录；"
+			"如需继续，请缩小筛选条件后重新搜索"
+		]
 
 	handle_output(
 		ctx, "history", items,
@@ -114,7 +126,7 @@ def history_cmd(ctx: click.Context, page: int) -> None:
 			page=page,
 			hint_next=(
 				f"more: {_hint_command(ctx, f'history --page {page + 1}')}"
-				if pagination["has_more"] else ""
+				if pagination["has_more"] and not at_page_limit else ""
 			),
 		),
 		pagination=pagination, hints=hints,

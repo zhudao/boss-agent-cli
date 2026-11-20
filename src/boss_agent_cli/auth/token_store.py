@@ -1,7 +1,9 @@
+import errno
 import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import time
@@ -19,11 +21,15 @@ from boss_agent_cli.services.json_files import read_bytes_if_regular
 from boss_agent_cli.services.private_files import (
 	chmod_best_effort,
 	load_or_create_private_salt,
+	tighten_private_file,
 	write_private_bytes,
 )
 
 _LOCK_TIMEOUT = 30
 _LOCK_POLL_SECONDS = 0.05
+# 机器 ID 的外部命令输出按名字取值：格式漂移只应落到指纹兜底，不能
+# 因下标越界抛 IndexError（Issue #1894）。
+_IO_PLATFORM_UUID_RE = re.compile(r'"IOPlatformUUID"\s*=\s*"([^"]+)"')
 
 
 class RefreshLockBusy(Exception):
@@ -40,8 +46,8 @@ class TokenStore:
 		self._salt_path = auth_dir / "salt"
 		self._lock_path = auth_dir / "refresh.lock"
 		for path in (self._salt_path, self._session_path):
-			if path.exists():
-				chmod_best_effort(path, 0o600)
+			# 只收紧普通文件：符号链接不能跟随（Issue #2206）。
+			tighten_private_file(path)
 
 	def _get_machine_id(self) -> str:
 		# 允许显式覆盖，便于测试 / CI / 沙箱环境稳定运行
@@ -60,7 +66,11 @@ class TokenStore:
 					)
 					for line in result.stdout.splitlines():
 						if "IOPlatformUUID" in line:
-							return line.split('"')[-2]
+							# 输出格式漂移（shim / 封装脚本）时按下标取值会抛
+							# IndexError 并绕过指纹兜底（Issue #1894）。
+							match = _IO_PLATFORM_UUID_RE.search(line)
+							if match:
+								return match.group(1)
 			elif system == "Linux":
 				machine_id = Path("/etc/machine-id")
 				if machine_id.exists():
@@ -75,7 +85,11 @@ class TokenStore:
 					)
 					for line in result.stdout.splitlines():
 						if "MachineGuid" in line:
-							return line.split()[-1]
+							# 没有值字段的行（shim / 格式漂移）跳过继续找，不能让
+							# 下标越界抛 IndexError 绕过指纹兜底（Issue #1894）。
+							parts = line.split()
+							if len(parts) >= 2 and parts[-1] not in {"MachineGuid", "REG_SZ"}:
+								return parts[-1]
 		except (OSError, ValueError):
 			pass
 
@@ -85,12 +99,18 @@ class TokenStore:
 			system or "unknown-system",
 			platform.machine() or "unknown-machine",
 		])
-		return hashlib.sha256(fingerprint.encode()).hexdigest()
+		return hashlib.sha256(fingerprint.encode("utf-8", "surrogatepass")).hexdigest()
 
 	def _get_salt(self) -> bytes:
 		# salt 决定 session.enc 的派生密钥；共享实现保证首个写入者获胜，
 		# 读取失败时不会用新 salt 覆盖旧密文（Issue #1633 / #1688）。
-		return load_or_create_private_salt(self._auth_dir)
+		try:
+			return load_or_create_private_salt(self._auth_dir)
+		except RuntimeError as exc:
+			# salt 路径是目录 / FIFO / 长度异常时共享实现抛 RuntimeError。status /
+			# doctor 等命令没有 AI 侧的转换，裸异常会变成 traceback 或可重试的
+			# NETWORK_ERROR（Issue #1996）。带上 filename 后全局分流按本地 IO 错误报。
+			raise OSError(errno.EINVAL, str(exc), str(self._auth_dir / "salt")) from exc
 
 	def _derive_key(self) -> bytes:
 		salt = self._get_salt()
@@ -101,12 +121,22 @@ class TokenStore:
 			salt=salt,
 			iterations=480000,
 		)
-		key = kdf.derive(machine_id.encode())
+		# machine_id 只作密钥派生的本地输入（不参与安全边界），稳定唯一即可：
+		# BOSS_AGENT_MACHINE_ID 经 surrogateescape 解码可含孤立代理字符，严格编码
+		# 会让 load / save 直接抛 UnicodeEncodeError，绕过登录态的「未登录 / 本地
+		# IO 错误」两种既有分流（Issue #2044）。surrogatepass 与 file_lock /
+		# cdp_risk_lock 的口径一致。
+		key = kdf.derive(machine_id.encode("utf-8", "surrogatepass"))
 		return urlsafe_b64encode(key)
 
 	def save(self, token_data: dict[str, Any]) -> None:
 		fernet = Fernet(self._derive_key())
-		plaintext = json.dumps(token_data, ensure_ascii=False).encode()
+		# cookie / stoken 值可能含孤立代理字符（非法 UTF-8 字节经 surrogateescape
+		# 解码，Issue #1918 已认定可达）。严格编码会抛 UnicodeEncodeError，被登录
+		# 错误分流当成 INVALID_PARAM，把平台已成功的登录说成参数非法（Issue #2040）。
+		# backslashreplace 写出合法的 ``\udcff`` 转义，读回值不变，与
+		# services/json_files.py / output.py 同口径。
+		plaintext = json.dumps(token_data, ensure_ascii=False).encode("utf-8", "backslashreplace")
 		encrypted = fernet.encrypt(plaintext)
 		write_private_bytes(self._session_path, encrypted)
 

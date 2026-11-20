@@ -10,7 +10,6 @@ import errno
 import html
 import sqlite3
 import stat
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -21,6 +20,7 @@ from rich.table import Table
 from boss_agent_cli import display
 from boss_agent_cli.cache.store import CacheDatabaseInvalid, is_cache_busy_error, is_cache_local_io_error
 from boss_agent_cli.commands._output_path import validate_output_path_or_emit
+from boss_agent_cli.output import write_document_stdout
 from boss_agent_cli.display import (
 	boss_command_for_ctx,
 	handle_error_output,
@@ -30,7 +30,7 @@ from boss_agent_cli.display import (
 	render_action_result,
 )
 from boss_agent_cli.services.output_path import prepare_output_path
-from boss_agent_cli.services.text_files import write_text_atomic
+from boss_agent_cli.services.text_files import sanitize_surrogates, write_text_atomic
 
 
 def _count_records(
@@ -41,7 +41,9 @@ def _count_records(
 	parameters: tuple[float, ...] = ()
 	if window is not None:
 		column, cutoff = window
-		query += f" WHERE {column} >= ?"
+		# SQLite 的存储类排序让 BLOB / 文本漂移值永远 >= 数值阈值：一行十天前
+		# 的时间戳写成 BLOB 后仍被计入一天窗口。只统计数值存储类，漂移行不进窗口。
+		query += f" WHERE {column} >= ? AND typeof({column}) IN ('integer', 'real')"
 		parameters = (cutoff,)
 	try:
 		result: int = conn.execute(query, parameters).fetchone()[0]
@@ -281,11 +283,11 @@ footer a {{ color: var(--accent); text-decoration: none; }}
 <body>
 
 <header>
-	<h1>📊 投递转化漏斗</h1>
+	<h1>投递转化漏斗</h1>
 	<div class="meta">窗口期：最近 {window_days} 天 · 生成时间：{generated_at}</div>
 </header>
 
-{f'<div class="note">⚠️ {note}</div>' if note else ''}
+{f'<div class="note">注意：{note}</div>' if note else ''}
 
 <section>
 	<h2>核心指标</h2>
@@ -381,7 +383,7 @@ def _render_stats(ctx: click.Context, data: dict[str, Any]) -> None:
 		display.console.print("\n  [bold]下一步：[/bold]")
 		for hint in hints:
 			# 目录名是外部输入：含 Rich 标签时必须按字面渲染，否则会被吞或抛 MarkupError。
-			display.console.print(f"    [dim]{display.escape(hint)}[/dim]")
+			display.console.print(f"    [dim]{display.escape_markup(hint)}[/dim]")
 
 
 def _percent(value: Any) -> str:
@@ -455,7 +457,11 @@ def stats_cmd(ctx: click.Context, days: int, output_format: str, output_path: Pa
 	data = _collect_stats(db_path, days)
 
 	if output_format == "html":
-		html_text = _render_html(ctx, data)
+		# HTML 内嵌 hints，其中的 --data-dir 路径可能带孤立代理字符（Linux 上
+		# 非 UTF-8 字节经 surrogateescape 解码）。先在出口归一，三个输出分支
+		# （-o / --json / stdout）与 bytes 计算才不会再抛 UnicodeEncodeError，
+		# 也不会出现「文件已写出却报失败」（Issue #2109）。
+		html_text = sanitize_surrogates(_render_html(ctx, data))
 		if output_path:
 			target = prepare_output_path(output_path)
 			write_text_atomic(target, html_text)
@@ -475,8 +481,7 @@ def stats_cmd(ctx: click.Context, days: int, output_format: str, output_path: Pa
 			)
 		else:
 			# stdout 直出 HTML（便于管道重定向）
-			sys.stdout.write(html_text)
-			sys.stdout.flush()
+			write_document_stdout(html_text)
 		return
 
 	stats_hints: dict[str, Any] = {"next_actions": _build_hints(ctx, data)}

@@ -8,7 +8,7 @@ from boss_agent_cli.api.endpoints import (
 	STAGE_CODES,
 )
 from boss_agent_cli.auth.manager import AuthManager
-from boss_agent_cli.cache.store import CacheStore, SavedSearchParamsError
+from boss_agent_cli.cache.store import CacheRecordInvalid, CacheStore, SavedSearchParamsError
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._platform import account_scope, get_platform_instance
 from boss_agent_cli.display import (
@@ -212,7 +212,12 @@ def watch_remove_cmd(ctx: click.Context, name: str) -> None:
 
 def _execute_single_watch(ctx: click.Context, cache: Any, name: str) -> dict[str, Any] | None:
 	"""执行单个 watch，返回聚合结果；找不到时返回 None。"""
-	record = cache.get_saved_search(name)
+	try:
+		record = cache.get_saved_search(name)
+	except CacheRecordInvalid as exc:
+		# 时间戳等列类型漂移与参数写坏同口径：本地记录损坏是确定性失败，
+		# 不能兜成可重试的 NETWORK_ERROR（Issue #2011）。
+		raise SavedSearchParamsError(name, f"本地记录损坏：{exc}") from exc
 	if record is None:
 		return None
 
@@ -408,8 +413,17 @@ def watch_run_cmd(ctx: click.Context, name: str | None, run_all: bool) -> None:
 						stopped_watch = record["name"]
 						break
 					summary = {"name": record["name"], "error": exc.code, "message": exc.message}
-				if summary is not None:
-					watches.append(summary)
+				if summary is None:
+					# 记录在列出之后按名称读取不到：并发删除会让它自然消失。
+					# 静默丢弃会让 --all 报 ok: true 却少跑一个 watch，必须显式
+					# 列出并说明原因（Issue #2164 同批：此前 BLOB 名称的记录
+					# 也会落进这个分支且完全不可见）。
+					summary = {
+						"name": record["name"],
+						"error": "SAVED_SEARCH_INVALID",
+						"message": "watch 记录在运行前已不存在（可能被并发删除）；请用 watch list 确认后重新创建",
+					}
+				watches.append(summary)
 			if risk_error is not None:
 				recoverable, recovery_action, risk_hints = platform_error_contract(risk_error.code, ctx=ctx)
 				handle_error_output(

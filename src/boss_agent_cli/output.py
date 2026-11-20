@@ -26,6 +26,7 @@ _SENSITIVE_KEY_PARTS = (
 	"cookie",
 	"credential",
 	"password",
+	"passwd",
 	"private",
 	"secret",
 	"session",
@@ -51,21 +52,40 @@ _TEXT_VALUE_TERMINATORS = r"\s,;，。、；：（）「」『』【】《》！
 # `登录token=abc` 曾整段漏脱敏（Issue #1662）。下划线与连字符是复合键的分隔符，
 # `access_token` / `x-api-key` 从凭据段开始匹配，前缀原样保留，替换后仍是完整键名
 # （Issue #1765）。键名后必须紧跟 `:` / `=`，所以 `token_expires_in` 等配置名不会命中。
-_ASCII_KEY_BOUNDARY = r"(?<![A-Za-z0-9])"
+# camelCase 键（`accessToken` / `refreshToken` / `clientSecret`）的关键字前是小写
+# 字母，非字母数字边界不成立，整段漏脱敏（Issue #2231）；补一条「小写→大写」
+# 转折边界。转折比较必须区分大小写，否则 IGNORECASE 会把任意字母都当成转折，
+# 等于取消边界。
+_ASCII_KEY_BOUNDARY = r"(?:(?<![A-Za-z0-9])|(?-i:(?<=[a-z])(?=[A-Z])))"
 _SENSITIVE_TEXT_PATTERNS = tuple(
 	re.compile(pattern, re.IGNORECASE)
 	for pattern in (
 		# Authorization 的方案名（Basic / Token / Digest / Bearer）属于凭据的一部分，
 		# 只替换键后的值时会把真正的密钥留在文本里（Issue #1663）。
-		rf"{_ASCII_KEY_BOUNDARY}(?P<key>authorization)(?P<sep>\s*[:=]\s*)(?P<scheme>(?:bearer|basic|digest|token)\s+)?(?P<value>[^{_TEXT_VALUE_TERMINATORS}]+)",
-		rf"{_ASCII_KEY_BOUNDARY}(?P<key>api[_-]?key|authorization|cookie|credential|password|secret|session(?:[_-]?id)?|stoken|token)(?P<sep>\s*[:=]\s*)(?P<value>[^{_TEXT_VALUE_TERMINATORS}]+)",
-		rf"{_ASCII_KEY_BOUNDARY}(?P<key>bearer)(?P<sep>\s+)(?P<value>[^{_TEXT_VALUE_TERMINATORS}]+)",
+		# Cookie 头是多段 `a=b; c=d`：停在第一个分号会把后续段落的明文留在
+		# 文本里（Issue #1899）。空格后的 `key=value` 不当作 cookie 续段——
+		# 那通常是另一个独立字段，由通用规则分别脱敏。
+		rf"{_ASCII_KEY_BOUNDARY}(?P<key>cookie)(?P<quote>[\"']?)(?P<sep>\s*[:=]\s*)(?P<value>[^\s,;{_TEXT_VALUE_TERMINATORS}]+(?:\s*[;,]\s*[^\s,;{_TEXT_VALUE_TERMINATORS}]+)*)",
+		rf"{_ASCII_KEY_BOUNDARY}(?P<key>authorization)(?P<quote>[\"']?)(?P<sep>\s*[:=]\s*)(?P<scheme>(?:bearer|basic|digest|token)\s+)?(?P<value>[^{_TEXT_VALUE_TERMINATORS}]+)",
+		# BOSS 的 stoken 查询参数名是 `__zp_stoken__`：通用 `stoken` 规则要求键后
+		# 直接是分隔符，双下划线让它整个漏过（Issue #2157）。单列一条，键名原样回填。
+		rf"{_ASCII_KEY_BOUNDARY}(?P<key>__zp_stoken__)(?P<quote>[\"']?)(?P<sep>\s*[:=]\s*)(?P<value>[^{_TEXT_VALUE_TERMINATORS}]+)",
+		rf"{_ASCII_KEY_BOUNDARY}(?P<key>api[_-]?key|authorization|cookie|credential|password|passwd|secret|session(?:[_-]?id)?|stoken|token)(?P<quote>[\"']?)(?P<sep>\s*[:=]\s*)(?P<value>[^{_TEXT_VALUE_TERMINATORS}]+)",
+		rf"{_ASCII_KEY_BOUNDARY}(?P<key>bearer)(?P<quote>)(?P<sep>\s+)(?P<value>[^{_TEXT_VALUE_TERMINATORS}]+)",
 	)
 )
 
 
-def _is_error_code_metadata(value: Any) -> bool:
-	"""Schema error-code metadata is public even when the code contains TOKEN."""
+def _is_error_code_metadata(value: Any, path: SchemaPath = ()) -> bool:
+	"""Schema error-code metadata is public even when the code contains TOKEN.
+
+	只对 ``SCHEMA_DATA["error_codes"][<code>]`` 这一层生效：形状启发式（恰好只含
+	message / recoverable / recovery_action 三个键）在任意嵌套位置都会让键名含
+	token / cookie 的子树整体跳过键名遮盖，只要值恰好长得像错误码元数据
+	（Issue #2049）。
+	"""
+	if len(path) < 2 or path[-2] != "error_codes":
+		return False
 	if not isinstance(value, dict):
 		return False
 	keys = set(value)
@@ -86,8 +106,11 @@ _FILESYSTEM_ERROR_TYPES: tuple[type[OSError], ...] = (
 # fd 级写入（write / flush / fsync）失败时异常不带 filename：磁盘满、配额耗尽、
 # 设备 I/O 错误只可能来自本地文件系统，兜成可重试的 NETWORK_ERROR 会让 Agent
 # 无限重试同一条命令（Issue #1400）。Windows 的 errno 模块不一定定义 EDQUOT。
+# EINVAL 同理由本地序列化失败构造（json_files 的深嵌套 / 超长整数，异常不带
+# filename）：项目内其余 EINVAL 都带目标路径，已由上面的 filename 分支覆盖；
+# 不在这条兜住会让确定性的本地失败被报成可重试网络错误（Issue #2078）。
 _LOCAL_IO_ERRNOS: frozenset[int] = frozenset(
-	code for code in (errno.ENOSPC, errno.EIO, getattr(errno, "EDQUOT", None)) if code is not None
+	code for code in (errno.ENOSPC, errno.EIO, errno.EINVAL, getattr(errno, "EDQUOT", None)) if code is not None
 )
 
 
@@ -124,11 +147,16 @@ def _redact_sensitive(
 		parameter_name = schema_parameters.get(path, "").lower().replace("-", "_")
 		sensitive_parameter = any(part in parameter_name for part in _SENSITIVE_KEY_PARTS)
 		for key, item in value.items():
-			key_text = str(key).lower()
+			try:
+				key_text = str(key).lower()
+			except ValueError:
+				# 十进制位数超上限的整数键在 str() 就抛 ValueError；这里按空键名
+				# 处理，交给序列化兜底产出七键信封（Issue #1897）。
+				key_text = ""
 			item_path = (*path, key)
 			if sensitive_parameter and key_text in _SCHEMA_VALUE_FIELDS and not isinstance(item, _NON_CREDENTIAL_TYPES):
 				redacted[key] = _REDACTED
-			elif item_path in schema_parameters or _is_error_code_metadata(item) or key_text in _PUBLIC_METADATA_KEYS:
+			elif item_path in schema_parameters or _is_error_code_metadata(item, item_path) or key_text in _PUBLIC_METADATA_KEYS:
 				redacted[key] = _redact_sensitive(item, schema_parameters, item_path, depth + 1)
 			elif any(part in key_text for part in _SENSITIVE_KEY_PARTS) and not isinstance(item, _NON_CREDENTIAL_TYPES):
 				redacted[key] = _REDACTED
@@ -154,7 +182,7 @@ def redact_sensitive_text(message: str) -> str:
 	"""Redact credential-like values embedded in free-form text."""
 	redacted = _URL_USERINFO_PASSWORD.sub(rf"\g<prefix>{_REDACTED}", message)
 	for pattern in _SENSITIVE_TEXT_PATTERNS:
-		redacted = pattern.sub(r"\g<key>\g<sep>[REDACTED]", redacted)
+		redacted = pattern.sub(r"\g<key>\g<quote>\g<sep>[REDACTED]", redacted)
 	return redacted
 
 
@@ -223,19 +251,48 @@ def serialization_failure_envelope(command: Any = None) -> dict[str, Any]:
 	}
 
 
-def _dumps_strict_envelope(payload: dict[str, Any]) -> str:
-	"""按严格 JSON 序列化信封；必要时归一，最后防线返回固定错误信封。"""
+def _stdout_encoding() -> str:
+	"""stdout 的实际编码；取不到时按 UTF-8（Issue #2213）。"""
+	encoding = getattr(sys.stdout, "encoding", None)
+	return encoding if isinstance(encoding, str) and encoding else "utf-8"
+
+
+def _dumps_strict_envelope(payload: dict[str, Any]) -> tuple[str, bool]:
+	"""按严格 JSON 序列化信封；必要时归一，最后防线返回固定错误信封。
+
+	第二个返回值表示是否走到了最后防线（``ok=false`` 的兜底信封）。成功出口
+	据此设置失败退出码，``exit 0 ⇔ ok=true`` 的契约在最后防线也成立
+	（Issue #2053）。
+	"""
+
+	def dump(ensure_ascii: bool) -> str:
+		return json.dumps(payload, ensure_ascii=ensure_ascii, allow_nan=False)
+
 	try:
 		# 快路径：正常信封输出与修复前逐字节一致，且不为深层合法结构多走一遍递归。
-		return json.dumps(payload, ensure_ascii=False, allow_nan=False)
+		text = dump(False)
+		# stdout 不一定是 UTF-8：中文 Windows 的 cp936 重定向下，emoji 等字符
+		# 写不出去会让整条命令丢掉信封（Issue #2213）。改用以 \uXXXX 转义的
+		# ASCII 输出，仍是合法 JSON，任何 ASCII 兼容编码都能写出；孤立代理
+		# 字符（Issue #1294）同样被这条路径覆盖。
+		try:
+			text.encode(_stdout_encoding())
+		except (UnicodeEncodeError, LookupError):
+			text = dump(True)
+		return text, False
 	except (TypeError, ValueError, RecursionError):
 		pass
 	try:
-		return json.dumps(json_safe_value(payload), ensure_ascii=False, allow_nan=False)
+		text = json.dumps(json_safe_value(payload), ensure_ascii=False, allow_nan=False)
+		try:
+			text.encode(_stdout_encoding())
+		except (UnicodeEncodeError, LookupError):
+			text = json.dumps(json_safe_value(payload), ensure_ascii=True, allow_nan=False)
+		return text, False
 	except (TypeError, ValueError, RecursionError):
 		# 归一后仍无法严格序列化（NaN 键、bytes、循环引用等）：返回固定错误信封。
 		command = payload.get("command") if isinstance(payload, dict) else None
-		return json.dumps(serialization_failure_envelope(command), ensure_ascii=False, allow_nan=False)
+		return json.dumps(serialization_failure_envelope(command), ensure_ascii=True, allow_nan=False), True
 
 
 def _encode_stdout_text(text: str) -> str:
@@ -243,7 +300,7 @@ def _encode_stdout_text(text: str) -> str:
 	return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
-def _dumps_envelope(payload: dict[str, Any]) -> str:
+def _dumps_envelope(payload: dict[str, Any]) -> tuple[str, bool]:
 	"""序列化信封并保证结果一定能按 UTF-8 写出（Issue #1294）。
 
 孤立代理字符（平台字段或本地坏文件里的 ``\\udcff`` / ``\\ud800``）会让
@@ -253,20 +310,22 @@ def _dumps_envelope(payload: dict[str, Any]) -> str:
 
 ``allow_nan=False`` 是严格 JSON 的最后防线（Issue #1391）：NaN / ±Infinity /
 超长整数先经 :func:`json_safe_value` 归一为 ``null``，归一后仍无法序列化时
-输出固定的 ``INTERNAL_ERROR`` 信封，异常不会穿出 stdout 边界。
+输出固定的 ``INTERNAL_ERROR`` 信封，异常不会穿出 stdout 边界。第二个返回值
+透传「是否走了兜底」（Issue #2053）。
 	"""
-	text = _dumps_strict_envelope(payload)
-	return _encode_stdout_text(text)
+	text, fallback = _dumps_strict_envelope(payload)
+	return _encode_stdout_text(text), fallback
 
 
-def envelope_success(
+def _success_envelope(
 	command: str,
 	data: Any,
 	*,
 	pagination: dict[str, Any] | None = None,
 	hints: dict[str, Any] | None = None,
 	schema_parameter_paths: SchemaParameterPaths | None = None,
-) -> str:
+) -> tuple[str, bool]:
+	"""构造成功信封；第二个返回值表示是否退化成固定错误信封（Issue #2053）。"""
 	# 只有 schema 命令从内置目录显式声明的参数路径可保留元数据。
 	# 任意业务字典自称 type=object 不能获得豁免，参数默认值/示例仍按敏感名称脱敏。
 	public_parameters = (schema_parameter_paths or {}) if command == "schema" else {}
@@ -282,10 +341,28 @@ def envelope_success(
 				"hints": redact_sensitive(hints),
 			}
 		)
-	except RecursionError:
-		# 脱敏阶段仍可能因容器自身深度或调用方构造的异常结构爆栈；stdout 必须
-		# 保留七键信封，不能只留空文本（Issue #1474）。
-		return _dumps_envelope(serialization_failure_envelope(command))
+	except (RecursionError, ValueError, TypeError):
+		# 脱敏阶段仍可能因容器自身深度、调用方构造的异常结构或无法 str() 的
+		# 键爆栈 / 抛错；stdout 必须保留七键信封，不能只留空文本
+		# （Issue #1474 #1897）。
+		return _dumps_envelope(serialization_failure_envelope(command))[0], True
+
+
+def envelope_success(
+	command: str,
+	data: Any,
+	*,
+	pagination: dict[str, Any] | None = None,
+	hints: dict[str, Any] | None = None,
+	schema_parameter_paths: SchemaParameterPaths | None = None,
+) -> str:
+	return _success_envelope(
+		command,
+		data,
+		pagination=pagination,
+		hints=hints,
+		schema_parameter_paths=schema_parameter_paths,
+	)[0]
 
 
 def envelope_error(
@@ -317,13 +394,25 @@ def envelope_error(
 		implied: dict[str, Any] = {"replay_safe": False}
 		if spec.get("outcome_unknown") is True:
 			implied["outcome_unknown"] = True
-		details = {**implied, **(details or {})}
+		# 非映射 details（list / str 漂移）不能在这里抛 TypeError 穿出 stdout 边界：
+		# 普通错误码的同类输入会落到下方 try 的 INTERNAL_ERROR 兜底，这里保持
+		# 一致（Issue #2052）。但 details 缺省（None）时不能连 implied 一起丢掉：
+		# 登记表要求的 ``replay_safe: false`` 是 Agent 判定「禁止自动重发」的唯一
+		# 依据（Issue #990），必须始终出现在信封里。
+		if isinstance(details, dict):
+			details = {**implied, **details}
+		elif details is None:
+			details = implied
 	try:
 		error = {
 			"code": code,
 			"message": redact_sensitive_text(message),
 			"recoverable": recoverable,
-			"recovery_action": recovery_action,
+			# 恢复指引可能内嵌 URL / 运行时字符串：与 message 同一脱敏契约，
+			# TTY 分支早已遮盖（Issue #880），JSON 出口此前漏了（Issue #2050）。
+			"recovery_action": (
+				redact_sensitive_text(recovery_action) if isinstance(recovery_action, str) else recovery_action
+			),
 		}
 		if details is not None:
 			# 结果未知的写操作有两个来源：CLI 传输层写 ``outcome="unknown"`` +
@@ -334,7 +423,11 @@ def envelope_error(
 			if normalized_details.get("outcome") == "unknown" and normalized_details.get("replay_safe") is False:
 				normalized_details.setdefault("outcome_unknown", True)
 			if "outcome_unknown" in normalized_details:
-				normalized_details.setdefault("replay_safe", not normalized_details["outcome_unknown"])
+				marker = normalized_details["outcome_unknown"]
+				# 只有布尔 True 才意味着「禁止重放」；非布尔漂移（0 / None / ""）
+				# 不能派生 replay_safe=true，否则结果未知的写被标成可重放
+				# （Issue #1898）。
+				normalized_details.setdefault("replay_safe", not marker if isinstance(marker, bool) else False)
 			error["details"] = redact_sensitive(normalized_details)
 		return _dumps_envelope(
 			{
@@ -347,15 +440,21 @@ def envelope_error(
 				"error": error,
 				"hints": redact_sensitive(hints),
 			}
-		)
-	except RecursionError:
-		# 与成功信封同理：details / hints 或错误码登记表结构过深时也要保住七键
-		# 信封，不能让异常穿出 stdout 边界（Issue #1474）。
-		return _dumps_envelope(serialization_failure_envelope(command))
+		)[0]
+	except (RecursionError, ValueError, TypeError):
+		# 与成功信封同理：details / hints 或错误码登记表结构过深、含无法 str()
+		# 的键时也要保住七键信封，不能让异常穿出 stdout 边界（Issue #1474 #1897）。
+		return _dumps_envelope(serialization_failure_envelope(command))[0]
 
 
 def emit_success(command: str, data: Any, **kwargs: Any) -> None:
-	click.echo(envelope_success(command, data, **kwargs))
+	text, degraded = _success_envelope(command, data, **kwargs)
+	click.echo(text)
+	if degraded:
+		# 序列化兜底返回的是 ok=false 的 INTERNAL_ERROR 信封：成功出口也必须
+		# 遵守「exit 0 ⇔ ok=true」，否则调用方会把输出失败当成命令成功
+		# （Issue #2053）。
+		sys.exit(exit_code_for_error("INTERNAL_ERROR"))
 
 
 # ── 可选语义化退出码（--exit-codes sysexits）────────────────────────────
@@ -406,6 +505,28 @@ def exit_code_for_error(code: str) -> int:
 def emit_error(command: str, **kwargs: Any) -> None:
 	click.echo(envelope_error(command, **kwargs))
 	sys.exit(exit_code_for_error(str(kwargs.get("code") or "")))
+
+
+def write_document_stdout(text: str) -> None:
+	"""把报表 / Markdown 等文档直出到 stdout（Issue #2213）。
+
+	重定向与管道：按 UTF-8 字节写出，文件内容与 ``-o`` 写出的 UTF-8 文件一致，
+	HTML 的 ``<meta charset="UTF-8">`` 不会与实际编码矛盾。终端：按 stdout 的
+	实际编码归一后写出，避免中文 Windows（cp936）控制台因个别字符整条失败。
+	"""
+	stream = sys.stdout
+	isatty = getattr(stream, "isatty", None)
+	if callable(isatty) and isatty():
+		stream.write(text.encode(_stdout_encoding(), "backslashreplace").decode(_stdout_encoding(), "replace"))
+		stream.flush()
+		return
+	buffer = getattr(stream, "buffer", None)
+	if buffer is not None:
+		buffer.write(text.encode("utf-8", "backslashreplace"))
+		buffer.flush()
+		return
+	stream.write(text.encode(_stdout_encoding(), "backslashreplace").decode(_stdout_encoding(), "replace"))
+	stream.flush()
 
 
 class Logger:

@@ -9,7 +9,7 @@ from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._platform import get_platform_instance
 from boss_agent_cli.commands._output_path import validate_output_path_or_emit
 from boss_agent_cli.services.chat_export import render_export
-from boss_agent_cli.services.friend_list_pages import friend_list_page_items
+from boss_agent_cli.services.friend_list_pages import friend_list_page_observation
 from boss_agent_cli.services.output_path import prepare_output_path
 from boss_agent_cli.services.text_files import write_text_atomic
 from boss_agent_cli.services.chat_snapshot import save_snapshot_and_diff, load_snapshot
@@ -112,9 +112,7 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 		platform_data = platform.unwrap_data(resp)
 		if not isinstance(platform_data, dict):
 			platform_data = {}
-		# 与 services/friend_list_pages 同一口径：元素级漂移只跳过坏元素（Issue #1141），
-		# result 是真值非列表时回退 friendList（Issue #1351）。
-		items = friend_list_page_items(platform_data)
+		items, page_items_complete = friend_list_page_observation(platform_data)
 
 		# 时间筛选阈值
 		cutoff_ts = None
@@ -180,9 +178,8 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 
 		raw_has_more = platform_data.get("hasMore")
 		has_more = raw_has_more if isinstance(raw_has_more, bool) else None
-		# 只有第 1 页且平台明确没有下一页，才能证明本次看到完整沟通列表；
-		# 部分页或未知 hasMore 不能作为“联系人已消失”的证据。
-		collection_complete = page == 1 and has_more is False
+		# 首页明确没有下一页，且未在解析时丢失条目，才能证明列表完整（#1914、#2179）。
+		collection_complete = page == 1 and has_more is False and page_items_complete
 
 		# ── 导出模式 ──────────────────────────────────────────────
 		if export_fmt is not None and output_path is not None:

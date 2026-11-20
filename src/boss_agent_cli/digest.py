@@ -1,7 +1,9 @@
 import time
 from typing import Any
 
+from boss_agent_cli.api.models import dict_items
 from boss_agent_cli.services.chat_utils import escape_md_cell as _escape_md_cell
+from boss_agent_cli.services.text_files import sanitize_surrogates
 
 
 def build_digest(*, new_matches: list[dict[str, Any]], follow_ups: list[dict[str, Any]], interviews: list[dict[str, Any]]) -> dict[str, Any]:
@@ -86,9 +88,11 @@ def render_digest_markdown(data: dict[str, Any], *, generated_at: str | None = N
 	if generated_at is None:
 		generated_at = time.strftime("%Y-%m-%d %H:%M:%S")
 
-	new_matches = data.get("new_matches") or []
-	follow_ups = data.get("follow_ups") or []
-	interviews = data.get("interviews") or []
+	# 非对象条目按缺失过滤（与 #2162 的导出服务边界同口径）：列表元素是
+	# null / 字符串 / 数字时不能整份日报渲染失败（Issue #2214）。
+	new_matches = dict_items(data.get("new_matches"))
+	follow_ups = dict_items(data.get("follow_ups"))
+	interviews = dict_items(data.get("interviews"))
 
 	lines: list[str] = []
 	lines.append("# 每日求职摘要")
@@ -108,7 +112,7 @@ def render_digest_markdown(data: dict[str, Any], *, generated_at: str | None = N
 		# 达到沟通列表分页上限时计数只是前缀；这份 Markdown 常被直接转发，
 		# 不带说明会被当成全量日报（Issue #885）。
 		pages = data.get("chat_pages_scanned")
-		lines.append(f"> ⚠️ 沟通列表超过 {pages} 页上限，以上计数仅覆盖已扫描的前 {pages} 页。")
+		lines.append(f"> 注意：沟通列表超过 {pages} 页上限，以上计数仅覆盖已扫描的前 {pages} 页。")
 		lines.append("")
 
 	lines.append("## 新匹配")
@@ -143,4 +147,8 @@ def render_digest_markdown(data: dict[str, Any], *, generated_at: str | None = N
 	lines.append("_由 `boss digest --format md` 生成 · [boss-agent-cli](https://github.com/can4hou6joeng4/boss-agent-cli)_")
 	lines.append("")
 
-	return "\n".join(lines)
+	# 平台文本可能含孤立代理字符（如被截断的 emoji）：在渲染出口按
+	# backslashreplace 归一，`-o` 的 bytes 计算、`--json` 的 data.content 与
+	# md 直写 stdout 三个分支才不会再抛 UnicodeEncodeError，也不会出现
+	# 「文件已写出却报失败」（Issue #2142，与 stats #2109 同口径）。
+	return sanitize_surrogates("\n".join(lines))

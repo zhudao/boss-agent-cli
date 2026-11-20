@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Any
 
 from boss_agent_cli.api.client import PlatformRiskError
-from boss_agent_cli.api.proxy import ProxyConfigurationError
+from boss_agent_cli.api.proxy import ProxyConfigurationError, resolve_proxy
 from boss_agent_cli.api.request_budget import RequestBudgetExceeded
 from boss_agent_cli.api.zhipin_errors import is_platform_success_code, normalize_risk_code
 from boss_agent_cli.auth.browser import (
@@ -94,25 +94,42 @@ class AuthManager:
 			platform_code=normalize_risk_code(raw_code),
 		)
 		self._unpersisted_risk_lock = lock
+		persisted = False
 		try:
 			cdp_risk_lock.write_lock(
 				self._data_dir, lock.stoken_sha256, cdp_url=lock.cdp_url, now=lock.locked_at,
 				reason=lock.reason, platform_code=lock.platform_code,
 			)
+			persisted = True
 			self._unpersisted_risk_lock = None
 		except OSError:
 			pass
 		from boss_agent_cli.api.request_budget import budget_directory
-		root = budget_directory(self._data_dir)
-		if root != self._data_dir.resolve():
+		try:
+			root = budget_directory(self._data_dir)
+			same_root = root == self._data_dir.resolve()
+		except (OSError, ValueError, RuntimeError):
+			# 配置文件损坏 / 预算目录非法时跳过后备位置：这个函数只记录、不抛，
+			# 这里的异常绝不能替换正在传播的 PlatformRiskError，也不能跳过
+			# error.details 的写入（Issue #1892）。RuntimeError 覆盖 3.11 / 3.12
+			# 上 resolve() 遇到符号链接环的情况（Issue #2155）。
+			root, same_root = None, True
+		if root is not None and not same_root:
 			try:
 				cdp_risk_lock.write_lock(root, None, now=lock.locked_at, reason=lock.reason, platform_code=lock.platform_code)
+				persisted = True
+				self._unpersisted_risk_lock = None
 			except OSError:
-				self._unpersisted_risk_lock = lock
+				pass
+		if not persisted:
+			# 两个位置都没写成功：保留进程内锁，fail-closed 到进程退出。
+			self._unpersisted_risk_lock = lock
 		if error is not None:
+			# 任一位置写成功都算已持久化：后备位置的新进程同样会读到锁
+			# （Issue #1893）。
 			error.details["risk_lock"] = {
 				"locked": True, "reason": lock.reason, "platform_code": lock.platform_code,
-				"explicit_resume_required": True, "persisted": self._unpersisted_risk_lock is None,
+				"explicit_resume_required": True, "persisted": persisted,
 			}
 
 	def _check_cdp_login_risk_lock(self, cdp_url: str | None) -> None:
@@ -126,7 +143,13 @@ class AuthManager:
 			raise PlatformRiskError.from_lock(lock)
 		from boss_agent_cli.api.request_budget import budget_directory, check_request_control
 		root = budget_directory(self._data_dir)
-		if root != self._data_dir.resolve():
+		try:
+			same_root = root == self._data_dir.resolve()
+		except RuntimeError:
+			# 数据目录本身含符号链接环时 resolve() 在 3.11 / 3.12 抛 RuntimeError。
+			# 查锁入口不能因此 traceback，按「不同目录」继续检查后备位置的锁（Issue #2155）。
+			same_root = False
+		if not same_root:
 			cdp_risk_lock.raise_if_locked(root)
 		check_request_control()
 
@@ -263,10 +286,16 @@ class AuthManager:
 	def _verify_cookie(self, token: dict[str, Any]) -> bool:
 		"""验证 Cookie 是否有效。"""
 		self._check_cdp_login_risk_lock(None)
+		# 代理环境变量坏了不是 Cookie 失效：httpx 会在请求前抛 ValueError /
+		# InvalidURL，前者被下面的通用兜底吞成 False（login 白降级到 CDP /
+		# 扫码，import_curl 报「导入登录态未通过验证」），后者直接逃逸
+		# （Issue #2203）。先走共享解析器校验代理配置，坏配置按
+		# ProxyConfigurationError 上抛，命令层映射成确定性的 INVALID_PARAM。
+		resolve_proxy()
 		try:
 			import httpx
 			from boss_agent_cli.api import endpoints
-			from boss_agent_cli.api.client import AccountRiskError
+			from boss_agent_cli.api.client import AccountRiskError, PlatformRateLimitError
 			from boss_agent_cli.api.zhipin_errors import platform_risk_page_response, raise_platform_risk_response
 
 			resp = httpx.get(
@@ -278,6 +307,10 @@ class AuthManager:
 					"Referer": "https://www.zhipin.com/",
 				},
 				timeout=10,
+				# 平台可能以 302 把请求送到 403 / verify / security 页：不跟随重定向
+				# 时响应体是空的重定向页、resp.url 仍是原地址，风控页判定不命中，
+				# 风险锁也不会落盘（Issue #2236）。与 _base_client 的最终 URL 口径一致。
+				follow_redirects=True,
 			)
 			try:
 				data = resp.json()
@@ -302,6 +335,17 @@ class AuthManager:
 				raise AccountRiskError(
 					"Cookie 验证遇到平台安全页，请先在官方页面完成验证",
 					details={"platform_code": None, "risk_source": "security_page_or_forbidden"},
+				)
+			# 限流不是会话失效的证据（与 _probe_reused_session 的 #2092 同口径）：
+			# 429 或业务码 9 说明验证被拒，不能据此清登录态并降级到 CDP / 扫码，
+			# 而应等待限流窗口后重试（Issue #2237）。
+			rate_limited_code = endpoints.CODE_RATE_LIMITED
+			if resp.status_code == 429 or (
+				isinstance(data, dict)
+				and data.get("code") in (rate_limited_code, str(rate_limited_code))
+			):
+				raise PlatformRateLimitError(
+					"登录态验证被平台限流，当前无法确认 Cookie 是否有效；请等待后重试"
 				)
 			resp.raise_for_status()
 			return bool(isinstance(data, dict) and is_platform_success_code(data.get("code")))
@@ -369,7 +413,25 @@ class AuthManager:
 						# 空串存进登录态覆盖旧 stoken，否则之后所有请求都拿空凭证
 						# 打平台、重试到预算耗尽（Issue #1305）。
 						raise TokenRefreshFailed("Token 刷新失败：刷新通道未返回 stoken，请重新登录")
+					previous_stoken = current.get("stoken")
+					if isinstance(previous_stoken, str) and previous_stoken and new_stoken == previous_stoken:
+						# 两条刷新通道在首页未加载时都会从 cookie jar 兜底读取，jar 里
+						# 可能仍是刷新前的旧值（CDP 是用户浏览器既有会话，headless 是
+						# 注入的旧 cookies）。把刚被平台拒绝的同一个 stoken 当成功写回，
+						# 调用方会继续拿它重试（Issue #2091）。
+						raise TokenRefreshFailed(
+							"Token 刷新失败：刷新通道返回的仍是原 stoken，请重新登录"
+						)
 					refreshed = {**current, "stoken": new_stoken}
+					# 登录 / 导入保存不持刷新锁（Issue #2042）：刷新走 CDP / headless
+					# 需要数秒，期间另一个进程可能已完成登录并写入全新会话。此时刷新
+					# 得到的新 stoken 属于快照里的旧账号，无条件写回会把新登录的整个
+					# jar 换回旧 cookies（换账号时尤其危险）。写回前重新读取，发现会话
+					# 已变就放弃写回、直接采纳对方写入的版本。
+					latest = self._store.load()
+					if latest != current:
+						self._token = latest
+						return
 					self._store.save(refreshed)
 					self._token = refreshed
 				except PlatformRiskError as error:

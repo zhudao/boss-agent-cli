@@ -32,6 +32,7 @@ from boss_agent_cli.api.httpx_helpers import (
 from boss_agent_cli.api.endpoints_loader import endpoint_for_request
 from boss_agent_cli.api.throttle import RequestThrottle
 from boss_agent_cli.api.request_budget import (
+	_MAX_COOLDOWN_SECONDS,
 	RequestBudget,
 	cancellable_sleep,
 	check_request_control,
@@ -51,6 +52,20 @@ if TYPE_CHECKING:
 
 _MAX_RETRIES = 3
 
+# 确定发生在请求发出之前的传输异常：连接未建立、代理握手失败、协议或连接池
+# 在选择阶段就终结，一个字节都没发出。写请求遇到它们时平台侧副作用一定没有
+# 发生，不能按「结果未知」报成 ``ACTION_UNCONFIRMED`` 并禁止重试（Issue #2216）。
+# 其余 ``httpx.TransportError``（读 / 写超时、RemoteProtocolError 等）发生在
+# 请求可能已送出之后，仍按未知处理。
+_UNSENT_TRANSPORT_ERRORS: tuple[type[httpx.TransportError], ...] = (
+	httpx.ConnectError,
+	httpx.ConnectTimeout,
+	httpx.PoolTimeout,
+	httpx.ProxyError,
+	httpx.UnsupportedProtocol,
+	httpx.LocalProtocolError,
+)
+
 
 class BrowserChannelRequired(RuntimeError):
 	"""CDP / 显式浏览器来源下，该操作只有 httpx 实现，拒绝用 httpx 携带浏览器凭据发送。"""
@@ -63,6 +78,27 @@ class PlatformResponseInvalid(ValueError):
 	不能兜成可重试的 ``NETWORK_ERROR``（Issue #1368）。子类化 ``ValueError`` 保留
 	旧调用方按 ``ValueError`` 捕获的兼容性。
 	"""
+
+
+def _status_error_without_query(exc: httpx.HTTPStatusError) -> httpx.HTTPStatusError:
+	"""重建不带查询参数的 ``HTTPStatusError``，保留类型、状态码与路径。
+
+	GET 请求统一注入 ``__zp_stoken__`` 查询参数（``add_stoken_to_get_params``），
+	httpx 的异常文本默认是 ``Client error '404 Not Found' for url '<完整 URL>'``；
+	原样上抛会让 stoken 经 ``handle_auth_errors`` 的兜底进入 ``error.message``，
+	写进 stdout 信封与 Agent 记录（Issue #2157）。``output.py`` 只按键名脱敏，
+	扫不到消息正文里的凭证。
+	"""
+	request = exc.request
+	url = request.url
+	status = exc.response.status_code
+	reason = getattr(exc.response, "reason_phrase", "") or ""
+	message = f"{request.method} {url.path or '/'} 返回 HTTP {status} {reason}".rstrip()
+	try:
+		safe_request = httpx.Request(request.method, url.copy_with(query=None))
+	except (httpx.InvalidURL, httpx.UnsupportedProtocol, ValueError):
+		safe_request = request
+	return httpx.HTTPStatusError(message, request=safe_request, response=exc.response)
 
 
 _SelfT = TypeVar("_SelfT", bound="_BaseHttpClient")
@@ -245,11 +281,19 @@ class _BaseHttpClient:
 		except (OSError, UnicodeError):
 			pass
 		budget = getattr(self, "_request_budget", None)
-		if budget is not None and budget.root != data_dir.resolve():
+		if budget is not None:
 			try:
-				budget.record_risk(reason=lock.reason, platform_code=lock.platform_code)
-			except (OSError, UnicodeError):
-				self._unpersisted_risk_lock = lock
+				same_root = budget.root == data_dir.resolve()
+			except RuntimeError:
+				# data_dir 含符号链接环时 resolve() 在 3.11 / 3.12 抛 RuntimeError：
+				# 记录风控的分支不能因此替换正在传播的 PlatformRiskError，按不同
+				# 目录把风控写进预算目录（fail-closed，Issue #2155）。
+				same_root = False
+			if not same_root:
+				try:
+					budget.record_risk(reason=lock.reason, platform_code=lock.platform_code)
+				except (OSError, UnicodeError):
+					self._unpersisted_risk_lock = lock
 		if error is not None:
 			error.details["risk_lock"] = {
 				"locked": True,
@@ -378,6 +422,7 @@ class _BaseHttpClient:
 		write_possible = operation is None or operation.effect != "read"
 		max_retries = _MAX_RETRIES if retry and operation is not None and operation.replay_safe else 0
 		budget = getattr(self, "_request_budget", None)
+		refreshed = False
 		for attempt in range(max_retries + 1):
 			# 凭据在预算窗口内才读取，于是未登录时也会先记一个名额、把 next_at 推后
 			# 一个 interval（默认 30 秒）：请求根本没发出，却让紧接着的下一条命令
@@ -402,9 +447,18 @@ class _BaseHttpClient:
 					if isinstance(error, PlatformRiskError):
 						self._record_cdp_risk_lock(error=error)
 						raise
-					if not isinstance(error, httpx.TransportError) or not write_possible:
-						raise
-					return self._unconfirmed_http_response(url, "transport_error")
+					if (
+						write_possible
+						and isinstance(error, httpx.TransportError)
+						and not isinstance(error, _UNSENT_TRANSPORT_ERRORS)
+					):
+						# 只有「请求可能已发出」的传输异常才落成结果未知；确定未发出的
+						# 连接 / 代理 / 协议错误原样上抛，由命令出口按可重试的
+						# NETWORK_ERROR 收口（Issue #2216）。
+						return self._unconfirmed_http_response(url, "transport_error")
+					if write_possible and isinstance(error, httpx.DecodingError):
+						return self._unconfirmed_http_response(url, "invalid_response")
+					raise
 				finally:
 					self._throttle.mark()
 				self._merge_cookies(resp)
@@ -454,9 +508,11 @@ class _BaseHttpClient:
 				try:
 					if resp.status_code != 429:
 						resp.raise_for_status()
-				except httpx.HTTPStatusError:
+				except httpx.HTTPStatusError as exc:
 					if not write_possible:
-						raise
+						# 读路径原样上抛：重建异常文本，查询参数里的 __zp_stoken__ 不能
+						# 随 error.message 进入信封（Issue #2157）。
+						raise _status_error_without_query(exc) from None
 					return self._unconfirmed_http_response(url, "http_status_error")
 				if data is None:
 					if write_possible:
@@ -469,14 +525,19 @@ class _BaseHttpClient:
 					data["code"] = self._CODE_RATE_LIMITED
 					cooldown = retry_after_seconds(response_headers.get("retry-after"))
 					cooldown = max(cooldown or 0.0, min(60, 10 * (2**attempt)))
+					# 服务端 Retry-After 可能是数小时甚至 HTTP-date 的未来时间：无预算
+					# 分支会把它原样交给 cancellable_sleep，一条 429 就能把进程挂起
+					# 数天（Issue #2234）。与 RequestBudget 的本地冷却上限同口径截断。
+					cooldown = min(cooldown, _MAX_COOLDOWN_SECONDS)
 					if budget is not None:
 						budget.cooldown(cooldown)
-			# stoken 过期 → 刷新重试（BOSS 客户端按语境分类，语义不明不刷新）
-			if self._should_refresh_token_response(data) and attempt < max_retries:
+			# 明确过期时每个请求只刷新一次，刷新后仍过期则交由调用方处理。
+			if not refreshed and attempt < max_retries and self._should_refresh_token_response(data):
 				backoff = (2**attempt) + random.uniform(0.5, 1.5)
 				cancellable_sleep(backoff, check=self._check_cdp_risk_lock)
 				self._auth.force_refresh(cdp_url=self._cdp_url, browser_source=self._browser_source)
 				self._client = None
+				refreshed = True
 				continue
 
 			# 频率限制 → 冷却重试

@@ -7,7 +7,7 @@ import os
 import random
 import socket
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -222,13 +222,14 @@ class DrissionCrawlerSession:
 		try:
 			self._profile_path = self._profile_path.resolve()
 			self._profile_path.mkdir(parents=True, exist_ok=True)
-		except (OSError, ValueError) as exc:
-			# 路径被同名文件占用或不可写（OSError），或含 NUL 等控制字符
-			# （ValueError）：确定性本地失败。原样上抛会被 _run 兜成
-			# status=stopped + crawl resume，重跑永远复现（Issue #1290、#1482）。
+		except (OSError, RuntimeError, ValueError) as exc:
+			# 路径被同名文件占用或不可写（OSError）、符号链接环（3.11 / 3.12 的
+			# Path.resolve 抛 RuntimeError，3.13+ 不再抛），或含 NUL 等控制
+			# 字符（ValueError）：确定性本地失败。原样上抛会被 _run 兜成
+			# status=stopped + crawl resume，重跑永远复现（Issue #1290、#1482、#2169）。
 			raise CrawlProfilePathInvalid(
 				f"采集配置目录 {self._profile_path!r} 无法创建或不是目录（{exc}）；"
-				"请检查该路径是否被同名文件占用、是否包含 NUL 等控制字符，"
+				"请检查该路径是否被同名文件占用、是否存在符号链接环、是否包含 NUL 等控制字符，"
 				"或修复数据目录的写权限后重试"
 			) from exc
 		port_busy = self._port_is_in_use(self._cdp_port)
@@ -272,14 +273,16 @@ class DrissionCrawlerSession:
 				attached=port_busy,
 			) from exc
 		self._raise_if_platform_risk_page()
-		# 注入 boss login 的 Cookie（附着已有窗口时也刷新，方便用户刚完成登录/验证）。
-		# 注入结果的失败信号必须在进入业务页之前消费：原来的 `pass`/`continue`
-		# 把本地 CDP 失败吞掉，随后登录页被误判成平台风控并写风险锁（Issue #1405）。
-		self._raise_if_seed_auth_failure(self._seed_session_cookies())
+		# Hook 必须在首个文档导航前注册：addScriptToEvaluateOnNewDocument 对已经
+		# 加载的文档不生效，而 seed 导航就是第一个平台文档（Issue #1935）。
 		results = inject_hook_profile(self._page, self._hook_profile, self._hook_dir)
 		failed = [item for item in results if not item.success]
 		if failed:
 			raise HookRegistrationError(results, hook_dir=self._hook_dir)
+		# 注入 boss login 的 Cookie（附着已有窗口时也刷新，方便用户刚完成登录/验证）。
+		# 注入结果的失败信号必须在进入业务页之前消费：原来的 `pass`/`continue`
+		# 把本地 CDP 失败吞掉，随后登录页被误判成平台风控并写风险锁（Issue #1405）。
+		self._raise_if_seed_auth_failure(self._seed_session_cookies())
 		self._start_joblist_listener()
 		return results
 
@@ -353,7 +356,9 @@ class DrissionCrawlerSession:
 				return text
 			try:
 				return json.loads(text)
-			except json.JSONDecodeError:
+			except (ValueError, RecursionError):
+				# 超长整数 / 深嵌套的裸 ValueError 也要按「非 JSON 文本」处理，
+				# 否则风险页文本判定不会执行（Issue #1936）。
 				return text
 		return body
 
@@ -371,6 +376,11 @@ class DrissionCrawlerSession:
 		# 请求预算（Issue #897）。同一页重试也要重新导航：上一次的页位置
 		# 不能当作这一次已经请求过。
 		navigating = self._page_no is None or target_page <= self._page_no
+		# 顺序翻页时外层 attempt 认领的就是本次第一页的滚动请求（见下方循环），
+		# 只有之后的翻页再各计一次：块内不会再发导航请求，外层不能额外多算一次
+		# 预算（Issue #1982、#2094）。外层 attempt 仍覆盖响应等待与风控检查，
+		# 风险锁在共享租约释放前落盘。
+		first_turn_covered = not navigating
 		try:
 			with self._attempt("list-navigation" if navigating else "list-pagination"):
 				try:
@@ -379,7 +389,15 @@ class DrissionCrawlerSession:
 						self._page.get(f"https://www.zhipin.com/web/geek/jobs?city={city_code}&query={quote(query)}")
 						position = 1
 					while position < target_page:
-						self._trigger_next_page()
+						# 每次翻页都会触发一次真实的 joblist 请求：预算与共享租约
+						# 必须按次计入，否则从断点恢复到第 N 页时整段滚动只算 1 次
+						# 请求，max_requests 与跨进程节流被绕过（Issue #1982）。
+						if first_turn_covered:
+							first_turn_covered = False
+							self._trigger_next_page()
+						else:
+							with self._attempt("list-pagination"):
+								self._trigger_next_page()
 						position += 1
 				except BaseException:
 					# 导航/滚动可能已让页签前进但没有完成：位置不可信，下次重新导航。
@@ -475,7 +493,7 @@ class DrissionCrawlerSession:
 		if isinstance(raw, str):
 			try:
 				raw = json.loads(raw)
-			except json.JSONDecodeError as exc:
+			except (ValueError, RecursionError) as exc:
 				raise RuntimeError("页面内请求返回无法解析的传输结果") from exc
 		if not isinstance(raw, dict):
 			raise RuntimeError(f"页面内请求返回类型异常：{type(raw).__name__}（async JS 未等待完成时常见为 None）")
@@ -483,7 +501,7 @@ class DrissionCrawlerSession:
 		text = str(raw.get("text") or "")
 		try:
 			payload = json.loads(text)
-		except json.JSONDecodeError:
+		except (ValueError, RecursionError):
 			payload = None
 		if isinstance(payload, dict):
 			self._raise_if_risk_response(payload)
@@ -532,7 +550,7 @@ class DrissionCrawlerSession:
 		if isinstance(value, str):
 			try:
 				parsed = json.loads(value)
-			except json.JSONDecodeError:
+			except (ValueError, RecursionError):
 				return None
 			return parsed if isinstance(parsed, dict) else None
 		if isinstance(value, dict):
@@ -581,9 +599,19 @@ class DrissionCrawlerSession:
 			return connection.connect_ex(("127.0.0.1", port)) == 0
 
 	@staticmethod
-	def _failure_reason(error: BaseException) -> str:
-		"""异常文本只用于本地诊断：压成单行并截断，且绝不拼接 Cookie 原值。"""
-		text = str(error).replace("\r", " ").replace("\n", " ").strip()
+	def _failure_reason(error: BaseException, *, secrets: Iterable[str] = ()) -> str:
+		"""异常文本只用于本地诊断：先抹掉 Cookie 原值，再压成单行并截断。
+
+		DrissionPage 的注入异常会把整个 cookie 字典（含 ``value``）拼进消息，
+		而这段文本最终会进入 ``AUTH_REQUIRED`` 信封的 ``error.message``。
+		输出层的按键脱敏拦不住第三方异常里的 ``'value'`` 键，必须在源头做
+		值级替换（Issue #2168）；``SessionSeedResult`` 不保留任何原值。
+		"""
+		text = str(error)
+		for secret in secrets:
+			if secret:
+				text = text.replace(secret, "[REDACTED]")
+		text = text.replace("\r", " ").replace("\n", " ").strip()
 		if len(text) > 200:
 			text = text[:200] + "…"
 		return f"{type(error).__name__}: {text}" if text else type(error).__name__
@@ -608,7 +636,7 @@ class DrissionCrawlerSession:
 		except Exception as error:
 			if is_request_stop(error):
 				raise
-			navigation_error = self._failure_reason(error)
+			navigation_error = self._failure_reason(error, secrets=self._seed_cookies.values())
 		self._raise_if_platform_risk_page()
 		cookie_items = [
 			{
@@ -643,7 +671,9 @@ class DrissionCrawlerSession:
 				set_cookies(item)
 				injected += 1
 			except Exception as error:
-				failures.append(f"{item['name']}: {self._failure_reason(error)}")
+				failures.append(
+					f"{item['name']}: {self._failure_reason(error, secrets=self._seed_cookies.values())}"
+				)
 		return SessionSeedResult(
 			attempted=attempted,
 			injected=injected,

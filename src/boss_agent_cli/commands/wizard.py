@@ -223,6 +223,28 @@ def _busy_hints(ctx: click.Context, error: Mapping[str, Any]) -> dict[str, list[
 	return {"next_actions": [status_cmd]}
 
 
+def _failed_run_error(run: Mapping[str, Any]) -> Mapping[str, Any]:
+	"""失败 run 的出口错误：顶层缺少有效 code 时回退到断点步骤的错误（Issue #2187）。
+
+	写入器总会给 run 的 ``error`` 带上 code；空对象只可能来自外部漂移。步骤里
+	仍保留 ``ACTION_UNCONFIRMED`` 与核对指引，用它出口比兜底成
+	``NETWORK_ERROR`` +「重试」更接近真实状态——重试并不会让被阻断的 workflow
+	继续，结果未知的写步骤需要先核对平台页面。
+	"""
+	top = run.get("error")
+	if isinstance(top, Mapping) and isinstance(top.get("code"), str) and top["code"]:
+		return top
+	current = run.get("current_step")
+	steps = [step for step in run.get("steps") or [] if isinstance(step, Mapping)]
+	# 优先当前步骤，其次按落盘顺序取第一个带有效错误的步骤。
+	steps.sort(key=lambda step: step.get("step_name") != current)
+	for step in steps:
+		step_error = step.get("error")
+		if isinstance(step_error, Mapping) and isinstance(step_error.get("code"), str) and step_error["code"]:
+			return step_error
+	return top if isinstance(top, Mapping) else {}
+
+
 def _plan_from_run(run: Mapping[str, Any]) -> WorkflowPlan:
 	# 历史 run 可能保存着已移除的平台（如 zhilian）；恢复前与新建 plan 走同一套校验，
 	# 否则会绕过 --platform 校验去读遗留登录态，并被兜底成可重试的 NETWORK_ERROR。
@@ -414,7 +436,7 @@ def _browse_list_results(
 
 def _emit_run(ctx: click.Context, run: Mapping[str, Any], *, interactive: bool) -> None:
 	if run.get("status") == "failed":
-		error = run.get("error") or {}
+		error = _failed_run_error(run)
 		if interactive:
 			render_run(run, command_for=_command_for_ctx(ctx))
 			return
@@ -754,6 +776,18 @@ def run_wizard_command(
 			recoverable=True,
 			recovery_action=f"{boss_command_for_ctx(ctx, 'wizard --input-json <object>', include_data_dir=True)} 重新创建任务；原记录无法恢复，已导出的文件不会自动删除",
 		)
+	except WorkflowActionError as exc:
+		# 断点落盘失败：runner 已把原始失败原因合成到这条错误里（Issue #1963）。
+		# 不能落到全局兜底变成 INTERNAL_ERROR，否则风控 / 预算的停止语义会丢。
+		_wizard_error(
+			ctx,
+			_is_interactive(ctx),
+			code=exc.code,
+			message=str(exc),
+			recoverable=exc.recoverable,
+			recovery_action=exc.recovery_action,
+			details=exc.details,
+		)
 
 
 def _run_wizard_command(
@@ -793,13 +827,20 @@ def _run_wizard_command(
 		# 传了 flag 但值为空时，旧逻辑把它当成「没有选择器」，回一句
 		# 「非交互模式需要 --input-json、--resume、--status 或 --stop」——
 		# 用户明明传了，看到的却是「你没传」，只能再猜一次。
+		is_json_input = selectors[0][0] == "--input-json"
+		recovery = (
+			"给 --input-json 传入 JSON 对象；根据 boss schema 中的 wizard catalog 修正输入"
+			if is_json_input
+			else f"补上 run_id 后重试；用 {boss_command_for_ctx(ctx, 'wizard --status <run_id>', include_data_dir=True)} 核对已有任务"
+		)
+		next_action = boss_command_for_ctx(ctx, "schema" if is_json_input else "wizard", include_data_dir=True)
 		_wizard_error(
 			ctx,
 			interactive,
 			code="INVALID_PARAM",
 			message=f"{selectors[0][0]} 的值不能为空",
-			recovery_action=f"补上 run_id 后重试；用 {boss_command_for_ctx(ctx, 'wizard --status <run_id>', include_data_dir=True)} 核对已有任务",
-			hints={"next_actions": [boss_command_for_ctx(ctx, "wizard", include_data_dir=True)]},
+			recovery_action=recovery,
+			hints={"next_actions": [next_action]},
 		)
 		return
 
@@ -832,31 +873,76 @@ def _run_wizard_command(
 			# 先读断点区分「不存在」与「已结束」：request_stop 只排除 completed，
 			# 把存在但已完成的任务误报为 ID 写错（Issue #1585）。损坏的断点不影响
 			# 停止标记本身，仍交给 request_stop 按既有补偿语义处理。
-			existing_run: dict[str, Any] | None = None
-			try:
-				existing_run = store.get_checkpoint(stop_run_id, validate_replay_markers=False)
-			except CacheRecordInvalid:
-				pass
-			if existing_run is not None and existing_run.get("status") == "completed":
+			def _stop_already_finished(*, recovery_action: str, next_actions: list[str]) -> None:
 				_wizard_error(
 					ctx,
 					interactive,
 					code="WORKFLOW_ALREADY_FINISHED",
 					message=f"任务已结束，无法停止: {stop_run_id}",
+					recovery_action=recovery_action,
+					hints={"next_actions": next_actions},
+				)
+
+			existing_run: dict[str, Any] | None = None
+			record_corrupt = False
+			try:
+				existing_run = store.get_checkpoint(stop_run_id, validate_replay_markers=False)
+			except CacheRecordInvalid:
+				# 记录存在但读不出来（params 等漂移）：request_stop 之后返回
+				# False 时不能报成「未找到」，否则与 --status 的损坏结论矛盾
+				# （Issue #2035）。
+				record_corrupt = True
+			if existing_run is not None and existing_run.get("status") == "completed":
+				_stop_already_finished(
 					recovery_action=(
 						f"{boss_command_for_ctx(ctx, 'wizard --status <run_id>', include_data_dir=True)} 查看结果与最终状态，或 "
 						f"{boss_command_for_ctx(ctx, 'wizard', include_data_dir=True)} 新建 workflow"
 					),
-					hints={
-						"next_actions": [
-							boss_command_for_ctx(
-								ctx, f"wizard --status {shell_argument(stop_run_id)}", include_data_dir=True
-							)
-						]
-					},
+					next_actions=[
+						boss_command_for_ctx(
+							ctx, f"wizard --status {shell_argument(stop_run_id)}", include_data_dir=True
+						)
+					],
 				)
 				return
 			if not store.request_stop(stop_run_id):
+				if record_corrupt:
+					# request_stop 的 SQL 只在 status = completed 时匹配 0 行，而记录
+					# 确实存在（刚读到损坏）：任务是已结束，不是 ID 写错（Issue #2035）。
+					_wizard_error(
+						ctx,
+						interactive,
+						code="WORKFLOW_ALREADY_FINISHED",
+						message=f"任务已结束，无法停止: {stop_run_id}（本地断点损坏，--status 可能无法读取）",
+						recovery_action=(
+							f"{boss_command_for_ctx(ctx, 'wizard', include_data_dir=True)} 新建 workflow；"
+							"如需查看结果，该 run 的断点已损坏、无法恢复"
+						),
+						hints={"next_actions": [boss_command_for_ctx(ctx, "wizard", include_data_dir=True)]},
+					)
+					return
+				# pre-read 与 request_stop 之间 worker 可能刚把 run 落成 completed
+				# （TOCTOU）：request_stop 的 WHERE status != 'completed' 返回 0 行，
+				# 与 run 不存在无法区分。重读断点再分类，恢复指引不能把已完成任务
+				# 说成 ID 写错（Issue #2057）。
+				after: dict[str, Any] | None = None
+				try:
+					after = store.get_checkpoint(stop_run_id, validate_replay_markers=False)
+				except CacheRecordInvalid:
+					after = None
+				if after is not None and after.get("status") == "completed":
+					_stop_already_finished(
+						recovery_action=(
+							f"{boss_command_for_ctx(ctx, 'wizard --status <run_id>', include_data_dir=True)} 查看结果与最终状态，或 "
+							f"{boss_command_for_ctx(ctx, 'wizard', include_data_dir=True)} 新建 workflow"
+						),
+						next_actions=[
+							boss_command_for_ctx(
+								ctx, f"wizard --status {shell_argument(stop_run_id)}", include_data_dir=True
+							)
+						],
+					)
+					return
 				_wizard_error(
 					ctx,
 					interactive,
@@ -955,7 +1041,7 @@ def _run_wizard_command(
 			return
 
 	if run.get("status") == "failed":
-		error = run.get("error") or {}
+		error = _failed_run_error(run)
 		if interactive:
 			render_run(run, command_for=_command_for_ctx(ctx))
 			raise SystemExit(1)

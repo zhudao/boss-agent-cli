@@ -4,11 +4,13 @@ Handles API key encryption (Fernet), provider settings, and model configuration.
 Reuses the auth salt file for key derivation.
 """
 
+import errno
 import hashlib
 import json
 import math
 import os
 import platform
+import unicodedata
 from base64 import urlsafe_b64encode
 from pathlib import Path
 from typing import Any
@@ -21,9 +23,9 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from boss_agent_cli.services.json_files import read_bytes_if_regular, write_json_atomic
 from boss_agent_cli.services.private_files import (
 	DIRECTORY_MODE,
-	FILE_MODE,
 	chmod_best_effort,
 	load_or_create_private_salt,
+	tighten_private_file,
 	write_private_bytes,
 )
 
@@ -114,6 +116,14 @@ def ai_text_setting(config: dict[str, Any], key: str, *, default: str | None = N
 	return value
 
 
+#: 显式 base_url 的长度上限。真实端点远短于此；超长地址会让 httpx 抛 InvalidURL。
+_BASE_URL_MAX_LENGTH = 2048
+_BASE_URL_PREVIEW_LENGTH = 80
+#: 合法 URL 不应出现的 Unicode 类别：控制（Cc）、格式（Cf，零宽 / BOM / 双向控制）、
+#: 代理（Cs）、行与段分隔符（Zl / Zp）。
+_BASE_URL_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+
+
 def normalize_base_url(value: str) -> str:
 	"""校验显式 base_url：必须是 http(s) 绝对地址（Issue #1431）。
 
@@ -122,15 +132,45 @@ def normalize_base_url(value: str) -> str:
 	必然复现。写入与解析端点时都走这里，报 ``INVALID_PARAM`` 级别的本地错误。
 	"""
 	text = value.strip()
+	if len(text) > _BASE_URL_MAX_LENGTH:
+		# httpx 对超长地址抛 InvalidURL：写入成功、之后每条命令确定性失败。
+		# 错误信息里不回显整串（可能有数万字符），只给长度与开头（Issue #2254）。
+		raise AIConfigValueError(
+			f"AI 配置项 ai_base_url 过长（{len(text)} 个字符，上限 {_BASE_URL_MAX_LENGTH}），"
+			f"开头是 {text[:_BASE_URL_PREVIEW_LENGTH]!r}…",
+			recovery_hint="ai config --base-url https://api.example.com/v1",
+		)
 	try:
 		parsed = urlsplit(text)
 		# 端口是惰性解析的：`http://host:abc/v1` 要读一次才会报错；未闭合的 IPv6
 		# 括号则在 urlsplit 里直接抛。两者都是裸 ValueError，放过去会在写入时
 		# 崩成 traceback，或存进配置后让每条 AI 命令在 httpx 里崩（Issue #1778）。
 		_ = parsed.port
-		valid = bool(text) and parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+		# urlsplit 会把 `\t` / `\r` / `\n` 从 authority 里剔除，host 含空格也照样
+		# 解析成功，但 httpx 对同一地址抛 InvalidURL：写入成功、之后每条命令
+		# 确定性失败（Issue #2205）。合法 URL 不可能包含裸空白或控制字符。
+		# 零宽空格、BOM、双向控制符等格式字符（Cf）与 C1 控制字符（Cc）肉眼不可见，
+		# 写进配置后请求会打到错误的主机 / 路径；行 / 段分隔符（Zl / Zp）同理
+		# （Issue #2254）。
+		has_unsafe_chars = any(
+			char.isspace() or unicodedata.category(char) in _BASE_URL_UNSAFE_CATEGORIES for char in text
+		)
+		valid = bool(text) and not has_unsafe_chars and parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+		# 服务层按 ``{base_url}/chat/completions`` 拼端点：带 query / fragment 的地址
+		# 会把路径拼进 query 或 fragment 里，请求确定性打不到聊天端点（Issue #2254）。
+		# 用分隔符本身判断：``https://host/v1?`` 的空 query 同样会吞掉后面的路径。
+		has_query_or_fragment = "?" in text or "#" in text
 	except ValueError:
 		valid = False
+		has_query_or_fragment = False
+	if valid and has_query_or_fragment:
+		# query 里常带密钥（``?api-key=…``）：只回显分隔符之前的部分。
+		prefix = text.split("?", 1)[0].split("#", 1)[0]
+		raise AIConfigValueError(
+			f"AI 配置项 ai_base_url 不能带 query（?）或 fragment（#）：{prefix!r} 之后的部分会吞掉"
+			"端点路径，请只保留到路径为止",
+			recovery_hint="ai config --base-url https://api.example.com/v1",
+		)
 	if not valid:
 		raise AIConfigValueError(
 			f"AI 配置项 ai_base_url 必须是 http(s):// 开头的绝对地址，实际是 {value.strip()!r}",
@@ -186,11 +226,9 @@ class AIConfigStore:
 		self._key_path = self._ai_dir / "api_key.enc"
 		self._config_path = self._ai_dir / "config.json"
 		self._auth_dir = data_dir / "auth"
-		if self._key_path.exists():
-			chmod_best_effort(self._key_path, FILE_MODE)
-		salt_path = self._auth_dir / "salt"
-		if salt_path.exists():
-			chmod_best_effort(salt_path, FILE_MODE)
+		# 只收紧普通文件：符号链接不能跟随（Issue #2206）。
+		tighten_private_file(self._key_path)
+		tighten_private_file(self._auth_dir / "salt")
 
 	def _get_machine_id(self) -> str:
 		"""Get a stable machine identifier for key derivation."""
@@ -209,7 +247,13 @@ class AIConfigStore:
 		Shares the auth-side lifecycle so a failed existence check can never
 		replace the salt that decrypts session.enc / api_key.enc (Issue #1688).
 		"""
-		return load_or_create_private_salt(self._auth_dir)
+		try:
+			return load_or_create_private_salt(self._auth_dir)
+		except RuntimeError as exc:
+			# salt 路径是目录 / FIFO / 长度异常时共享实现抛 RuntimeError；AI 命令没有
+			# auth 侧的转换，裸异常会变成 traceback 而不是信封（Issue #1950）。
+			# 带上 filename，全局分流才会按本地 IO 错误报，而不是可重试的网络错误。
+			raise OSError(errno.EINVAL, str(exc), str(self._auth_dir / "salt")) from exc
 
 	def _derive_key(self) -> bytes:
 		"""Derive a Fernet key from machine ID and salt."""
@@ -221,7 +265,10 @@ class AIConfigStore:
 			salt=salt,
 			iterations=480000,
 		)
-		key = kdf.derive(machine_id.encode())
+		# 与 TokenStore 同口径（Issue #2044）：环境变量按 surrogateescape 解码，
+		# 可能包含孤立代理字符；严格 UTF-8 编码会抛 UnicodeEncodeError，让同一
+		# 机器 ID 在 auth 侧可用、AI 侧崩（Issue #2204）。
+		key = kdf.derive(machine_id.encode("utf-8", "surrogatepass"))
 		return urlsafe_b64encode(key)
 
 	def save_api_key(self, key: str) -> None:
@@ -315,6 +362,12 @@ class AIConfigStore:
 		config = self.load_config()
 		provider = config.get("ai_provider")
 		base_url = config.get("ai_base_url")
+		if base_url:
+			# 手工编辑 / 旧版本写入的配置也走写入侧同一套校验：缺 scheme 的地址
+			# 若原样透传，httpx 会抛 UnsupportedProtocol 并被兜成可重试的
+			# AI_API_ERROR（Issue #2205）。损坏配置按带 recovery_hint 的本地
+			# 配置错误报出。
+			base_url = normalize_base_url(str(base_url))
 		return provider_endpoint(
 			str(provider) if provider else None,
 			str(base_url) if base_url else None,

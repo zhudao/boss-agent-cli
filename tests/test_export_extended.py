@@ -67,7 +67,8 @@ def test_write_export_file_stringifies_list_items(tmp_path):
 
 	rows = list(csv.DictReader(path.read_text(encoding="utf-8").splitlines()))
 	assert rows[0]["skills"] == "101, Golang"
-	assert rows[0]["welfare"] == "True"
+	# 布尔按 JSON 字面量写出，与 JSON 分支一致（Issue #2018）。
+	assert rows[0]["welfare"] == "true"
 
 
 def test_write_export_file_csv_disables_newline_translation(tmp_path, monkeypatch):
@@ -105,7 +106,9 @@ def test_write_export_file_keeps_existing_file_on_serialization_failure(tmp_path
 	path = tmp_path / "jobs.json"
 	path.write_text("previous export", encoding="utf-8")
 
-	with pytest.raises(TypeError):
+	# 序列化失败统一按本地 IO 错误上报（Issue #2220）：TypeError 裸穿出命令层
+	# 会让 stdout 无信封、stderr 裸 traceback。
+	with pytest.raises(OSError):
 		write_export_file([{"value": object()}], "json", str(path))
 
 	assert path.read_text(encoding="utf-8") == "previous export"
