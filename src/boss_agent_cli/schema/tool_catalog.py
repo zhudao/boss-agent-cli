@@ -265,6 +265,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 						"description": "导出格式；指定后把沟通列表写入文件而不是返回列表",
 					},
 					"output_file": {"type": "string", "description": "导出文件路径（不指定则保存到配置的 export_dir）"},
+					"raw": {"type": "boolean", "description": "为每条记录附加 raw 原始联系人对象，保留原始键名与编码；与 format 合用时不影响导出文件、快照与 diff"},
 				},
 				"required": [],
 				# -o/--output 只在导出分支生效；CLI 对只有 output_file 的调用必返回 INVALID_PARAM。
@@ -316,6 +317,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				"type": "object",
 				"properties": {
 					"security_id": {"type": "string", "description": "好友的 uid（推荐，取自 boss_chat，跨请求稳定）或 security_id"},
+					"friend_uid": {"type": "string", "description": "已知稳定 uid 时直接读取消息：security_id 按本次请求的令牌使用，跳过沟通列表扫描"},
 					"page": {"type": "integer", "minimum": 1, "description": "页码", "default": 1},
 					"count": {"type": "integer", "minimum": 1, "description": "每页消息数量", "default": 20},
 					"raw": {"type": "boolean", "description": "输出保真结构化消息字段（仍受合规门控）", "default": False},

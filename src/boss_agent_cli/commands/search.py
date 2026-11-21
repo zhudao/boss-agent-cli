@@ -4,7 +4,7 @@ from typing import Any, NamedTuple
 import click
 
 from boss_agent_cli.auth.manager import AuthManager
-from boss_agent_cli.cache.store import CacheStore, SavedSearchParamsError
+from boss_agent_cli.cache.store import CacheStore, SavedSearchParamsError, saved_search_name_error
 from boss_agent_cli.commands._platform import account_scope, get_platform_instance
 from boss_agent_cli.crawler.service import CrawlBudget
 from boss_agent_cli.display import (
@@ -22,7 +22,7 @@ from boss_agent_cli.display import (
 	shell_argument,
 	show_command_for_ctx,
 )
-from boss_agent_cli.index_cache import get_index_snapshot, try_save_index
+from boss_agent_cli.index_cache import try_save_index
 from boss_agent_cli.match_score import score_job_dict
 from boss_agent_cli.search_filters import (
 	SearchFilterCriteria,
@@ -342,6 +342,18 @@ def search_cmd(
 		remove_cmd = _hint_command(ctx, f"preset remove {positional_hint(preset)}")
 		preset_origin = f"（来自 preset '{preset}'，可用 {remove_cmd} 删除后重建）"
 
+	if preset and (problem := saved_search_name_error(preset)):
+		list_cmd = _hint_command(ctx, "preset list")
+		handle_error_output(
+			ctx,
+			"search",
+			code="INVALID_PARAM",
+			message=f"预设{problem}",
+			recovery_action=f"换一条只含普通 Unicode 文本的预设名重试；用 {list_cmd} 查看已有预设",
+			hints={"next_actions": [list_cmd]},
+		)
+		return
+
 	if preset:
 		with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
 			try:
@@ -497,12 +509,13 @@ def search_cmd(
 					logger.debug("搜索命中缓存")
 					items = _refresh_greeted(result["data"], cache, account)
 					items = _sort_search_items(items, sort_mode)
-					saved = try_save_index(data_dir, items, source=f"search:{query}", page=page, logger=logger)
+					snapshot = try_save_index(data_dir, items, source=f"search:{query}", page=page, logger=logger)
+					saved = bool(snapshot)
 					cached_pagination = result.get("pagination")
-					if saved and isinstance(cached_pagination, dict):
-						snapshot = get_index_snapshot(data_dir)
-						if snapshot is not None:
-							cached_pagination["index_snapshot"] = snapshot
+					# 只把本次写入的快照身份放进信封；保存后读回可变文件在并发下
+					# 会挂上另一次搜索的身份（Issue #2292）。
+					if isinstance(snapshot, dict) and isinstance(cached_pagination, dict):
+						cached_pagination["index_snapshot"] = snapshot
 					# 提示按本次调用重建，不取缓存里的旧值：分页证据来自缓存的
 					# pagination，数据目录 / --sort 来自本次调用。
 					cached_has_more = cached_pagination.get("has_more") if isinstance(cached_pagination, dict) else None
@@ -601,7 +614,8 @@ def search_cmd(
 				items = [score_job_dict(item, criteria=criteria, expect_data=None) for item in items]
 			cache_items = items
 			output_items = _sort_search_items(items, sort_mode)
-			saved = try_save_index(data_dir, output_items, source=f"search:{query}", page=page, logger=logger)
+			snapshot = try_save_index(data_dir, output_items, source=f"search:{query}", page=page, logger=logger)
+			saved = bool(snapshot)
 
 			# Emit search_completed hook
 			hooks = ctx.obj.get("hooks")
@@ -653,11 +667,10 @@ def search_cmd(
 				cache_data = {"data": cache_items, "pagination": pagination}
 				cache.put_search(search_params, json.dumps(cache_data, ensure_ascii=False))
 
-			# 快照身份只对本次返回有效，不写进搜索缓存；缓存命中时重新读取。
-			if saved:
-				snapshot = get_index_snapshot(data_dir)
-				if snapshot is not None:
-					pagination["index_snapshot"] = snapshot
+			# 快照身份只对本次返回有效，不写进搜索缓存；取本次写入的值，
+			# 保存后不再读回可变文件（Issue #2292）。
+			if isinstance(snapshot, dict):
+				pagination["index_snapshot"] = snapshot
 
 			title_suffix = " (welfare filter)" if welfare_conditions else ""
 			if active_level:
