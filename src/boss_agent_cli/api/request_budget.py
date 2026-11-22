@@ -144,8 +144,20 @@ def cancellable_sleep(
 	check_request_control(check)
 
 
+def _is_finite(value: Any) -> bool:
+	"""``math.isfinite`` 的溢出安全版本：超过 float 上限的 int 视为非有限。
+
+	Python int 转 float 时超上限抛 ``OverflowError``；数值校验对调用方承诺的
+	是 ``ValueError``（Issue #2352），不能让另一种异常类型穿出去。
+	"""
+	try:
+		return math.isfinite(value)
+	except (OverflowError, TypeError):
+		return False
+
+
 def validate_delay(delay: tuple[float, float]) -> None:
-	if len(delay) != 2 or not all(math.isfinite(value) for value in delay) or not 0 <= delay[0] <= delay[1]:
+	if len(delay) != 2 or not all(_is_finite(value) for value in delay) or not 0 <= delay[0] <= delay[1]:
 		raise ValueError("request delay must be finite and satisfy 0 <= low <= high")
 
 
@@ -229,6 +241,11 @@ def risk_lock_status(data_dir: Path) -> dict[str, Any]:
 	return {**(local if local["locked"] else group), "group_path": str(root), "group_locked": group["locked"]}
 
 
+#: 节流间隔之外的等待余量：高斯间隔的高值已按 60 秒计，burst 罚时最多再 +7 秒、
+#: 5% 概率的额外停顿 +2–5 秒，15 秒覆盖这些抖动（Issue #2461）。
+_PACING_WAIT_MARGIN = 15.0
+
+
 class RequestBudget:
 	"""One active operation per local budget directory, with a shared ceiling."""
 
@@ -241,21 +258,23 @@ class RequestBudget:
 		wait_timeout: float = 30.0,
 		root: Path | None = None,
 	) -> None:
-		if not math.isfinite(interval) or interval < 0:
+		if not _is_finite(interval) or interval < 0:
 			raise ValueError("request budget interval must be finite and nonnegative")
 		if isinstance(max_per_minute, bool) or not isinstance(max_per_minute, int) or max_per_minute <= 0:
 			raise ValueError("request_max_per_minute must be a positive integer")
-		if not math.isfinite(wait_timeout) or wait_timeout <= 0:
+		if not _is_finite(wait_timeout) or wait_timeout <= 0:
 			raise ValueError("request_wait_timeout must be finite and positive")
-		self.data_dir = data_dir.resolve()
-		self.root = (root or data_dir).resolve()
+		self.data_dir = _resolve_budget_path(data_dir)
+		self.root = _resolve_budget_path(root or data_dir)
 		self.interval = interval
 		self.max_per_minute = max_per_minute
 		self.wait_timeout = wait_timeout
 		self._unpersisted_risk_lock: RiskLock | None = None
 
 	@classmethod
-	def for_data_dir(cls, data_dir: Path, *, interval: float = 1.5) -> RequestBudget:
+	def for_data_dir(
+		cls, data_dir: Path, *, interval: float = 1.5, pacing_limit: float | None = None
+	) -> RequestBudget:
 		from boss_agent_cli.config import load_config
 
 		root = budget_directory(data_dir)
@@ -264,13 +283,22 @@ class RequestBudget:
 		from boss_agent_cli.config import validate_request_config
 
 		validate_request_config(config)
-		group_interval = max(interval, float(config["request_delay"][0])) if root != data_dir.resolve() else interval
+		group_interval = (
+			max(interval, float(config["request_delay"][0])) if root != _resolve_budget_path(data_dir) else interval
+		)
+		wait_timeout = float(config["request_wait_timeout"])
+		if pacing_limit is not None:
+			# 等待上限必须容得下刻意节流本身：默认间隔 30–60 秒时 30 秒的上限让
+			# 同进程第 2 次请求必然失败（Issue #2461）。显式配置过小的用户也在
+			# 运行时自愈；组配置的 request_delay 上限一并计入。
+			pacing_high = max(pacing_limit, float(config["request_delay"][1]))
+			wait_timeout = max(wait_timeout, pacing_high + _PACING_WAIT_MARGIN)
 		return cls(
 			data_dir,
 			root=root,
 			interval=group_interval,
 			max_per_minute=config["request_max_per_minute"],
-			wait_timeout=config["request_wait_timeout"],
+			wait_timeout=wait_timeout,
 		)
 
 	def check_risk(self) -> None:
@@ -636,7 +664,7 @@ class RequestBudget:
 
 	def cooldown(self, seconds: float) -> None:
 		"""Store server/explicit rate-limit feedback without waiting or unlocking."""
-		if not math.isfinite(seconds) or seconds < 0:
+		if not _is_finite(seconds) or seconds < 0:
 			raise ValueError("cooldown must be finite and nonnegative")
 		# Response feedback must survive a stop/deadline which arrived in flight.
 		# An active operation already holds the lease; this write sends nothing.

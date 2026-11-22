@@ -11,6 +11,7 @@ Supports two modes:
 
 import base64
 import json
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -33,7 +34,12 @@ from boss_agent_cli.api.browser_urls import DEFAULT_CDP_URL, is_zhipin_url
 from boss_agent_cli.api.endpoints_loader import EndpointSpec, endpoint_for_request
 from boss_agent_cli.api.httpx_helpers import new_trace_id
 from boss_agent_cli.api.throttle import RequestThrottle
-from boss_agent_cli.api.request_budget import RequestBudget, check_request_control, is_request_stop, retry_after_seconds
+from boss_agent_cli.api.request_budget import (
+	RequestBudget,
+	check_request_control,
+	is_request_stop,
+	retry_after_seconds,
+)
 from boss_agent_cli.api.zhipin_errors import platform_risk_page_response, raise_platform_risk_response
 
 HOME_URL = "https://www.zhipin.com/"
@@ -166,6 +172,10 @@ _FETCH_SCRIPT = r"""
 			async ({method, url, params, data, referer, timeoutMs, identity, traceId}) => {
 				const controller = new AbortController();
 				let timer;
+				// fetch() 调用之前抛出的异常（URL / headers 构造失败）确定没有发出
+				// 请求；catch 里回传该证据，写路径才能区分「未发出」与「结果未知」
+				// （Issue #2380）。
+				let started = false;
 				const deadline = new Promise((_, reject) => {
 					timer = setTimeout(() => {
 						controller.abort();
@@ -204,6 +214,7 @@ _FETCH_SCRIPT = r"""
 						options.body = formData.toString();
 					}
 
+					started = true;
 					const resp = await fetch(fetchUrl, options);
 					if (resp.status === 403) {
 						controller.abort();
@@ -218,6 +229,16 @@ _FETCH_SCRIPT = r"""
 					const body = await resp.text();
 					try {
 						const result = JSON.parse(body);
+						// __cli_* 是页面脚本与 CLI 之间的传输标记，不是平台字段。
+						// 平台响应可以带任意顶层键名：解析后先剔除同名键，防止
+						// 平台（或被注入的响应）伪造「未发出 / 已中断 / 安全页」
+						// 改变写请求的重试语义（Issue #2438）。CLI 自己的标记在
+						// 剥除之后再注入。
+						if (result && typeof result === 'object' && !Array.isArray(result)) {
+							for (const key of Object.keys(result)) {
+								if (key.startsWith('__cli_')) delete result[key];
+							}
+						}
 						if (result && (result.code === 9 || result.code === '9')) {
 							result.__cli_rate_limit__ = {retry_after: resp.headers.get('Retry-After') || ''};
 						}
@@ -235,7 +256,7 @@ _FETCH_SCRIPT = r"""
 					})()]);
 				} catch (e) {
 					return {code: -1, message: 'browser request interrupted', zpData: {},
-						__cli_request_interrupted__: true};
+						__cli_request_interrupted__: true, __cli_request_started__: started};
 				} finally {
 					clearTimeout(timer);
 				}
@@ -247,13 +268,38 @@ _CONTEXT_DESTROYED_MARKERS = (
 	"execution context is not available",
 	"cannot find context with specified id",
 	"target closed",
+	# patchright 的 TargetClosedError 文案是「Target page, context or browser has
+	# been closed」，不含 "target closed"（Issue #2379）。用户关闭复用的页签后，
+	# 读请求此前直接裸抛该异常，跳过既有的有界恢复。
+	"has been closed",
+	"target page, context or browser",
 )
 
 
 def _is_context_destroyed_error(exc: BaseException) -> bool:
-	"""页面在 evaluate 期间发生导航/重载时 patchright 抛出的那一类错误。"""
+	"""页面在 evaluate 期间发生导航/重载/关闭时 patchright 抛出的那一类错误。"""
 	text = str(exc).lower()
 	return any(marker in text for marker in _CONTEXT_DESTROYED_MARKERS)
+
+
+class RequestNotSentError(RuntimeError):
+	"""CDP 通道在写出 ``Runtime.evaluate`` 之前失败。
+
+	会话建立与请求载荷序列化都发生在任何 CDP 消息发出之前，平台侧确定没有
+	收到请求；与 httpx 通道的 ``_UNSENT_TRANSPORT_ERRORS`` 同口径，读 / 写都
+	可以安全重试（Issue #2380）。
+	"""
+
+
+class RequestNotSentLocalError(RequestNotSentError):
+	"""预派发阶段的本地状态错误：平台侧确定没有收到请求。
+
+	预算租约、节流等待与请求前检查都在 ``Runtime.evaluate`` 写出之前执行；
+	其中的 ``sqlite3.Error`` / ``OSError`` 是本地状态问题，不是网络故障。
+	保留原始 cause 让命令层继续按 ``LOCAL_IO_ERROR`` 的恢复指引收口，同时
+	维持「确定未发出」的重试语义（Issue #2437）。``RequestBudgetExceeded``
+	本身带 ``request_sent=False`` 且经 ``is_request_stop`` 原样上抛，不走这里。
+	"""
 
 
 class BrowserSession:
@@ -318,54 +364,80 @@ class BrowserSession:
 		from contextlib import nullcontext
 
 		budget = getattr(self, "_request_budget", None)
-		window = (
-			budget.attempt("browser-fetch", check=self._check_request, before_wait=self._throttle.wait)
-			if budget is not None
-			else nullcontext()
-		)
-		with window:
-			if budget is None:
-				self._throttle.wait()
-			check_request_control(self._check_request)
-			try:
-				result = self._evaluate_fetch(payload)
-			finally:
-				self._throttle.mark()
-			if not isinstance(result, dict):
-				# JSON.parse 的顶层值可以是数组 / 字符串 / 数字 / null（Issue #2046）：
-				# 调用方与风险分类都假定对象响应。容器漂移若原样下传，会在
-				# response.get 处抛 AttributeError（命令层升级成 INTERNAL_ERROR），
-				# 且响应上的风控字段不被分类。按端点语义归一：读请求可重试，写
-				# 请求结果未知、不可重放。
-				return self._unparsed_response(endpoint)
-			limit = result.pop("__cli_rate_limit__", None)
-			if result.get("code") in (9, "9"):
-				result["code"] = 9
-			if budget is not None and (isinstance(limit, dict) or result.get("code") in (9, "9")):
-				budget.cooldown(
-					max(
-						10.0,
-						retry_after_seconds(limit.get("retry_after") if isinstance(limit, dict) else None) or 0.0,
+		# 预算窗口的进入（租约 / 节流等待 / SQLite 调度元数据）与请求前检查都
+		# 发生在任何 Runtime.evaluate 写出之前。记录「已派发」边界，让外层
+		# 只把真正的预派发失败报成「确定未发出」（Issue #2437）。
+		dispatched = False
+		try:
+			window = (
+				budget.attempt("browser-fetch", check=self._check_request, before_wait=self._throttle.wait)
+				if budget is not None
+				else nullcontext()
+			)
+			with window:
+				if budget is None:
+					self._throttle.wait()
+				check_request_control(self._check_request)
+				dispatched = True
+				try:
+					result = self._evaluate_fetch(payload)
+				finally:
+					self._throttle.mark()
+				if not isinstance(result, dict):
+					# JSON.parse 的顶层值可以是数组 / 字符串 / 数字 / null（Issue #2046）：
+					# 调用方与风险分类都假定对象响应。容器漂移若原样下传，会在
+					# response.get 处抛 AttributeError（命令层升级成 INTERNAL_ERROR），
+					# 且响应上的风控字段不被分类。按端点语义归一：读请求可重试，写
+					# 请求结果未知、不可重放。
+					return self._unparsed_response(endpoint)
+				limit = result.pop("__cli_rate_limit__", None)
+				# 限流码来自 response_codes 单一真源：硬编码 9 会让 YAML 的调整只对
+				# httpx 通道生效，两条通道对同一平台响应的分类就此分叉（Issue #2446）。
+				rate_code = endpoints.CODE_RATE_LIMITED
+				if result.get("code") in (rate_code, str(rate_code)):
+					result["code"] = rate_code
+				if budget is not None and (isinstance(limit, dict) or result.get("code") in (rate_code, str(rate_code))):
+					budget.cooldown(
+						max(
+							10.0,
+							retry_after_seconds(limit.get("retry_after") if isinstance(limit, dict) else None) or 0.0,
+						)
 					)
-				)
-			security = result.pop("__cli_security_response__", None)
-			if isinstance(security, dict):
-				page_risk = platform_risk_page_response(
-					url=str(security.get("url") or ""),
-					content_type=str(security.get("content_type") or ""),
-					body="<title>访问受限</title>"
-					if security.get("restricted") is True
-					else f"<title>{security.get('title', '')}</title>",
-				)
-				if page_risk is not None:
-					raise_platform_risk_response(page_risk, is_cdp=self._is_cdp)
-			if budget is not None:
-				raise_platform_risk_response(result, is_cdp=self._is_cdp)
-			if result.pop("__cli_request_interrupted__", False):
-				return self._interrupted_request_response(endpoint)
-			if result.pop("__cli_unparsed_response__", False):
-				return self._unparsed_response(endpoint)
-			return result
+				security = result.pop("__cli_security_response__", None)
+				if isinstance(security, dict):
+					page_risk = platform_risk_page_response(
+						url=str(security.get("url") or ""),
+						content_type=str(security.get("content_type") or ""),
+						body="<title>访问受限</title>"
+						if security.get("restricted") is True
+						else f"<title>{security.get('title', '')}</title>",
+					)
+					if page_risk is not None:
+						raise_platform_risk_response(page_risk, is_cdp=self._is_cdp)
+				if budget is not None:
+					raise_platform_risk_response(result, is_cdp=self._is_cdp)
+				started = result.pop("__cli_request_started__", True)
+				if result.pop("__cli_request_interrupted__", False):
+					# 只有明确回传 started=false 才算「确定未发出」；缺少证据（例如
+					# Runtime.evaluate 自身超时）仍按结果未知收口（Issue #2380）。
+					if started is False:
+						return self._not_sent_response()
+					return self._interrupted_request_response(endpoint)
+				if result.pop("__cli_unparsed_response__", False):
+					return self._unparsed_response(endpoint)
+				return result
+		except Exception as exc:
+			if dispatched or isinstance(exc, RequestNotSentError) or is_request_stop(exc):
+				raise
+			from boss_agent_cli.api.client import PlatformRiskError
+
+			if isinstance(exc, PlatformRiskError):
+				raise
+			if isinstance(exc, (sqlite3.Error, OSError)):
+				raise RequestNotSentLocalError(
+					f"browser request throttling failed before dispatch: {exc}"
+				) from exc
+			raise RequestNotSentError(f"browser request throttling failed before dispatch: {exc}") from exc
 
 	def _navigate_home(self, *, channel: str | None = None) -> None:
 		"""打开首页并确认 domcontentloaded。
@@ -814,6 +886,18 @@ class BrowserSession:
 		}
 		try:
 			result = self._send_fetch(payload, endpoint)
+		except RequestNotSentLocalError as exc:
+			# 预算 / 租约等本地状态错误只可能发生在派发之前：平台侧确定没有
+			# 收到请求，但恢复指引属于原始错误码（LOCAL_IO_ERROR 等），不能
+			# 折叠成 NETWORK_ERROR 或 ACTION_UNCONFIRMED（Issue #2437）。
+			cause = exc.__cause__
+			if cause is None:
+				return self._not_sent_response()
+			raise cause
+		except RequestNotSentError:
+			# 页面 / 上下文在写出 Runtime.evaluate 之前已关闭，或载荷无法序列化：
+			# 平台侧确定没有收到请求，读 / 写都可安全重试（Issue #2379、#2380）。
+			return self._not_sent_response()
 		except Exception as exc:
 			# 复用用户页签时，用户恰好在请求那一瞬间手动导航会让执行上下文被销毁
 			# （Chromium 返回 "Execution context was destroyed"）。仅明确可重放的读取
@@ -837,7 +921,15 @@ class BrowserSession:
 				return self._interrupted_request_response(endpoint)
 			self._page_ready = True
 			self._raise_if_security_page()
-			result = self._send_fetch(payload, endpoint)
+			try:
+				result = self._send_fetch(payload, endpoint)
+			except RequestNotSentLocalError as exc:
+				cause = exc.__cause__
+				if cause is None:
+					return self._not_sent_response()
+				raise cause
+			except RequestNotSentError:
+				return self._not_sent_response()
 		return result
 
 	def _raise_if_security_page(self) -> None:
@@ -854,12 +946,25 @@ class BrowserSession:
 		Playwright driver transport still requires its normal disconnect handling;
 		this does not cancel a write which the platform may already have accepted.
 		"""
-		cdp = self._context.new_cdp_session(self._page)
 		try:
+			cdp = self._context.new_cdp_session(self._page)
+		except Exception as exc:
+			if is_request_stop(exc):
+				raise
+			# 会话建立发生在任何 Runtime.evaluate 写出之前：平台侧确定没有副作用，
+			# 不能把写请求报成「可能已生效」（Issue #2379、#2380）。
+			raise RequestNotSentError(f"browser CDP session unavailable before dispatch: {exc}") from exc
+		try:
+			try:
+				expression = _build_eval_expression(_FETCH_SCRIPT, payload)
+			except (TypeError, ValueError, RecursionError) as exc:
+				# 请求载荷在 Python 侧序列化失败（如超出 int 转换上限的超大整数、
+				# 非 JSON 类型漂移）：同样确定未发出（Issue #2380）。
+				raise RequestNotSentError(f"browser request payload could not be serialized: {exc}") from exc
 			response = cdp.send(
 				"Runtime.evaluate",
 				{
-					"expression": _build_eval_expression(_FETCH_SCRIPT, payload),
+					"expression": expression,
 					"returnByValue": True,
 					"awaitPromise": True,
 					"timeout": _EVALUATE_TIMEOUT_MS,
@@ -904,6 +1009,21 @@ class BrowserSession:
 			"zpData": {},
 			"__cli_error_code__": code,
 			"__cli_error_details__": details,
+		}
+
+	@staticmethod
+	def _not_sent_response() -> dict[str, Any]:
+		"""请求在写出前失败：平台侧确定没有副作用，读 / 写都可安全重试。
+
+		与 httpx 通道的 ``_UNSENT_TRANSPORT_ERRORS`` 同口径：确定未发出的失败
+		不能报成不可重放的 ``ACTION_UNCONFIRMED``（Issue #2380）。
+		"""
+		return {
+			"code": -1,
+			"message": "浏览器通道在请求发出前中断，平台侧未收到请求；可安全重试",
+			"zpData": {},
+			"__cli_error_code__": "NETWORK_ERROR",
+			"__cli_error_details__": {"outcome": "not_sent", "request_sent": False, "replay_safe": True},
 		}
 
 	@staticmethod
@@ -1093,11 +1213,30 @@ def _build_eval_expression(script: str, arg: Any) -> str:
 	return script
 
 
-def _carve_utf8_bits(bs: bytes) -> list[str]:
+#: WebSocket 帧只用于聊天事件摘要：单帧最多扫描 8KB、最多取 10 个片段。
+#: 原实现对每个起始字节从 240 向下尝试 decode（每字节最多 236 次），收包循环
+#: 又接受二进制帧，1MB 帧要扫描数十秒，同步调用会让 30s 的 listen deadline
+#: 失效（Issue #2381）。
+_CARVE_SCAN_LIMIT = 8 * 1024
+_CARVE_MAX_FRAGMENTS = 10
+
+#: 可作为可打印 UTF-8 片段首字节的候选：可打印 ASCII、\t\n\r 与 0xC2–0xF4 的
+#: 多字节前导字节。续字节（0x80–0xBF）、NUL 等控制字符与非法前导不能开启片段，
+#: 直接跳过，避免对每个字节做最多 236 次 decode 尝试。
+_CARVE_START_BYTES = frozenset({0x09, 0x0A, 0x0D, *range(0x20, 0x7F), *range(0xC2, 0xF5)})
+
+
+def _carve_utf8_bits(
+	bs: bytes, *, limit: int = _CARVE_MAX_FRAGMENTS, scan_limit: int = _CARVE_SCAN_LIMIT
+) -> list[str]:
 	out: list[str] = []
+	stop = min(len(bs), scan_limit)
 	i = 0
-	while i < len(bs):
-		for length in range(min(len(bs) - i, 240), 4, -1):
+	while i < stop and len(out) < limit:
+		if bs[i] not in _CARVE_START_BYTES:
+			i += 1
+			continue
+		for length in range(min(stop - i, 240), 4, -1):
 			try:
 				text = bs[i : i + length].decode("utf-8")
 			except UnicodeDecodeError:
@@ -1111,6 +1250,29 @@ def _carve_utf8_bits(bs: bytes) -> list[str]:
 	return out
 
 
+def _open_chat_tab_websocket(cdp_http_url: str, script: str, arg: Any) -> tuple[Any, str]:
+	"""连接聊天页 CDP WebSocket，返回 ``(connection, expression)``。
+
+	参数序列化与 WebSocket 握手都发生在首个 CDP 帧写出之前：失败时聊天页
+	动作确定没有派发，必须与「动作已发出、结果未知」区分（Issue #2439）。
+	连接建立后的 ``send`` / ``recv`` 失败仍保持结果未知，不在这里包装。
+	"""
+	import websockets.sync.client as _ws_client
+
+	target_ws = _pick_chat_target_ws(cdp_http_url)
+	try:
+		expression = _build_eval_expression(script, arg)
+	except (TypeError, ValueError, RecursionError) as exc:
+		raise ChatTabCdpUnreachable(f"chat tab script could not be serialized before dispatch: {exc}") from exc
+	try:
+		ws = _ws_client.connect(target_ws, max_size=8 * 1024 * 1024, open_timeout=5, close_timeout=1)
+	except Exception as exc:
+		if is_request_stop(exc):
+			raise
+		raise ChatTabCdpUnreachable(f"cannot open CDP websocket at {safe_cdp_endpoint(target_ws)}: {exc}") from exc
+	return ws, expression
+
+
 def _cdp_evaluate_in_chat_tab(cdp_http_url: str, script: str, arg: Any) -> Any:
 	"""Send Runtime.evaluate to the BOSS recruiter chat tab via raw CDP.
 
@@ -1122,12 +1284,9 @@ def _cdp_evaluate_in_chat_tab(cdp_http_url: str, script: str, arg: Any) -> Any:
 	"""
 	import json as _json
 
-	import websockets.sync.client as _ws_client
+	ws, expression = _open_chat_tab_websocket(cdp_http_url, script, arg)
 
-	target_ws = _pick_chat_target_ws(cdp_http_url)
-	expression = _build_eval_expression(script, arg)
-
-	with _ws_client.connect(target_ws, max_size=8 * 1024 * 1024, open_timeout=5, close_timeout=1) as ws:
+	with ws:
 		ws.send(
 			_json.dumps(
 				{
@@ -1327,12 +1486,9 @@ def _cdp_evaluate_with_chat_events_in_chat_tab(
 ) -> dict[str, Any]:
 	import json as _json
 
-	import websockets.sync.client as _ws_client
+	ws, expression = _open_chat_tab_websocket(cdp_http_url, script, arg)
 
-	target_ws = _pick_chat_target_ws(cdp_http_url)
-	expression = _build_eval_expression(script, arg)
-
-	with _ws_client.connect(target_ws, max_size=8 * 1024 * 1024, open_timeout=5, close_timeout=1) as ws:
+	with ws:
 		ws.send(_json.dumps({"id": 1, "method": "Network.enable"}))
 		ws.send(
 			_json.dumps(
@@ -1411,7 +1567,7 @@ def _cdp_evaluate_with_chat_events_in_chat_tab(
 					"ts": time.time(),
 					"kind": "ws_send" if method.endswith("Sent") else "ws_recv",
 					"bytes": len(bs),
-					"utf8_bits": _carve_utf8_bits(bs)[:10],
+					"utf8_bits": _carve_utf8_bits(bs),
 				}
 			)
 

@@ -57,6 +57,8 @@ _MAX_RETRIES = 3
 # 发生，不能按「结果未知」报成 ``ACTION_UNCONFIRMED`` 并禁止重试（Issue #2216）。
 # 其余 ``httpx.TransportError``（读 / 写超时、RemoteProtocolError 等）发生在
 # 请求可能已送出之后，仍按未知处理。
+# 写请求不自动跟随重定向（Issue #2424），所以这些异常对写请求只可能来自首跳，
+# 「未发出」判定完整；3xx 响应本身按结果未知收口。
 _UNSENT_TRANSPORT_ERRORS: tuple[type[httpx.TransportError], ...] = (
 	httpx.ConnectError,
 	httpx.ConnectTimeout,
@@ -130,7 +132,11 @@ class _BaseHttpClient:
 		self._browser_session: "BrowserSession | None" = None
 		self._throttle = RequestThrottle(delay, check=self._check_cdp_risk_lock)
 		data_dir = self._risk_lock_dir()
-		self._request_budget = RequestBudget.for_data_dir(data_dir, interval=delay[0]) if data_dir is not None else None
+		self._request_budget = (
+			RequestBudget.for_data_dir(data_dir, interval=delay[0], pacing_limit=delay[1])
+			if data_dir is not None
+			else None
+		)
 		self._cdp_url = cdp_url
 		# 浏览器通道来源意图；None = auto（默认路径行为不变）。
 		# 只在此处保存并透传给唯一的 BrowserSession 构造点，不在本类上派生
@@ -439,6 +445,13 @@ class _BaseHttpClient:
 				# traceid 是请求级的：真实页面每个请求都换一个，不能放进客户端级默认头。
 				headers = {**self._headers_for(url), "traceid": new_trace_id(), **extra_headers_override}
 				check_request_control(self._check_cdp_risk_lock)
+				if write_possible:
+					# 写请求不跟随重定向：首跳 3xx 说明平台已经收到请求，307/308
+					# 还会让中间层把 body 重发到新地址；跟随之后抛出的连接类异常
+					# 再也无法证明「一个字节都没发出」，按未发出上抛会让 Agent
+					# 重试并重复写入（Issue #2424）。3xx 响应本身在下方按结果
+					# 未知收口；读请求保持既有的跟随行为（登录跳转、页面迁移）。
+					kwargs["follow_redirects"] = False
 				try:
 					resp = client.request(method, url, headers=headers, **kwargs)
 				except Exception as error:
@@ -449,12 +462,15 @@ class _BaseHttpClient:
 						raise
 					if (
 						write_possible
-						and isinstance(error, httpx.TransportError)
+						and isinstance(error, (httpx.TransportError, httpx.TooManyRedirects))
 						and not isinstance(error, _UNSENT_TRANSPORT_ERRORS)
 					):
 						# 只有「请求可能已发出」的传输异常才落成结果未知；确定未发出的
 						# 连接 / 代理 / 协议错误原样上抛，由命令出口按可重试的
 						# NETWORK_ERROR 收口（Issue #2216）。
+						# TooManyRedirects 是 RequestError 而非 TransportError：客户端
+						# 已跟随重定向多次，写请求可能已在其中一次生效，读路径仍按
+						# 普通网络错误上抛（Issue #2396）。
 						return self._unconfirmed_http_response(url, "transport_error")
 					if write_possible and isinstance(error, httpx.DecodingError):
 						return self._unconfirmed_http_response(url, "invalid_response")
@@ -496,6 +512,11 @@ class _BaseHttpClient:
 				except PlatformRiskError as error:
 					self._record_cdp_risk_lock(error=error)
 					raise
+				if write_possible and 300 <= resp.status_code < 400:
+					# 写请求已按 follow_redirects=False 发出：首跳 3xx 说明平台已
+					# 接收，307/308 还会让中间层把 body 重发到新地址，副作用无法
+					# 证明不存在，按结果未知收口（Issue #2424）。
+					return self._unconfirmed_http_response(url, "redirect")
 				if resp.status_code == 401:
 					return {"code": 401, "message": "平台认证已失效，请重新登录", "zpData": {}}
 				if resp.status_code == 429:

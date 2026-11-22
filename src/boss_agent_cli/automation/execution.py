@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any, Final
 
@@ -11,7 +12,7 @@ from boss_agent_cli.api.browser_source import BrowserSourceUnavailable
 from boss_agent_cli.api.request_budget import RequestBudgetExceeded
 from boss_agent_cli.automation.adapters import RecruiterAutomationPlatform
 from boss_agent_cli.automation.config import AutomationConfig
-from boss_agent_cli.automation.decision import decide_action
+from boss_agent_cli.automation.decision import decide_action, prior_sent
 from boss_agent_cli.automation.events import make_event, now_iso
 from boss_agent_cli.automation.models import (
 	AutomationEvent,
@@ -133,11 +134,19 @@ def process_pending(
 			continue
 		prior = _conversation_prior(state, item.candidate_key)
 		stage_key = _ACTION_STAGE_KEYS.get(action)
-		if prior is not None and stage_key is not None and bool(prior.get(stage_key)):
+		if prior is not None and stage_key is not None and prior_sent(prior, stage_key):
 			# 同一动作在一个会话里只发生一次：扫描路径（或更早的队列行）已经
 			# 完成过这个阶段。队列行是操作者批准的动作，但再发一份问卷 / 跟进
 			# 是确定性的重复触达（Issue #2211）。标记为已执行而不是留在
 			# pending，否则下一轮还会派发同一条消息。
+			#
+			# 阶段字段与决策路径共用 ``prior_sent`` 的 ISO 校验：只按 ``bool()``
+			# 会把 ``"false"`` 这类漂移值当作已完成，丢掉批准消息，同时让扫描
+			# 路径按「缺失」判定并同轮改发模板（Issue #2450）。
+			#
+			# 该候选人已由队列处置，加入本轮已派发集合：扫描路径不得再用模板
+			# 话术补位，即使两条路径对同一份 prior 的判断再次出现分歧。
+			dispatched_conversations.add(item.candidate_key)
 			if dry_run:
 				event = make_event(
 					platform,
@@ -207,32 +216,41 @@ def process_pending(
 				if stop:
 					break
 				continue
+		before_queue_dispatch: Callable[[], None] | None = None
 		if not dry_run:
-			# 先落盘「执行中」再派发：进程在写请求发出后中断时，下一轮看到
-			# executing 行就知道结果未知，不会把可能已生效的动作重发一遍
-			# （Issue #1245）。写盘失败时动作尚未发出，行仍是 pending，可安全重试。
-			actions[index] = _pending_with_status(item, "executing")
-			store.write_pending(actions)
-			actions[index] = item
-			if prior is not None and state is not None:
-				# 队列路径同样在派发前落会话级在途标记：队列行只保护队列自己，
-				# 扫描路径读不到它；两边共用标记后任意路径中断都不会重发
-				# （Issue #1514）。
-				_start_inflight(prior, decision, ref)
-				try:
-					store.write_state(state)
-				except Exception:
-					# 状态写不进去（控制锁被占 / 磁盘故障）不能挡住派发：队列行
-					# 已落盘为 executing，本身就是重放屏障；进程中断后下一轮会
-					# 把它转成 verification-required 并补写标记。发送成功而状态
-					# 仍未落盘时，队列行保持 executing，不会退回 pending 重放。
-					_clear_inflight(prior)
-			# 队列已把这一行标成 executing：接下来动作可能真的发出，控制锁
-			# 冲突的语义要按「可能已生效」处理（Issue #1307）。
-			if dispatched is not None:
-				dispatched[0] = True
+			def _before_queue_dispatch() -> None:
+				# 「执行中」行与在途标记都在预检通过、真正调用适配器之前落盘：
+				# 进程在写请求发出后中断时，下一轮看到 executing 行就知道结果未知，
+				# 不会把可能已生效的动作重发一遍（Issue #1245）。预检拒绝（限额 /
+				# stop / 安全告警）发生在任何平台写入之前，此时不落 executing，也
+				# 不置 dispatched，避免紧随其后的本地写失败被误报成「可能已发出」
+				# （Issue #2451）。
+				actions[index] = _pending_with_status(item, "executing")
+				store.write_pending(actions)
+				actions[index] = item
+				if prior is not None and state is not None:
+					# 队列路径同样在派发前落会话级在途标记：队列行只保护队列自己，
+					# 扫描路径读不到它；两边共用标记后任意路径中断都不会重发
+					# （Issue #1514）。
+					_start_inflight(prior, decision, ref)
+					try:
+						store.write_state(state)
+					except Exception:
+						# 状态写不进去（控制锁被占 / 磁盘故障）不能挡住派发：
+						# 队列行已落盘为 executing，本身就是重放屏障；进程中断后
+						# 下一轮会把它转成 verification-required 并补写标记。
+						# 发送成功而状态仍未落盘时，队列行保持 executing，不会
+						# 退回 pending 重放。
+						_clear_inflight(prior)
+				# 队列已把这一行标成 executing：接下来动作可能真的发出，控制锁
+				# 冲突的语义要按「可能已生效」处理（Issue #1307）。
+				if dispatched is not None:
+					dispatched[0] = True
+			before_queue_dispatch = _before_queue_dispatch
 		try:
-			status, event_reason = execute_or_dry_run(adapter, guard, decision, ref, dry_run)
+			status, event_reason = execute_or_dry_run(
+				adapter, guard, decision, ref, dry_run, before_dispatch=before_queue_dispatch
+			)
 		except (ChatTabCdpUnreachable, RecruiterChatTabRequired, BrowserSourceUnavailable):
 			# 这三类异常都表示请求尚未发出（聊天页未就绪 / CDP 端点不可达 / 浏览器
 			# 通道全部不可用）：队列行必须回到 pending，否则下一轮会把一个从未派发
@@ -341,19 +359,31 @@ def process_ref(
 			status = EventStatus.CIRCUIT_BREAKER_OPEN if safety.circuit_breaker else EventStatus.STOPPED_BY_SAFETY
 			event_reason = safety.reason
 	elif status is EventStatus.AUTO_EXECUTED or status is EventStatus.DRY_RUN:
+		before_scan_dispatch: Callable[[], None] | None = None
 		if status is EventStatus.AUTO_EXECUTED:
-			# 直接扫描路径没有待执行队列行：先把这个可能发出的动作落进 state，
-			# 进程在发送后被杀 / checkpoint 撞控制锁时，下一轮看到未 settle 的
-			# 在途标记就转 verification-required，不再凭 transcript 重发
-			# （Issue #1511）。标记写盘失败时动作尚未发出，可安全重试。
-			_start_inflight(prior, decision, ref)
-			store.write_state(state)
-		# 真实执行会向平台发请求：先标记，之后控制锁冲突按「可能已生效」处理
-		# （Issue #1307）。
-		if dispatched is not None and not dry_run:
-			dispatched[0] = True
+			def _before_scan_dispatch() -> None:
+				# 直接扫描路径没有待执行队列行：在预检通过、真正调用适配器之前
+				# 把这个可能发出的动作落进 state，进程在发送后被杀 / checkpoint
+				# 撞控制锁时，下一轮看到未 settle 的在途标记就转
+				# verification-required，不再凭 transcript 重发（Issue #1511）。
+				# 预检拒绝发生在任何平台写入之前，此时不落标记也不置 dispatched：
+				# 否则紧随其后的本地写失败会被误报成「可能已发出」（Issue #2451）。
+				# 标记写盘失败时动作尚未发出，清理内存标记后可安全重试。
+				_start_inflight(prior, decision, ref)
+				try:
+					store.write_state(state)
+				except Exception:
+					_clear_inflight(prior)
+					raise
+				# 真实执行会向平台发请求：先标记，之后控制锁冲突按「可能已生效」
+				# 处理（Issue #1307）。
+				if dispatched is not None:
+					dispatched[0] = True
+			before_scan_dispatch = _before_scan_dispatch
 		try:
-			status, event_reason = execute_or_dry_run(adapter, guard, decision, ref, dry_run)
+			status, event_reason = execute_or_dry_run(
+				adapter, guard, decision, ref, dry_run, before_dispatch=before_scan_dispatch
+			)
 		except (ChatTabCdpUnreachable, RecruiterChatTabRequired, BrowserSourceUnavailable):
 			# 请求尚未发出：释放在途标记再抛出，避免下一轮把从未派发的动作
 			# 转成 verification-required（与队列 #1469 同口径，Issue #1511）。
@@ -418,7 +448,16 @@ def execute_or_dry_run(
 	decision: Decision,
 	ref: ConversationRef,
 	dry_run: bool,
+	*,
+	before_dispatch: Callable[[], None] | None = None,
 ) -> tuple[EventStatus, str]:
+	"""跑预检并执行（或演练）一个动作。
+
+	``before_dispatch`` 在预检（stop / 安全告警 / 限额）全部通过、适配器即将
+	被调用时执行：调用方在这里落盘 executing 行 / 在途标记并置 dispatched。
+	预检拒绝时不会调用它，因此从未派发的动作不会留下「可能已发出」的证据
+	（Issue #2451）。
+	"""
 	stop = guard.stop_reason()
 	if stop is not None:
 		return EventStatus.CIRCUIT_BREAKER_OPEN, stop
@@ -434,6 +473,8 @@ def execute_or_dry_run(
 		return EventStatus.STOPPED_BY_SAFETY, safety.reason
 	if dry_run:
 		return EventStatus.DRY_RUN, decision.reason
+	if before_dispatch is not None:
+		before_dispatch()
 	result = adapter.execute_action(decision.action, decision.message, ref)
 	if result.status == "unconfirmed":
 		# 结果可能已生效：不重试、不继续处理其他候选人，

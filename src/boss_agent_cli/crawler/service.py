@@ -55,6 +55,7 @@ from boss_agent_cli.crawler.hooks import (
 from boss_agent_cli.crawler.transport import CrawlRiskError, CrawlTransport
 from boss_agent_cli.display import boss_command, risk_error_message, shell_argument
 from boss_agent_cli.services.file_lock import exclusive_file_lock, run_lock_path
+from boss_agent_cli.services.text_files import sanitize_surrogates
 
 
 class CrawlBusyError(RuntimeError):
@@ -63,6 +64,10 @@ class CrawlBusyError(RuntimeError):
 	def __init__(self, run_id: str) -> None:
 		super().__init__(f"crawl run {run_id} 正在由另一次调用执行")
 		self.run_id = run_id
+
+
+class PagesOverrideError(ValueError):
+	"""resume 的 ``--pages`` 与断点进度矛盾：要调整的是本次参数，不是断点设置。"""
 
 
 def validate_pages_override(next_page: int, pages: int) -> None:
@@ -77,7 +82,7 @@ def validate_pages_override(next_page: int, pages: int) -> None:
 	"""
 	if next_page <= pages + 1:
 		return
-	raise ValueError(
+	raise PagesOverrideError(
 		f"--pages {pages} 小于断点进度：任务已推进到第 {next_page} 页，"
 		f"页数上限不能小于 {next_page - 1}；要按更小页数采集请用 crawl start 新建任务"
 	)
@@ -468,6 +473,26 @@ class CrawlRunBudget:
 		return self._elapsed_before_start + max(0, int(self._clock() - self._started_at))
 
 
+def crawl_executor_active(data_dir: Path, run_id: str) -> bool:
+	"""探测 crawl run 是否仍有执行器持有执行锁。
+
+	``crawl status`` / ``crawl stop`` 只读 DB 里的 ``running`` 无法区分「真的在
+	跑」与「执行器被 SIGKILL、内核已释放锁」；不探测就会出现 stop 假成功与永远
+	running 的状态页（Issue #2465）。探测会短暂取得再释放执行锁，语义与
+	``_prepare_background_resume`` 的检查一致；只读命令不改任务状态。
+
+	锁文件不存在时直接判否：执行器只在取锁之后才把状态写成 queued / running，
+	路径为空等价于没有执行器，不必为一个只读查询创建 / 删除锁文件。
+	"""
+	path = run_lock_path(data_dir / "cache" / "crawl-locks", run_id)
+	try:
+		path.lstat()
+	except FileNotFoundError:
+		return False
+	with exclusive_file_lock(path) as acquired:
+		return not acquired
+
+
 class CrawlService:
 	"""Run an explicit browser crawl and retain every recovery-relevant state."""
 
@@ -620,6 +645,12 @@ class CrawlService:
 		if with_detail:
 			settings = replace(settings, with_detail=True)
 		self._validate_settings(settings)
+		# --pages 与断点进度的矛盾必须在 completed 快速路径之前判定：已完成任务
+		# 若绕过校验，会把「缩小页数上限」静默接受成成功，与 stopped / queued
+		# 任务的 INVALID_PARAM 口径不一致（Issue #2386，同 #2061 的不能静默
+		# clamp 契约）。
+		if pages is not None:
+			validate_pages_override(int(run["next_page"]), settings.pages)
 		if not self.has_resume_work(run, pages=pages, with_detail=with_detail):
 			output_dir = Path(str(run["output_dir"]))
 			if not _artifacts_present(output_dir):
@@ -638,8 +669,6 @@ class CrawlService:
 					_remove_run_artifacts(output_dir)
 					raise KeyError(run_id)
 			return self._completed_outcome(run)
-		if pages is not None:
-			validate_pages_override(int(run["next_page"]), settings.pages)
 		# 旧 stop 必须在预检之前清掉：预检要探测可选依赖、读取登录态，可能
 		# 耗时；这期间到达的新 stop 不能被后面的清理当成上一轮残留一起清掉
 		# （与后台恢复同构，Issue #1115 / #2209）。预检失败时还原旧 stop 与
@@ -720,24 +749,17 @@ class CrawlService:
 		output_dir: Path,
 		list_finished: bool = False,
 	) -> CrawlOutcome:
-		self._check_risk_lock()
-		transport = self._transport_factory(settings)
-		budget = self._budget_factory(self._cache)
-		previous = self._cache.get_crawl_run(run_id)
-		if previous is None:
-			raise KeyError(run_id)
-		run_budget = CrawlRunBudget(
-			settings,
-			requests_attempted=int(previous["requests_attempted"]),
-			detail_requests_attempted=int(previous["detail_requests_attempted"]),
-			elapsed_seconds=int(previous["elapsed_seconds"]),
-			on_change=lambda current: self._cache.update_crawl_run_budget(
-				run_id,
-				requests_attempted=current.requests_attempted,
-				detail_requests_attempted=current.detail_requests_attempted,
-				elapsed_seconds=current.elapsed_seconds,
-			),
-		)
+		# 预检 / 构造阶段也必须在 try 内（Issue #2466）：transport_factory 抛确定性
+		# 失败或命中风控锁时，只有进入 finally 才会写回终态；留在 try 外会把
+		# `_resume_locked` 已标记的 running 永久留在断点里、清空上一轮错误，并让
+		# `crawl stop` 假成功（叠加 Issue #2465）。
+		transport: CrawlTransport | None = None
+		run_budget: CrawlRunBudget | None = None
+		# 构造阶段失败时 run_budget 还没建好：outcome 改用断点里上一次的预算
+		# 计数（本轮 finally 也无从写回），不能让 AttributeError 盖住原始失败。
+		baseline_requests = 0
+		baseline_details = 0
+		baseline_elapsed = 0
 		hooks: tuple[HookInjection, ...] = ()
 		# 只有 transport.open() 返回（或 HookRegistrationError 带回了注入结果）
 		# 之后 hook_results 才可信；否则 finally 必须传 None 保留断点里的上一份
@@ -754,18 +776,42 @@ class CrawlService:
 		current_page = next_page
 		# 风控/待人工处理时保留采集 Chrome，便于用户在窗口内登录或过验证。
 		keep_browser = False
-
-		def check_attempt() -> None:
-			self._raise_if_stop_requested(run_id)
-			run_budget.check_time()
-
-		bind_check = getattr(budget, "bind_check", None)
-		if callable(bind_check):
-			bind_check(check_attempt)
-		bind_attempts = getattr(transport, "bind_attempts", None)
-		if callable(bind_attempts):
-			bind_attempts(lambda kind: self._attempt(run_id, budget, run_budget, kind), self._request_budget.cooldown)
 		try:
+			previous = self._cache.get_crawl_run(run_id)
+			if previous is None:
+				raise KeyError(run_id)
+			baseline_requests = int(previous["requests_attempted"])
+			baseline_details = int(previous["detail_requests_attempted"])
+			baseline_elapsed = int(previous["elapsed_seconds"])
+			self._check_risk_lock()
+			transport = self._transport_factory(settings)
+			budget = self._budget_factory(self._cache)
+			active_budget = CrawlRunBudget(
+				settings,
+				requests_attempted=baseline_requests,
+				detail_requests_attempted=baseline_details,
+				elapsed_seconds=baseline_elapsed,
+				on_change=lambda current: self._cache.update_crawl_run_budget(
+					run_id,
+					requests_attempted=current.requests_attempted,
+					detail_requests_attempted=current.detail_requests_attempted,
+					elapsed_seconds=current.elapsed_seconds,
+				),
+			)
+			run_budget = active_budget
+
+			def check_attempt() -> None:
+				self._raise_if_stop_requested(run_id)
+				active_budget.check_time()
+
+			bind_check = getattr(budget, "bind_check", None)
+			if callable(bind_check):
+				bind_check(check_attempt)
+			bind_attempts = getattr(transport, "bind_attempts", None)
+			if callable(bind_attempts):
+				bind_attempts(
+					lambda kind: self._attempt(run_id, budget, active_budget, kind), self._request_budget.cooldown
+				)
 			# 恢复 stopped 等终态 run 时，状态要在打开浏览器之前落成 running：
 			# 否则浏览器启动与 seed 导航期间 `crawl stop` 会按终态被拒，而采集
 			# 照常继续（Issue #1771）。放在 try 内，任何失败都由 finally 写回终态。
@@ -820,6 +866,7 @@ class CrawlService:
 					run_id, settings, transport, budget, run_budget, failed_keys=failed_detail_keys
 				)
 				write_run_outputs(output_dir, [item["payload"] for item in self._cache.list_crawl_jobs(run_id)])
+				_discard_artifacts_if_run_removed(self._cache, run_id, output_dir)
 				if list_finished:
 					break
 			# 最后一页的导出必须在 completed 落库之前（Issue #1238）：第二次 resume
@@ -830,6 +877,7 @@ class CrawlService:
 			self._raise_if_stop_requested(run_id)
 			rows = [item["payload"] for item in self._cache.list_crawl_jobs(run_id)]
 			paths = write_run_outputs(output_dir, rows)
+			_discard_artifacts_if_run_removed(self._cache, run_id, output_dir)
 		except HookRegistrationError as exc:
 			# Hook 注入失败是确定性本地失败：保存断点后原样抛出，由入口按
 			# LOCAL_IO_ERROR 回报并给出具体目录。落成普通 stopped 会让调用方拿到
@@ -875,6 +923,13 @@ class CrawlService:
 		except CrawlStopRequested as exc:
 			status = "stopped"
 			error = str(exc)
+		except KeyError:
+			# 初始读取或导出后重读断点发现行已被 clean --privacy 删除：本次
+			# 没有产物（或产物已撤销），按 run 不存在上抛，命令层回
+			# CRAWL_RUN_NOT_FOUND（Issue #2323、#2466）。
+			status = "stopped"
+			error = "crawl run was removed before this attempt finished"
+			raise
 		except (CacheBusyError, sqlite3.OperationalError) as exc:
 			# 缓存层写锁冲突：`CacheBusyError` 是 `_GuardedConnection` 归一后的形态，
 			# 原始 `sqlite3.OperationalError('database is locked')` 也可能直接从
@@ -932,16 +987,17 @@ class CrawlService:
 			# 否则 run 永远停在 running、本次错误丢失，采集 Chrome 继续占用共享
 			# profile（Issue #1277）。
 			cleanup_errors: list[BaseException] = []
-			try:
-				# Save progress before cleanup: a detached browser can fail to close.
-				self._cache.update_crawl_run_budget(
-					run_id,
-					requests_attempted=run_budget.requests_attempted,
-					detail_requests_attempted=run_budget.detail_requests_attempted,
-					elapsed_seconds=run_budget.elapsed_seconds,
-				)
-			except Exception as exc:
-				cleanup_errors.append(exc)
+			if run_budget is not None:
+				try:
+					# Save progress before cleanup: a detached browser can fail to close.
+					self._cache.update_crawl_run_budget(
+						run_id,
+						requests_attempted=run_budget.requests_attempted,
+						detail_requests_attempted=run_budget.detail_requests_attempted,
+						elapsed_seconds=run_budget.elapsed_seconds,
+					)
+				except Exception as exc:
+					cleanup_errors.append(exc)
 			try:
 				self._cache.update_crawl_run(
 					run_id,
@@ -985,9 +1041,11 @@ class CrawlService:
 			output_paths=paths,
 			hooks=hooks,
 			error=error,
-			requests_attempted=run_budget.requests_attempted,
-			detail_requests_attempted=run_budget.detail_requests_attempted,
-			elapsed_seconds=run_budget.elapsed_seconds,
+			requests_attempted=run_budget.requests_attempted if run_budget is not None else baseline_requests,
+			detail_requests_attempted=(
+				run_budget.detail_requests_attempted if run_budget is not None else baseline_details
+			),
+			elapsed_seconds=run_budget.elapsed_seconds if run_budget is not None else baseline_elapsed,
 			risk_lock=risk_lock,
 			data_dir=self._data_dir,
 		)
@@ -1081,6 +1139,9 @@ class CrawlService:
 				try:
 					card = self._with_retry(fetch_detail, max_retries=settings.max_retries)
 				except Exception as exc:
+					# 本地缓存锁冲突 / 断点损坏与 _with_retry 同口径原样上抛，
+					# 不能降级成单条 detail-error 后把整轮报成 completed
+					# （Issue #2324、#2351）。
 					if is_request_stop(exc) or isinstance(
 						exc,
 						(
@@ -1088,6 +1149,8 @@ class CrawlService:
 							CrawlRiskError,
 							CrawlRuntimeUnavailable,
 							CrawlSessionAuthError,
+							CacheBusyError,
+							CacheRecordInvalid,
 							sqlite3.DatabaseError,
 						),
 					):
@@ -1119,9 +1182,19 @@ class CrawlService:
 		for _ in range(max_retries + 1):
 			try:
 				return action()
-			except (PlatformRiskError, CrawlRiskError, CrawlLimitExceeded, CrawlStopRequested, sqlite3.DatabaseError):
+			except (
+				PlatformRiskError,
+				CrawlRiskError,
+				CrawlLimitExceeded,
+				CrawlStopRequested,
+				CacheBusyError,
+				CacheRecordInvalid,
+				sqlite3.DatabaseError,
+			):
 				# 只读目录 / 磁盘满等本地数据库故障重试同一次请求不会自愈；保留原始
 				# `sqlite3.DatabaseError` 让上层按 LOCAL_IO_ERROR 收口（Issue #1467）。
+				# 写锁冲突与断点损坏同样不重试：每次重跑都会重新 claim，虚增预算并
+				# 重复占用节流槽（Issue #2324）。
 				raise
 			except Exception as exc:
 				if is_request_stop(exc):
@@ -1247,15 +1320,29 @@ class CrawlService:
 		except ValueError as exc:
 			raise CrawlHookDirInvalid(str(exc), hook_dir=settings.hook_dir) from exc
 
+	def validate_resume_basics(self, settings: CrawlSettings) -> None:
+		"""completed 快速路径只校验设置语义，与前台 resume 的校验顺序一致。
+
+		前台在 ``has_resume_work`` 之前就执行 ``_validate_settings``；后台无需启动
+		worker 的 completed 路径也要先拒绝空白关键词等确定性坏设置，否则同一个
+		断点会因入口形式不同得到相反结论（Issue #2402）。Hook 目录探测留到真正
+		启动 worker 前，completed 路径不额外收紧。
+		"""
+		self._validate_settings(settings)
+
 
 def _normalize_job(raw: dict[str, Any], query: str, page_no: int, rank: int) -> tuple[str, dict[str, Any]]:
-	job_id = str(raw.get("encryptJobId") or "")
-	security_id = str(raw.get("securityId") or "")
+	# 平台 JSON 可能出现孤立代理项（与 cache/store.py 的 watch 路径同源）：job_id
+	# 与兜底标题会作为 SQLite 参数绑定，严格 UTF-8 编码抛 UnicodeEncodeError 后
+	# 被 _run 的通用分支吞成 ok:true 的 stopped，任务永远无法推进（Issue #2350）。
+	# 与导出文本同口径归一为可编码的转义文本。
+	job_id = sanitize_surrogates(str(raw.get("encryptJobId") or ""))
+	security_id = sanitize_surrogates(str(raw.get("securityId") or ""))
 	# securityId 每次搜索请求都会轮换（operations.import_shortlist 同样不拿它做
 	# 跨 run 去重）：页内崩溃后 resume 重抓同一页会拿到新值，用它当身份会让同一
 	# 职位以新键再插一行。无稳定 job_id 时按「页 + 名次 + 标题」兜底，它们在
 	# 同一页的重复抓取之间保持不变（Issue #2029）。
-	job_key = job_id or f"{page_no}:{rank}:{field_text(raw, 'jobName')}"
+	job_key = job_id or f"{page_no}:{rank}:{sanitize_surrogates(field_text(raw, 'jobName'))}"
 	labels = raw.get("jobLabels", [])
 	benefits = raw.get("welfareList", [])
 	return job_key, {
@@ -1326,6 +1413,18 @@ def _hook_injections(raw: Any, *, run_id: str = "") -> tuple[HookInjection, ...]
 
 def _output_paths(output_dir: Path) -> dict[str, str]:
 	return {extension: str(output_dir / f"jobs.{extension}") for extension in ("json", "csv", "xlsx")}
+
+
+def _discard_artifacts_if_run_removed(cache: CacheStore, run_id: str, output_dir: Path) -> None:
+	"""导出后重读断点：并发 ``clean --privacy`` 已删行时删掉刚写出的产物。
+
+	clean 先提交删行、再删产物；执行器可能在删行前读完 payload，序列化
+	CSV/XLSX 本身耗时，窗口不小。行消失说明清理已生效，不能把隐私数据重新
+	落盘（Issue #2241、#2323）。
+	"""
+	if cache.get_crawl_run(run_id) is None:
+		_remove_run_artifacts(output_dir)
+		raise KeyError(run_id)
 
 
 def _remove_run_artifacts(output_dir: Path) -> None:

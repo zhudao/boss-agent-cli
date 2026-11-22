@@ -169,9 +169,9 @@ After every page, `<data-dir>/crawl/runs/<run_id>/jobs.json`, `jobs.csv`, and a 
 
 | Command | Description |
 |---------|-------------|
-| `boss greet <sid> <jid>` | Greet a recruiter; duplicates return `ALREADY_GREETED` |
+| `boss greet <sid> <jid>` | Greet a recruiter; duplicates return `ALREADY_GREETED`; failures before dispatch (not logged in, invalid proxy config, home navigation failure, missing browser kernel) release the local reservation so the action can be retried once fixed |
 | `boss batch-greet <query>` | Search and greet up to an explicit `--count`; supports `--dry-run`; on `ACCOUNT_RISK` / `ENVIRONMENT_RISK` the batch stops immediately with `ok:false`, and already-greeted items are returned in `error.details.greeted`; an unconfirmed greeting (a sent request whose response was interrupted, `ACTION_UNCONFIRMED`) also stops the batch immediately with `ok:false` and `error.details` carrying `outcome_unknown: true` / `replay_safe: false`, never auto-resending |
-| `boss apply <sid> <jid>` | Apply or start a conversation; duplicates return `ALREADY_APPLIED` |
+| `boss apply <sid> <jid>` | Apply or start a conversation; duplicates return `ALREADY_APPLIED`; pre-dispatch failures release the reservation like `greet` |
 | `boss exchange <uid-or-sid>` | Request a phone-number or WeChat exchange; prefer the stable `uid` returned by `boss chat` |
 
 The execution hint returned by `batch-greet --dry-run` preserves the current data directory and any explicitly given `--browser-source` / `--cdp-url` / `--delay`, removing only `--dry-run`, so following it uses the same login state, dedupe cache, browser channel, and throttle range as the preview.
@@ -352,7 +352,7 @@ CLI calls, Python clients, MCP subprocesses and crawl using the same `data_dir` 
 | --- | --- | --- |
 | `request_delay` | `[30.0, 60.0]` | Per-instance interval range; Gaussian samples stay within it, while additional pauses may lengthen the interval |
 | `request_max_per_minute` | `20` | Positive integer ceiling for active operations in the shared rolling 60-second window |
-| `request_wait_timeout` | `30.0` | Total seconds allowed per lease, pacing, budget and cooldown acquisition; an earlier workflow deadline takes precedence |
+| `request_wait_timeout` | `120.0` | Total seconds allowed per lease, pacing, budget and cooldown acquisition; an earlier workflow deadline takes precedence. The effective value never drops below `request_delay` high + 15 seconds, so a smaller explicit value cannot make intentional pacing time out |
 | `request_budget_dir` | `null` | Uses the current `data_dir` by default; an absolute path explicitly groups multiple data directories |
 
 To share limits across local tasks, configure the group directory and point each member to it:

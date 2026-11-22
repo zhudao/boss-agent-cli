@@ -28,6 +28,12 @@ class TokenRefreshFailed(Exception):
 	pass
 
 
+#: 登录等待窗口上限（秒）：与 CLI ``--timeout`` 的上界一致。超过它的整数没有实际
+#: 意义，却会让 ``time.time() + timeout`` 抛 OverflowError、CDP 轮询变成事实上的
+#: 无上界等待；这是确定性输入错误，进入登录链路前就要拒绝（Issue #2303）。
+MAX_LOGIN_TIMEOUT_SECONDS = 3600
+
+
 def _stoken_changed(before: dict[str, Any] | None, after: dict[str, Any] | None) -> bool:
 	"""等待刷新锁期间登录态是否已被另一个进程更新。"""
 	if not isinstance(before, dict) or not isinstance(after, dict):
@@ -203,6 +209,11 @@ class AuthManager:
 				后重新登录。与 ``force_cdp`` 正交。
 			ignore_risk_lock: 历史兼容参数，不再跳过锁检查；仅用户显式清除本地锁后允许恢复。
 		"""
+		# 超过上界的等待窗口是确定性输入错误（Issue #2303）：CLI 用 IntRange 在解析
+		# 阶段拒绝，Python API 调用也要在碰浏览器之前失败，不能等到
+		# ``time.time() + timeout`` 抛 OverflowError 或被报成可重试的网络错误。
+		if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= MAX_LOGIN_TIMEOUT_SECONDS:
+			raise ValueError(f"timeout 必须是 1–{MAX_LOGIN_TIMEOUT_SECONDS} 之间的整数秒")
 		self._check_cdp_login_risk_lock(cdp_url)
 		method = "未知"
 		token: dict[str, Any] | None = None
@@ -235,6 +246,9 @@ class AuthManager:
 			self._logger.info("未能从浏览器提取 Cookie，降级到 CDP")
 
 		# 第二步：CDP 自动探测
+		# Cookie 提取（钥匙串弹窗）可能耗时数十秒，期间另一进程可能写下风控锁：
+		# 每一级自动通道在真正发起平台访问之前都要复查同一把锁（Issue #2394）。
+		self._check_cdp_login_risk_lock(cdp_url)
 		if probe_cdp(cdp_url):
 			self._logger.info("检测到 CDP 可用，尝试 CDP 登录...")
 			# 只有 CDP 登录本身失败才降级到扫码。落盘失败（权限 / 磁盘满）意味着
@@ -256,6 +270,9 @@ class AuthManager:
 			self._logger.info("CDP 不可用，改用浏览器扫码登录")
 
 		# 第三步：patchright 扫码（兜底）
+		# CDP 探测 / 登录同样可能耗时，扫码通道在打开浏览器访问平台前必须复查
+		# 风控锁，不能把另一进程新写下的一致锁完全忽略（Issue #2394）。
+		self._check_cdp_login_risk_lock(cdp_url)
 		try:
 			token = login_via_browser(timeout=timeout, platform=self._platform)
 		except PlatformRiskError as error:
@@ -372,6 +389,11 @@ class AuthManager:
 		snapshot = self._store.load()
 		try:
 			with self._store.refresh_lock():
+				# 刷新锁最长等待 30 秒，等锁期间另一个进程/通道可能已落下风控锁。
+				# 拿到锁后、启动任何浏览器通道前必须复查同一把锁（与 login 的
+				# 逐级复查同口径，Issue #2394）；命中即停止，不写回新凭证
+				# （Issue #2427）。
+				self._check_cdp_login_risk_lock(cdp_url)
 				current = self._store.load()
 				if current is None:
 					raise TokenRefreshFailed("无法刷新 Token，请重新登录")

@@ -148,6 +148,17 @@ _UNCONFIRMED_WRITE_FALLBACK: dict[str, Any] = {
 }
 
 
+def _error_blocks_replay(error: Mapping[str, Any]) -> bool:
+	"""错误标记是否声明「写动作可能已生效、不得重放」。
+
+	``replay_safe: false`` 是显式证据；``ACTION_UNCONFIRMED`` 本身已表示结果
+	未知（``_persisted_write_marker`` 同口径）。旧数据 / 外部漂移缺少布尔值时
+	按错误码 fail-closed，否则 --resume 会重放结果未知的写步骤并把 run 落成
+	completed（Issue #2398，与 #1159 的类型漂移同族）。
+	"""
+	return error.get("replay_safe") is False or error.get("code") == _UNCONFIRMED_WRITE_FALLBACK["code"]
+
+
 def _search_pipeline_error(
 	exc: SearchPipelinePlatformError,
 	plan: WorkflowPlan,
@@ -211,7 +222,7 @@ def has_blocked_step(run: Mapping[str, Any]) -> bool:
 		if not isinstance(step, Mapping) or str(step.get("status")) not in _REPLAY_BLOCKING_STATUSES:
 			continue
 		error = step.get("error")
-		if isinstance(error, Mapping) and error.get("replay_safe") is False:
+		if isinstance(error, Mapping) and _error_blocks_replay(error):
 			return True
 	return False
 
@@ -228,9 +239,12 @@ class WorkflowControl:
 	resume_action: str | None = None
 
 	def poll(self) -> str | None:
-		# 只看断点里的状态：叠加实时采集结果会让损坏的 crawl 记录挡住停止信号。
-		run = self.store.get_checkpoint(self.run_id)
-		if run is not None and run.get("status") == WorkflowStatus.STOPPED.value:
+		# 只看 run 的原始状态列：完整断点校验会让任一字段漂移（如 replay_safe
+		# 变成字符串）在停止 / 截止时间到达时抛 CacheRecordInvalid，把控制信号
+		# 吞掉并让 runner 用写前标记把只读步骤改写成「结果未知」（Issue #2443，
+		# 与 #1128 的「记录读不出来也要能停」同口径）。
+		status = self.store.get_run_status(self.run_id)
+		if status == WorkflowStatus.STOPPED.value:
 			return "stop"
 		if self.deadline is not None and time.monotonic() >= self.deadline:
 			return "timeout"
@@ -277,10 +291,26 @@ class WorkflowControl:
 				"CACHE_RECORD_INVALID",
 				f"workflow 步骤 {self.step_name!r}（run {self.run_id!r}）的记录不存在，写前标记无法落盘",
 				# 重试同一条命令必然复现：恢复方式是重建任务，不是「重试」。
+				# request_sent=False 与 replay_safe=False 是两条独立语义：标记都没落盘，
+				# 写请求就没有发出，候选人动作预约可以安全释放（Issue #2299）。
 				recoverable=False,
 				recovery_action=recovery,
+				details={"request_sent": False},
 				replay_safe=False,
 			)
+
+	def clear_write(self) -> None:
+		"""撤销 ``begin_write`` 预落的写标记：异常已证明写请求没有发出。
+
+		候选人动作在 fetch 派发前失败（登录态、代理、导航、内核缺失）时，请求
+		从未发出，留着标记会让 ``--resume`` 拒绝重试一次不存在的写操作
+		（Issue #2298）。清理失败保持 fail-closed：标记仍在，恢复时仍按结果未知
+		处理，不用本地写错误替换原始异常。
+		"""
+		try:
+			self.store.set_step_error(self.run_id, self.step_name, None)
+		except Exception:
+			pass
 
 	def raise_if_requested(self) -> None:
 		signal = self.poll()
@@ -420,7 +450,7 @@ class WorkflowRunner:
 		blocked_steps: dict[str, dict[str, Any]] = {}
 		for step in stored_run["steps"]:
 			error = step.get("error") or {}
-			if step["status"] in _REPLAY_BLOCKING_STATUSES and error.get("replay_safe") is False:
+			if step["status"] in _REPLAY_BLOCKING_STATUSES and _error_blocks_replay(error):
 				# 动作可能已经生效：--resume 不得再执行一次。步骤落成 stopped 而 run
 				# 还没写完就中断时同样要阻断（Issue #1957）。
 				blocked_steps[step["step_name"]] = error

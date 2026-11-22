@@ -8,7 +8,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, NoReturn, cast
 
-from boss_agent_cli.api.models import dict_items, field_dict, field_list, platform_data_dict
+from boss_agent_cli.api.models import (
+	dict_items,
+	field_dict,
+	field_list,
+	field_text,
+	platform_data_dict,
+	scalar_or_none,
+)
 from boss_agent_cli.config import DEFAULT_REQUEST_DELAY
 from boss_agent_cli.auth.identity import account_scope
 from boss_agent_cli.auth.manager import AuthManager
@@ -20,6 +27,7 @@ from boss_agent_cli.platforms.factory import build_platform_instance, build_recr
 from boss_agent_cli.services.candidate_actions import (
 	CandidateActionBlocked,
 	CandidateActionNotRecorded,
+	candidate_action_provably_unsent,
 	run_candidate_action,
 )
 from boss_agent_cli.services.contact_lookup import FriendListShapeError, FriendLookupLimitExceeded, find_friend
@@ -282,21 +290,23 @@ def execute_recruiter_candidate_search(platform: Any, inputs: Mapping[str, Any])
 	"""Shared recruiter search call used by the command and workflow action."""
 	# platform 按鸭子类型接收真实适配器与测试替身，返回的平台响应字典由调用方
 	# 按 API 响应契约读取；这里显式收敛 Any，避免整条调用链丢失类型。
+	# 字符串筛选项与求职者侧同口径走 strict：false / 0 / 容器不能经 str()
+	# 静默变成空关键词或 repr 文本后真实发往平台（Issue #2009、#2347）。
 	return cast(
 		"dict[str, Any]",
 		platform.search_geeks(
-			str(inputs.get("query") or ""),
-			city=_optional_str(inputs.get("city")),
+			_optional_str_strict(inputs, "query") or "",
+			city=_optional_str_strict(inputs, "city") or None,
 			page=_int_input(inputs, "page", 1, minimum=1),
-			job_id=_optional_str(inputs.get("job_id")),
-			experience=_optional_str(inputs.get("experience")),
-			degree=_optional_str(inputs.get("degree")),
-			age=_optional_str(inputs.get("age")),
-			school_level=_optional_str(inputs.get("school_level")),
-			activeness=_optional_str(inputs.get("activeness")),
-			source=_optional_str(inputs.get("source")),
+			job_id=_optional_str_strict(inputs, "job_id") or None,
+			experience=_optional_str_strict(inputs, "experience") or None,
+			degree=_optional_str_strict(inputs, "degree") or None,
+			age=_optional_str_strict(inputs, "age") or None,
+			school_level=_optional_str_strict(inputs, "school_level") or None,
+			activeness=_optional_str_strict(inputs, "activeness") or None,
+			source=_optional_str_strict(inputs, "source") or None,
 			select=_bool_input(inputs, "select"),
-			salary=_optional_str(inputs.get("salary")),
+			salary=_optional_str_strict(inputs, "salary") or None,
 		),
 	)
 
@@ -365,6 +375,25 @@ def _required_str(inputs: Mapping[str, Any], name: str) -> str:
 	if not isinstance(raw, str):
 		raise WorkflowInputError(f"wizard 输入 {name} 必须是字符串，收到 {_brief_value(raw)}")
 	return raw
+
+
+def _required_nonblank_str(inputs: Mapping[str, Any], name: str) -> str:
+	"""读取必填的非空白字符串。
+
+	``CacheStore.claim_candidate_action`` 对纯空白 job_id 返回 ``"pending"``
+	（Issue #1645 的空 ID 保护），预约层会把它当成「上一次动作仍在」并给出
+	结果未知指引。wizard 必须在预约前把空白参数报成 INVALID_PARAM，让 Agent
+	修正输入而不是去平台核对一个不存在的动作（Issue #2320）。
+	"""
+	value = _required_str(inputs, name).strip()
+	if not value:
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			f"wizard 输入 {name} 不能只有空白字符",
+			recoverable=True,
+			recovery_action=f"在 inputs 中提供有效的 {name} 后重试",
+		)
+	return value
 
 
 def _optional_str_strict(inputs: Mapping[str, Any], name: str) -> str | None:
@@ -546,6 +575,10 @@ def _classify_action_error(
 			code = "INVALID_PARAM"
 		elif not write:
 			code = "NETWORK_ERROR"
+	if code == "NETWORK_ERROR" and write:
+		# HTTP 5xx / 超时文案的写响应无法证明动作没有生效：按结果未知处理，
+		# 与候选人预约保留 pending 的口径一致（Issue #2316）。
+		code = "ACTION_UNCONFIRMED"
 	if code == "UNKNOWN":
 		# 写操作的未识别响应：沿用登记表的「先核对、勿自动重试」契约。
 		return code, False, str(ERROR_CODES[code]["recovery_action"])
@@ -641,6 +674,7 @@ def _write_call(
 	fallback: str,
 	*,
 	check_command: str | None = None,
+	provably_unsent: Callable[[BaseException], bool] | None = None,
 ) -> Any:
 	"""发出一次写请求并按写语义解包响应；所有写动作都经由这里。
 
@@ -649,12 +683,22 @@ def _write_call(
 	``--resume`` 凭这条记录拒绝重放（Issue #1019）。``call`` 只负责发请求：参数的
 	校验与前置读取放在调用之前，那时被终止的步骤没有记录，恢复后照常重跑。
 
+	``provably_unsent`` 只由**单请求**写动作传入：异常命中判定时撤销预落的
+	「结果未知」标记，让 ``--resume`` 能重试一次从未发出的写请求（与
+	greet / apply 的 #2298 同口径）。复合动作（写后还有读取，例如
+	``view_geek`` 或聊天页发送）不得传入：同一异常类型可能发生在写请求之后。
+
 	不经 runner 直接调用动作时没有步骤可记，直接执行。
 	"""
 	control = context.workflow_control
 	if control is not None:
 		control.begin_write(_unconfirmed_write_recovery(context, check_command))
-	return _unwrap(platform, call(), fallback, context=context, write=True, check_command=check_command)
+	try:
+		return _unwrap(platform, call(), fallback, context=context, write=True, check_command=check_command)
+	except BaseException as exc:
+		if provably_unsent is not None and provably_unsent(exc) and control is not None:
+			control.clear_write()
+		raise
 
 
 def execute_candidate_detail(
@@ -673,7 +717,7 @@ def execute_candidate_detail(
 	风控异常原样上抛，不再换通道补请求。
 	"""
 	from boss_agent_cli.api.models import employment_type_from_raw
-	from boss_agent_cli.services.job_card import build_job_from_card
+	from boss_agent_cli.services.job_card import build_job_from_card, text_items
 
 	greeted = False
 	if data_dir is not None:
@@ -692,28 +736,28 @@ def execute_candidate_detail(
 			if job_info:
 				boss_info = field_dict(platform_data, "bossInfo")
 				brand_info = field_dict(platform_data, "brandComInfo")
-				raw_job_type = job_info.get("jobType")
+				raw_job_type = scalar_or_none(job_info.get("jobType"))
 				return {
 					"job_id": job_id,
-					"title": job_info.get("jobName", ""),
-					"company": brand_info.get("brandName", ""),
-					"salary": job_info.get("salaryDesc", ""),
-					"city": job_info.get("cityName", ""),
-					"experience": job_info.get("experienceName", ""),
-					"education": job_info.get("degreeName", ""),
-					"description": platform_data.get("jobDetail", "") or job_info.get("postDescription", ""),
-					"address": job_info.get("address", ""),
-					"skills": field_list(job_info, "jobLabels") or field_list(job_info, "skills"),
-					"boss_name": boss_info.get("name", ""),
-					"boss_title": boss_info.get("title", ""),
-					"boss_active": boss_info.get("activeTimeDesc", "离线"),
+					"title": field_text(job_info, "jobName"),
+					"company": field_text(brand_info, "brandName"),
+					"salary": field_text(job_info, "salaryDesc"),
+					"city": field_text(job_info, "cityName"),
+					"experience": field_text(job_info, "experienceName"),
+					"education": field_text(job_info, "degreeName"),
+					"description": field_text(platform_data, "jobDetail") or field_text(job_info, "postDescription"),
+					"address": field_text(job_info, "address"),
+					"skills": text_items(job_info, "jobLabels") or text_items(job_info, "skills"),
+					"boss_name": field_text(boss_info, "name"),
+					"boss_title": field_text(boss_info, "title"),
+					"boss_active": field_text(boss_info, "activeTimeDesc", "离线"),
 					"security_id": security_id,
 					"lid": lid,
 					"raw_job_type": raw_job_type,
 					"employment_type": employment_type_from_raw(raw_job_type),
-					"days_per_week": job_info.get("daysPerWeekDesc", ""),
-					"least_month": job_info.get("leastMonthDesc", ""),
-					"pay_type": job_info.get("payTypeDesc", ""),
+					"days_per_week": field_text(job_info, "daysPerWeekDesc"),
+					"least_month": field_text(job_info, "leastMonthDesc"),
+					"pay_type": field_text(job_info, "payTypeDesc"),
 					"greeted": greeted,
 					"channel": "job_detail",
 				}
@@ -825,7 +869,7 @@ def _candidate_recommend(context: ActionContext, inputs: Mapping[str, Any], prio
 def _candidate_detail(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	from boss_agent_cli.wizard.renderer import busy_status
 
-	security_id = str(_required(inputs, "security_id"))
+	security_id = _required_str(inputs, "security_id")
 	job_id = _optional_str(inputs.get("job_id"))
 	lid = str(inputs.get("lid") or "")
 	with busy_status("正在读取职位详情…"):
@@ -872,8 +916,8 @@ def _raise_candidate_action_blocked(
 
 
 def _candidate_apply(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	security_id = str(_required(inputs, "security_id"))
-	job_id = str(_required(inputs, "job_id"))
+	security_id = _required_nonblank_str(inputs, "security_id")
+	job_id = _required_nonblank_str(inputs, "job_id")
 	lid = str(inputs.get("lid") or "")
 	account = account_scope(context.auth())
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
@@ -903,12 +947,18 @@ def _candidate_apply(context: ActionContext, inputs: Mapping[str, Any], prior: M
 					"投递/立即沟通已提交，但本地状态保存失败；不要自动重发",
 					{"security_id": security_id, "job_id": job_id, "applied": True, "recorded": False},
 				)
+			except BaseException as exc:
+				# 派发前失败：撤销 _write_call 预落的「结果未知」写标记，让 --resume
+				# 能重试一次从未发出的写请求（Issue #2298）。
+				if candidate_action_provably_unsent(exc) and context.workflow_control is not None:
+					context.workflow_control.clear_write()
+				raise
 	return StepResult({"security_id": security_id, "job_id": job_id, "result": data})
 
 
 def _candidate_greet(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	security_id = _required_str(inputs, "security_id")
-	job_id = _required_str(inputs, "job_id")
+	security_id = _required_nonblank_str(inputs, "security_id")
+	job_id = _required_nonblank_str(inputs, "job_id")
 	# message 可选，但类型必须严格：0 / false 经 ``or ""`` 会静默变成平台默认
 	# 招呼，容器会被 str() 成 repr 发给真人（Issue #1906）。
 	message = _optional_str_strict(inputs, "message") or ""
@@ -939,6 +989,12 @@ def _candidate_greet(context: ActionContext, inputs: Mapping[str, Any], prior: M
 					"已向该招聘者打招呼，但本地状态保存失败；不要自动重发",
 					{"security_id": security_id, "job_id": job_id, "greeted": True, "recorded": False},
 				)
+			except BaseException as exc:
+				# 派发前失败：撤销 _write_call 预落的「结果未知」写标记，让 --resume
+				# 能重试一次从未发出的写请求（Issue #2298）。
+				if candidate_action_provably_unsent(exc) and context.workflow_control is not None:
+					context.workflow_control.clear_write()
+				raise
 	return StepResult({"security_id": security_id, "job_id": job_id, "result": data})
 
 
@@ -990,7 +1046,7 @@ def _candidate_current_security_id(friend: Mapping[str, Any]) -> str:
 
 
 def _candidate_exchange(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	identifier = str(_required(inputs, "security_id"))
+	identifier = _required_str(inputs, "security_id")
 	exchange_type = _exchange_type(inputs)
 	with context.candidate_platform() as platform:
 		friend = _candidate_friend(platform, identifier, context=context)
@@ -1002,6 +1058,10 @@ def _candidate_exchange(context: ActionContext, inputs: Mapping[str, Any], prior
 			platform,
 			lambda: platform.exchange_contact(security_id, uid, name, exchange_type=exchange_type),
 			"联系方式交换失败",
+			# exchange_contact 是单次写请求：浏览器通道在 fetch 派发前失败
+			# （代理 / 内核 / 导航 / 预算）时撤销写标记，--resume 可重试
+			# 一次从未发出的请求（Issue #2441）。
+			provably_unsent=candidate_action_provably_unsent,
 		)
 	return StepResult({"uid": uid, "security_id": security_id, "result": data})
 
@@ -1039,6 +1099,8 @@ def _candidate_mark(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 			platform,
 			lambda: platform.friend_label(uid, label_id, friend_source, remove=remove),
 			"联系人标签更新失败",
+			# friend_label 是单次写请求（Issue #2441）。
+			provably_unsent=candidate_action_provably_unsent,
 		)
 	return StepResult(
 		{
@@ -1064,7 +1126,7 @@ def _candidate_chat(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 
 def _candidate_chat_history(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	with context.candidate_platform() as platform:
-		friend = _candidate_friend(platform, str(_required(inputs, "gid")), context=context)
+		friend = _candidate_friend(platform, _required_str(inputs, "gid"), context=context)
 		gid = str(friend.get("uid") or "")
 		security_id = _candidate_current_security_id(friend)
 		response = platform.chat_history(
@@ -1150,7 +1212,7 @@ def _local_resumes(context: ActionContext, inputs: Mapping[str, Any], prior: Map
 
 
 def _ai_assist(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	resume_name = str(_required(inputs, "resume"))
+	resume_name = _required_str(inputs, "resume")
 	resume, load_error = ResumeStore(context.data_dir / "resumes").get_with_error(resume_name)
 	if resume is None and load_error is not None:
 		# 文件存在但读不出来：报「不存在」会让 Agent 去 resume init，又被同名
@@ -1167,6 +1229,10 @@ def _ai_assist(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping
 		)
 	if resume is None:
 		raise WorkflowActionError("RESUME_NOT_FOUND", f"简历 {resume_name!r} 不存在")
+	# 其余输入都经 _required* 校验；prompt 也必须走同口径，且先于本地 AI 配置
+	# 检查：旧断点缺该键时应是参数 / 输入错误，而不是 KeyError 被归入
+	# INTERNAL_ERROR 或先报 AI_NOT_CONFIGURED（Issue #2348）。
+	prompt = _required_str(inputs, "prompt")
 	config_store = AIConfigStore(context.data_dir)
 	config = config_store.load_config()
 	api_key = config_store.get_api_key()
@@ -1203,7 +1269,7 @@ def _ai_assist(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping
 		result = service.chat(
 			[
 				{"role": "system", "content": "你是求职顾问。"},
-				{"role": "user", "content": f"{inputs['prompt']}\n\n简历:\n{resume_to_text(resume)}"},
+				{"role": "user", "content": f"{prompt}\n\n简历:\n{resume_to_text(resume)}"},
 			]
 		)
 	except AIServiceError as exc:
@@ -1227,6 +1293,7 @@ _EXPORT_OUTPUT_CONTRACTS: dict[OutputPathProblem, tuple[str, str]] = {
 	OutputPathProblem.PARENT_NOT_DIR: ("LOCAL_IO_ERROR", "换一个父目录存在且可写的路径后重试"),
 	OutputPathProblem.NOT_WRITABLE: ("LOCAL_IO_ERROR", "换一个父目录可写的路径后重试"),
 	OutputPathProblem.UNEXPANDABLE_USER: ("INVALID_PARAM", "改用绝对路径或 ~/ 开头的当前用户路径"),
+	OutputPathProblem.FILENAME_NOT_UTF8: ("INVALID_PARAM", "改用合法 UTF-8 的文件名后重试"),
 }
 
 
@@ -1258,6 +1325,8 @@ def _export_output_path(context: ActionContext, inputs: Mapping[str, Any], fmt: 
 		message = f"wizard export 的 output 需要普通文件路径，{str(target)!r} 不是普通文件"
 	elif problem is OutputPathProblem.UNEXPANDABLE_USER:
 		message = f"wizard export 的 output 里有一个系统里查不到的用户，无法展开家目录写法: {str(target)!r}"
+	elif problem is OutputPathProblem.FILENAME_NOT_UTF8:
+		message = f"wizard export 的 output 文件名不是合法 UTF-8，当前文件系统无法创建: {str(target)!r}"
 	elif problem is OutputPathProblem.NOT_WRITABLE:
 		message = f"wizard export 的 output 父目录不可写，无法创建输出文件: {str(target)!r}"
 	else:
@@ -1311,7 +1380,7 @@ def _candidate_watch(context: ActionContext, inputs: Mapping[str, Any], prior: M
 			if corrupt:
 				data["corrupt"] = corrupt
 			return StepResult(data)
-		name = str(_required(inputs, "name"))
+		name = _required_str(inputs, "name")
 		if action == "add":
 			params: dict[str, Any] = {}
 			for key in (
@@ -1330,7 +1399,15 @@ def _candidate_watch(context: ActionContext, inputs: Mapping[str, Any], prior: M
 				if key == "welfare" and isinstance(value, (list, tuple)):
 					# 存储格式与 CLI `watch add --welfare` 一致（逗号分隔字符串）：
 					# 直接写数组会让后续 `watch run` 在 `.split(",")` 上抛 AttributeError。
-					value = ",".join(str(item).strip() for item in value if str(item).strip())
+					# 元素必须是字符串：容器经 ``str()`` 会变成 repr 并持久化，后续
+					# 筛选把不可识别的标签静默当成关键词（Issue #2421）。
+					for index, item in enumerate(value):
+						if not isinstance(item, str):
+							raise WorkflowActionError(
+								"INVALID_PARAM",
+								f"watch 参数 welfare 的第 {index} 个元素必须是字符串（收到 {type(item).__name__}）",
+							)
+					value = ",".join(item.strip() for item in value if item.strip())
 				elif value is not None and not isinstance(value, str):
 					raise WorkflowActionError(
 						"INVALID_PARAM", f"watch 参数 {key} 必须是字符串（收到 {type(value).__name__}）"
@@ -1865,7 +1942,7 @@ def _crawl_start(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 		)
 	crawl_config = dict(crawl_value or {})
 	raw_query = inputs.get("query")
-	city = str(_required(inputs, "city"))
+	city = _required_str(inputs, "city")
 	city_code = CITY_CODES.get(city, city if city.isascii() and city.isdigit() else None)
 	if city_code is None:
 		raise WorkflowActionError("INVALID_PARAM", f"未知城市: {city}")
@@ -2092,10 +2169,18 @@ def _recruiter_call(
 	list_keys: tuple[str, ...] = (),
 	write: bool = False,
 	check_command: str | None = None,
+	provably_unsent: Callable[[BaseException], bool] | None = None,
 ) -> StepResult:
 	with context.recruiter_platform() as platform:
 		if write:
-			data = _write_call(context, platform, lambda: call(platform), fallback, check_command=check_command)
+			data = _write_call(
+				context,
+				platform,
+				lambda: call(platform),
+				fallback,
+				check_command=check_command,
+				provably_unsent=provably_unsent,
+			)
 		else:
 			data = _unwrap(platform, call(platform), fallback, context=context, check_command=check_command)
 	payload: dict[str, Any] = {"result": data}
@@ -2128,8 +2213,8 @@ def _recruiter_applications(context: ActionContext, inputs: Mapping[str, Any], p
 
 
 def _recruiter_resume(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	geek_id = str(_required(inputs, "geek_id"))
-	job_id = str(_required(inputs, "job_id"))
+	geek_id = _required_str(inputs, "geek_id")
+	job_id = _required_str(inputs, "job_id")
 	security_id = _optional_str(inputs.get("security_id"))
 	return _recruiter_call(
 		context,
@@ -2258,21 +2343,33 @@ def _recruiter_jobs_list(context: ActionContext, inputs: Mapping[str, Any], prio
 
 
 def _recruiter_jobs_detail(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	job_id = str(_required(inputs, "job_id"))
+	job_id = _required_str(inputs, "job_id")
 	return _recruiter_call(context, lambda platform: platform.job_detail(job_id), "职位详情获取失败")
 
 
 def _recruiter_jobs_online(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	job_id = str(_required(inputs, "job_id"))
+	job_id = _required_str(inputs, "job_id")
 	return _recruiter_call(
-		context, lambda platform: platform.job_online(job_id), "职位上线失败", write=True, check_command="hr jobs list"
+		context,
+		lambda platform: platform.job_online(job_id),
+		"职位上线失败",
+		write=True,
+		check_command="hr jobs list",
+		# 单次写请求：派发前失败不保留「结果未知」标记（Issue #2441）。
+		provably_unsent=candidate_action_provably_unsent,
 	)
 
 
 def _recruiter_jobs_offline(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	job_id = str(_required(inputs, "job_id"))
+	job_id = _required_str(inputs, "job_id")
 	return _recruiter_call(
-		context, lambda platform: platform.job_offline(job_id), "职位下线失败", write=True, check_command="hr jobs list"
+		context,
+		lambda platform: platform.job_offline(job_id),
+		"职位下线失败",
+		write=True,
+		check_command="hr jobs list",
+		# 单次写请求：派发前失败不保留「结果未知」标记（Issue #2441）。
+		provably_unsent=candidate_action_provably_unsent,
 	)
 
 

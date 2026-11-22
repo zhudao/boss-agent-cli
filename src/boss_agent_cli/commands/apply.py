@@ -1,5 +1,7 @@
 import click
 
+from boss_agent_cli.api.client import PlatformRiskError
+from boss_agent_cli.api.request_budget import is_request_stop
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.cache.store import CacheStore
 from boss_agent_cli.compliance import require_compliance_allowed
@@ -8,7 +10,10 @@ from boss_agent_cli.display import boss_command_for_ctx, error_contract_for_code
 from boss_agent_cli.services.candidate_actions import (
 	CandidateActionBlocked,
 	CandidateActionNotRecorded,
+	CandidateActionReleaseFailed,
+	candidate_action_provably_unsent,
 	classify_platform_response,
+	outcome_unknown_cause,
 	run_candidate_action,
 )
 
@@ -31,7 +36,9 @@ def _emit_already_applied(ctx: click.Context) -> None:
 	)
 
 
-def _emit_apply_unconfirmed(ctx: click.Context, message: str) -> None:
+def _emit_apply_unconfirmed(
+	ctx: click.Context, message: str, *, cause: BaseException | None = None
+) -> None:
 	deliver_cmd = _hint_command(ctx, "me --section deliver")
 	chat_cmd = _hint_command(ctx, "chat")
 	handle_error_output(
@@ -41,7 +48,7 @@ def _emit_apply_unconfirmed(ctx: click.Context, message: str) -> None:
 		message=message,
 		recoverable=False,
 		recovery_action=f"动作可能已生效：先用 {deliver_cmd} 核对投递记录，不要直接重试",
-		details={"outcome_unknown": True, "replay_safe": False},
+		details={"outcome_unknown": True, "replay_safe": False, **outcome_unknown_cause(cause)},
 		hints={
 			"next_actions": [deliver_cmd, chat_cmd],
 			"operator_actions": ["先到 BOSS 直聘投递记录页核对本次投递是否已提交；不要自动重发"],
@@ -125,12 +132,51 @@ def apply_cmd(ctx: click.Context, security_id: str, job_id: str, lid: str) -> No
 					hints={"operator_actions": ["先在 BOSS 直聘官方页面核对投递状态；不要自动重发本次投递"]},
 				)
 				return
+			except CandidateActionReleaseFailed:
+				# 平台拒绝了本次投递（未产生记录），但本地 pending 预约没删掉。
+				# 直接重试会被预约拦住：报本地状态错误，提示先修缓存再重试。
+				handle_error_output(
+					ctx,
+					"apply",
+					code="LOCAL_STATE_WRITE_FAILED",
+					message="平台未接受本次投递，但本地预约未释放；修复本地缓存后再重试",
+					recoverable=False,
+					recovery_action="先确认数据目录可写（磁盘空间、缓存目录权限），再重新执行同一条投递命令",
+					details={
+						"security_id": security_id,
+						"job_id": job_id,
+						"lid": lid,
+						"request_sent": False,
+						"recorded": False,
+					},
+					hints={"operator_actions": ["检查磁盘空间与 ~/.boss-agent 目录权限；本次投递没有被平台接受，修好后可重试"]},
+				)
+				return
+			except Exception as exc:
+				# 不能证明请求未发出：预约已保留，本次调用必须与下一次调用的口径
+				# 一致——报结果未知，而不是可重试的 NETWORK_ERROR（Issue #2297）。
+				# 预算 / 时限停止保留各自错误码（request_sent=false，预约已释放），
+				# 风控保留 RISK_ERROR_CONTRACTS 的终止语义。
+				if (
+					not is_request_stop(exc)
+					and not isinstance(exc, PlatformRiskError)
+					and not candidate_action_provably_unsent(exc)
+				):
+					_emit_apply_unconfirmed(
+						ctx,
+						"投递结果未确认；请求可能已生效，请先到平台核对，勿直接重试",
+						cause=exc,
+					)
+					return
+				raise
 
 			if not platform.is_success(resp):
 				error_code, _ = platform.parse_error(resp)
-				if error_code == "ACTION_UNCONFIRMED":
+				if error_code in ("ACTION_UNCONFIRMED", "NETWORK_ERROR"):
 					# 求职者侧结果未知：核对投递记录与本机会话，而不是招聘者的
-					# `boss hr chatmsg`（Issue #990）。
+					# `boss hr chatmsg`（Issue #990）。NETWORK_ERROR 覆盖 HTTP
+					# 5xx / 超时文案：写请求可能已在平台落库，不能给「重试」指引
+					# （Issue #2316）。
 					deliver_cmd = _hint_command(ctx, "me --section deliver")
 					chat_cmd = _hint_command(ctx, "chat")
 					details = resp.get("__cli_error_details__") if isinstance(resp, dict) else None

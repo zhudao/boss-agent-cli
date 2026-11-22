@@ -9,7 +9,8 @@
 - 抢不到且仍是 ``pending``（上一次进程在发送窗口内退出）→
   ``ACTION_UNCONFIRMED``：结果未知、禁止重试；
 - 抢到后平台确认成功 → settle 成成功记录（旧表 + 预约 sent）；
-- 平台明确失败、或抛出可证明「请求未发出」的异常（``request_sent=false``）
+- 平台明确失败、或抛出可证明「请求未发出」的异常（``request_sent=false``，
+  以及候选人单次请求特有的派发前失败，见 ``candidate_action_provably_unsent``）
   → 释放 pending，允许后续重试；
 - 风控 / 超时 / ``UNKNOWN`` / 进程中断 → 保留 pending，后续按结果未知处理。
 
@@ -35,7 +36,9 @@ _ALREADY_MESSAGE: dict[str, str] = {
 }
 _ACTION_LABEL: dict[str, str] = {"greet": "打招呼", "apply": "投递"}
 #: 无法证明请求没有生效的错误码：保留 pending，禁止自动重放。
-_UNKNOWN_CODES = frozenset({"ACTION_UNCONFIRMED", "UNKNOWN"}) | frozenset(RISK_ERROR_BY_CODE)
+#: ``NETWORK_ERROR`` 包含 HTTP 5xx 与超时 / 连接中断文案：写请求可能已在平台
+#: 落库，不能当成明确拒绝释放预约（Issue #2316）。
+_UNKNOWN_CODES = frozenset({"ACTION_UNCONFIRMED", "UNKNOWN", "NETWORK_ERROR"}) | frozenset(RISK_ERROR_BY_CODE)
 
 
 class CandidateActionBlocked(Exception):
@@ -56,6 +59,20 @@ class CandidateActionNotRecorded(Exception):
 
 	保留原始异常（``__cause__``）供日志诊断，但命令层不能把它当成可重试的
 	发送失败：重跑会绕过位于 pending/sent 的预约再发一次。
+	"""
+
+	def __init__(self, action: CandidateAction, cause: BaseException) -> None:
+		super().__init__(str(cause) or type(cause).__name__)
+		self.action = action
+		self.cause = cause
+
+
+class CandidateActionReleaseFailed(Exception):
+	"""平台明确拒绝本次请求，但释放本地预约失败。
+
+	请求本身可以重试（限流 / 参数 / 登录态），但 pending 行仍在：直接重试会
+	撞上 ``ACTION_UNCONFIRMED``。命令层必须输出不可重试的本地状态错误，说明
+	「平台未接受本次请求，但本地预约未释放」，而不是结果未知（Issue #2315）。
 	"""
 
 	def __init__(self, action: CandidateAction, cause: BaseException) -> None:
@@ -147,6 +164,54 @@ def was_provably_unsent(exc: BaseException) -> bool:
 	return getattr(exc, "replay_safe", None) is True
 
 
+def candidate_action_provably_unsent(exc: BaseException) -> bool:
+	"""单请求写操作（greet / apply / exchange / mark / 职位上下线）的异常是否证明请求尚未派发。
+
+	这些动作每次只发一个浏览器 fetch 或一个表单请求。下面这些异常都发生在
+	``BrowserSession._send_fetch`` 之前，异常本身却不带 ``request_sent`` 证据：
+
+	- ``AuthRequired`` / ``TokenRefreshFailed``：建立浏览器会话时取登录态失败；
+	- ``ProxyConfigurationError``：通道启动前解析代理环境变量失败；
+	- ``BrowserNavigationError``：首页导航在本次 fetch 之前失败；
+	- Playwright 内核缺失（普通 ``OSError`` / ``RuntimeError``，按文本识别）。
+
+	不释放预约会让该职位被 pending 永久挡住：没有 TTL，也没有清理命令
+	（Issue #2296）；wizard 侧则以同一判定撤销预落的写标记（Issue #2441）。
+	这些类型**不能**并入共享的 ``was_provably_unsent``，也**不能**用于复合
+	动作：招聘者侧在写之后还有读取，同一个类型（例如附件下载在传输之后才报
+	``AuthRequired``）在那些路径上不证明写请求未发出。
+	"""
+	if was_provably_unsent(exc):
+		return True
+
+	from boss_agent_cli.api.browser_client import BrowserNavigationError
+	from boss_agent_cli.api.proxy import ProxyConfigurationError
+	from boss_agent_cli.auth.manager import AuthRequired, TokenRefreshFailed
+	from boss_agent_cli.services.browser_runtime import is_browser_kernel_missing
+
+	if isinstance(exc, (AuthRequired, TokenRefreshFailed, ProxyConfigurationError, BrowserNavigationError)):
+		return True
+	try:
+		text = str(exc)
+	except Exception:
+		# 异常对象自身无法转成文本（如携带超长整数的 ValueError）时不能证明
+		# 写请求未发出：fail-open 保留原始异常继续传播，不放宽预约释放判定
+		# （Issue #2376）。
+		return False
+	return is_browser_kernel_missing(text)
+
+
+def outcome_unknown_cause(exc: BaseException | None) -> dict[str, Any]:
+	"""结果未知信封的 ``cause`` 字段：只放错误码 / 类型名，不复制原始消息。
+
+	平台异常文本可能夹带临时凭据（Issue #2157），而 ``output.py`` 只按键名脱敏。
+	"""
+	if exc is None:
+		return {}
+	code = getattr(exc, "code", None)
+	return {"cause": code if isinstance(code, str) and code else type(exc).__name__}
+
+
 def run_candidate_action(
 	cache: CacheStore,
 	*,
@@ -170,8 +235,14 @@ def run_candidate_action(
 	try:
 		result = send()
 	except BaseException as exc:
-		if was_provably_unsent(exc):
-			release_candidate_action(cache, job_id, action, account=account)
+		if candidate_action_provably_unsent(exc):
+			# 释放本身也可能写失败（database is locked / 磁盘满）：不能让它替换
+			# 原始异常，否则命令层会把「请求未发出」报成结果未知，丢掉真正的
+			# 恢复动作（重新登录 / 修代理，Issue #2315）。释放失败只记 note。
+			try:
+				release_candidate_action(cache, job_id, action, account=account)
+			except Exception as release_exc:
+				exc.add_note(f"释放候选人动作预约失败: {type(release_exc).__name__}: {release_exc}")
 		raise
 	outcome = classify(result) if classify is not None else "success"
 	if outcome == "success":
@@ -181,6 +252,11 @@ def run_candidate_action(
 			raise CandidateActionNotRecorded(action, exc) from exc
 	elif outcome == "retryable":
 		# 平台明确拒绝且没有产生记录：释放预约，修正参数 / 等待限流后可重试。
-		release_candidate_action(cache, job_id, action, account=account)
+		try:
+			release_candidate_action(cache, job_id, action, account=account)
+		except Exception as exc:
+			# 平台没接受请求，但 pending 行还在：直接重试会被预约拦住。报明确的
+			# 本地状态错误，而不是让下一次调用落成 ACTION_UNCONFIRMED。
+			raise CandidateActionReleaseFailed(action, exc) from exc
 	# outcome == "unknown"：保留 pending，后续调用按结果未知处理。
 	return result

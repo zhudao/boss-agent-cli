@@ -253,6 +253,17 @@ _ACTION_DIMENSION_TOOL_NAMES = frozenset(
 	tool.name for tool in TOOLS if "action" in tool.input_schema.get("properties", {})
 )
 
+#: schema 缺省 ``dry_run=true`` 的工具：省略该键时 ``mcp_args._build_args`` 仍会
+#: 生成 ``--dry-run``，实际语义是只预览。不能按「未显式声明只读」归为写，否则
+#: 超时 / 取消会误报 ``outcome_unknown`` 并让 Agent 去核对并不存在的平台写入
+#: （Issue #2414）。守卫测试保证集合与 TOOLS 的 schema 默认值一致。
+#: MCP 侧固定不产生平台写入的工具：schema 缺省 ``dry_run=true`` 的 ``boss_agent_run``，
+#: 以及从不生成 ``--live`` 的 ``boss_agent_train``（CLI 的 ``agent train`` 不传
+#: ``--live`` 即演练，MCP 工具没有 live 参数）。不能按「未显式声明只读」归为写，
+#: 否则超时 / 取消会误报 ``outcome_unknown`` 并让 Agent 去核对并不存在的平台写入
+#: （Issue #2414、#2454）。守卫测试保证 schema 默认 dry_run=true 的工具都登记在案。
+_DRY_RUN_DEFAULT_TOOL_NAMES = frozenset({"boss_agent_run", "boss_agent_train"})
+
 _WRITE_INTERRUPT_RECOVERY = "检查本地 checkpoint 与平台实际结果，再显式恢复；未确认的写操作不要直接重试"
 _READ_INTERRUPT_RECOVERY = "只读命令已中断，不产生平台写入；先降低 limit/count 或改用 active=online 再重试"
 #: search / watch 没有 limit / count 参数，恢复文案不能提示不存在的选项（Issue #1860）。
@@ -260,9 +271,13 @@ _FILTER_READ_INTERRUPT_RECOVERY = (
 	"只读命令已中断，不产生平台写入；该命令按福利 / 活跃度筛选逐条查详情，"
 	"改用 active=online 或缩小筛选范围后重试"
 )
+#: agent train 的 MCP 映射固定演练，没有 active 等筛选参数（Issue #2454）。
+_DRY_RUN_INTERRUPT_RECOVERY = "演练命令已中断，不产生平台写入；可直接重试或降低 limit"
 
 
 def _read_interrupt_recovery(args: tuple[str, ...]) -> str:
+	if args[:2] == ("agent", "train"):
+		return _DRY_RUN_INTERRUPT_RECOVERY
 	if args and args[0] in {"search", "watch"}:
 		return _FILTER_READ_INTERRUPT_RECOVERY
 	return _READ_INTERRUPT_RECOVERY
@@ -287,6 +302,9 @@ def _tool_may_write(tool_name: str, arguments: dict[str, Any] | None = None) -> 
 	# hr greet / hr location / hr accept-resume）。按工具名整体归为写会让超时 /
 	# 取消返回 outcome_unknown 并要求核对并不存在的平台写入（Issue #2177）。
 	if arguments.get("dry_run") is True:
+		return False
+	if tool_name in _DRY_RUN_DEFAULT_TOOL_NAMES and "dry_run" not in arguments:
+		# schema 默认 dry_run=true：省略键与显式 true 的 argv 完全相同。
 		return False
 	if tool_name not in _READ_ONLY_TOOL_NAMES:
 		return True
@@ -894,18 +912,34 @@ def _argument_type_errors(tool_name: str, arguments: dict[str, Any]) -> list[str
 		item_min_length = items.get("minLength")
 		item_minimum = items.get("minimum")
 		item_maximum = items.get("maximum")
+		# 取值错误与类型错误共用上限：十万个空标签逐个拼进 message 会让错误信封
+		# 膨胀到数 MB，与 `_MAX_ELEMENT_TYPE_ERRORS` 声明的「不随输入规模膨胀」
+		# 相悖（Issue #2399）。
+		value_errors: list[str] = []
+		value_error_count = 0
+
+		def _record_value_error(message: str) -> None:
+			nonlocal value_error_count
+			if len(value_errors) < _MAX_ELEMENT_TYPE_ERRORS:
+				value_errors.append(message)
+			else:
+				value_error_count += 1
+
 		for index, item in enumerate(value):
 			if isinstance(item_min_length, int) and not isinstance(item_min_length, bool):
 				# schema 的 items.minLength 是客户端与入口共同的契约：空标签不会
 				# 走到 CLI，也不会在 mapping 层被拼成 `--add-tag ""`（Issue #1595）。
 				if isinstance(item, str) and len(item) < item_min_length:
-					errors.append(f"{key}[{index}] 至少需要 {item_min_length} 个字符")
+					_record_value_error(f"{key}[{index}] 至少需要 {item_min_length} 个字符")
 			if isinstance(item_minimum, (int, float)) and not isinstance(item_minimum, bool):
 				if isinstance(item, (int, float)) and not isinstance(item, bool) and item < item_minimum:
-					errors.append(f"{key}[{index}]={_brief_numeric(item)} 不能小于 {item_minimum}")
+					_record_value_error(f"{key}[{index}]={_brief_numeric(item)} 不能小于 {item_minimum}")
 			if isinstance(item_maximum, (int, float)) and not isinstance(item_maximum, bool):
 				if isinstance(item, (int, float)) and not isinstance(item, bool) and item > item_maximum:
-					errors.append(f"{key}[{index}]={_brief_numeric(item)} 不能大于 {item_maximum}")
+					_record_value_error(f"{key}[{index}]={_brief_numeric(item)} 不能大于 {item_maximum}")
+		errors.extend(value_errors)
+		if value_error_count:
+			errors.append(f"{key} 另有 {value_error_count} 个元素取值错误")
 	return errors
 
 

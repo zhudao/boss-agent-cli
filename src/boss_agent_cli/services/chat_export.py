@@ -63,6 +63,10 @@ def prepare_render_data(
 	diff_result: dict[str, Any],
 ) -> dict[str, Any]:
 	"""公共数据准备：分组、统计、diff 标记、渲染顺序。供 MD/HTML 共用。"""
+	# 公共入口可能收到 None / 非对象：直接 ``.get`` 会落成 AttributeError，
+	# 整份导出变成 INTERNAL_ERROR（Issue #2321）。
+	if not isinstance(diff_result, dict):
+		diff_result = {}
 	now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
 	# 非对象元素在渲染入口跳过：公共边界上的坏条目不能让整份导出落成
@@ -79,8 +83,16 @@ def prepare_render_data(
 		key = item.get("initiated_by", "未知")
 		groups.setdefault(key, []).append((item, contact_identity(raw_item), raw_item))
 
-	total = len(usable)
-	counts = {k: len(v) for k, v in groups.items()}
+	# from_who 决定最终可见分组：总计 / 分组统计必须与 sections 同源，否则
+	# 直接传入全部好友再按方向过滤时会出现「总计 2 条」却只渲染 1 行
+	# （Issue #2392）。未知 from_who 与 sections 的条件一致，保持全部可见。
+	visible_keys = {
+		key
+		for key in groups
+		if not (from_who == "boss" and key != "对方主动") and not (from_who == "me" and key != "我主动")
+	}
+	total = sum(len(groups[key]) for key in visible_keys)
+	counts = {k: len(groups[k]) for k in groups if k in visible_keys}
 	count_parts = [f"{k} {v}" for k, v in counts.items()]
 
 	me_items = groups.get("我主动", [])
@@ -155,7 +167,10 @@ def prepare_render_data(
 			# 判断必须用原始值：_text_cell 已把标量转成字符串，转换后的 "1"
 			# 会被 ``type(...) is int`` 误判为缺失（Issue #2162）。
 			unread_value = raw_item.get("unread")
-			unread = unread_value if type(unread_value) is int else 0
+			# 超大整数（>4300 位十进制）在 md/html 的 str()/f-string 里抛裸
+			# ValueError，整份导出会落成无信封的 traceback；与 safe_text 同口径
+			# 按缺失处理（Issue #2343）。
+			unread = unread_value if type(unread_value) is int and safe_text(unread_value) else 0
 			rows.append({
 				"ref": ref, "is_new": is_new, "sid": sid, "key": key,
 				"brand_name": item.get("brand_name") or "-",
@@ -197,8 +212,10 @@ def render_export(
 	"""将沟通列表渲染为指定格式的字符串。"""
 	if fmt == "json":
 		# 严格 JSON：平台数值漂移（NaN / Infinity）归一为 null，
-		# 不让 jq 等严格解析器拒绝整份导出（Issue #1851）。
-		return strict_json_text(friends)
+		# 不让 jq 等严格解析器拒绝整份导出（Issue #1851）。孤立代理字符
+		# （平台 JSON 的 "\ud800"）会绕过文本单元格的清洗，按严格 UTF-8 写盘
+		# 时抛 UnicodeEncodeError，返回前统一替换（Issue #2321）。
+		return _sanitize_surrogates(strict_json_text(friends, null_oversized_ints=True))
 	if fmt == "csv":
 		return _render_csv(friends)
 	if fmt == "html":
@@ -242,17 +259,23 @@ def _render_markdown(
 		"# BOSS 直聘沟通列表",
 		"",
 		f"> 生成时间：{rd['now_str']}  ",
-		f"> 总计：{rd['total']} 条（{' / '.join(rd['count_parts'])}）",
+		f"> 总计：{rd['total']} 条（{' / '.join(escape_md_cell(part) for part in rd['count_parts'])}）",
 	]
 
 	if rd["diff_summary"]:
 		ds = rd["diff_summary"]
-		lines.append(f"> 较上次（{ds['prev_date']}）变化：{ds['change']}")
+		# 快照来自本地旧版本，值可能含换行 / 链接语法：与表格单元格同口径转义，
+		# 避免向导出报告注入额外行（Issue #2321）。
+		lines.append(
+			f"> 较上次（{escape_md_cell(ds['prev_date'])}）变化：{escape_md_cell(ds['change'])}"
+		)
 
 	lines.append("")
 
 	for section in rd["sections"]:
-		lines.append(f"## {section['subtitle']}")
+		# 分组标题来自平台字段 initiated_by：换行 / 链接语法不转义可向导出报告
+		# 插入伪造章节（与 #2321 的 diff 行同口径，Issue #2344）。
+		lines.append(f"## {escape_md_cell(section['subtitle'])}")
 		lines.append("")
 		lines.append("| # | 公司 | 联系人 | 职称 | 时间 | 未读 | 已读 | 最近消息 |")
 		lines.append("|---|------|--------|------|------|------|------|----------|")

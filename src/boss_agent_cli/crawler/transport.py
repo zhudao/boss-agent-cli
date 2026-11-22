@@ -6,6 +6,7 @@ import json
 import os
 import random
 import socket
+import sqlite3
 import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, nullcontext
@@ -21,6 +22,7 @@ from boss_agent_cli.api.request_budget import (
 	is_request_stop,
 	retry_after_seconds,
 )
+from boss_agent_cli.cache.store import CacheBusyError, CacheRecordInvalid
 from boss_agent_cli.crawler.controls import (
 	CrawlBrowserStartError,
 	CrawlProfileBusy,
@@ -38,6 +40,16 @@ JOBLIST_URL = "https://www.zhipin.com/wapi/zpgeek/search/joblist.json"
 JOB_CARD_URL = "https://www.zhipin.com/wapi/zpgeek/job/card.json"
 JOBLIST_PATH = "/wapi/zpgeek/search/joblist.json"
 JOB_CARD_PATH = "/wapi/zpgeek/job/card.json"
+
+
+def _is_local_cache_error(exc: BaseException) -> bool:
+	"""attempt 回调里抛出的本地缓存错误。
+
+	预算 / 断点读写通过 ``bind_attempts`` 回调在本模块内执行；``CacheBusyError``、
+	``CacheRecordInvalid`` 与 ``sqlite3.DatabaseError`` 重试同一次请求不会自愈，
+	也不能被兜成可重试的传输错误（Issue #2324）。
+	"""
+	return isinstance(exc, (CacheBusyError, CacheRecordInvalid, sqlite3.DatabaseError))
 
 
 def packet_page_no(packet: Any) -> int | None:
@@ -189,6 +201,9 @@ class DrissionCrawlerSession:
 		# 断点恢复会带着 next_page>1 进入，必须据此先把页签对齐到目标页
 		# （Issue #897）。
 		self._page_no: int | None = None
+		# 监听器是否已成功启动：start 失败时 fetch_page 跳过监听等待，
+		# 直接走页面内同源请求（Issue #2428）。
+		self._listener_ready = False
 		self._attempt_callback: Callable[[str], ContextManager[None]] | None = None
 		self._cooldown_callback: Callable[[float], None] | None = None
 
@@ -288,9 +303,11 @@ class DrissionCrawlerSession:
 
 	def _start_joblist_listener(self) -> None:
 		if self._page is None:
+			self._listener_ready = False
 			return
 		listen = getattr(self._page, "listen", None)
 		if listen is None:
+			self._listener_ready = False
 			return
 		stop = getattr(listen, "stop", None)
 		if callable(stop):
@@ -298,7 +315,16 @@ class DrissionCrawlerSession:
 				stop()
 			except Exception:
 				pass
-		listen.start(JOBLIST_TARGET, is_regex=True, method=("GET", "POST"))
+		try:
+			listen.start(JOBLIST_TARGET, is_regex=True, method=("GET", "POST"))
+		except Exception:
+			# 监听器不可用不阻止采集：fetch_page 会跳过监听等待，退到页面内
+			# 同源请求（模块顶部声明的降级设计）。异常若照原样穿出，service 会
+			# 把确定性失败记成可 resume 的 stopped，resume 永远重复同一次失败
+			# （Issue #2428）。
+			self._listener_ready = False
+			return
+		self._listener_ready = True
 
 	def _joblist_packet_body(self, packet: Any) -> Any:
 		"""解析监听包，并在按页码筛选之前执行统一的风险检查。"""
@@ -325,7 +351,7 @@ class DrissionCrawlerSession:
 		会把第 1 页的数据记成第 N 页并且断点照常前进。页码读不出的包只在
 		请求第 1 页时接受，其余情况继续等目标页或超时后走页面内兜底。
 		"""
-		if self._page is None:
+		if self._page is None or not self._listener_ready:
 			return None
 		deadline = time.monotonic() + self._timeout
 		while True:
@@ -405,7 +431,7 @@ class DrissionCrawlerSession:
 					raise
 				self._page_no = position
 				self._raise_if_security_page()
-				packet = self._wait_for_joblist_packet(target_page)
+				packet = self._wait_for_joblist_packet(target_page) if self._listener_ready else None
 				if packet is not None:
 					response = getattr(packet, "response", None)
 					body = self._joblist_packet_body(packet)
@@ -421,11 +447,15 @@ class DrissionCrawlerSession:
 						return body
 					listen_error = ValueError("职位监听响应不是 JSON 对象")
 				else:
-					listen_error = TimeoutError(f"第 {page_no} 页等待 joblist.json 超时")
+					listen_error = (
+						TimeoutError(f"第 {page_no} 页等待 joblist.json 超时")
+						if self._listener_ready
+						else RuntimeError("职位监听器不可用")
+					)
 		except CrawlRiskError:
 			raise
 		except Exception as exc:
-			if is_request_stop(exc):
+			if is_request_stop(exc) or _is_local_cache_error(exc):
 				raise
 			listen_error = exc
 
@@ -443,7 +473,7 @@ class DrissionCrawlerSession:
 		except CrawlRiskError:
 			raise
 		except Exception as page_exc:
-			if is_request_stop(page_exc):
+			if is_request_stop(page_exc) or _is_local_cache_error(page_exc):
 				raise
 			errors.append(f"页面内 fetch 失败：{page_exc}")
 		self._raise_if_security_page(require_job_list=True)

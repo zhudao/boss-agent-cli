@@ -40,7 +40,9 @@ class PlatformRiskError(Exception):
 
 	def __init__(self, message: str = "", is_cdp: bool = False, *, details: dict[str, Any] | None = None):
 		self.is_cdp = is_cdp
-		self.details = details or {}
+		# 容器漂移防御：非对象 details 会让信封构造 dict(details) 失败，风控码被
+		# 兜成 INTERNAL_ERROR。只接受 dict，其余按空证据处理（Issue #2312）。
+		self.details = details if isinstance(details, dict) else {}
 		super().__init__(message)
 
 	@staticmethod
@@ -71,6 +73,9 @@ class PlatformRiskError(Exception):
 			f"BOSS 直聘此前命中{cause}，本地风控锁尚未显式解除，本次请求未发送。{steps}。",
 			is_cdp=bool(getattr(lock, "cdp_url", None)),
 			details={
+				# 本地锁在任何通道发请求之前拦截：写动作的预约可以安全释放
+				# （`was_provably_unsent` 的唯一真源是这条显式证据，Issue #2296）。
+				"request_sent": False,
 				"risk_lock": {
 					"locked": True,
 					"reason": reason,

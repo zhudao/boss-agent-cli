@@ -165,9 +165,9 @@ boss crawl stop <run_id>
 
 | 命令 | 说明 |
 |------|------|
-| `boss greet <sid> <jid>` | 向指定招聘者打招呼；重复记录返回 `ALREADY_GREETED` |
+| `boss greet <sid> <jid>` | 向指定招聘者打招呼；重复记录返回 `ALREADY_GREETED`；请求派发前失败（未登录、代理配置非法、首页导航失败、浏览器内核缺失）会释放本地预约，修复后可重试 |
 | `boss batch-greet <query>` | 搜索后按显式 `--count` 批量打招呼，支持 `--dry-run`；命中 `ACCOUNT_RISK` / `ENVIRONMENT_RISK` 立即停批并返回 `ok:false`，已成功项随 `error.details.greeted` 带回；单条招呼结果未确认（`ACTION_UNCONFIRMED`，请求已发出但响应中断）同样立即停批，返回 `ok:false` 且 `error.details` 带 `outcome_unknown: true` / `replay_safe: false`，不自动重发 |
-| `boss apply <sid> <jid>` | 发起投递或立即沟通；重复记录返回 `ALREADY_APPLIED` |
+| `boss apply <sid> <jid>` | 发起投递或立即沟通；重复记录返回 `ALREADY_APPLIED`；派发前失败与 `greet` 同样释放预约 |
 | `boss exchange <uid-or-sid>` | 请求交换手机号或微信；优先使用 `boss chat` 输出的稳定 `uid` |
 
 `batch-greet --dry-run` 的执行提示保留本次数据目录以及显式给出的 `--browser-source` / `--cdp-url` / `--delay`，只去掉 `--dry-run`；照提示执行时使用的登录态、去重缓存、浏览器通道与节流区间与预览一致。
@@ -370,7 +370,7 @@ boss --platform zhipin config set platform zhipin
 | --- | --- | --- |
 | `request_delay` | `[30.0, 60.0]` | 实例内间隔范围；高斯采样限制在该范围，额外停顿仍可能延长间隔 |
 | `request_max_per_minute` | `20` | 共享滑动 60 秒窗口内的主动操作上限，必须为正整数 |
-| `request_wait_timeout` | `30.0` | 每次申请执行锁、节流、预算和冷却的总等待上限（秒）；workflow 截止时间更早时优先停止 |
+| `request_wait_timeout` | `120.0` | 每次申请执行锁、节流、预算和冷却的总等待上限（秒）；workflow 截止时间更早时优先停止。实际生效值不低于「`request_delay` 上限 + 15 秒」，显式调小也不会让刻意节流必然超时 |
 | `request_budget_dir` | `null` | 默认使用当前 `data_dir`；绝对路径可将多个数据目录显式加入同一预算组 |
 
 如多个本地任务需要共用一组限制，可先配置组目录，再将成员指向它：

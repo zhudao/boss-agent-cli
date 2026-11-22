@@ -15,12 +15,14 @@ def safe_text(value: Any) -> str:
 
 	平台字段漂移出超大整数时，裸 ``str()`` 抛 ValueError，从命令层穿出后
 	会被兜成 INTERNAL_ERROR 或可重试的 NETWORK_ERROR。展示字段按缺失处理。
+	深嵌套容器在 ``str()`` 时抛 ``RecursionError``（与本地 JSON 解析异常族
+	同口径），同样按缺失处理，不能穿出映射层（Issue #2319）。
 	"""
 	if isinstance(value, int) and not isinstance(value, bool) and value.bit_length() > _MAX_TEXT_INT_BITS:
 		return ""
 	try:
 		return str(value)
-	except ValueError:
+	except (ValueError, RecursionError):
 		return ""
 
 
@@ -66,6 +68,20 @@ def field_dict(data: Any, key: str) -> dict[str, Any]:
 	"""取对象字段：缺失、为 null 或不是对象时返回空字典。"""
 	value = data.get(key) if isinstance(data, dict) else None
 	return value if isinstance(value, dict) else {}
+
+
+def scalar_or_none(value: Any) -> Any:
+	"""标量字段输出归一：容器与非有限数按缺失处理，不再落 Python repr（Issue #2327）。
+
+	``raw_job_type`` 的声明类型是 ``int | str | None``；平台把它漂移成
+	dict / list / NaN 时，裸透传会让信封和本地索引缓存出现与契约
+	不符的值。与 ``field_text`` 对容器的口径一致，但保留原始标量类型。
+	"""
+	if value is None or isinstance(value, (dict, list, tuple)):
+		return None
+	if isinstance(value, float) and not math.isfinite(value):
+		return None
+	return value
 
 
 def platform_data_dict(value: Any) -> dict[str, Any]:
@@ -147,10 +163,10 @@ class JobItem:
 		if not isinstance(raw, dict):
 			# 兜底：调用点应先用 dict_items 过滤，这里保证单独调用也不 traceback。
 			raw = {}
-		raw_job_type = raw.get("jobType")
+		raw_job_type = scalar_or_none(raw.get("jobType"))
 		return cls(
 			job_id=field_text(raw, "encryptJobId"),
-			job_url=job_public_url(str(raw.get("encryptJobId") or "")),
+			job_url=job_public_url(field_text(raw, "encryptJobId")),
 			title=field_text(raw, "jobName"),
 			company=field_text(raw, "brandName"),
 			salary=field_text(raw, "salaryDesc"),
@@ -234,7 +250,7 @@ class JobDetail:
 		job_info = field_dict(raw, "jobInfo")
 		boss_info = field_dict(raw, "bossInfo")
 		brand_info = field_dict(raw, "brandComInfo")
-		raw_job_type = job_info.get("jobType")
+		raw_job_type = scalar_or_none(job_info.get("jobType"))
 		return cls(
 			job_id=field_text(job_info, "encryptJobId"),
 			title=field_text(job_info, "jobName"),
