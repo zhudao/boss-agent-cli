@@ -16,6 +16,8 @@ from boss_agent_cli.api.client import PlatformRiskError
 from boss_agent_cli.api.request_budget import RequestBudgetExceeded, is_request_stop, request_control, request_controls_active
 from boss_agent_cli.api.models import BOSS_INTERNSHIP_RESPONSE_JOB_TYPE, JobItem, field_list, is_boss_online
 from boss_agent_cli.services.job_identity import deduplicate_job_result
+from boss_agent_cli.services.pagination import MAX_TRUSTED_PAGE
+from boss_agent_cli.services.text_files import is_utf8_encodable
 
 # ── Ordinal lookups for threshold comparisons ───────────────────────
 
@@ -36,12 +38,25 @@ class UnsupportedCityError(ValueError):
 	"""
 
 
+def ensure_text_encodable(label: str, value: str | None) -> None:
+	"""搜索文本必须能按严格 UTF-8 编码（Issue #2528）。
+
+	argv 里的非法字节经 surrogateescape 解码成孤立代理项；这类关键词进入
+	httpx 组 URL 参数时抛 ``UnicodeEncodeError``，被全局兜成带磁盘指引的
+	``LOCAL_IO_ERROR``，而同一条输入重试多少次都复现。命令入口与存量记录
+	校验共用这一份判定，把「输入非法」与「本地存储故障」分开。
+	"""
+	if isinstance(value, str) and not is_utf8_encodable(value):
+		raise ValueError(f"{label}含有无法按 UTF-8 编码的字符（如孤立代理项），请换成普通 Unicode 文本")
+
+
 def ensure_supported_city(city: str | None) -> None:
 	"""校验城市名；未知城市必须在命令层报参数错误。
 
 	留到 ``search_jobs`` 里才发现时，`ValueError` 会被兜底成可重试的
 	`NETWORK_ERROR`，拿同一个非法城市重试永远修不好。
 	"""
+	ensure_text_encodable("城市", city)
 	if city and city not in endpoints.CITY_CODES:
 		raise UnsupportedCityError(f"未知城市: {city}，请换成支持的城市名（boss cities 可查看）")
 
@@ -151,6 +166,7 @@ _ACTIVE_LEVEL_ALIASES: dict[str, str] = {
 
 def resolve_active_level(value: str | None) -> str | None:
 	"""把 --active 的取值（含别名）规范成 ACTIVE_LEVELS 的键；空值返回 None。"""
+	ensure_text_encodable("活跃度", value)
 	if value is None:
 		return None
 	text = re.sub(r"\s+", "", str(value)).lower()
@@ -286,7 +302,13 @@ def _first_query_value(parsed: dict[str, list[str]], key: str) -> str:
 
 def parse_boss_search_url(search_url: str) -> ParsedSearchUrl:
 	"""Parse a user-copied BOSS search URL into whitelisted API search params."""
-	parts = urlparse(search_url)
+	try:
+		parts = urlparse(search_url)
+	except ValueError as exc:
+		# 畸形链接（如无效 IPv6 主机名）会让 urlparse 同步抛 ValueError，
+		# 此前被命令层兜成可重试的 NETWORK_ERROR，指引只会让人重试
+		# （Issue #2546）。
+		raise SearchUrlParseError("搜索 URL 格式无效，请检查链接是否完整") from exc
 	if parts.scheme not in {"http", "https"} or parts.netloc not in _BOSS_SEARCH_HOSTS:
 		raise SearchUrlParseError("仅支持 zhipin.com 的职位搜索 URL")
 	if parts.path.rstrip("/") not in _BOSS_SEARCH_PATHS:
@@ -306,6 +328,9 @@ def parse_boss_search_url(search_url: str) -> ParsedSearchUrl:
 			page = max(1, int(raw_page))
 		except ValueError as exc:
 			raise SearchUrlParseError("URL 中的 page 参数不是有效数字") from exc
+		# URL 里的页码与 --page 同口径钳制：它会被原样带进搜索请求与下一页
+		# 提示，超长页码在 `page + 1` 字符串化时会抛 ValueError（Issue #2546）。
+		page = min(page, MAX_TRUSTED_PAGE)
 
 	if not query and not any(key in params for key in _URL_SEARCH_PARAM_KEYS):
 		raise SearchUrlParseError("URL 中没有可用的搜索参数")
@@ -318,6 +343,7 @@ def _split_multi_value(value: str) -> list[str]:
 
 def resolve_lookup_codes(value: str | None, lookup: dict[str, str], label: str) -> str | None:
 	"""Resolve comma-separated display labels or raw numeric codes into API codes."""
+	ensure_text_encodable(label, value)
 	if not value:
 		return None
 	codes: list[str] = []

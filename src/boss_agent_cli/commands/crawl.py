@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
-import math
 import subprocess
 import sys
-import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +19,7 @@ from boss_agent_cli.auth.manager import AuthManager, AuthRequired
 from boss_agent_cli.cache.store import CacheRecordInvalid, CacheStore
 from boss_agent_cli.compliance import operating_mode, require_compliance_allowed
 from boss_agent_cli.config import DEFAULTS
-from boss_agent_cli.crawler.operations import crawl_results, crawl_status, import_crawl_shortlist
+from boss_agent_cli.crawler.operations import crawl_results, crawl_status_from_run, import_crawl_shortlist
 from boss_agent_cli.crawler.service import (
 	CrawlBusyError,
 	CrawlService,
@@ -28,8 +27,10 @@ from boss_agent_cli.crawler.service import (
 	PagesOverrideError,
 	crawl_cdp_port,
 	crawl_chrome_path,
-	crawl_executor_active,
+	crawl_execution_lock,
 	crawl_int_setting,
+	crawl_run_awaiting_worker as _awaiting_queued_worker,
+	tolerated_timestamp as _tolerated_timestamp,
 	unused_local_port,
 	validate_pages_override,
 )
@@ -46,6 +47,7 @@ from boss_agent_cli.crawler.hooks import HookRegistrationError, verify_hook_prof
 from boss_agent_cli.crawler.transport import DrissionCrawlerSession, ensure_crawl_runtime
 from boss_agent_cli.services.install_extras import extras_install_hint, extras_requirement
 from boss_agent_cli.services.json_files import read_bytes_if_regular, write_json_atomic
+from boss_agent_cli.services.text_files import is_utf8_encodable
 from boss_agent_cli.display import (
 	auth_required_hints,
 	boss_command_for_ctx,
@@ -84,15 +86,33 @@ def _run_not_found_hints(ctx: click.Context) -> dict[str, list[str]]:
 
 
 def _require_run_id(ctx: click.Context, command: str, run_id: str) -> bool:
-	"""空 run_id 是 argv 少传了值，不是「任务不存在」。
+	"""空 run_id 与不可编码文本都是 argv 问题，不是「任务不存在」。
 
 	``--data-dir`` 拼错、复制命令时漏掉最后一个词都会落到这里。原样查缓存会报
 	``CRAWL_RUN_NOT_FOUND``「未找到 crawl run: 」（冒号后面什么都没有），Agent 会
 	以为任务丢了而重建；``crawl resume ""`` 更先撞上登录校验，报 ``AUTH_REQUIRED``，
 	把参数写错的人送去重新登录。
+
+	argv 里的非法 UTF-8 字节经 surrogateescape 成为孤立代理项，绑定 sqlite 时
+	抛 ``UnicodeEncodeError``，会被全局兜成「处理本地文本失败」的
+	``LOCAL_IO_ERROR`` 并给出磁盘恢复指引——实际是输入非法，重试与查磁盘都不会
+	改变结果（Issue #2499）。
 	"""
 	if run_id.strip():
-		return True
+		if is_utf8_encodable(run_id):
+			return True
+		handle_error_output(
+			ctx,
+			command,
+			code="INVALID_PARAM",
+			message="run_id 含有无法按 UTF-8 编码的字符（孤立代理项）；它不可能是 boss crawl 生成的 ID",
+			recovery_action=(
+				f"从 {boss_command_for_ctx(ctx, 'crawl status <run_id>', include_data_dir=True)} "
+				"输出的 run_id 重新复制后重试"
+			),
+			hints=_run_not_found_hints(ctx),
+		)
+		return False
 	handle_error_output(
 		ctx,
 		command,
@@ -688,11 +708,13 @@ def _run_service(
 			*risk_lock_persistence_actions({"risk_lock": outcome.risk_lock}),
 		]}
 	elif outcome.status == "budget_stopped":
-		# 预算计数与 settings 都持久化，resume 不会推进（Issue #1238）：只给只读状态。
+		# 预算计数随断点持久化。先提供只读状态与已有结果（Issue #1238、#2463）。
+		results_command = boss_command_for_ctx(ctx, f"crawl results {shell_argument(outcome.run_id)}", include_data_dir=True)
 		hints = {
 			"next_actions": [status_command],
 			"operator_actions": [
-				"该任务的预算已用完，继续采集需要新建任务（或调高 max_requests 后重新 crawl start）",
+				f"该任务的预算已用完或不足以到达断点。可用 {results_command} 读取已采集的数据。"
+				"如需继续采集，请按所需预算配置并新建任务。",
 			],
 		}
 	elif outcome.status == "throttle_stopped":
@@ -729,64 +751,6 @@ def _run_service(
 		render=lambda d: render_record_result(d, title="crawl", next_steps=hints.get("next_actions", [])),
 		hints=hints,
 	)
-
-
-# worker 从被拉起到取得执行锁只需要解释器启动与一次本地读取；超过这段时间
-# 仍是 queued 且锁空闲，说明它没有活下来（Issue #1045）。
-_QUEUE_HANDOFF_GRACE_SECONDS = 30.0
-
-#: 交接新鲜度允许的未来偏斜（与 `cache/store.py` 的未来偏斜同口径）。
-#:
-#: 写入方用 `time.time()` 落 `updated_at`；轻微时钟偏斜仍应视为「刚排队」。
-#: 更远的有限未来值只可能是漂移（时钟快进后校正、手工写坏的库），必须按
-#: 排队已久处理，否则任务永远留在交接窗口里（Issue #2193）。
-_QUEUE_FUTURE_SKEW_SECONDS = 60.0
-
-
-def _tolerated_timestamp(value: Any) -> float:
-	"""本地记录时间戳的容错读取：漂移值按 0 参与调度（与 Issue #1192 同口径）。
-
-	`get_crawl_run` 故意不校验 `created_at` / `updated_at`，消费方必须自行降级；
-	纯本地元数据问题不能拦停恢复，更不能被兜成可重试的 NETWORK_ERROR（Issue #1206）。
-	`inf` / `nan` 同样按 0：`time.time() - inf` 是 `-inf`，小于交接窗口，会让
-	queued 任务被永远当成「刚排队」，后台恢复返回成功却不启动 worker（Issue #1349）；
-	超大整数在 `float()` 抛 `OverflowError`，也不能逃成 INTERNAL_ERROR。
-	"""
-	try:
-		parsed = float(value or 0.0)
-	except (TypeError, ValueError, OverflowError):
-		return 0.0
-	return parsed if math.isfinite(parsed) else 0.0
-
-
-def _awaiting_queued_worker(run: dict[str, Any]) -> bool:
-	"""任务刚排队：原 worker 可能正要取锁，父进程不探测、不抢占。"""
-	if run["status"] != "queued":
-		return False
-	# 时钟回拨得到负值时按仍在窗口内处理，宁可多等也不抢；时间戳类型漂移
-	# 无法判断新鲜度，按「排队已久」去探测锁，不能让父进程 traceback（Issue #1192）。
-	now = time.time()
-	updated = _tolerated_timestamp(run["updated_at"])
-	# 有限但远在未来的值是漂移：减法得到巨大负数，任务会被永远当成刚排队，
-	# 后台恢复不拉起 worker、status 也不报 queue_overdue（与 Issue #1349 的
-	# inf/nan 同一失败模式）。超过允许偏斜的按排队已久去探测执行锁。
-	if updated > now + _QUEUE_FUTURE_SKEW_SECONDS:
-		return False
-	return now - updated < _QUEUE_HANDOFF_GRACE_SECONDS
-
-
-def _executor_active(data_dir: Path, run: dict[str, Any], run_id: str) -> bool:
-	"""queued / running 的 run 是否仍有执行器持有执行锁。
-
-	DB 的 ``running`` 可能来自被 SIGKILL 的执行器（内核已释放锁），状态不会
-	自己变；不探测就会让 ``crawl stop`` 写一条没人消费的标记并报成功，状态页
-	也永远显示运行中（Issue #2465）。queued 在交接宽限内按仍有 worker 处理。
-	"""
-	if run["status"] not in ("queued", "running"):
-		return False
-	if run["status"] == "queued" and _awaiting_queued_worker(run):
-		return True
-	return crawl_executor_active(data_dir, run_id)
 
 
 class CrawlHandoffPending(RuntimeError):
@@ -1460,35 +1424,39 @@ def status_cmd(ctx: click.Context, run_id: str) -> None:
 	"""读取 crawl 任务状态，不打开浏览器。"""
 	if not _require_run_id(ctx, "crawl.status", run_id):
 		return
+	data_dir = ctx.obj["data_dir"]
 	try:
-		with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
-			payload = crawl_status(cache, run_id, data_dir=ctx.obj["data_dir"])
+		with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
 			run = cache.get_crawl_run(run_id)
-			queue_overdue = run is not None and run["status"] == "queued" and not _awaiting_queued_worker(run)
-			executor_active = run is not None and _executor_active(ctx.obj["data_dir"], run, run_id)
+			if run is None:
+				raise KeyError(run_id)
+			payload = crawl_status_from_run(cache, run, data_dir=data_dir)
 	except KeyError:
 		handle_error_output(ctx, "crawl.status", code="CRAWL_RUN_NOT_FOUND", message=f"未找到 crawl run: {run_id}", hints=_run_not_found_hints(ctx))
 		return
 	except CacheRecordInvalid as exc:
 		_report_corrupt_run(ctx, "crawl.status", run_id, exc)
 		return
-	# running 的 run 没有执行器持锁说明执行器已被杀、状态不会再前进（Issue #2465）。
-	running_stale = payload["status"] == "running" and not executor_active
-	payload["executor_active"] = executor_active
-	if running_stale:
-		payload["running_stale"] = True
+	# 执行器字段由 crawl_status_from_run 用同一次任务行读取生成（Issue #2479）：
+	# running 无执行器说明它已被杀、状态不会再前进（Issue #2465）。
+	running_stale = bool(payload.get("running_stale"))
+	queue_overdue = bool(payload.get("queue_overdue"))
+	stop_pending = bool(payload.get("stop_requested"))
 	hints: dict[str, list[str]] | None = None
-	# TTY 的下一步与信封 hints 必须同一口径：只有还在跑的 run 才值得提示 stop，
-	# 已结束的 run 上 `crawl stop` 仍会返回 stop_requested，但什么都不会停。
+	# TTY 与信封共用下一步指引，终态任务只提示读取结果。
 	next_steps = [boss_command_for_ctx(ctx, f"crawl results {shell_argument(run_id)}", include_data_dir=True)]
 	resume_command = boss_command_for_ctx(ctx, f"crawl resume {shell_argument(run_id)} --background", include_data_dir=True)
+	stop_command = boss_command_for_ctx(ctx, f"crawl stop {shell_argument(run_id)}", include_data_dir=True)
 	if payload["status"] in ("queued", "running"):
-		if running_stale:
-			# 执行器已不在：stop 不会生效，下一步是重新拉起 worker 从断点继续。
+		if running_stale and not stop_pending:
+			# 执行器已退出，可重新启动 worker 从断点继续。
 			next_steps.append(resume_command)
-		else:
-			next_steps.append(boss_command_for_ctx(ctx, f"crawl stop {shell_argument(run_id)}", include_data_dir=True))
-	if queue_overdue:
+		elif stop_pending or not running_stale:
+			# 已受理的停止请求还没被消费：执行器已退出时再执行一次 stop 会按断点
+			# 结算 stopped；不能建议 resume --background——它默认清除 stop 标记，
+			# 跟随工具指引就等于静默撤销用户已受理的停止请求（Issue #2482）。
+			next_steps.append(stop_command)
+	if queue_overdue and not stop_pending:
 		# 排队过久多半是后台进程没活下来：只轮询 status 永远等不到结果。后台恢复
 		# 会先探测执行锁，仍有执行器时只回报 running，不会重复启动（Issue #1045）。
 		next_steps.append(resume_command)
@@ -1523,61 +1491,53 @@ def stop_cmd(ctx: click.Context, run_id: str) -> None:
 	"""请求运行中的 crawl 在下一安全点停止并保留 checkpoint。"""
 	if not _require_run_id(ctx, "crawl.stop", run_id):
 		return
+	data_dir = Path(ctx.obj["data_dir"])
+	accepted = False
+	settle_reason = None
 	try:
-		with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
+		with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
 			run = cache.get_crawl_run(run_id)
-			if run is None:
-				handle_error_output(ctx, "crawl.stop", code="CRAWL_RUN_NOT_FOUND", message=f"未找到 crawl run: {run_id}", hints=_run_not_found_hints(ctx))
-				return
-			# 终态 run 上停止请求不会生效（Issue #1574）：继续报 stop_requested 会让
-			# 调用方以为任务已被叫停。只有 queued / running 接受停止请求。
-			status = run["status"]
-			if status not in ("queued", "running"):
-				status_command = boss_command_for_ctx(ctx, f"crawl status {shell_argument(run_id)}", include_data_dir=True)
-				results_command = boss_command_for_ctx(ctx, f"crawl results {shell_argument(run_id)}", include_data_dir=True)
-				handle_error_output(
-					ctx,
-					"crawl.stop",
-					code="CRAWL_RUN_FINISHED",
-					message=f"crawl 任务已结束（{status}），停止请求没有生效",
-					recovery_action=f"用 {status_command} 查看最终状态，或 {results_command} 读取已采集结果；需要重新采集时新建 crawl 任务",
-					hints={"next_actions": [status_command, results_command]},
-				)
-				return
-			# queued / running 但没有执行器持锁：worker 已被杀或从未启动，停止请求
-			# 没有可送达的执行器，等它自己生效永远等不到（Issue #2465）。直接按
-			# 断点落 stopped；同时留下 stop 标记，避免探测与落库之间刚启动的
-			# worker 无视本次意图继续抓页。next_page 原样写回：类型漂移的断点
-			# 继续由 status / resume 按损坏记录上报，这里不做静默修正。
-			if not _executor_active(ctx.obj["data_dir"], run, run_id):
-				cache.request_crawl_stop(run_id)
-				cache.update_crawl_run(
-					run_id,
-					status="stopped",
-					next_page=run["next_page"],
-					error="executor exited before this stop request; resume to continue from the checkpoint",
-				)
-				status_command = boss_command_for_ctx(ctx, f"crawl status {shell_argument(run_id)}", include_data_dir=True)
-				resume_command = boss_command_for_ctx(ctx, f"crawl resume {shell_argument(run_id)} --background", include_data_dir=True)
-				handle_output(
-					ctx,
-					"crawl.stop",
-					{"run_id": run_id, "status": "stopped", "stale_recovered": True},
-					render=lambda d: render_action_result(d, title="crawl stop", next_steps=[status_command, resume_command]),
-					hints={"next_actions": [status_command, resume_command]},
-				)
-				return
-			cache.request_crawl_stop(run_id)
+			status = str(run["status"]) if run is not None else None
+			if run is not None and status in _UNSETTLED_STATUSES:
+				# 交接中的 worker 可能马上取锁。向它写停止标记即可。
+				lock = nullcontext(False) if _awaiting_queued_worker(run) else crawl_execution_lock(data_dir, run_id)
+				with lock as acquired:
+					if acquired:
+						# 持锁重读交接时间，并持锁至写入完成。另一执行器可能在
+						# 首次读取后已更新断点或安排了新的交接（Issue #2470）。
+						run = cache.get_crawl_run(run_id)
+						if run is not None and not _awaiting_queued_worker(run):
+							settle_reason = "executor exited before this stop request; resume to continue from the checkpoint"
+					accepted, status = cache.stop_active_crawl_run(run_id, settle_reason=settle_reason)
 	except CacheRecordInvalid as exc:
 		_report_corrupt_run(ctx, "crawl.stop", run_id, exc)
 		return
 	status_command = boss_command_for_ctx(ctx, f"crawl status {shell_argument(run_id)}", include_data_dir=True)
+	if not accepted:
+		if status is None:
+			handle_error_output(ctx, "crawl.stop", code="CRAWL_RUN_NOT_FOUND", message=f"未找到 crawl run: {run_id}", hints=_run_not_found_hints(ctx))
+			return
+		results_command = boss_command_for_ctx(ctx, f"crawl results {shell_argument(run_id)}", include_data_dir=True)
+		handle_error_output(
+			ctx,
+			"crawl.stop",
+			code="CRAWL_RUN_FINISHED",
+			message=f"crawl 任务已结束（{status}），停止请求没有生效",
+			recovery_action=f"用 {status_command} 查看最终状态，或 {results_command} 读取已采集结果；需要重新采集时新建 crawl 任务",
+			hints={"next_actions": [status_command, results_command]},
+		)
+		return
+	payload: dict[str, Any] = {"run_id": run_id, "status": "stop_requested"}
+	next_steps = [status_command]
+	if settle_reason is not None:
+		payload = {"run_id": run_id, "status": "stopped", "stale_recovered": True}
+		next_steps.append(boss_command_for_ctx(ctx, f"crawl resume {shell_argument(run_id)} --background", include_data_dir=True))
 	handle_output(
 		ctx,
 		"crawl.stop",
-		{"run_id": run_id, "status": "stop_requested"},
-		render=lambda d: render_action_result(d, title="crawl stop", next_steps=[status_command]),
-		hints={"next_actions": [status_command]},
+		payload,
+		render=lambda d: render_action_result(d, title="crawl stop", next_steps=next_steps),
+		hints={"next_actions": next_steps},
 	)
 
 
@@ -1647,6 +1607,17 @@ def shortlist_cmd(
 			message="必须且只能使用 --all 或至少一个 --selector 选择要导入的职位",
 			recovery_action=f"用 --all 导入该 run 的全部结果，或改用至少一个 --selector 指定要导入的职位；候选 selector 可用 {results_cmd} 查看",
 			hints={"next_actions": [results_cmd]},
+		)
+		return
+	if not is_utf8_encodable(tags):
+		list_cmd = boss_command_for_ctx(ctx, "shortlist list", include_data_dir=True)
+		handle_error_output(
+			ctx,
+			"crawl.shortlist",
+			code="INVALID_PARAM",
+			message="--tags 含有无法按 UTF-8 编码的字符（孤立代理项）",
+			recovery_action=f"请重新输入标签或省略 --tags；候选池现有标签可用 {list_cmd} 查看",
+			hints={"next_actions": [list_cmd]},
 		)
 		return
 

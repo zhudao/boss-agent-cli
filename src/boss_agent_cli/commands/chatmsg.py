@@ -7,6 +7,7 @@ from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._contact_lookup import current_friend_security_id_or_emit, current_friend_uid_or_emit, resolve_friend_or_emit
 from boss_agent_cli.commands._platform import get_platform_instance
+from boss_agent_cli.commands._text_guard import reject_unencodable_params
 from boss_agent_cli.display import (
 	boss_command_for_ctx,
 	handle_auth_errors,
@@ -19,7 +20,14 @@ from boss_agent_cli.display import (
 	shell_argument,
 )
 from boss_agent_cli.services.chat_utils import int_code, message_list, safe_local_time
-from boss_agent_cli.services.pagination import UNKNOWN_HAS_MORE_OPERATOR_ACTION, list_pagination, page_can_advance
+from boss_agent_cli.services.pagination import (
+	MAX_TRUSTED_COUNT,
+	MAX_TRUSTED_PAGE,
+	UNKNOWN_HAS_MORE_OPERATOR_ACTION,
+	clamp_trusted,
+	list_pagination,
+	page_can_advance,
+)
 
 _MSG_TYPE_MAP = {
 	1: "文本", 2: "图片", 3: "招呼", 4: "简历", 5: "系统",
@@ -37,8 +45,8 @@ _MSG_TYPE_MAP = {
 		"security_id 使用，跳过沟通列表扫描。security_id 过期时按平台错误返回，不退回全列表查找"
 	),
 )
-@click.option("--page", default=1, type=click.IntRange(min=1), help="页码")
-@click.option("--count", default=20, type=click.IntRange(min=1), help="每页消息数量")
+@click.option("--page", default=1, type=click.IntRange(min=1, max=MAX_TRUSTED_PAGE), help="页码")
+@click.option("--count", default=20, type=click.IntRange(min=1, max=MAX_TRUSTED_COUNT), help="每页消息数量")
 @click.option("--raw", "show_raw", is_flag=True, default=False, help="输出保真结构化消息字段")
 @click.pass_context
 @handle_auth_errors("chatmsg")
@@ -57,6 +65,15 @@ def chatmsg_cmd(
 	"""
 	if not require_compliance_allowed(ctx, "chatmsg"):
 		ctx.exit(1)
+
+	# 直读路径会把 security_id 原样发给 chat/history：孤立代理项会在 httpx
+	# 编码阶段失败，入口先按参数错误拒绝（Issue #2533）。
+	if reject_unencodable_params(ctx, "chatmsg", security_id=security_id, **{"--friend-uid": friend_uid}):
+		return
+
+	# 直接调用回调也要限制页码和数量，避免超长整数进入请求序列化（Issue #2550）。
+	page = clamp_trusted(page)
+	count = clamp_trusted(count, MAX_TRUSTED_COUNT)
 
 	data_dir = ctx.obj["data_dir"]
 	logger = ctx.obj["logger"]

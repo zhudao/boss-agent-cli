@@ -12,6 +12,7 @@ from types import TracebackType
 from typing import Any, Literal, NoReturn, TypeVar, cast, overload
 
 from boss_agent_cli.services.job_identity import deduplicate_job_result
+from boss_agent_cli.services.text_files import is_utf8_encodable, sanitize_surrogates
 
 _SEARCH_TTL = 86400  # 24 hours
 _MAX_SEARCH_CACHE = 100
@@ -132,11 +133,19 @@ def _decode_record(kind: str, record_id: str, column: str, raw: Any, *, expected
 def _decode_optional_record(
 	kind: str, record_id: str, column: str, raw: Any, *, expected: type | None = None
 ) -> Any:
-	return None if not raw else _decode_record(kind, record_id, column, raw, expected=expected)
+	"""可空 JSON 列的读取：只有 SQL NULL 表示「没有值」（Issue #2484）。
+
+	不能用 ``not raw`` 判空：空串 / 空 BLOB / 空数组 / 0 都是漂移值，按「没有
+	值」解码会让 ``workflow_steps.error`` 里的写前标记凭空消失——恢复时
+	``_persisted_write_marker`` 读不到标记，结果未知的写操作会被重放。
+	非 NULL 的值统一交给 ``_decode_record`` 校验，损坏时报 ``CacheRecordInvalid``，
+	由调用方按 fail-closed 处理。
+	"""
+	return None if raw is None else _decode_record(kind, record_id, column, raw, expected=expected)
 
 
 def _decode_text_column(
-	kind: str, record_id: str, column: str, raw: Any, *, allow_none: bool = False
+	kind: str, record_id: str, column: str, raw: Any, *, allow_none: bool = False, allow_surrogates: bool = False
 ) -> str | None:
 	"""TEXT 列的类型漂移在读取边界拦下（Issue #1885）。
 
@@ -152,7 +161,7 @@ def _decode_text_column(
 		return raw
 	if isinstance(raw, (bytes, bytearray)):
 		try:
-			return bytes(raw).decode("utf-8")
+			return bytes(raw).decode("utf-8", errors="surrogatepass" if allow_surrogates else "strict")
 		except UnicodeDecodeError as exc:
 			raise CacheRecordInvalid(kind, record_id, column, f"不是有效的 UTF-8 文本（{exc}）") from exc
 	raise CacheRecordInvalid(kind, record_id, column, f"期望文本，实际是 {type(raw).__name__}")
@@ -206,6 +215,44 @@ def _decode_timestamp_column(
 	raise CacheRecordInvalid(kind, record_id, column, f"期望数值时间戳，实际是 {type(raw).__name__}")
 
 
+def _shortlist_text(value: Any) -> Any:
+	"""候选池文本字段的写入归一（Issue #2502）。
+
+	平台原文的 ``"\\ud800"`` 会解码成孤立代理项，sqlite3 绑定抛
+	``UnicodeEncodeError``，把整批收藏同步 / crawl 导入兜成带磁盘指引的
+	``LOCAL_IO_ERROR``。候选池是本地缓存：单个字段漂移按字面转义保存
+	（``\\ud800``），不丢弃整条职位记录；argv 输入仍由命令入口按
+	``INVALID_PARAM`` 拒绝（与 #2499 同口径）。
+
+	非字符串原样返回：``None`` / 整数仍交给 sqlite 按列约束判定，不能让
+	归一把 ``title=None`` 变成空串、绕过 NOT NULL（Issue #1886 的约束冲突
+	契约）。
+	"""
+	if isinstance(value, str):
+		return sanitize_surrogates(value)
+	return value
+
+
+def _shortlist_display_text(value: Any) -> str:
+	"""候选池展示字段：沿用既有字符串转换后处理孤立代理项（Issue #2502）。"""
+	return sanitize_surrogates(value if isinstance(value, str) else str(value or ""))
+
+
+def _text_key(value: str) -> str | bytes:
+	"""按原值绑定可作唯一键的文本；不可编码时用 BLOB 区分（Issue #2503、#2509）。
+
+	简历名来自文件系统、职位标识来自平台 JSON：两者都可能带孤立代理项。把原值
+	转义成文本会与合法字面标识碰撞（例如 ``\\ud800`` 转义后撞上同文本的职位），
+	所以不可编码时改绑定 ``surrogatepass`` 字节串——可逆、与所有 TEXT 行不相等，
+	普通文本仍按 TEXT 绑定，存量记录不受影响。
+	"""
+	try:
+		value.encode("utf-8")
+	except UnicodeEncodeError:
+		return value.encode("utf-8", errors="surrogatepass")
+	return value
+
+
 def saved_search_name_error(name: str) -> str | None:
 	"""名称能否作为 SQLite TEXT 主键保存；不能时返回原因（Issue #2268）。
 
@@ -218,6 +265,25 @@ def saved_search_name_error(name: str) -> str | None:
 	except UnicodeEncodeError:
 		return "名称含有无法保存的字符（如孤立代理项），请换成普通 Unicode 文本"
 	return None
+
+
+def _saved_search_corrupt_label(raw: Any) -> str:
+	"""坏记录列表里的展示名称必须能直接用于 remove（Issue #2529）。
+
+	name 列允许 BLOB 存储类（#2147）：``str(row[0])`` 得到 ``b'legacy'``，
+	照抄到 ``watch remove b'legacy'`` / ``preset remove b'legacy'`` 只会返回
+	``removed: false``，坏记录永远留在库里。按读取侧同一解码口径还原 BLOB，
+	使恢复提示可直接执行；BLOB 不是有效 UTF-8 时保留可读转义并说明需手工
+	清理，不能给出必然失败的删除命令。
+	"""
+	try:
+		decoded = _decode_text_column("saved_search", "", "name", raw, allow_surrogates=True)
+	except CacheRecordInvalid:
+		return f"{sanitize_surrogates(str(raw))}（名称不是有效 UTF-8，需手工清理本地数据库）"
+	assert isinstance(decoded, str)
+	if not is_utf8_encodable(decoded):
+		return f"{sanitize_surrogates(decoded)}（名称不是有效 UTF-8，需手工清理本地数据库）"
+	return decoded
 
 
 def _tolerated_timestamp(raw: Any, *, default: float = 0.0) -> float:
@@ -303,6 +369,15 @@ class CacheDatabaseInvalid(Exception):
 		super().__init__(f"本地缓存库 {path} 无法使用（{detail}）")
 		self.path = path
 		self.detail = detail
+
+
+class CacheRowDecodeError(CacheDatabaseInvalid):
+	"""单行文本列无法按 UTF-8 解码（如 ``search_cache.response`` 存了非法字节）。
+
+	库本身健康（``integrity_check`` 通过），只影响该行缓存：调用方按未命中
+	处理并删除该行，不能升级成「库损坏、备份后删库」——那会连带丢掉候选池、
+	预设与任务断点（Issue #2545）。
+	"""
 
 
 class CacheBusyError(Exception):
@@ -500,6 +575,10 @@ class _GuardedConnection(sqlite3.Connection):
 			# 引导用户备份并删除完好的缓存库（Issue #2225）。按调用方可修正的
 			# 写入拒绝上报，不给删库指引。
 			return CacheWriteRejected(self.db_path, str(exc))
+		if "could not decode to utf-8" in str(exc).lower():
+			# TEXT 列里存了非法 UTF-8 字节：只有该行读不出来，库本身完好。
+			# 读取方可以按未命中处理并删除该行（Issue #2545）。
+			return CacheRowDecodeError(self.db_path, str(exc))
 		return CacheDatabaseInvalid(self.db_path, str(exc))
 
 	def _raise_translated(self, exc: sqlite3.DatabaseError) -> NoReturn:
@@ -1090,6 +1169,25 @@ class CacheStore:
 		self._conn.commit()
 		return cursor.rowcount > 0
 
+	def stop_active_crawl_run(self, run_id: str, *, settle_reason: str | None = None) -> tuple[bool, str | None]:
+		"""停止活跃任务。调用方持有执行锁时可一并写入终态和原因。"""
+		assignments = "stop_requested = 1, updated_at = ?"
+		values: list[Any] = [time.time()]
+		if settle_reason is not None:
+			assignments += ", status = 'stopped', error = ?"
+			values.append(settle_reason)
+		cursor = self._conn.execute(
+			f"UPDATE crawl_runs SET {assignments} WHERE run_id = ? AND status IN ('queued', 'running')",
+			[*values, run_id],
+		)
+		if cursor.rowcount:
+			self._conn.commit()
+			return True, None
+		# 在同一事务读取失败原因，避免并发恢复改变本次更新所见的状态。
+		row = self._conn.execute("SELECT status FROM crawl_runs WHERE run_id = ?", (run_id,)).fetchone()
+		self._conn.commit()
+		return False, _decode_text_column("crawl_run", run_id, "status", row[0]) if row is not None else None
+
 	def clear_crawl_stop_request(self, run_id: str) -> None:
 		self._conn.execute(
 			"UPDATE crawl_runs SET stop_requested = 0, updated_at = ? WHERE run_id = ?",
@@ -1518,7 +1616,9 @@ class CacheStore:
 		normalized: list[str] = []
 		seen: set[str] = set()
 		for tag in tags:
-			clean = str(tag).strip()
+			# 孤立代理项落库后读回来仍不可编码，TTY 渲染 / 严格 UTF-8 出口会炸；
+			# 写入与读取共用的归一在这里按字面转义（Issue #2502）。
+			clean = sanitize_surrogates(str(tag)).strip()
 			if not clean or clean in seen:
 				continue
 			normalized.append(clean)
@@ -1569,12 +1669,12 @@ class CacheStore:
 		if account and job_id:
 			row = self._conn.execute(
 				"SELECT 1 FROM greet_records WHERE account = ? AND job_id = ?",
-				(account, job_id),
+				(_text_key(account), _text_key(job_id)),
 			).fetchone()
 		elif security_id:
 			row = self._conn.execute(
 				"SELECT 1 FROM greet_records WHERE security_id = ?",
-				(security_id,),
+				(_text_key(security_id),),
 			).fetchone()
 		else:
 			return False
@@ -1587,15 +1687,17 @@ class CacheStore:
 		进程退出或响应丢失时保留 pending，禁止自动再次发送。
 		"""
 		with self._conn:
+			geek_key = _text_key(geek_id)
+			job_key = _text_key(job_id)
 			cursor = self._conn.execute(
 				"INSERT OR IGNORE INTO recruiter_greet_records VALUES (?, ?, ?, ?)",
-				(geek_id, job_id, "pending", time.time()),
+				(geek_key, job_key, "pending", time.time()),
 			)
 			if cursor.rowcount:
 				return None
 			row = self._conn.execute(
 				"SELECT status FROM recruiter_greet_records WHERE geek_id = ? AND job_id = ?",
-				(geek_id, job_id),
+				(geek_key, job_key),
 			).fetchone()
 			return str(row[0])
 
@@ -1609,7 +1711,7 @@ class CacheStore:
 		with self._conn:
 			cursor = self._conn.execute(
 				"UPDATE recruiter_greet_records SET status = ?, updated_at = ? WHERE geek_id = ? AND job_id = ?",
-				(status, time.time(), geek_id, job_id),
+				(status, time.time(), _text_key(geek_id), _text_key(job_id)),
 			)
 			if cursor.rowcount != 1:
 				raise sqlite3.OperationalError("招聘者招呼记录不存在，无法标记发送结果")
@@ -1651,7 +1753,7 @@ class CacheStore:
 			cursor = self._conn.execute(
 				"UPDATE recruiter_location_records SET status = 'sent', job_id = ?, name = '', updated_at = ? "
 				"WHERE friend_id = ?",
-				(job_id, time.time(), str(friend_id)),
+				(_text_key(job_id), time.time(), str(friend_id)),
 			)
 			if cursor.rowcount != 1:
 				raise sqlite3.OperationalError("工作地点发送记录不存在，无法标记为已发送")
@@ -1674,37 +1776,60 @@ class CacheStore:
 		with self._conn:
 			cursor = self._conn.execute(
 				"DELETE FROM recruiter_greet_records WHERE geek_id = ? AND job_id = ? AND status = 'pending'",
-				(geek_id, job_id),
+				(_text_key(geek_id), _text_key(job_id)),
 			)
 			return bool(cursor.rowcount)
 
 	def get_job_id(self, security_id: str) -> str | None:
 		row = self._conn.execute(
 			"SELECT job_id FROM greet_records WHERE security_id = ? ORDER BY greeted_at DESC LIMIT 1",
-			(security_id,),
+			(_text_key(security_id),),
 		).fetchone()
-		return row[0] if row else None
+		if row is None:
+			return None
+		# 不可编码的 job_id 以 BLOB 落库（Issue #2509），按原值还原；其它漂移
+		# BLOB（无效 UTF-8）与类型漂移一样按「没有可用的 job_id」处理
+		# （与 get_job_desc 同口径，Issue #1815）。
+		raw = row[0]
+		if isinstance(raw, str):
+			return raw
+		if isinstance(raw, (bytes, bytearray)):
+			try:
+				return bytes(raw).decode("utf-8", errors="surrogatepass")
+			except UnicodeDecodeError:
+				return None
+		return None
 
 	def record_greet(self, security_id: str, job_id: str, *, account: str = "") -> None:
 		self._conn.execute(
 			"INSERT OR REPLACE INTO greet_records (account, job_id, security_id, greeted_at) VALUES (?, ?, ?, ?)",
-			(account, job_id, security_id, time.time()),
+			(_text_key(account), _text_key(job_id), _text_key(security_id), time.time()),
 		)
 		self._conn.commit()
 
 	def get_search(self, params: dict[str, Any]) -> str | None:
 		key = self._make_search_key(params)
-		row = self._conn.execute(
-			"SELECT response, created_at FROM search_cache WHERE cache_key = ?",
-			(key,),
-		).fetchone()
+		try:
+			row = self._conn.execute(
+				"SELECT response, created_at FROM search_cache WHERE cache_key = ?",
+				(key,),
+			).fetchone()
+		except CacheRowDecodeError:
+			# 该行 TEXT 存了非法 UTF-8：只影响这一条缓存，删除后按未命中处理，
+			# 本次搜索会重新请求并覆盖同一键。真正的库损坏会在删除时继续抛出
+			# CacheDatabaseInvalid，仍按删库指引上报（Issue #2545）。
+			self._conn.execute("DELETE FROM search_cache WHERE cache_key = ?", (key,))
+			self._conn.commit()
+			return None
 		if row is None:
 			return None
 		if _cache_entry_expired(row[1], self._search_ttl):
 			self._conn.execute("DELETE FROM search_cache WHERE cache_key = ?", (key,))
 			self._conn.commit()
 			return None
-		return cast("str", row[0])
+		# response 列类型漂移（BLOB / 数字）按未命中处理：上层只接受 JSON 文本。
+		response = row[0]
+		return response if isinstance(response, str) else None
 
 	def put_search(self, params: dict[str, Any], response: str) -> None:
 		key = self._make_search_key(params)
@@ -1735,14 +1860,15 @@ class CacheStore:
 		"""
 		if not isinstance(job_id, str) or not job_id:
 			return None
+		job_key = _text_key(job_id)
 		row = self._conn.execute(
 			"SELECT description, created_at FROM job_desc_cache WHERE job_id = ?",
-			(job_id,),
+			(job_key,),
 		).fetchone()
 		if row is None:
 			return None
 		if _cache_entry_expired(row[1], self._search_ttl):
-			self._conn.execute("DELETE FROM job_desc_cache WHERE job_id = ?", (job_id,))
+			self._conn.execute("DELETE FROM job_desc_cache WHERE job_id = ?", (job_key,))
 			self._conn.commit()
 			return None
 		raw = row[0]
@@ -1758,13 +1884,15 @@ class CacheStore:
 	def put_job_desc(self, job_id: str, description: str) -> None:
 		"""缓存非空职位描述，超过容量时淘汰保存时间最早的条目。
 
-		非字符串键 / 描述同样按「没有可缓存内容」跳过（Issue #1890）。
+		非字符串键 / 描述同样按「没有可缓存内容」跳过（Issue #1890）。平台文本里的
+		孤立代理项无法绑定进 SQLite TEXT：描述按展示口径转义，职位标识走可逆
+		BLOB 键，一个漂移字段不再拖垮整条 ``--welfare`` 管线（Issue #2509）。
 		"""
 		if not isinstance(job_id, str) or not job_id or not isinstance(description, str) or not description:
 			return
 		self._conn.execute(
 			"INSERT OR REPLACE INTO job_desc_cache (job_id, description, created_at) VALUES (?, ?, ?)",
-			(job_id, description, time.time()),
+			(_text_key(job_id), sanitize_surrogates(description), time.time()),
 		)
 		self._conn.commit()
 		self._evict_old_job_desc_cache()
@@ -1855,7 +1983,7 @@ class CacheStore:
 				created_at = _decode_timestamp_column("saved_search", name, "created_at", row[2])
 				updated_at = _decode_timestamp_column("saved_search", name, "updated_at", row[3])
 			except (SavedSearchParamsError, CacheRecordInvalid):
-				corrupt.append(str(row[0]))
+				corrupt.append(_saved_search_corrupt_label(row[0]))
 				continue
 			items.append(
 				{
@@ -1953,18 +2081,18 @@ class CacheStore:
 		if account and job_id:
 			row = self._conn.execute(
 				"SELECT 1 FROM apply_records WHERE account = ? AND job_id = ?",
-				(account, job_id),
+				(_text_key(account), _text_key(job_id)),
 			).fetchone()
 		elif security_id and job_id:
 			# 没有账号作用域时保留旧语义：(security_id, job_id) 组合命中
 			row = self._conn.execute(
 				"SELECT 1 FROM apply_records WHERE security_id = ? AND job_id = ?",
-				(security_id, job_id),
+				(_text_key(security_id), _text_key(job_id)),
 			).fetchone()
 		elif security_id:
 			row = self._conn.execute(
 				"SELECT 1 FROM apply_records WHERE security_id = ?",
-				(security_id,),
+				(_text_key(security_id),),
 			).fetchone()
 		else:
 			row = None
@@ -1973,7 +2101,7 @@ class CacheStore:
 	def record_apply(self, security_id: str, job_id: str, *, account: str = "") -> None:
 		self._conn.execute(
 			"INSERT OR REPLACE INTO apply_records (account, job_id, security_id, applied_at) VALUES (?, ?, ?, ?)",
-			(account, job_id, security_id, time.time()),
+			(_text_key(account), _text_key(job_id), _text_key(security_id), time.time()),
 		)
 		self._conn.commit()
 
@@ -2016,13 +2144,13 @@ class CacheStore:
 				"INSERT OR IGNORE INTO candidate_action_claims "
 				"(account, job_id, action, security_id, status, updated_at) "
 				"VALUES (?, ?, ?, ?, 'pending', ?)",
-				(account, job_id, action, security_id, time.time()),
+				(_text_key(account), _text_key(job_id), action, _text_key(security_id), time.time()),
 			)
 			if cursor.rowcount:
 				return None
 			row = self._conn.execute(
 				"SELECT status FROM candidate_action_claims WHERE account = ? AND job_id = ? AND action = ?",
-				(account, job_id, action),
+				(_text_key(account), _text_key(job_id), action),
 			).fetchone()
 		# 冲突行只可能来自已提交的另一个进程；读不到时按 pending 保守处理。
 		return str(row[0]) if row is not None else "pending"
@@ -2045,7 +2173,7 @@ class CacheStore:
 				"VALUES (?, ?, ?, ?, 'sent', ?) "
 				"ON CONFLICT(account, job_id, action) DO UPDATE SET "
 				"security_id = excluded.security_id, status = 'sent', updated_at = excluded.updated_at",
-				(account, job_id, action, security_id, time.time()),
+				(_text_key(account), _text_key(job_id), action, _text_key(security_id), time.time()),
 			)
 
 	def release_candidate_action(
@@ -2058,14 +2186,14 @@ class CacheStore:
 			cursor = self._conn.execute(
 				"DELETE FROM candidate_action_claims "
 				"WHERE account = ? AND job_id = ? AND action = ? AND status = 'pending'",
-				(account, job_id, action),
+				(_text_key(account), _text_key(job_id), action),
 			)
 			return bool(cursor.rowcount)
 
 	def is_shortlisted(self, security_id: str, job_id: str) -> bool:
 		row = self._conn.execute(
 			"SELECT 1 FROM shortlist_records WHERE security_id = ? AND job_id = ?",
-			(security_id, job_id),
+			(_text_key(security_id), _text_key(job_id)),
 		).fetchone()
 		return row is not None
 
@@ -2079,9 +2207,11 @@ class CacheStore:
 		"""
 		security_id = str(item.get("security_id") or "")
 		job_id = str(item.get("job_id") or "")
-		source = str(item.get("source") or "")
+		if not is_utf8_encodable(security_id) or not is_utf8_encodable(job_id):
+			raise CacheWriteRejected(self._db_path, "security_id 与 job_id 必须可按 UTF-8 编码")
+		source = _shortlist_display_text(item.get("source"))
 		lid_value = item.get("lid")
-		lid = lid_value if isinstance(lid_value, str) else ""
+		lid = lid_value if isinstance(lid_value, str) and is_utf8_encodable(lid_value) else ""
 		if not lid:
 			lid = self._crawl_shortlist_lid(security_id, job_id, source)
 		self._conn.execute(
@@ -2101,13 +2231,13 @@ class CacheStore:
 			(
 				security_id,
 				job_id,
-				item.get("title", ""),
-				item.get("company", ""),
-				item.get("city", ""),
-				item.get("salary", ""),
+				_shortlist_text(item.get("title", "")),
+				_shortlist_text(item.get("company", "")),
+				_shortlist_text(item.get("city", "")),
+				_shortlist_text(item.get("salary", "")),
 				source,
 				self._serialize_shortlist_tags(item.get("tags", [])),
-				item.get("note", ""),
+				_shortlist_text(item.get("note", "")),
 				lid,
 				security_id,
 				job_id,
@@ -2142,6 +2272,7 @@ class CacheStore:
 		imported_count = 0
 		existing_count = 0
 		skipped_count = 0
+		source = sanitize_surrogates(source)
 		with self._conn:
 			existing_by_job_id: dict[str, tuple[str, str]] = {}
 			for row in self._conn.execute(
@@ -2166,8 +2297,9 @@ class CacheStore:
 				security_id = str(item.get("security_id") or "")
 				job_id = str(item.get("job_id") or "")
 				lid_value = item.get("lid")
-				lid = lid_value if isinstance(lid_value, str) else ""
-				if not security_id or not job_id:
+				lid = lid_value if isinstance(lid_value, str) and is_utf8_encodable(lid_value) else ""
+				# 转义标识可能与已有合法标识相同，导致更新错误的条目。
+				if not security_id or not job_id or not is_utf8_encodable(security_id) or not is_utf8_encodable(job_id):
 					skipped_count += 1
 					continue
 				if job_id in existing_by_job_id:
@@ -2196,6 +2328,7 @@ class CacheStore:
 						)
 					existing_count += 1
 					continue
+				item_source = _shortlist_text(item.get("source") or source)
 				cursor = self._conn.execute(
 					"INSERT OR IGNORE INTO shortlist_records "
 					"(security_id, job_id, title, company, city, salary, source, tags, note, lid, created_at) "
@@ -2203,20 +2336,20 @@ class CacheStore:
 					(
 						security_id,
 						job_id,
-						str(item.get("title", "") or ""),
-						str(item.get("company", "") or ""),
-						str(item.get("city", "") or ""),
-						str(item.get("salary", "") or ""),
-						item.get("source") or source,
+						_shortlist_display_text(item.get("title", "")),
+						_shortlist_display_text(item.get("company", "")),
+						_shortlist_display_text(item.get("city", "")),
+						_shortlist_display_text(item.get("salary", "")),
+						item_source,
 						self._serialize_shortlist_tags(item.get("tags", [])),
-						str(item.get("note", "") or ""),
+						_shortlist_display_text(item.get("note", "")),
 						lid,
 						time.time(),
 					),
 				)
 				if cursor.rowcount == 1:
 					imported_count += 1
-					existing_by_job_id[job_id] = (security_id, str(item.get("source") or source))
+					existing_by_job_id[job_id] = (security_id, str(item_source))
 				else:
 					existing_count += 1
 		return {
@@ -2292,7 +2425,7 @@ class CacheStore:
 		if str(payload.get("job_id") or "") != job_id or str(payload.get("security_id") or "") != security_id:
 			return ""
 		lid = payload.get("lid")
-		return lid if isinstance(lid, str) else ""
+		return lid if isinstance(lid, str) and is_utf8_encodable(lid) else ""
 
 	def set_shortlist_tags(self, security_id: str, job_id: str, tags: list[str]) -> bool:
 		cursor = self._conn.execute(
@@ -2305,7 +2438,7 @@ class CacheStore:
 	def set_shortlist_note(self, security_id: str, job_id: str, note: str) -> bool:
 		cursor = self._conn.execute(
 			"UPDATE shortlist_records SET note = ? WHERE security_id = ? AND job_id = ?",
-			(note, security_id, job_id),
+			(_shortlist_text(note), security_id, job_id),
 		)
 		self._conn.commit()
 		return cursor.rowcount > 0
@@ -2337,23 +2470,24 @@ class CacheStore:
 		`job_id` 已有记录时，把该行迁到本次的新标识，而不是再插入一行 `prepared` 记录
 		（Issue #901）。
 		"""
+		resume_key = _text_key(resume_name)
 		now = time.time()
 		with self._conn:
 			exact = self._conn.execute(
 				"SELECT 1 FROM resume_job_links WHERE resume_name = ? AND security_id = ? AND job_id = ?",
-				(resume_name, security_id, job_id),
+				(resume_key, security_id, job_id),
 			).fetchone()
 			if exact is None:
 				existing = self._conn.execute(
 					"SELECT security_id FROM resume_job_links "
 					"WHERE resume_name = ? AND job_id = ? ORDER BY updated_at DESC LIMIT 1",
-					(resume_name, job_id),
+					(resume_key, job_id),
 				).fetchone()
 				if existing is not None:
 					self._conn.execute(
 						"UPDATE resume_job_links SET security_id = ?, updated_at = ? "
 						"WHERE resume_name = ? AND security_id = ? AND job_id = ?",
-						(security_id, now, resume_name, str(existing[0]), job_id),
+						(security_id, now, resume_key, str(existing[0]), job_id),
 					)
 			self._conn.execute(
 				"INSERT INTO resume_job_links "
@@ -2363,7 +2497,7 @@ class CacheStore:
 				"job_title = COALESCE(NULLIF(excluded.job_title, ''), resume_job_links.job_title), "
 				"company = COALESCE(NULLIF(excluded.company, ''), resume_job_links.company), "
 				"updated_at = excluded.updated_at",
-				(resume_name, security_id, job_id, job_title, company, now, now),
+				(resume_key, security_id, job_id, job_title, company, now, now),
 			)
 
 	def update_job_link_status(
@@ -2379,7 +2513,7 @@ class CacheStore:
 		cursor = self._conn.execute(
 			"UPDATE resume_job_links SET status = ?, notes = ?, updated_at = ? "
 			"WHERE resume_name = ? AND security_id = ? AND job_id = ?",
-			(status, notes, now, resume_name, security_id, job_id),
+			(status, notes, now, _text_key(resume_name), security_id, job_id),
 		)
 		self._conn.commit()
 		return cursor.rowcount > 0
@@ -2387,7 +2521,7 @@ class CacheStore:
 	def _resume_link_row_to_dict(self, row: Any) -> dict[str, Any]:
 		record_id = f"{row[0]}/{row[1]}/{row[2]}"
 		return {
-			"resume_name": _decode_text_column("resume_link", record_id, "resume_name", row[0]),
+			"resume_name": _decode_text_column("resume_link", record_id, "resume_name", row[0], allow_surrogates=True),
 			"security_id": _decode_text_column("resume_link", record_id, "security_id", row[1]),
 			"job_id": _decode_text_column("resume_link", record_id, "job_id", row[2]),
 			"job_title": _decode_text_column("resume_link", record_id, "job_title", row[3]),
@@ -2404,7 +2538,7 @@ class CacheStore:
 		rows = self._conn.execute(
 			"SELECT resume_name, security_id, job_id, job_title, company, status, notes, linked_at, updated_at "
 			"FROM resume_job_links WHERE resume_name = ? ORDER BY updated_at DESC",
-			(resume_name,),
+			(_text_key(resume_name),),
 		).fetchall()
 		return [self._resume_link_row_to_dict(row) for row in rows]
 
@@ -2421,7 +2555,7 @@ class CacheStore:
 		"""移除简历职位关联"""
 		cursor = self._conn.execute(
 			"DELETE FROM resume_job_links WHERE resume_name = ? AND security_id = ? AND job_id = ?",
-			(resume_name, security_id, job_id),
+			(_text_key(resume_name), security_id, job_id),
 		)
 		self._conn.commit()
 		return cursor.rowcount > 0
@@ -2434,7 +2568,7 @@ class CacheStore:
 		"""
 		cursor = self._conn.execute(
 			"DELETE FROM resume_job_links WHERE resume_name = ?",
-			(resume_name,),
+			(_text_key(resume_name),),
 		)
 		self._conn.commit()
 		return cursor.rowcount

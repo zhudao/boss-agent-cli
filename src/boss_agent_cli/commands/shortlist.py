@@ -9,6 +9,7 @@ from boss_agent_cli.display import (
 	positional_args,
 	render_simple_list,
 )
+from boss_agent_cli.services.text_files import is_utf8_encodable
 
 
 def _hint_command(ctx: click.Context, command: str) -> str:
@@ -39,6 +40,23 @@ def _find_shortlist_item(items: list[dict[str, Any]], security_id: str, job_id: 
 		if item.get("security_id") == security_id and item.get("job_id") == job_id:
 			return item
 	return None
+
+
+def _reject_unencodable_fields(ctx: click.Context, fields: tuple[tuple[str, str], ...]) -> bool:
+	"""在存储或匹配前拒绝无法按 UTF-8 编码的候选池参数。"""
+	bad = dict.fromkeys(name for name, value in fields if not is_utf8_encodable(value))
+	if not bad:
+		return True
+	list_cmd = _hint_command(ctx, "shortlist list")
+	handle_error_output(
+		ctx,
+		"shortlist",
+		code="INVALID_PARAM",
+		message=f"{' / '.join(bad)} 含有无法按 UTF-8 编码的字符（孤立代理项），请使用有效的文本参数",
+		recovery_action=f"重新复制这些字段后重试；候选池现有条目可用 {list_cmd} 查看",
+		hints={"next_actions": [list_cmd]},
+	)
+	return False
 
 
 def _compare_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -99,6 +117,22 @@ def shortlist_add_cmd(
 			recovery_action=f"补上两个编号后重试；编号可从 {search_cmd} 的结果中取到",
 			hints={"next_actions": [search_cmd]},
 		)
+		return
+	if not _reject_unencodable_fields(
+		ctx,
+		(
+			("security_id", security_id),
+			("job_id", job_id),
+			("--title", title),
+			("--company", company),
+			("--city", city),
+			("--salary", salary),
+			("--source", source),
+			("--lid", lid),
+			("--tags", tags),
+			("--note", note),
+		),
+	):
 		return
 	parsed_tags = _parse_tags(tags)
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
@@ -200,6 +234,18 @@ def shortlist_annotate_cmd(
 			hints={"next_actions": [list_cmd]},
 		)
 		return
+	note_fields: tuple[tuple[str, str], ...] = (("--note", note),) if note is not None else ()
+	if not _reject_unencodable_fields(
+		ctx,
+		(
+			("security_id", security_id),
+			("job_id", job_id),
+			*note_fields,
+			*(("--add-tag", value) for value in add_tag),
+			*(("--remove-tag", value) for value in remove_tag),
+		),
+	):
+		return
 	# annotate 是一次显式修改：既没有标签也没给 note 时，旧实现仍返回
 	# updated=true，Agent 会以为字段已经写入；空标签同样被 _parse_tags 丢掉，
 	# 信封却报告成功（Issue #1565）。两者都要在查找条目与写库之前拒绝。
@@ -299,6 +345,8 @@ def shortlist_compare_cmd(ctx: click.Context, tag: str | None) -> None:
 			hints={"next_actions": [compare_cmd, list_cmd]},
 		)
 		return
+	if tag is not None and not _reject_unencodable_fields(ctx, (("--tag", tag),)):
+		return
 	normalized_tag = tag.strip() if tag is not None else None
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		pool = cache.list_shortlist()
@@ -359,6 +407,11 @@ def shortlist_remove_cmd(ctx: click.Context, security_id: str, job_id: str) -> N
 			recovery_action=f"补上两个编号后重试；候选池条目的编号可用 {list_cmd} 查看",
 			hints={"next_actions": [list_cmd]},
 		)
+		return
+	if not _reject_unencodable_fields(
+		ctx,
+		(("security_id", security_id), ("job_id", job_id)),
+	):
 		return
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		removed = cache.remove_shortlist(security_id, job_id)

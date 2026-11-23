@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import socket
 import stat
@@ -452,6 +453,16 @@ class CrawlRunBudget:
 		self.requests_attempted = requests_attempted
 		self.detail_requests_attempted = detail_requests_attempted
 
+	def check_list_request_capacity(self, transport: CrawlTransport, page_no: int, *, before_open: bool = False) -> None:
+		"""在多次导航开始前检查请求下限，实际请求仍逐次认领预算。"""
+		minimum_list_requests = getattr(transport, "minimum_list_requests", None)
+		if not callable(minimum_list_requests):
+			return
+		required = minimum_list_requests(page_no, before_open=before_open)
+		remaining = max(0, self._settings.max_requests - self.requests_attempted)
+		if required > remaining:
+			raise CrawlLimitExceeded(f"到达采集断点第 {page_no} 页至少需要 {required} 次请求，剩余预算为 {remaining} 次")
+
 	def claim_request(self, kind: str) -> None:
 		self.check_time()
 		if self.requests_attempted >= self._settings.max_requests:
@@ -471,6 +482,55 @@ class CrawlRunBudget:
 	@property
 	def elapsed_seconds(self) -> int:
 		return self._elapsed_before_start + max(0, int(self._clock() - self._started_at))
+
+
+def crawl_execution_lock(data_dir: Path, run_id: str) -> AbstractContextManager[bool]:
+	return exclusive_file_lock(run_lock_path(data_dir / "cache" / "crawl-locks", run_id))
+
+
+#: worker 从被拉起到取得执行锁只需要解释器启动与一次本地读取；超过这段时间
+#: 仍是 queued 且锁空闲，说明它没有活下来（Issue #1045）。
+QUEUE_HANDOFF_GRACE_SECONDS = 30.0
+
+#: 交接新鲜度允许的未来偏斜（与 ``cache/store.py`` 的未来偏斜同口径）。
+#:
+#: 写入方用 ``time.time()`` 落 ``updated_at``；轻微时钟偏斜仍应视为「刚排队」。
+#: 更远的有限未来值只可能是漂移（时钟快进后校正、手工写坏的库），必须按
+#: 排队已久处理，否则任务永远留在交接窗口里（Issue #2193）。
+QUEUE_FUTURE_SKEW_SECONDS = 60.0
+
+
+def tolerated_timestamp(value: Any) -> float:
+	"""本地记录时间戳的容错读取：漂移值按 0 参与调度（与 Issue #1192 同口径）。
+
+	``get_crawl_run`` 故意不校验 ``created_at`` / ``updated_at``，消费方必须自行
+	降级；纯本地元数据问题不能拦停恢复，更不能被兜成可重试的 NETWORK_ERROR
+	（Issue #1206）。``inf`` / ``nan`` 同样按 0：``time.time() - inf`` 是
+	``-inf``，小于交接窗口，会让 queued 任务被永远当成「刚排队」，后台恢复返回
+	成功却不启动 worker（Issue #1349）；超大整数在 ``float()`` 抛
+	``OverflowError``，也不能逃成 INTERNAL_ERROR。
+	"""
+	try:
+		parsed = float(value or 0.0)
+	except (TypeError, ValueError, OverflowError):
+		return 0.0
+	return parsed if math.isfinite(parsed) else 0.0
+
+
+def crawl_run_awaiting_worker(run: Mapping[str, Any]) -> bool:
+	"""任务刚排队：原 worker 可能正要取锁，调用方不探测、不抢占。"""
+	if run["status"] != "queued":
+		return False
+	# 时钟回拨得到负值时按仍在窗口内处理，宁可多等也不抢；时间戳类型漂移
+	# 无法判断新鲜度，按「排队已久」去探测锁，不能让调用方 traceback（Issue #1192）。
+	now = time.time()
+	updated = tolerated_timestamp(run["updated_at"])
+	# 有限但远在未来的值是漂移：减法得到巨大负数，任务会被永远当成刚排队，
+	# 后台恢复不拉起 worker、status 也不报 queue_overdue（与 Issue #1349 的
+	# inf/nan 同一失败模式）。超过允许偏斜的按排队已久去探测执行锁。
+	if updated > now + QUEUE_FUTURE_SKEW_SECONDS:
+		return False
+	return now - updated < QUEUE_HANDOFF_GRACE_SECONDS
 
 
 def crawl_executor_active(data_dir: Path, run_id: str) -> bool:
@@ -518,15 +578,13 @@ class CrawlService:
 		self._preflight = preflight
 		self._unpersisted_risk_lock: cdp_risk_lock.RiskLock | None = None
 		self._request_budget = RequestBudget.for_data_dir(data_dir)
-		self._lock_dir = data_dir / "cache" / "crawl-locks"
 
 	def execution_lock(self, run_id: str) -> AbstractContextManager[bool]:
 		"""同一 crawl run 的执行权：跨进程独占、不等待，进程退出时由操作系统释放。
 
-		只约束「执行」。`crawl status` / `crawl results` 等只读命令不取这把锁，执行
-		期间照常可用；不同 run 各用各的锁文件，互不阻塞。
+		每个 run 使用独立锁。执行和无执行器时的停止结算共用这把锁。
 		"""
-		return exclusive_file_lock(run_lock_path(self._lock_dir, run_id))
+		return crawl_execution_lock(self._data_dir, run_id)
 
 	@contextmanager
 	def _execution_right(self, run_id: str) -> Iterator[None]:
@@ -701,17 +759,32 @@ class CrawlService:
 				self._preflight()
 			self._check_risk_lock()
 			self._cache.update_crawl_run_params(run_id, settings.as_dict())
-		except BaseException:
+		except BaseException as original:
+			# 还原本身也可能失败（磁盘满 / 库锁冲突）：不能让还原异常顶替原始
+			# 预检错误，否则操作者看不到真正原因，run 还停在 running。原始异常
+			# 类型与文案保持不变，还原失败以 note 附加（Issue #2562）。
+			restore_failures: list[str] = []
 			if clear_stop and previous_stop:
 				# 预检 / 参数落库失败：放回清除前的 stop，失败的调用不改动任务。
-				self._cache.restore_crawl_stop_request(run_id, updated_at=previous_updated_at)
-			self._cache.restore_crawl_run_state(
-				run_id,
-				status=previous_status,
-				error=previous_error,
-				updated_at=previous_updated_at,
-				marked_at=marked_at,
-			)
+				try:
+					self._cache.restore_crawl_stop_request(run_id, updated_at=previous_updated_at)
+				except Exception as exc:
+					restore_failures.append(f"stop 标记还原失败（{type(exc).__name__}: {exc}）")
+			try:
+				self._cache.restore_crawl_run_state(
+					run_id,
+					status=previous_status,
+					error=previous_error,
+					updated_at=previous_updated_at,
+					marked_at=marked_at,
+				)
+			except Exception as exc:
+				restore_failures.append(f"运行状态还原失败（{type(exc).__name__}: {exc}）")
+			if restore_failures:
+				original.add_note(
+					"恢复失败后的状态还原未完成：" + "；".join(restore_failures)
+					+ "。先核对 crawl status，再决定是否手工修正断点"
+				)
 			raise
 		return self._run(
 			run_id,
@@ -817,6 +890,9 @@ class CrawlService:
 			# 照常继续（Issue #1771）。放在 try 内，任何失败都由 finally 写回终态。
 			self._cache.mark_crawl_run_active(run_id, "running")
 			self._raise_if_stop_requested(run_id)
+			if not list_finished and 1 < next_page <= settings.pages:
+				# 深层断点的导航本身就可能超过剩余预算，先检查再打开浏览器（Issue #2463）。
+				run_budget.check_list_request_capacity(transport, next_page, before_open=True)
 			hooks = tuple(transport.open())
 			hooks_recorded = True
 			self._raise_if_stop_requested(run_id)
@@ -1214,6 +1290,9 @@ class CrawlService:
 		page_no: int,
 	) -> dict[str, Any]:
 		self._raise_if_stop_requested(run_id)
+		if page_no > 1:
+			# 详情补取和前一次导航失败都可能改变可用预算。
+			run_budget.check_list_request_capacity(transport, page_no)
 		window = (
 			nullcontext()
 			if callable(getattr(transport, "bind_attempts", None))

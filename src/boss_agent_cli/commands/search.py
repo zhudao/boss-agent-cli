@@ -4,7 +4,7 @@ from typing import Any, NamedTuple
 import click
 
 from boss_agent_cli.auth.manager import AuthManager
-from boss_agent_cli.cache.store import CacheStore, SavedSearchParamsError, saved_search_name_error
+from boss_agent_cli.cache.store import CacheRecordInvalid, CacheStore, SavedSearchParamsError, saved_search_name_error
 from boss_agent_cli.commands._platform import account_scope, get_platform_instance
 from boss_agent_cli.crawler.service import CrawlBudget
 from boss_agent_cli.display import (
@@ -24,6 +24,7 @@ from boss_agent_cli.display import (
 )
 from boss_agent_cli.index_cache import try_save_index
 from boss_agent_cli.match_score import score_job_dict
+from boss_agent_cli.services.pagination import MAX_TRUSTED_PAGE, page_can_advance
 from boss_agent_cli.search_filters import (
 	SearchFilterCriteria,
 	SearchPipelinePlatformError,
@@ -32,6 +33,7 @@ from boss_agent_cli.search_filters import (
 	detail_channel_for,
 	detail_filter_max_pages,
 	ensure_supported_city,
+	ensure_text_encodable,
 	parse_boss_search_url,
 	resolve_active_level,
 	resolve_search_code_params,
@@ -76,10 +78,33 @@ def _parse_cached_result(raw: str) -> dict[str, Any] | None:
 	if not all(isinstance(item, dict) for item in parsed["data"]):
 		return None
 	# pagination 只能是对象或 null：形状漂移的缓存按未命中处理，不让非法类型
-	# 原样进入成功信封（Issue #1136）。
-	if parsed.get("pagination") is not None and not isinstance(parsed["pagination"], dict):
-		return None
+	# 原样进入成功信封（Issue #1136）。字段级类型漂移（page=true / has_more 为
+	# 字符串）同样按未命中处理，本次搜索会覆盖同一坏行（Issue #2545）。
+	pagination = parsed.get("pagination")
+	if pagination is not None:
+		if not isinstance(pagination, dict) or not _valid_cached_pagination(pagination):
+			return None
 	return parsed
+
+
+def _valid_cached_pagination(pagination: dict[str, Any]) -> bool:
+	"""缓存里的分页证据是否仍是可信形态（Issue #2545）。
+
+	只校验会被原样放进成功信封的字段；未知键（如旧版本写入的额外信息）忽略。
+	"""
+	page = pagination.get("page")
+	if page is not None and (type(page) is not int or not 1 <= page <= MAX_TRUSTED_PAGE):
+		return False
+	has_more = pagination.get("has_more")
+	if has_more is not None and not isinstance(has_more, bool):
+		return False
+	total = pagination.get("total")
+	if total is not None and (type(total) is not int or total < 0):
+		return False
+	total_kind = pagination.get("total_kind")
+	if total_kind is not None and not isinstance(total_kind, str):
+		return False
+	return True
 
 
 def _sort_search_items(items: list[dict[str, Any]], sort: str) -> list[dict[str, Any]]:
@@ -214,7 +239,9 @@ def _result_hints(
 		],
 	}
 	next_page_command = ""
-	if has_next_page:
+	if has_next_page and page_can_advance({"page": page}):
+		# 达到可信页码上限时保留平台的 has_more 证据，但不再生成必然重复同一
+		# 请求的下一页命令（Issue #2546，与 #2434 同口径）。
 		next_page_command = _build_next_page_command(ctx, page=page, params=params)
 		hints["next_actions"].append(next_page_command)
 	elif has_more_unknown:
@@ -275,7 +302,7 @@ def _active_filter_hint(level: str, pipeline_result: Any) -> dict[str, Any]:
 	default=None,
 	help="只保留 HR 活跃度不低于该档的职位：" + " / ".join(ACTIVE_LEVELS) + "（也认 3day、3日 等写法）；online 只看列表，其余档位列表看不出时会逐个查职位详情（更慢、风险更高）",
 )
-@click.option("--page", default=1, type=click.IntRange(min=1), help="页码")
+@click.option("--page", default=1, type=click.IntRange(min=1, max=MAX_TRUSTED_PAGE), help="页码")
 @click.option("--no-cache", is_flag=True, default=False, help="跳过缓存")
 @click.option("--with-score", is_flag=True, default=False, help="附加匹配分和原因")
 @click.option("--sort", "sort_mode", default="relevance", type=click.Choice(["relevance", "score"]), help="排序方式")
@@ -338,6 +365,9 @@ def search_cmd(
 	# 校验失败的筛选项若完全来自 preset，错误消息要点名是哪条本地预设：
 	# 用户这次没传任何筛选参数，只说「未知薪资范围」看不出该改哪里。
 	preset_origin = ""
+	# 记录最终关键词是否由预设补上：坏预设要让用户看到删除重建指引，
+	# 而不是只报一条通用的参数错误（Issue #2528）。
+	query_from_preset = False
 	if preset and not any((city, salary, experience, education, industry, scale, stage, job_type)):
 		remove_cmd = _hint_command(ctx, f"preset remove {positional_hint(preset)}")
 		preset_origin = f"（来自 preset '{preset}'，可用 {remove_cmd} 删除后重建）"
@@ -358,9 +388,10 @@ def search_cmd(
 		with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
 			try:
 				record = cache.get_saved_search(preset)
-			except SavedSearchParamsError as exc:
-				# 预设参数写坏时给可执行的删除重建指引，而不是把 JSON 解析错误
-				# 兜成 NETWORK_ERROR 让 Agent 无限重试。
+			except (SavedSearchParamsError, CacheRecordInvalid) as exc:
+				# 参数写坏与 name / 时间戳等元数据漂移同口径：本地记录损坏是
+				# 确定性失败，给可执行的删除重建指引，不能落成与预设无关的
+				# CACHE_RECORD_INVALID 并诱导重试（Issue #2011、#2529）。
 				handle_error_output(
 					ctx, "search", code="SAVED_SEARCH_INVALID", message=str(exc),
 					hints={"next_actions": [
@@ -384,7 +415,15 @@ def search_cmd(
 		# 显式参数优先，preset 只补未提供的项（schema 的 --preset 描述）：
 		# 这里必须用 `is not None` 而不是真值判断——显式空串（如 `--city ""`）
 		# 表示「该项不筛选」，不能被预设值反向覆盖（Issue #1569、#1573）。
-		query = query if query is not None else params.get("query")
+		preset_query = params.get("query")
+		# 存量记录里的空白关键词按缺失处理：否则它是真值，会挡住 --url 链接里的
+		# query，并把空白关键词发给平台（Issue #2513）。没有 --url 时下面按记录
+		# 失效明确拒绝，而不是报容易误导的「未提供 query」。
+		if isinstance(preset_query, str) and not preset_query.strip():
+			preset_query = None
+		if query is None and preset_query is not None:
+			query_from_preset = True
+		query = query if query is not None else preset_query
 		city = city if city is not None else params.get("city")
 		salary = salary if salary is not None else params.get("salary")
 		experience = experience if experience is not None else params.get("experience")
@@ -410,10 +449,51 @@ def search_cmd(
 				hints={"next_actions": [search_cmd]},
 			)
 			return
-		query = query or parsed_url.query
+		if parsed_url.query and not query:
+			# --url 链接补上的关键词来源明确：不做「坏预设」指引。
+			query = parsed_url.query
+			query_from_preset = False
 		raw_params.update(parsed_url.params)
 		if parsed_url.page is not None and page == 1:
 			page = parsed_url.page
+
+	# 预设里的空白关键词与 `watch run` 同口径拒绝（Issue #1798、#2511、#2513）：
+	# 命令行参数的空白关键词已在合并预设之前归一为 None，合并时空白预设值也
+	# 按缺失处理，所以 --url 链接里的 query 仍会生效。没有 --url 时若最终仍无
+	# 关键词，按记录失效明确拒绝，而不是把真值的 `"   "` 发给平台。
+	if preset and not search_url and not (query or "").strip():
+		handle_error_output(
+			ctx,
+			"search",
+			code="SAVED_SEARCH_INVALID",
+			message=f"预设 '{preset}' 的参数已失效：关键词不能为空（缺失或为空值）",
+			hints={"next_actions": [
+				_hint_command(ctx, f"preset remove {positional_hint(preset)}"),
+				_hint_command(ctx, f"preset add {positional_hint(preset)} <关键词>"),
+			]},
+		)
+		return
+
+	# 关键词原样进入 httpx 的 URL 参数：孤立代理项会抛 UnicodeEncodeError，
+	# 被全局兜成带磁盘指引的 LOCAL_IO_ERROR（Issue #2528）。预设里的坏关键词
+	# 与空白关键词同口径报 SAVED_SEARCH_INVALID 并给删除重建命令。
+	try:
+		ensure_text_encodable("搜索关键词", query)
+	except ValueError as exc:
+		if preset and query_from_preset:
+			handle_error_output(
+				ctx,
+				"search",
+				code="SAVED_SEARCH_INVALID",
+				message=f"预设 '{preset}' 的参数已失效：{exc}",
+				hints={"next_actions": [
+					_hint_command(ctx, f"preset remove {positional_hint(preset)}"),
+					_hint_command(ctx, f"preset add {positional_hint(preset)} <关键词>"),
+				]},
+			)
+		else:
+			emit_filter_error(ctx, "search", exc)
+		return
 
 	if not query and not search_url:
 		search_cmd = _hint_command(ctx, "search <关键词>")
@@ -664,8 +744,12 @@ def search_cmd(
 					"account": account,
 				}
 				# 只缓存结果与分页证据；hints 取决于调用上下文，命中时重建。
+				# 缓存文本要能绑定进 SQLite TEXT：平台字段里的孤立代理项在
+				# ensure_ascii=False 时会原样保留，绑定阶段抛 UnicodeEncodeError，
+				# 被兜成带磁盘指引的 LOCAL_IO_ERROR（Issue #2545）。转义后的
+				# JSON 读取时还原成同样的值，输出层已有 ensure_ascii 回退。
 				cache_data = {"data": cache_items, "pagination": pagination}
-				cache.put_search(search_params, json.dumps(cache_data, ensure_ascii=False))
+				cache.put_search(search_params, json.dumps(cache_data))
 
 			# 快照身份只对本次返回有效，不写进搜索缓存；取本次写入的值，
 			# 保存后不再读回可变文件（Issue #2292）。

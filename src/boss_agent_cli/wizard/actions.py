@@ -8,6 +8,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, NoReturn, cast
 
+from boss_agent_cli.api._base_client import parameter_status_code
+from boss_agent_cli.api.client import PlatformRateLimitError
 from boss_agent_cli.api.models import (
 	dict_items,
 	field_dict,
@@ -22,7 +24,12 @@ from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.api.endpoints import CITY_CODES
 from boss_agent_cli.ai.config import AIConfigStore, ai_float_setting, ai_int_setting
 from boss_agent_cli.ai.service import AIService, AIServiceError, recovery_action_for
-from boss_agent_cli.cache.store import CacheRecordInvalid, CacheStore, SavedSearchParamsError
+from boss_agent_cli.cache.store import (
+	CacheRecordInvalid,
+	CacheStore,
+	SavedSearchParamsError,
+	saved_search_name_error,
+)
 from boss_agent_cli.platforms.factory import build_platform_instance, build_recruiter_platform_instance
 from boss_agent_cli.services.candidate_actions import (
 	CandidateActionBlocked,
@@ -30,7 +37,13 @@ from boss_agent_cli.services.candidate_actions import (
 	candidate_action_provably_unsent,
 	run_candidate_action,
 )
-from boss_agent_cli.services.contact_lookup import FriendListShapeError, FriendLookupLimitExceeded, find_friend
+from boss_agent_cli.services.contact_lookup import (
+	FriendListShapeError,
+	FriendLookupLimitExceeded,
+	find_friend,
+	friend_security_id,
+	friend_uid,
+)
 from boss_agent_cli.services.friend_list_pages import collect_friend_list_page
 from boss_agent_cli.services.output_path import OutputPathProblem, inspect_output_path, prepare_output_path
 from boss_agent_cli.crawler.operations import crawl_status
@@ -41,7 +54,9 @@ from boss_agent_cli.crawler.service import (
 	CrawlSettings,
 	crawl_cdp_port,
 	crawl_chrome_path,
+	crawl_execution_lock,
 	crawl_int_setting,
+	crawl_run_awaiting_worker,
 	unused_local_port,
 )
 from boss_agent_cli.api.egress import EgressContradictionError
@@ -57,6 +72,7 @@ from boss_agent_cli.crawler.hooks import HookRegistrationError, verify_hook_prof
 from boss_agent_cli.crawler.transport import DrissionCrawlerSession, ensure_crawl_runtime
 from boss_agent_cli.services.install_extras import extras_requirement
 from boss_agent_cli.services.labels import LABEL_MAP, brief_label, parse_label_id
+from boss_agent_cli.services.saved_searches import validate_stored_search_params
 from boss_agent_cli.digest import build_digest
 from boss_agent_cli.display import (
 	RISK_ERROR_CONTRACTS,
@@ -377,6 +393,24 @@ def _required_str(inputs: Mapping[str, Any], name: str) -> str:
 	return raw
 
 
+def _required_nonblank_value(inputs: Mapping[str, Any], name: str) -> str:
+	"""必填且非空白的原始字符串：只校验、不 strip。
+
+	CLI 的位置参数只判断 ``.strip()``、原样透传（`detail` / `hr jobs` /
+	`hr reply`），向导必须同口径：空白值在入口报 ``INVALID_PARAM``，非空白值
+	不被悄悄改写（Issue #2516）。
+	"""
+	value = _required_str(inputs, name)
+	if not value.strip():
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			f"wizard 输入 {name} 不能只有空白字符",
+			recoverable=True,
+			recovery_action=f"在 inputs 中提供有效的 {name} 后重试",
+		)
+	return value
+
+
 def _required_nonblank_str(inputs: Mapping[str, Any], name: str) -> str:
 	"""读取必填的非空白字符串。
 
@@ -385,15 +419,7 @@ def _required_nonblank_str(inputs: Mapping[str, Any], name: str) -> str:
 	结果未知指引。wizard 必须在预约前把空白参数报成 INVALID_PARAM，让 Agent
 	修正输入而不是去平台核对一个不存在的动作（Issue #2320）。
 	"""
-	value = _required_str(inputs, name).strip()
-	if not value:
-		raise WorkflowActionError(
-			"INVALID_PARAM",
-			f"wizard 输入 {name} 不能只有空白字符",
-			recoverable=True,
-			recovery_action=f"在 inputs 中提供有效的 {name} 后重试",
-		)
-	return value
+	return _required_nonblank_value(inputs, name).strip()
 
 
 def _optional_str_strict(inputs: Mapping[str, Any], name: str) -> str | None:
@@ -784,6 +810,25 @@ def execute_candidate_detail(
 			recoverable=True,
 			recovery_action="切换平台或改用其他事项",
 		) from exc
+	except Exception as exc:
+		# 与单次命令同口径：参数类 4xx 与限流是确定性 / 停止信号，换通道或
+		# 自动重试都不会改变结果（Issue #2548）。
+		status = parameter_status_code(exc)
+		if status is not None:
+			text = f"平台拒绝了请求参数（HTTP {status}）"
+			code, recoverable, recovery = _classify_action_error("INVALID_PARAM", text)
+			raise WorkflowActionError(
+				code,
+				text,
+				recoverable=recoverable,
+				recovery_action=recovery,
+				auto_retry=False,
+			) from exc
+		if isinstance(exc, PlatformRateLimitError):
+			text = str(exc) or "平台限流，请稍后重试"
+			code, recoverable, recovery = _classify_action_error("RATE_LIMITED", text)
+			raise WorkflowActionError(code, text, recoverable=recoverable, recovery_action=recovery) from exc
+		raise
 
 	if platform.is_success(raw_card):
 		card = field_dict(platform.unwrap_data(raw_card), "jobCard")
@@ -834,7 +879,10 @@ def _auth_status(context: ActionContext, inputs: Mapping[str, Any], prior: Mappi
 
 
 def _candidate_search(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	_required_str(inputs, "query")
+	# 纯空白关键词与 CLI `search " "` / 向导 watch 同口径拒绝（Issue #1798、
+	# #2511、#2514）：`execute_candidate_search` 里 `_optional_str_strict(...) or ""`
+	# 会原样接受它，平台按「无关键词」返回推荐并向动作报成功。
+	_required_nonblank_str(inputs, "query")
 	account = account_scope(context.auth())
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		with context.candidate_platform() as platform:
@@ -869,7 +917,9 @@ def _candidate_recommend(context: ActionContext, inputs: Mapping[str, Any], prio
 def _candidate_detail(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	from boss_agent_cli.wizard.renderer import busy_status
 
-	security_id = _required_str(inputs, "security_id")
+	# 与 CLI `detail` 同口径：空 security_id 不是「查不到」，而是参数构造错了；
+	# 照常发请求只会换来一次注定失败的平台往返（Issue #2516）。
+	security_id = _required_nonblank_value(inputs, "security_id")
 	job_id = _optional_str(inputs.get("job_id"))
 	lid = str(inputs.get("lid") or "")
 	with busy_status("正在读取职位详情…"):
@@ -1034,7 +1084,10 @@ def _candidate_friend(platform: Any, identifier: str, *, context: ActionContext 
 
 
 def _candidate_current_security_id(friend: Mapping[str, Any]) -> str:
-	security_id = str(friend.get("securityId") or friend.get("security_id") or "").strip()
+	# 与 CLI 侧 commands/_contact_lookup 共用同一份判定：布尔 / 容器漂移时
+	# str() 出的 "True" / "{'a': 1}" 绝不能当身份发给 exchange_contact 等
+	# 写请求（Issue #1812 只修了 CLI 侧，Issue #2543 统一）。
+	security_id = friend_security_id(friend)
 	if security_id:
 		return security_id
 	raise WorkflowActionError(
@@ -1045,12 +1098,25 @@ def _candidate_current_security_id(friend: Mapping[str, Any]) -> str:
 	)
 
 
+def _candidate_current_uid(friend: Mapping[str, Any]) -> str:
+	"""读取本次列表返回的稳定 uid；缺失 / 类型漂移时安全停止（Issue #2543）。"""
+	uid = friend_uid(friend)
+	if uid:
+		return uid
+	raise WorkflowActionError(
+		"NETWORK_ERROR",
+		"沟通列表返回的联系人缺少稳定 uid，已停止执行；按当前列表重试不会改变结果",
+		recoverable=False,
+		recovery_action="刷新沟通列表并取到联系人 uid 后重新执行；不要自动重试同一列表结果",
+	)
+
+
 def _candidate_exchange(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	identifier = _required_str(inputs, "security_id")
+	identifier = _required_nonblank_value(inputs, "security_id")
 	exchange_type = _exchange_type(inputs)
 	with context.candidate_platform() as platform:
 		friend = _candidate_friend(platform, identifier, context=context)
-		uid = str(friend.get("uid") or "")
+		uid = _candidate_current_uid(friend)
 		security_id = _candidate_current_security_id(friend)
 		name = str(friend.get("name") or "-")
 		data = _write_call(
@@ -1067,7 +1133,7 @@ def _candidate_exchange(context: ActionContext, inputs: Mapping[str, Any], prior
 
 
 def _candidate_mark(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	identifier = _required_str(inputs, "security_id")
+	identifier = _required_nonblank_value(inputs, "security_id")
 	label = _required_str(inputs, "label")
 	# 先校验布尔值，再查联系人：非法输入不应产生任何平台请求。
 	remove = _bool_input(inputs, "remove")
@@ -1085,7 +1151,7 @@ def _candidate_mark(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 		)
 	with context.candidate_platform() as platform:
 		friend = _candidate_friend(platform, identifier, context=context)
-		uid = str(friend.get("uid") or "")
+		uid = _candidate_current_uid(friend)
 		# friendSource 只是回传给标签接口的定位参数：平台字段漂移成非数字串 /
 		# 对象 / 1e400 时按缺失的默认 0 处理，不能让 int() 的 ValueError 把整个
 		# 步骤兜成可重试的 NETWORK_ERROR（Issue #1314）。
@@ -1105,7 +1171,7 @@ def _candidate_mark(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 	return StepResult(
 		{
 			"uid": uid,
-			"security_id": str(friend.get("securityId") or friend.get("security_id") or ""),
+			"security_id": friend_security_id(friend),
 			"label": label,
 			"result": data,
 		}
@@ -1125,9 +1191,12 @@ def _candidate_chat(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 
 
 def _candidate_chat_history(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
+	# 空白 gid 不可能命中联系人：CLI chatmsg 在 resolve_friend_or_emit 里直接报
+	# 参数错误，向导同样不能先翻一遍沟通列表再报 CONTACT_NOT_FOUND（Issue #2523）。
+	identifier = _required_nonblank_value(inputs, "gid")
 	with context.candidate_platform() as platform:
-		friend = _candidate_friend(platform, _required_str(inputs, "gid"), context=context)
-		gid = str(friend.get("uid") or "")
+		friend = _candidate_friend(platform, identifier, context=context)
+		gid = _candidate_current_uid(friend)
 		security_id = _candidate_current_security_id(friend)
 		response = platform.chat_history(
 			gid,
@@ -1212,7 +1281,9 @@ def _local_resumes(context: ActionContext, inputs: Mapping[str, Any], prior: Map
 
 
 def _ai_assist(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	resume_name = _required_str(inputs, "resume")
+	# 空白简历名在 CLI 由 `_load_resume_text` 报 INVALID_PARAM，不能落到
+	# RESUME_NOT_FOUND 把参数错误伪装成「简历不存在」（Issue #2523）。
+	resume_name = _required_nonblank_value(inputs, "resume")
 	resume, load_error = ResumeStore(context.data_dir / "resumes").get_with_error(resume_name)
 	if resume is None and load_error is not None:
 		# 文件存在但读不出来：报「不存在」会让 Agent 去 resume init，又被同名
@@ -1232,7 +1303,9 @@ def _ai_assist(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping
 	# 其余输入都经 _required* 校验；prompt 也必须走同口径，且先于本地 AI 配置
 	# 检查：旧断点缺该键时应是参数 / 输入错误，而不是 KeyError 被归入
 	# INTERNAL_ERROR 或先报 AI_NOT_CONFIGURED（Issue #2348）。
-	prompt = _required_str(inputs, "prompt")
+	# 空白 prompt 不能照常发起一次计费请求：CLI ai 命令族自 Issue #1975 起
+	# 统一经 _ensure_text_not_blank 拒绝，向导必须在同一位置收口（Issue #2523）。
+	prompt = _required_nonblank_value(inputs, "prompt")
 	config_store = AIConfigStore(context.data_dir)
 	config = config_store.load_config()
 	api_key = config_store.get_api_key()
@@ -1339,6 +1412,10 @@ def _candidate_export(context: ActionContext, inputs: Mapping[str, Any], prior: 
 
 	# 参数与路径必须在平台请求之前校验：非法 format 不能先翻完页才发现，
 	# `output` 指向目录也不能消耗一次受限请求（与命令层 `-o` 预检同口径）。
+	# 纯空白 query 与 CLI `export " "` / `candidate_search` 同口径拒绝：否则
+	# `execute_candidate_search` 的 ``or ""`` 会让平台按无关键词返回空泛结果，
+	# 导出文件照常生成并报成功（Issue #2519）。
+	_required_nonblank_str(inputs, "query")
 	include_private = _bool_input(inputs, "include_private")
 	fmt = str(inputs.get("format") or "json")
 	if fmt not in {"json", "csv"}:
@@ -1380,7 +1457,27 @@ def _candidate_watch(context: ActionContext, inputs: Mapping[str, Any], prior: M
 			if corrupt:
 				data["corrupt"] = corrupt
 			return StepResult(data)
+		# 名称与 CLI `watch add/remove/run` 同口径：空白名不可能被命令点名，
+		# 存下来后 CLI 既不能 run 也不能 remove（Issue #2511）。这里只校验、
+		# 不 strip：CLI 允许名称首尾带空格，向导必须能按原值寻址。
 		name = _required_str(inputs, "name")
+		if not name.strip():
+			raise WorkflowActionError(
+				"INVALID_PARAM",
+				"wizard 输入 name 不能只有空白字符",
+				recoverable=True,
+				recovery_action="在 inputs 中提供有效的 name 后重试",
+			)
+		# 名称要作为 SQLite TEXT 键绑定：孤立代理项（JSON 的 ``"\udcff"`` 转义）
+		# 会在绑定参数时抛 ``UnicodeEncodeError``，被顶层兜成带磁盘指引的
+		# ``LOCAL_IO_ERROR``。CLI 在入口用同一判据拒绝（Issue #2268、#2512）。
+		if problem := saved_search_name_error(name):
+			raise WorkflowActionError(
+				"INVALID_PARAM",
+				f"watch 名称无效：{problem}",
+				recoverable=True,
+				recovery_action="换一个只含普通 Unicode 文本的名称后重试",
+			)
 		if action == "add":
 			params: dict[str, Any] = {}
 			for key in (
@@ -1418,7 +1515,9 @@ def _candidate_watch(context: ActionContext, inputs: Mapping[str, Any], prior: M
 					params["active"] = resolve_active_level(str(inputs.get("active")))
 				except ValueError as exc:
 					raise WorkflowActionError("INVALID_PARAM", str(exc)) from exc
-			_required(inputs, "query")
+			# 与 CLI `watch add` 同口径：纯空白关键词会让 run 发起空泛搜索并
+			# 返回成功，必须在写入前拒绝（Issue #1798、#2511）。
+			_required_nonblank_str(inputs, "query")
 			try:
 				_validate_search_filters(params)
 			except ValueError as exc:
@@ -1433,12 +1532,17 @@ def _candidate_watch(context: ActionContext, inputs: Mapping[str, Any], prior: M
 			raise WorkflowActionError("INVALID_PARAM", f"未知的 watch 动作: {action}（可选: add、remove、run）")
 		try:
 			record = cache.get_saved_search(name)
-		except SavedSearchParamsError as exc:
+		except (SavedSearchParamsError, CacheRecordInvalid) as exc:
+			# 参数写坏与 name / 时间戳等元数据漂移同口径：本地记录损坏是确定性
+			# 失败，必须报 SAVED_SEARCH_INVALID 并给出删除重建指引，不能落成
+			# CACHE_RECORD_INVALID（Issue #2011、#2529）。
 			raise _saved_search_invalid_error(context, name, str(exc)) from exc
 		if record is None:
 			raise WorkflowActionError("SAVED_SEARCH_NOT_FOUND", f"未找到 watch: {name}")
+		# 读取侧与 CLI `watch run` 共用同一份校验：旧版本 / 手工编辑写下的
+		# 空白关键词与类型漂移不能以空泛搜索返回成功（Issue #1338、#1798、#2511）。
 		try:
-			_validate_search_filters(record["params"])
+			validate_stored_search_params(record["params"])
 		except ValueError as exc:
 			raise _saved_search_invalid_error(context, name, f"watch {name!r} 的参数已失效：{exc}") from exc
 		account = account_scope(context.auth())
@@ -2083,7 +2187,17 @@ def _crawl_status(context: ActionContext, inputs: Mapping[str, Any], prior: Mapp
 					"或用 boss crawl start <query> 新建任务"
 				),
 			) from exc
-	return StepResult(data)
+	# 执行器已退出 / 排队超时的任务只轮询状态永远等不到结果：与 `boss crawl status`
+	# 一样把后台恢复作为下一步，数据里的 executor_active 供调用方判定（Issue #2479）。
+	# 已受理的停止请求还没被消费时改为按断点结算 stop：resume --background 会先
+	# 清除 stop 标记，跟随指引就撤销了用户的停止请求（Issue #2482）。
+	next_action = None
+	if data.get("running_stale") or data.get("queue_overdue"):
+		if data.get("stop_requested"):
+			next_action = _hint_command(context, f"crawl stop {shell_argument(run_id)}")
+		else:
+			next_action = _hint_command(context, f"crawl resume {shell_argument(run_id)} --background")
+	return StepResult(data, next_action=next_action)
 
 
 def _crawl_resume(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
@@ -2139,25 +2253,51 @@ def _crawl_resume(context: ActionContext, inputs: Mapping[str, Any], prior: Mapp
 		return _crawl_outcome_result(outcome, cache)
 
 
+def _crawl_run_finished_error(context: ActionContext, run_id: str, status: str | None) -> WorkflowActionError:
+	status_command = _hint_command(context, f"crawl status {shell_argument(run_id)}")
+	results_command = _hint_command(context, f"crawl results {shell_argument(run_id)}")
+	return WorkflowActionError(
+		"CRAWL_RUN_FINISHED",
+		f"crawl 任务已结束（{status}），停止请求没有生效",
+		recovery_action=f"用 {status_command} 查看最终状态，或 {results_command} 读取已采集结果；需要重新采集时新建 crawl 任务",
+		auto_retry=False,
+	)
+
+
 def _crawl_stop(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	run_id = _require_run_id(inputs)
+	settle_reason = None
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		run = cache.get_crawl_run(run_id)
 		if run is None:
 			raise WorkflowActionError("CRAWL_RUN_NOT_FOUND", f"未找到 crawl run: {run_id}")
-		# 与 `boss crawl stop` 同口径（Issue #1574 #1786）：终态任务上的停止请求
-		# 不会生效，继续报 stop_requested 会让调用方以为任务已被叫停。
+		# 与 `boss crawl stop` 同口径（Issue #1574 #1786 #2465）：终态任务上的
+		# 停止请求不会生效；记录仍是 queued / running 但执行锁空闲说明执行器已
+		# 退出，此时只写停止标记没人消费，必须按断点结算 stopped。
 		status = run["status"]
 		if status not in ("queued", "running"):
-			status_command = _hint_command(context, f"crawl status {shell_argument(run_id)}")
-			results_command = _hint_command(context, f"crawl results {shell_argument(run_id)}")
-			raise WorkflowActionError(
-				"CRAWL_RUN_FINISHED",
-				f"crawl 任务已结束（{status}），停止请求没有生效",
-				recovery_action=f"用 {status_command} 查看最终状态，或 {results_command} 读取已采集结果；需要重新采集时新建 crawl 任务",
-				auto_retry=False,
-			)
-		cache.request_crawl_stop(run_id)
+			raise _crawl_run_finished_error(context, run_id, status)
+		accepted = False
+		final_status: str | None = status
+		if crawl_run_awaiting_worker(run):
+			# 交接窗口内的 worker 可能正要取锁：只写停止标记，交给它消费。
+			accepted, final_status = cache.stop_active_crawl_run(run_id)
+		else:
+			with crawl_execution_lock(context.data_dir, run_id) as acquired:
+				if acquired:
+					# 持锁重读：另一执行器可能在首次读取后更新断点或安排新交接。
+					run = cache.get_crawl_run(run_id)
+					if run is not None and not crawl_run_awaiting_worker(run):
+						settle_reason = (
+							"executor exited before this stop request; resume to continue from the checkpoint"
+						)
+				accepted, final_status = cache.stop_active_crawl_run(run_id, settle_reason=settle_reason)
+	if not accepted:
+		if final_status is None:
+			raise WorkflowActionError("CRAWL_RUN_NOT_FOUND", f"未找到 crawl run: {run_id}")
+		raise _crawl_run_finished_error(context, run_id, final_status)
+	if settle_reason is not None:
+		return StepResult({"run_id": run_id, "status": "stopped", "stale_recovered": True})
 	return StepResult({"run_id": run_id, "status": "stop_requested"})
 
 
@@ -2213,8 +2353,11 @@ def _recruiter_applications(context: ActionContext, inputs: Mapping[str, Any], p
 
 
 def _recruiter_resume(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	geek_id = _required_str(inputs, "geek_id")
-	job_id = _required_str(inputs, "job_id")
+	# 与 CLI `hr resume` 同口径：geek_id / job_id 去空白后必须非空。view_geek
+	# 声明 effect: unknown，空白标识的请求不可能命中候选人，必须在构造平台
+	# 之前按参数错误收口（Issue #2525）。
+	geek_id = _required_nonblank_value(inputs, "geek_id")
+	job_id = _required_nonblank_value(inputs, "job_id")
 	security_id = _optional_str(inputs.get("security_id"))
 	return _recruiter_call(
 		context,
@@ -2282,7 +2425,9 @@ def _recruiter_reply(context: ActionContext, inputs: Mapping[str, Any], prior: M
 	friend_id = _required_int(inputs, "friend_id", minimum=1)
 	# message 是发给真人的自由文本：LIST / dict / 数字经 str() 会把 Python repr
 	# 当成真实消息发出去（Issue #1906）；只在 --input-json / MCP 路径可达。
-	message = _required_str(inputs, "message")
+	# 纯空白消息与 CLI `hr reply` 同口径拒绝：它会被当成一条空消息真正发给
+	# 候选人（Issue #2516）。
+	message = _required_nonblank_value(inputs, "message")
 	return _recruiter_call(
 		context,
 		lambda platform: platform.send_message_by_friend(friend_id, message),
@@ -2343,12 +2488,14 @@ def _recruiter_jobs_list(context: ActionContext, inputs: Mapping[str, Any], prio
 
 
 def _recruiter_jobs_detail(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	job_id = _required_str(inputs, "job_id")
+	# 与 CLI `hr jobs detail` 同口径：空 job_id 无法命中任何职位（Issue #2516）。
+	job_id = _required_nonblank_value(inputs, "job_id")
 	return _recruiter_call(context, lambda platform: platform.job_detail(job_id), "职位详情获取失败")
 
 
 def _recruiter_jobs_online(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	job_id = _required_str(inputs, "job_id")
+	# 空白 job_id 的「上线」请求只会换来一次无意义的平台状态变更（Issue #2516）。
+	job_id = _required_nonblank_value(inputs, "job_id")
 	return _recruiter_call(
 		context,
 		lambda platform: platform.job_online(job_id),
@@ -2361,7 +2508,8 @@ def _recruiter_jobs_online(context: ActionContext, inputs: Mapping[str, Any], pr
 
 
 def _recruiter_jobs_offline(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	job_id = _required_str(inputs, "job_id")
+	# 与 online 同理（Issue #2516）。
+	job_id = _required_nonblank_value(inputs, "job_id")
 	return _recruiter_call(
 		context,
 		lambda platform: platform.job_offline(job_id),

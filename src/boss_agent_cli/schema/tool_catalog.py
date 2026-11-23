@@ -204,10 +204,9 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"welfare": {"type": "string", "description": "福利筛选，逗号分隔 AND 逻辑（如 双休,五险一金）"},
 					"active": {
 						"type": "string",
-						"enum": ["", "online", "today", "3d", "week", "2w", "month", "half-year"],
-						"description": "只保留 HR 活跃度不低于该档的职位；online 只看列表、请求量与普通搜索相同，其余档位列表看不出时会逐个查详情（更慢、风控风险更高），活跃度未知的职位会被排除并写进 hints.active_filter；空串表示清除 preset 保存的活跃度筛选",
+						"description": "只保留 HR 活跃度不低于该档的职位；标准值为 online / today / 3d / week / 2w / month / half-year，也支持 3day、3日 等 CLI 别名。online 只看列表、请求量与普通搜索相同，其余档位列表看不出时会逐个查详情（更慢、风控风险更高），活跃度未知的职位会被排除并写进 hints.active_filter；空串表示清除 preset 保存的活跃度筛选",
 					},
-					"page": {"type": "integer", "minimum": 1, "description": "页码", "default": 1},
+					"page": {"type": "integer", "minimum": 1, "maximum": 1000000, "description": "页码", "default": 1},
 					"no_cache": {"type": "boolean", "description": "跳过缓存，强制重新请求", "default": False},
 					"with_score": {"type": "boolean", "description": "附加匹配分和原因（使用本地简历）", "default": False},
 					"sort": {"type": "string", "enum": ["relevance", "score"], "description": "排序方式", "default": "relevance"},
@@ -223,7 +222,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 			input_schema={
 				"type": "object",
 				"properties": {
-					"page": {"type": "integer", "minimum": 1, "description": "页码", "default": 1},
+					"page": {"type": "integer", "minimum": 1, "maximum": 1000000, "description": "页码", "default": 1},
 					"with_score": {"type": "boolean", "description": "附加匹配分和原因（使用本地简历）", "default": False},
 				},
 				"required": [],
@@ -263,7 +262,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				"properties": {
 					"from_who": {"type": "string", "enum": ["boss", "me"], "description": "筛选发起方"},
 					"days": {"type": "integer", "minimum": 0, "maximum": 36500, "description": "只显示最近 N 天的记录"},
-					"page": {"type": "integer", "minimum": 1, "description": "页码", "default": 1},
+					"page": {"type": "integer", "minimum": 1, "maximum": 1000000, "description": "页码", "default": 1},
 					"format": {
 						"type": "string",
 						"enum": ["html", "md", "csv", "json"],
@@ -323,8 +322,8 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				"properties": {
 					"security_id": {"type": "string", "description": "好友的 uid（推荐，取自 boss_chat，跨请求稳定）或 security_id"},
 					"friend_uid": {"type": "string", "description": "已知稳定 uid 时直接读取消息：security_id 按本次请求的令牌使用，跳过沟通列表扫描"},
-					"page": {"type": "integer", "minimum": 1, "description": "页码", "default": 1},
-					"count": {"type": "integer", "minimum": 1, "description": "每页消息数量", "default": 20},
+					"page": {"type": "integer", "minimum": 1, "maximum": 1000000, "description": "页码", "default": 1},
+					"count": {"type": "integer", "minimum": 1, "maximum": 1000000, "description": "每页消息数量", "default": 20},
 					"raw": {"type": "boolean", "description": "输出保真结构化消息字段（仍受合规门控）", "default": False},
 				},
 				"required": ["security_id"],
@@ -337,8 +336,8 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				"type": "object",
 				"properties": {
 					"security_id": {"type": "string", "description": "好友的 uid（推荐，取自 boss_chat，跨请求稳定）或 security_id"},
-					"page": {"type": "integer", "minimum": 1, "description": "消息页码", "default": 1},
-					"count": {"type": "integer", "minimum": 1, "description": "每页消息数量", "default": 20},
+					"page": {"type": "integer", "minimum": 1, "maximum": 1000000, "description": "消息页码", "default": 1},
+					"count": {"type": "integer", "minimum": 1, "maximum": 1000000, "description": "每页消息数量", "default": 20},
 				},
 				"required": ["security_id"],
 			},
@@ -399,7 +398,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_batch_greet",
-			description="搜索后批量打招呼（上限 10）；筛选条件与搜索一致，未传时默认最多 5 个",
+			description="搜索后批量打招呼（上限 10）；支持关键词、城市、薪资、经验、学历、行业、规模、阶段与职位类型筛选，未传 limit 时默认最多 5 个",
 			input_schema={
 				"type": "object",
 				"properties": {
@@ -927,8 +926,8 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"welfare": {"type": "string", "description": "福利筛选（可选）"},
 					"active": {
 						"type": "string",
-						"enum": ["online", "today", "3d", "week", "2w", "month", "half-year"],
-						"description": "HR 活跃度下限（可选）",
+						"minLength": 1,
+						"description": "HR 活跃度下限（可选）：online / today / 3d / week / 2w / month / half-year，也支持 3day、3日 等 CLI 别名；不设筛选请省略",
 					},
 				},
 				"required": ["name", "query"],

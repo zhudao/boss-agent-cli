@@ -8,6 +8,7 @@ from typing import Any
 import click
 
 from boss_agent_cli import __version__
+from boss_agent_cli.api._base_client import RequestTextEncodingError
 from boss_agent_cli.api.browser_source import POLICIES as BROWSER_SOURCES
 from boss_agent_cli.cache.store import (
 	CacheBusyError,
@@ -1003,6 +1004,25 @@ class BossCliGroup(click.Group):
 				recovery_action=internal_recovery_action,
 			)
 			return None
+		except RequestTextEncodingError:
+			# 请求参数编码失败（孤立代理项等）是输入问题：请求未发出，不能给
+			# 磁盘 / 权限指引（Issue #2533）。装饰器命令已由 handle_auth_errors
+			# 收口，这里兜住没有装饰器的命令。
+			if not standalone_mode:
+				raise
+			command = _invoked_command_name(args, self.name or "boss")
+			encoding_recoverable, _encoding_recovery = error_contract_for_code("INVALID_PARAM")
+			emit_error(
+				command,
+				code="INVALID_PARAM",
+				message=f"{command} 请求参数含有无法按 UTF-8 编码的字符（如孤立代理项），请求未发出",
+				recoverable=encoding_recoverable,
+				recovery_action=(
+					"检查命令中的标识 / 关键词 / 消息文本，去掉无效字符后重试；"
+					"编号建议重新从 search 或 chat 的结果中取"
+				),
+			)
+			return None
 		except UnicodeError as exc:
 			# 孤立代理字符等不可编码内容属于确定性本地数据问题：既不是平台网络
 			# 故障（重试无意义），也不是「升级版本可解」的内部缺陷（Issue #1294）。
@@ -1019,6 +1039,27 @@ class BossCliGroup(click.Group):
 			)
 			return None
 		except OSError as exc:
+			from boss_agent_cli.services.chat_snapshot import ChatSnapshotBusyError
+
+			# 快照锁争用是并发导出的正常现象：可重试，且不能给磁盘 / 权限指引
+			# （Issue #2538）。chat 命令已有装饰器收口，这里兜住没有装饰器的
+			# 调用路径。
+			if isinstance(exc, ChatSnapshotBusyError):
+				if not standalone_mode:
+					raise
+				command = _invoked_command_name(args, self.name or "boss")
+				busy_recoverable, _ = error_contract_for_code("CACHE_BUSY")
+				emit_error(
+					command,
+					code="CACHE_BUSY",
+					message=str(exc),
+					recoverable=busy_recoverable,
+					recovery_action=(
+						"稍后重试本命令；并发导出同一数据目录时会短暂争用当天快照锁，"
+						"快照文件本身完好，不需要删除"
+					),
+				)
+				return None
 			# 网兜：导出、保存配置这类直接写文件的路径没有统一装饰器，
 			# 写失败时必须给信封，而不是把 traceback 甩给 Agent。
 			if not standalone_mode:

@@ -22,7 +22,7 @@ from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
-from boss_agent_cli.api._base_client import PlatformResponseInvalid
+from boss_agent_cli.api._base_client import PlatformResponseInvalid, RequestTextEncodingError
 from boss_agent_cli.cache.store import (
 	CacheBusyError,
 	CacheDatabaseInvalid,
@@ -37,6 +37,7 @@ from boss_agent_cli.services.browser_runtime import (
 	patchright_headless_shell_command,
 	patchright_install_command,
 )
+from boss_agent_cli.services.text_files import sanitize_surrogates
 
 #: C0（保留 ``\t`` / ``\n``）与 C1 控制字符。Rich 只处理 markup，不会剥离原始
 #: 转义字节：平台文本里的 ESC / OSC / CSI 会原样写进终端，可改写标题、伪造
@@ -120,7 +121,7 @@ def escape_markup(value: Any) -> str:
 	悬空的 ``[`` 够不到值外的 ``]``；结尾反斜杠加倍后恰好还原成原数量，
 	闭合标签保持有效。
 	"""
-	text = strip_control(str(value))
+	text = strip_control(sanitize_surrogates(str(value)))
 	if "[" not in text and not text.endswith("\\"):
 		return text
 	parts: list[str] = []
@@ -1371,7 +1372,7 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 			from boss_agent_cli.ai.config import AIConfigValueError
 			from boss_agent_cli.api._base_client import BrowserChannelRequired
 			from boss_agent_cli.api.browser_source import BrowserSourceUnavailable, BrowserSourceUnsupported
-			from boss_agent_cli.api.client import PlatformRiskError
+			from boss_agent_cli.api.client import PlatformRateLimitError, PlatformRiskError
 			from boss_agent_cli.api.proxy import ProxyConfigurationError
 			from boss_agent_cli.api.request_budget import RequestBudgetExceeded
 			from boss_agent_cli.auth.manager import AuthRequired, TokenRefreshFailed
@@ -1486,6 +1487,19 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					recoverable=True,
 					recovery_action=login_action,
 					hints=auth_required_hints(ctx),
+				)
+			except PlatformRateLimitError as e:
+				# 限流不是风控、也不是认证失效：等待限流窗口即可（Issue #2237）。
+				# 泛化兜底会把它报成可重试的 NETWORK_ERROR，丢掉登记表的恢复指引
+				# （Issue #2548）。
+				rate_recoverable, rate_recovery = error_contract_for_code("RATE_LIMITED")
+				handle_error_output(
+					ctx,
+					command_name,
+					code="RATE_LIMITED",
+					message=str(e) or "平台限流，请稍后重试",
+					recoverable=rate_recoverable,
+					recovery_action=rate_recovery,
 				)
 			except PlatformRiskError as e:
 				recovery_action, contract_hints = risk_error_contract(e.code, ctx=ctx)
@@ -1652,7 +1666,24 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 					recovery_action=internal_recovery,
 				)
 			except OSError as e:
-				if is_browser_kernel_missing(str(e)):
+				from boss_agent_cli.services.chat_snapshot import ChatSnapshotBusyError
+
+				if isinstance(e, ChatSnapshotBusyError):
+					# 并发导出的正常争用：等另一进程写完快照即可，不能落成
+					# 不可重试的 LOCAL_IO_ERROR + 磁盘 / 权限指引（Issue #2538）。
+					busy_recoverable, _busy_recovery = error_contract_for_code("CACHE_BUSY")
+					handle_error_output(
+						ctx,
+						command_name,
+						code="CACHE_BUSY",
+						message=str(e),
+						recoverable=busy_recoverable,
+						recovery_action=(
+							"稍后重试本命令；并发导出同一数据目录时会短暂争用当天快照锁，"
+							"快照文件本身完好，不需要删除"
+						),
+					)
+				elif is_browser_kernel_missing(str(e)):
 					# Playwright 以 OSError 子类抛「内核缺失」时同样不能被兜成可重试。
 					handle_browser_kernel_missing(ctx, command_name, e)
 				elif is_local_io_error(e):
@@ -1725,6 +1756,23 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 				# 兜成 NETWORK_ERROR +「重试」让 Agent 反复打平台。
 				if is_browser_kernel_missing(str(e)):
 					handle_browser_kernel_missing(ctx, command_name, e)
+					return
+				# 请求参数在 httpx 编码阶段失败（孤立代理项等）是输入问题：
+				# 请求确定未发出，不能给磁盘 / 权限指引，也不能建议无脑重试
+				# （Issue #2533）。
+				if isinstance(e, RequestTextEncodingError):
+					encoding_recoverable, _encoding_recovery = error_contract_for_code("INVALID_PARAM")
+					handle_error_output(
+						ctx,
+						command_name,
+						code="INVALID_PARAM",
+						message=f"{command_name} 请求参数含有无法按 UTF-8 编码的字符（如孤立代理项），请求未发出",
+						recoverable=encoding_recoverable,
+						recovery_action=(
+							"检查命令中的标识 / 关键词 / 消息文本，去掉无效字符后重试；"
+							"编号建议重新从 search 或 chat 的结果中取"
+						),
+					)
 					return
 				# 孤立代理字符等不可编码 / 不可解码的本地文本是确定性失败：
 				# 重试只会复现，不能兜成 NETWORK_ERROR +「重试」（Issue #1294）。

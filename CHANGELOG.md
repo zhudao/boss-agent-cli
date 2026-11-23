@@ -4,6 +4,113 @@
 
 ## [Unreleased]
 
+## [3.4.163] - 2026-11-23
+
+### Fixed
+- `agent review reject` 不再因 `pending-actions.jsonl` 里 `approved_review_id` 类型漂移而漏拦已批准动作：`null` / 容器值此前经 `str()` 变成 `"None"` / `"{...}"`，拒绝时找不到关联行，复核项写成 `rejected` 但那条待派发动作仍留在 `pending`。现在与 `status` / `confidence` 同口径按状态损坏 fail-closed，并在改写复核之前报错（Issue #2562）。
+- `crawl resume` 预检失败后的状态还原不再顶替原始错误：还原写库失败（磁盘满 / 库锁冲突）时保留预检异常的类型与文案，还原失败以 note 附加并提示先核对 `crawl status`，不再让操作者只看到本地 IO 错误而 run 停在 `running`（Issue #2562）。
+- 自动化执行器的陈旧状态快照不再复活操作者已清除的停止闩锁：`write_state` 重建 `stop.json` 前重读磁盘 `state.json`，磁盘熔断已解除时不复活旧熔断，也不把快照里的旧 `circuit_breaker` 写回；磁盘仍熔断时沿用磁盘原因（Issue #2562）。
+- MCP 的 `boss_wizard` 按 `action` 区分中断后的恢复方式：`status` 只读本地断点，可重新查询；`stop` 可能已写入本地停止标记，应先查同一任务的状态，不自动重放。`run`、`resume` 和省略 `action`（默认执行 `run`）仍按可能产生写入处理（Issue #2552）。
+- MCP 将以 `--` 开头的选项值与选项名合并为单个 argv 元素，避免误判结束符或开关，同时原样保留 `-o` 的输出路径；参数入口拒绝非有限数、超出 `2^53-1` 的整值浮点及不在工具声明 `enum` 中的取值。`preset_add active=""` 不再被静默丢弃，`search` 仍支持 CLI 的活跃度别名与显式清除筛选（Issue #2553）。
+- MCP 调用在 CLI 子进程启动期间或运行中被取消时，宿主仍会停止并回收自己启动的进程，保留已返回的断点信息，不把派发过的写调用标为安全重试。超时估算失败改在启动前拒绝，不再先启动子进程（Issue #2555）。
+- MCP 只接受字段完整、`ok` 为布尔且与 CLI 退出码一致的 JSON 信封；畸形对象或矛盾的退出状态按 `CLI_ERROR` 上报。已启动的写命令保留结果未知、不可自动重发的标记（Issue #2556）。
+- MCP 异步调用在启动前与同步入口一样校验完整 argv：宿主注入的 `--data-dir` 等全局值或 CLI 路径含 NUL / 孤立代理项时按 `INVALID_PARAM` 拒绝，不再漏成 MCP 内部错误（Issue #2558）。
+- `doctor` 的浏览器缓存探测不再把「读不出来」当成「没安装」：不可读的缓存根（`Path.glob` 对权限错误静默返回空）、缓存根解析整体失败、悬空的符号链接根都归入「无法确认」并按 warn 提示，而不是引导重复下载内核；缓存条目枚举改用 `listdir`，只把 `FileNotFoundError` 当缺失。缓存根解析与 patchright 驱动同优先级读取 `PLAYWRIGHT_BROWSERS_PATH` → `npm_config_playwright_browsers_path` → `npm_package_config_playwright_browsers_path`（及 `INIT_CWD` 的回退），从 npm 脚本启动时不再与驱动定位到不同根（Issue #2559）。
+- `search` 读取缓存时，单行 `response` 存了非法 UTF-8 不再被归成「缓存库损坏」并引导删除整库（候选池、预设、断点都在里面）：`CacheRowDecodeError` 让该行按缓存未命中处理并删除，本次搜索重新请求覆盖；`response` 列类型漂移（BLOB / 数字）同样按未命中；缓存里的 `pagination` 字段类型漂移（`page=true` / `has_more` 为字符串等）不再原样进入成功信封（Issue #2545）。
+- 平台职位字段含孤立代理项时，搜索缓存文本改用默认 JSON 转义后落库：SQLite 绑定阶段不再抛 `UnicodeEncodeError` 被兜成带磁盘指引的 `LOCAL_IO_ERROR`，普通搜索与加 `--with-score` 一样能返回结果（Issue #2545）。
+- `search --page` 与 URL 里的 `page` 统一钳制到 `MAX_TRUSTED_PAGE`，达到上限时保留平台的 `has_more` 证据但不再生成必然重复同一请求的下一页命令；4300 位页码在发出请求前按 `INVALID_PARAM` 拒绝。格式错误的 `--url`（如无效 IPv6 主机名）转成 `SearchUrlParseError`，按 `INVALID_PARAM` 提示修正链接，不再是可重试的 `NETWORK_ERROR`（Issue #2546）。
+- `export --format json` 遇到单个职位包含深嵌套字段时逐条降级：坏条目保留仍可序列化的标量字段并标注 `export_error`，其余职位照常写出，不再因 `RecursionError` 让整份导出失败并给出磁盘权限指引（Issue #2546）。
+- 联系人身份判定在 CLI 与向导之间统一到 `services/contact_lookup`：向导的 `candidate_exchange` / `candidate_mark` / `candidate_chat_history` 不再把漂移成布尔 / 容器的 `securityId` / `uid` 经 `str()` 变成 `"True"` / `"{'a': 1}"` 发给平台（`candidate_exchange` 属写请求），类型漂移与缺失一律按 `NETWORK_ERROR`、`recoverable=false` 停止；`current_friend_uid_or_emit` 对超过 4300 位的整数不再落成可重试错误，与 `stable_uid` 同口径按缺失 uid 处理（Issue #2543）。
+- `preset add` / `watch add` 在写库前调用读取侧同一份 `validate_stored_search_params`：`--welfare "\udcff"` 之类不可编码的筛选参数不再能保存成「每次运行都报 `SAVED_SEARCH_INVALID`、删除重建仍然失败」的记录（此前入口只校验关键词，Issue #2543）。
+- `chat --page` 与其它列表命令同口径钳制到可信页码上限（`MAX_TRUSTED_PAGE`）：4300 位页码不再通过 Click 解析后在 `page + 1` 字符串化时抛 `ValueError` 被兜成可重试的 `NETWORK_ERROR`，信封 `pagination.page` 不再回显未钳制的请求页，达到上限时也不再给出必然重复同一请求的下一页提示；`boss schema` 中 `chat` 的 `--page` 补上 `maximum`（Issue #2542）。
+- `chat` 的时间列不再因时间戳边界让整条命令失败：本地时区偏移把 UTC 边界时间推过 year 10000 时 `astimezone()` 的 `OverflowError` 按「无时间」输出 `-`（与 #1295 的 `fromtimestamp` 越界同口径），`chat --export` 因此不再整体失败；未来时间戳不再渲染成负的「N天前」，改为绝对日期（Issue #2542）。
+- `detail` / `show` 的通道降级不再掩盖确定性失败：详情响应为 `RATE_LIMITED` 时不再换浏览器通道再撞同一限流窗口；参数类 HTTP 4xx（400 / 406 / 409 / 410 / 422）不再回退浏览器，按 `INVALID_PARAM` 收口；httpx 卡片成功但 `zpData.jobCard` 缺失时回退浏览器（`job_card` 此前只在抛异常时降级），仍为空才报 `JOB_NOT_FOUND`；本地缓存锁冲突 / 库损坏不再被当作「httpx 通道不可用」触发降级；响应 `code` 为布尔时按不可重试的 `INTERNAL_ERROR` 收口，不再兜成可重试的 `NETWORK_ERROR`（Issue #2548）。
+- `detail` 从缓存取出的 job_id 含孤立代理项时按未命中处理，继续用 `security_id` 走卡片通道，不再让整条命令报 `INVALID_PARAM`（显式 `--job-id` 仍按输入错误拒绝）；`show` / `detail` 的 TTY 渲染把平台文本里的孤立代理项归一为可编码文本，严格 UTF-8 的 stderr 不再抛 `UnicodeEncodeError`；`jobType` 漂移成布尔时 `raw_job_type` 按缺失输出，不再出现 `true`（Issue #2549）。
+- `recommend` / `chatmsg` / `chat-summary` 的 `--page` 与 `--count` 与 `search` / `chat` 同口径钳制到可信上限（`MAX_TRUSTED_PAGE` / `MAX_TRUSTED_COUNT`）：4300 位数值不再在 httpx 参数序列化、本地索引写入或 `page + 1` 提示拼接时抛 `ValueError` 被兜成可重试的 `NETWORK_ERROR` / `INTERNAL_ERROR`；`boss schema` 与 MCP 工具目录两个来源同步补 `maximum`（Issue #2550）。
+
+## [3.4.162] - 2026-11-23
+
+### Fixed
+- `agent stop` / `agent review reject` 的 `--reason` 与 `agent crawl --run-id` 在入口校验 UTF-8 可编码性：孤立代理项不再在 JSONL 写入层被误报成「自动化状态文件无法解析」（`AUTOMATION_STATE_INVALID`，还可能引导删除待审队列），也不再让 `agent crawl` 指向无关的 crawl 配置；三个入口统一按 `INVALID_PARAM` 指明具体参数（Issue #2537）。
+- 聊天快照锁等待超时不再被兜成不可重试的 `LOCAL_IO_ERROR` + 磁盘 / 权限指引：`ChatSnapshotBusyError` 在命令出口按可重试的 `CACHE_BUSY` 上报并提示稍后重试，并发导出的正常锁争用不再让 Agent 直接放弃；上一份快照读取失败时的降级行为保持不变（Issue #2538）。
+
+## [3.4.161] - 2026-11-23
+
+### Fixed
+- 请求参数的编码失败不再被误报成本地磁盘问题：`httpx` 在构造 URL / 请求体时抛出的不可编码错误统一翻译成 `RequestTextEncodingError`，命令出口按 `INVALID_PARAM` 收口（此前是带「检查目录权限 / 磁盘空间」指引、不可重试的 `LOCAL_IO_ERROR`）。`detail` / `chatmsg` / `apply` / `greet` / `hr candidates` / `hr resume` / `hr jobs detail|online|offline` 在入口先拒绝不可编码的标识、关键词与消息文本，`detail` 与 `job_card` 不再为此白降级一次浏览器；单请求写操作把它认定为「确定未发出」并释放预约，修正参数后可立即重试（Issue #2533）。
+- `search` / `export` 的关键词与 `watch add` / `preset add` 的写入参数在入口校验 UTF-8 可编码性：argv 的孤立代理项按 `INVALID_PARAM` 拒绝，不再等到 `httpx` 组 URL 参数时被兜成带磁盘指引的 `LOCAL_IO_ERROR`。存量记录的可编码性纳入 `validate_stored_search_params`，`watch run` / `search --preset` 对坏记录报 `SAVED_SEARCH_INVALID` 并给删除重建指引，`watch run --all` 不再因一条坏记录中止整批；编码无效的预设关键词同样按预设失效处理（Issue #2528）。
+- `watch list` / `preset list` / `watch run --all` 的坏记录标签改用解码后的名称：BLOB 存储类的名称不再显示为 `b'legacy'` 并给出必然失败的删除命令，名称本身不是有效 UTF-8 时明确提示需手工清理本地数据库。`search --preset` 与向导 `candidate_watch run` 把 name / 时间戳等元数据损坏与参数损坏同口径报 `SAVED_SEARCH_INVALID` 并附删除重建指引，不再落成与预设无关的 `CACHE_RECORD_INVALID`（Issue #2529）。
+
+## [3.4.160] - 2026-11-23
+
+### Fixed
+- 向导 `ai_assist` 的 `resume` / `prompt` 与联系人动作 `candidate_exchange` / `candidate_mark` / `candidate_chat_history` 在入口拒绝纯空白输入（`INVALID_PARAM`）：空白提示词不再照常发起一次计费 AI 请求，空白联系人标识不再先翻一遍沟通列表再报「联系人不存在」。与 CLI `ai` 命令族及 `resolve_friend_or_emit` 同口径，非空白值按原样透传（Issue #2523）。
+- 向导 `candidate_resume` 在构造平台之前拒绝纯空白的 `geek_id` / `job_id`（`INVALID_PARAM`），不再发起一次不可能命中候选人的 `view_geek` 请求；与 CLI `hr resume` 及 `recruiter_jobs_*` 同口径，非空白值按原样透传（Issue #2525）。
+
+## [3.4.159] - 2026-11-23
+
+### Fixed
+- 招呼 / 投递 / 招聘者招呼记录与职位描述缓存不再被无法按 UTF-8 编码的平台标识拖垮：标识在可编码时仍按 TEXT 存储，不可编码时按可逆的 BLOB 键绑定，转义后的字面标识不会与之碰撞。`search` / `recommend` 的 `greeted` 标记、平台确认发送后的去重记录与 `--welfare` 管线因此不再被单张漂移卡片报成带磁盘指引的 `LOCAL_IO_ERROR`（Issue #2509）。
+- 向导的 export 动作在发起平台请求前拒绝纯空白关键词（`INVALID_PARAM`），与 CLI `export` / `search` 及 `candidate_search` 同口径，不再生成一份看似成功、实际没有关键词筛选的导出文件（Issue #2519）。
+- 向导的 watch 动作与 CLI 对齐：空白名称与空白关键词在写入时按 `INVALID_PARAM` 拒绝；运行存量记录时复用 CLI 的读取侧校验（关键词必填、参数类型、城市 / 标签 / 活跃度取值域），失效记录报 `SAVED_SEARCH_INVALID` 并给出可执行的删除重建指引（Issue #2511）。
+- `search --preset` 在读取预设时拒绝纯空白关键词：记录报 `SAVED_SEARCH_INVALID` 并给出带数据目录的 `preset remove` + `preset add` 删除重建指引，不再以空泛搜索返回成功；显式命令行关键词或 `--url` 链接里的关键词仍可覆盖（Issue #2513）。
+- 向导的 search 动作在入口拒绝纯空白关键词（`INVALID_PARAM`），与 CLI `search " "` 及 watch 动作同口径，不再以无关键词的空泛搜索返回成功（Issue #2514）。
+- 向导 watch 动作的名称按 CLI 同口径校验可编码性：含孤立代理项的名称在 `add` / `run` / `remove` 均报 `INVALID_PARAM`，不再以 `UnicodeEncodeError` 崩溃并被兜成带磁盘指引的 `LOCAL_IO_ERROR`（Issue #2512）。
+- 向导的 `candidate_detail`、`recruiter_jobs_detail/online/offline` 与 `recruiter_reply` 在入口拒绝纯空白标识与空消息（`INVALID_PARAM`），与 CLI `detail` / `hr jobs` / `hr reply` 同口径，不再把空白参数发到平台或把空消息发给候选人；非空白值按原样透传（Issue #2516）。
+
+## [3.4.158] - 2026-11-23
+
+### Fixed
+- `shortlist add/annotate/remove` 在命令入口校验会写入 sqlite 的文本字段：含孤立代理项（argv 的非 UTF-8 字节经 surrogateescape）时报 `INVALID_PARAM` 并指明字段，不再被 sqlite3 绑定异常兜成带磁盘恢复指引的 `LOCAL_IO_ERROR`（Issue #2502）。
+- 收藏同步与采集导入遇到无法按 UTF-8 编码的职位标识时跳过该条目并计入 `skipped_count`，有效条目继续导入。候选池按字面转义保存职位描述中的孤立代理项，并将无法编码的 `lid` 视为缺失（Issue #2502）。
+- `resume link` 的职位字段（security_id / job_id / `--title` / `--company`）在命令入口校验可编码性：含孤立代理项时报 `INVALID_PARAM` 并指明字段，不再被 sqlite3 绑定异常兜成带磁盘恢复指引的 `LOCAL_IO_ERROR`（Issue #2503）。
+- `resume link`、`resume applications` 和 `resume delete` 支持文件名含非 UTF-8 字节的现有简历。简历职位关联按原始名称区分，删除简历时只清理对应名称的关联（Issue #2503）。
+- `shortlist add/annotate/compare` 和 `crawl shortlist` 拒绝无法按 UTF-8 编码的标签参数，并返回包含参数名的 `INVALID_PARAM`。候选池中已转义的标签可以按 `shortlist list` 返回的文本查找和移除（Issue #2506）。
+
+## [3.4.157] - 2026-11-23
+
+### Fixed
+- `crawl resume/status/stop/results/shortlist` 与 `wizard --status/--resume/--stop` 的 `run_id` 在命令入口校验可编码性：含孤立代理项（argv 的非 UTF-8 字节经 surrogateescape）时报 `INVALID_PARAM` 并提示重新复制 run_id，不再被兜成带磁盘恢复指引的 `LOCAL_IO_ERROR`；正常 run_id 的「任务不存在」分类保持不变（Issue #2499）。
+
+## [3.4.156] - 2026-11-23
+
+### Fixed
+- 向导的状态 / 任务列表 / 停止不再被断点里不可编码的内部 `run_id`（如 `\ud800`）拖垮：绑定 sqlite 前先把值归一成可写编码，不可寻址的内部任务按「没有绑定」跳过；`wizard --stop` 在停止标记已落盘后返回成功，不再报 `LOCAL_IO_ERROR`（Issue #2495）。
+- 沟通导出的 md / html 返回值与 JSON 分支同口径归一孤立代理字符：联系人映射表 key、diff 的 `prev_date` 等原始平台字段不再让 Python API 拿到不可严格 UTF-8 编码的文本（Issue #2496）。
+
+## [3.4.155] - 2026-11-23
+
+### Fixed
+- `crawl` 导出不再把 mkstemp 预建的空备份恢复成 0 字节产物：预检后目标在搬运前被外部删除时按首次导出安装完整新产物，失败路径保持目标不存在（Issue #2491）。
+- `crawl` 导出在搬备份前复核目标仍是普通文件：序列化期间目标被换成符号链接 / FIFO 时按 `CrawlExportError` 停止并保持链接原样，不再把用户的链接搬进备份、安装成功后静默删除；目标消失按首次导出处理（Issue #2492）。
+- `crawl` 导出的 XLSX 单元格对容器字段兜底 `str()` 的 `ValueError` / `RecursionError`：容器内含 4300 位以上整数或深嵌套时按缺失处理，单条漂移字段不再让整份导出永久失败（Issue #2490）。
+
+## [3.4.154] - 2026-11-23
+
+### Fixed
+- 向导与 MCP 的 `crawl_stop` 步骤与 `boss crawl stop` 同口径：执行器已退出（执行锁空闲）时按断点结算 `stopped` 并回报 `stale_recovered`，不再写一条没人消费的停止标记后报 `stop_requested`；写停止标记改为只对 queued / running 生效，执行器并发写下的终态会按 `CRAWL_RUN_FINISHED` 回报真实状态（Issue #2478）。
+- 采集附着已有调试端口前核对浏览器归属：配置目录 `SingletonLock` 记录的 Chrome 主进程 pid 必须与 CDP 报告的浏览器进程一致，Windows 没有该锁时退回读进程命令行的 `--user-data-dir`；确认不了归属（如端口被日常 Chrome 占用）时按 `CRAWL_PROFILE_BUSY` 停止，不注入 boss login 的 Cookie、不注册 Hook，也不退出对方的浏览器。同一配置目录的打开流程增加跨进程锁（Issue #2464）。
+- 向导与 MCP 的 `crawl_status` 步骤与 `boss crawl status` 同口径：用同一次任务行读取回报 `executor_active`，`running` 无执行器时标记 `running_stale`、`queued` 超出交接窗口时标记 `queue_overdue`，并在步骤指引里给出 `crawl resume <run_id> --background`（Issue #2479）。
+- `crawl status` 在 queued / running 时回报待处理的 `stop_requested`；执行器已退出但停止请求还没被消费时，下一步建议 `crawl stop` 按断点结算，不再建议会先清除标记的 `crawl resume --background`。向导与 MCP 的 `crawl_status` 步骤同口径（Issue #2482）。
+- 本地断点里可空的 JSON 列（`workflow_steps.error` / `result`、`workflow_runs.error` / `last_result`）只在 SQL NULL 时视为缺失：空串 / 空 BLOB / 空数组 / 数字漂移一律按记录损坏处理。写请求发出后标记漂移成空值时，恢复按结果未知 fail-closed（`replay_safe: false`），不再重放可能已生效的写操作（Issue #2484）。
+- 向导输入的对象键只接受字符串：数字 / 布尔 / null 键及其混合键此前能通过 `WizardInput.from_mapping`，落库时 `json.dumps(sort_keys=True)` 抛 `TypeError` 并被兜成 `INTERNAL_ERROR`；现在入口直接给出 `INVALID_PARAM` 诊断（Issue #2485）。
+
+## [3.4.153] - 2026-11-23
+
+### Fixed
+- 采集职位监听按关键词、城市和页码确认响应归属，避免把同页码的其他搜索结果写入当前任务。风控与限流响应仍优先处理（Issue #2464）。
+- `crawl status` 用同一次任务行读取生成状态、游标和执行器提示，避免并发恢复时同一个信封同时显示已停止和执行器活跃（Issue #2474）。
+
+## [3.4.152] - 2026-11-23
+
+### Fixed
+- `crawl resume` 在打开浏览器前检查剩余预算能否到达深层断点。预算不足时记录目标页、最低请求数和剩余预算，保留断点及已有结果，避免重复导航消耗剩余额度（Issue #2463）。
+- 招聘自动化的 `verification-required` 队列行在人工处置完成前继续认领该候选人：按旧指引只删除 `inflight_action` 标记后，扫描路径不再把批准文案当成从未发出、用模板问卷补位；恢复指引区分「确认已发出」（先写阶段时间并把队列行标为 `executed`）与「确认未发出」（队列行恢复 `pending`），最后才删除标记（Issue #2452）。
+- crawl 的 `running` 状态不再被当作「仍在执行」的证据：`crawl status` 探测执行锁并回报 `executor_active` / `running_stale`，执行器被 SIGKILL 后不再永远显示运行中，也不再提示去 stop 一个没人消费的标记（Issue #2465）。
+- `crawl stop` 在 queued / running 但没有执行器持锁时直接按断点落 `stopped` 并回报 `stale_recovered`，不再写一条永远没人消费的停止标记后报成功；执行器仍持锁时维持原停止语义（Issue #2465）。
+- crawl 恢复的预检与 transport / 预算构造移入终止路径：构造失败或命中风控锁时按断点写回 `stopped`（保留上一轮错误与断点里的预算计数），不再把执行权标记永久留在 `running`、清空错误并让随后的 `crawl stop` 假成功（Issue #2466）。
+- `crawl stop` 持有执行锁直到无执行器的任务完成停止结算，并在同一笔更新中写入停止标记和终态。并发恢复推进的游标、新安排的交接和已完成任务的终态得以保留，已被清理的任务返回 `CRAWL_RUN_NOT_FOUND`（Issue #2470）。
+
 ## [3.4.151] - 2026-11-22
 
 ### Fixed
@@ -31,9 +138,6 @@
 - 导出 JSON 的孤立代理项改为字面 `\ud800` 文本（合法代理对合并为单个码点）：`backslashreplace` 写出的未配对转义会让 jq 等严格解析器拒绝整份产物（Issue #2457）。
 - `-o` 预检在 macOS 上提前拒绝 APFS 无法创建的非法 UTF-8 文件名，参数错误不再留到平台分页与快照更新之后才以 EILSEQ 暴露（Issue #2458）。
 - CSV 清洗在判定公式前缀时跳过前导换行 / VT / FF / NUL / BOM，`"\n=..."` 一类单元格不再绕过单引号前缀（Issue #2459）。
-- crawl 的 `running` 状态不再被当作「仍在执行」的证据：`crawl status` 探测执行锁并回报 `executor_active` / `running_stale`，执行器被 SIGKILL 后不再永远显示运行中，也不再提示去 stop 一个没人消费的标记（Issue #2465）。
-- `crawl stop` 在 queued / running 但没有执行器持锁时直接按断点落 `stopped` 并回报 `stale_recovered`，不再写一条永远没人消费的停止标记后报成功；执行器仍持锁时维持原停止语义（Issue #2465）。
-- crawl 恢复的预检与 transport / 预算构造移入终止路径：构造失败或命中风控锁时按断点写回 `stopped`（保留上一轮错误与断点里的预算计数），不再把执行权标记永久留在 `running`、清空错误并让随后的 `crawl stop` 假成功（Issue #2466）。
 
 ## [3.4.150] - 2026-11-22
 

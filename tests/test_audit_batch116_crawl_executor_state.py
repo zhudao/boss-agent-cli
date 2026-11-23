@@ -10,11 +10,14 @@
 """
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from boss_agent_cli.cache.store import CacheStore
+from boss_agent_cli.commands import crawl as crawl_command
 from boss_agent_cli.crawler.service import CrawlService, CrawlSettings, crawl_executor_active
 from boss_agent_cli.main import cli
 from boss_agent_cli.services.file_lock import exclusive_file_lock, run_lock_path
@@ -121,6 +124,30 @@ def test_status_terminal_run_never_probes_or_claims_stale(tmp_path):
 	assert not any("crawl stop" in action for action in payload["hints"]["next_actions"])
 
 
+def test_status_uses_same_run_snapshot_for_status_and_executor(tmp_path, monkeypatch):
+	run_id = _seed_run(tmp_path, status="stopped")
+	get_crawl_run = CacheStore.get_crawl_run
+	reads = 0
+
+	def read_during_resume(cache, requested_id):
+		nonlocal reads
+		record = get_crawl_run(cache, requested_id)
+		reads += 1
+		if reads == 1:
+			cache.update_crawl_run(run_id, status="running", next_page=2)
+		return record
+
+	monkeypatch.setattr(CacheStore, "get_crawl_run", read_during_resume)
+	with exclusive_file_lock(_lock_path(tmp_path, run_id)) as acquired:
+		assert acquired
+		payload = _envelope(_invoke(tmp_path, "status", run_id))
+
+	assert payload["data"]["status"] == "stopped"
+	assert payload["data"]["next_page"] == 1
+	assert payload["data"]["executor_active"] is False
+	assert reads == 1
+
+
 # ── Issue #2465：stop 在无执行器时按断点落 stopped ───────────────────
 
 
@@ -167,6 +194,63 @@ def test_stop_recovers_stale_queued_run_after_handoff_grace(tmp_path):
 	assert payload["data"] == {"run_id": "run-1", "status": "stopped", "stale_recovered": True}
 	with CacheStore(_db(tmp_path)) as cache:
 		assert cache.get_crawl_run("run-1")["status"] == "stopped"
+
+
+@pytest.mark.parametrize("concurrent_status", ["running", "queued", "completed"])
+def test_stop_checks_latest_checkpoint_under_execution_lock(tmp_path, monkeypatch, concurrent_status):
+	_seed_run(tmp_path, status="running")
+	write_stop = CacheStore.stop_active_crawl_run
+
+	@contextmanager
+	def lock_after_worker_progress(data_dir, run_id):
+		path = _lock_path(data_dir, run_id)
+		with exclusive_file_lock(path) as acquired:
+			assert acquired
+			with CacheStore(_db(tmp_path)) as cache:
+				cache.update_crawl_run(run_id, status=concurrent_status, next_page=2, list_finished=True)
+		with exclusive_file_lock(path) as acquired:
+			assert acquired
+			yield acquired
+
+	def write_while_locked(cache, run_id, **kwargs):
+		with exclusive_file_lock(_lock_path(tmp_path, run_id)) as acquired:
+			assert not acquired
+		return write_stop(cache, run_id, **kwargs)
+
+	monkeypatch.setattr(crawl_command, "crawl_execution_lock", lock_after_worker_progress)
+	monkeypatch.setattr(CacheStore, "stop_active_crawl_run", write_while_locked)
+	result = _invoke(tmp_path, "stop", "run-1")
+	with CacheStore(_db(tmp_path)) as cache:
+		run = cache.get_crawl_run("run-1")
+	assert run["next_page"] == 2
+	assert run["list_finished"] is True
+	if concurrent_status == "completed":
+		assert result.exit_code == 1, result.output
+		assert json.loads(result.stdout)["error"]["code"] == "CRAWL_RUN_FINISHED"
+		assert run["status"] == "completed"
+		assert run["stop_requested"] is False
+	else:
+		status = "stopped" if concurrent_status == "running" else "stop_requested"
+		assert _envelope(result)["data"]["status"] == status
+		assert run["status"] == ("stopped" if concurrent_status == "running" else "queued")
+		assert run["stop_requested"] is True
+
+
+def test_stop_reports_run_deleted_before_the_write(tmp_path, monkeypatch):
+	_seed_run(tmp_path, status="running")
+	write_stop = CacheStore.stop_active_crawl_run
+
+	def delete_before_write(cache, run_id, **kwargs):
+		with CacheStore(_db(tmp_path)) as other:
+			other._conn.execute("DELETE FROM crawl_runs WHERE run_id = ?", (run_id,))
+			other._conn.commit()
+		return write_stop(cache, run_id, **kwargs)
+
+	monkeypatch.setattr(CacheStore, "stop_active_crawl_run", delete_before_write)
+	result = _invoke(tmp_path, "stop", "run-1")
+
+	assert result.exit_code == 1, result.output
+	assert json.loads(result.stdout)["error"]["code"] == "CRAWL_RUN_NOT_FOUND"
 
 
 def test_stop_on_drifted_next_page_reports_corrupt_record_without_changes(tmp_path):

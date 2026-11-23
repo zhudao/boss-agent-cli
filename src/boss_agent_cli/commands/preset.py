@@ -13,10 +13,12 @@ from boss_agent_cli.search_filters import (
 	ACTIVE_LEVELS,
 	build_search_params,
 	ensure_supported_city,
+	ensure_text_encodable,
 	resolve_active_level,
 	resolve_search_code_params,
 )
 from boss_agent_cli.commands._filter_errors import emit_filter_error
+from boss_agent_cli.services.saved_searches import validate_stored_search_params
 
 
 def _build_params(
@@ -108,6 +110,9 @@ def preset_add_cmd(
 	# 写进预设后，`search --preset` 每次都要先在参数解析处失败，而预设本身
 	# 仍显示为「已保存」，用户很难看出该改的是这条本地记录。
 	try:
+		# 与 watch add 同口径：关键词最终进入 httpx 的 URL 参数，孤立代理项
+		# 会在组参数时抛 UnicodeEncodeError（Issue #2528）。
+		ensure_text_encodable("搜索关键词", query)
 		ensure_supported_city(city)
 		resolve_search_code_params(
 			salary=salary, experience=experience, education=education,
@@ -126,6 +131,15 @@ def preset_add_cmd(
 	if active_level:
 		# 只在设置时写入，旧预设和不带 --active 的预设保持原有 10 个键
 		params["active"] = active_level
+	# 与读取侧（search --preset / watch run）共用同一份存量校验：入口此前只
+	# 校验关键词的可编码性，`--welfare "\udcff"` 之类能保存成功，随后每次
+	# 运行都以 SAVED_SEARCH_INVALID 拒绝，删除后按同样参数重建仍然失败
+	# （Issue #2543）。
+	try:
+		validate_stored_search_params(params)
+	except ValueError as exc:
+		emit_filter_error(ctx, "preset", exc)
+		return
 	with CacheStore(ctx.obj["data_dir"] / "cache" / "boss_agent.db") as cache:
 		cache.save_saved_search(name, params)
 	next_actions = [
