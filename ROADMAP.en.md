@@ -4,6 +4,58 @@ This document tracks the medium-term and long-term direction of `boss-agent-cli`
 
 ## Released
 
+v3.4.189 (2026-11-24): the wizard / MCP `recommendations` and `job_search` goals now support `with_score`; recommendations read the job expectation like top-level `recommend` and search reuses the current query filters like top-level `search`, attaching match scores and reasons. The default keeps the previous output, non-boolean values return a parameter error before any platform request, and the scoring implementation is shared with the CLI (Issues #2662, #2665).
+
+v3.4.188 (2026-11-24): the wizard / MCP `job_search` (`candidate_search`) goal now supports `sort`; the default keeps platform order, `score` sorts by local match score with type-drift values counted as 0, and invalid / explicit empty values return `INVALID_PARAM` before any platform request. The sorting implementation is shared with top-level `boss search --sort` (Issue #2660).
+
+v3.4.187 (2026-11-24): the wizard / MCP `export` goal now keeps scanning when the platform omits `hasMore`, matching top-level export semantics, so a `count` request no longer stops at the first page; `data` gains the same `stop_reason` vocabulary as the CLI and `truncated` is only true when the page budget runs out (Issue #2657).
+
+v3.4.186 (2026-11-24): the wizard / MCP `welfare` input now requires a string or an array of strings; numbers and nested arrays no longer become never-matching labels, and explicit `false` / `0` / objects are rejected as parameter errors instead of being treated as no filter (Issue #2654).
+
+v3.4.185 (2026-11-24): wizard / MCP watch add now rejects unencodable search text (keywords, welfare and other filters) before writing, and search / export validate the keyword with the same entry-level rule as the CLI, so no permanently unrunnable watch record can be created (Issue #2651).
+
+v3.4.184 (2026-11-24): the wizard / MCP `boss_wizard` export goal now honors `count`, scanning with the same page budget as top-level `boss export` and stopping once the requested number is reached; `data` gains `requested` and `truncated`, while omitting `count` keeps the previous export scope (Issue #2648).
+
+v3.4.183 (2026-11-24): the wizard / MCP `boss_wizard` watch save action rejects a non-string or blank `active` as a parameter error before writing, instead of silently saving no filter (Issue #2645).
+
+v3.4.182 (2026-11-24): the `crawl` detail cache no longer treats an explicit null job_id in the checkpoint as a shared key, a failed background resume preflight keeps its original error even if the state restore fails, and a queued run with a live executor lock no longer reports queue overdue (Issue #2642).
+
+v3.4.181 (2026-11-24): `clean --risk-lock --privacy` reports the real cleared state of the local risk lock when the privacy step fails, and `clean --privacy --dry-run` no longer counts aged snapshots and exports twice, matching the real run (Issue #2639).
+
+v3.4.180 (2026-11-24): the wizard / MCP `boss_wizard` apply action rejects a non-string lid as a parameter error before the local claim and any platform call (Issue #2636).
+
+v3.4.179 (2026-11-24): the wizard / MCP `boss_wizard` pipeline and digest actions validate days_stale / now_ts_ms before any platform request, with digest sharing the top-level days_stale cap; the recruiter resume action rejects a non-string security_id (Issues #2631, #2633).
+
+v3.4.178 (2026-11-24): the wizard / MCP `boss_wizard` detail action reuses a valid cached job_id for the httpx fast path and tightens job_id / lid type, blank and encoding checks, matching the top-level `boss detail` command (Issue #2628).
+
+v3.4.177 (2026-11-24): the wizard / MCP `boss_wizard` chat-history action rejects explicit `max_msg_id: 0` / negative cursors, the greet action rejects explicit blank `message`, and candidate paging actions reject pages above `MAX_TRUSTED_PAGE`, all matching the top-level commands (Issue #2621 / #2623 / #2625).
+
+v3.4.176 (2026-11-24): recruiter actions in the wizard / MCP `boss_wizard` path reject explicit blank filters with `INVALID_PARAM`, matching the top-level `hr ...` commands (Issue #2618).
+
+v3.4.175 (2026-11-24): MCP argument mapping no longer drops explicit empty strings for write tools (`boss_greet` message, `boss_batch_greet` filters, `boss_hr_candidates` city / job); the CLI rejects them with `INVALID_PARAM` before any platform call (Issue #2615).
+
+v3.4.174 (2026-11-24): every recruiter write entry point now reads the circuit breaker from both `stop.json` and `state.json`; a persisted breaker, unreadable state or a wizard / MCP write action returns `CIRCUIT_BREAKER_OPEN` before dispatch (Issue #2612).
+
+v3.4.173 (2026-11-23): wizard checkpoints after a platform-risk failure no longer offer or execute `--resume`; write-result markers cover run-level errors, waiting-input steps and error-code drift (Issues #2608 / #2609).
+
+v3.4.172 (2026-11-23): blank `batch-greet` filters and a blank `greet --message` are rejected before any platform call instead of greeting an unbounded result set or silently sending the default text; `agent crawl` reports a blank city accurately (Issues #2602 / #2603 / #2604).
+
+v3.4.171 (2026-11-23): recruiter write requests that provably never left the machine release local reservations and retry as network errors, precheck failures on resume acceptance use the read-only error contract, and explicitly blank filters are rejected instead of silently widening results (Issues #2596 / #2597 / #2598).
+
+v3.4.170 (2026-11-23): `chat --export` degrades individual unserializable contact fields with the same stack depth as the final write, so one malformed contact no longer fails the whole export with misleading disk guidance (Issue #2593).
+
+v3.4.169 (2026-11-23): a failed response-body decode on read requests is reported as a deterministic `INTERNAL_ERROR` instead of a retryable network error (Issue #2590).
+
+v3.4.168 (2026-11-23): when an in-flight action for a candidate has an unknown outcome, the append-only queue no longer dispatches another message for that candidate; pending actions stay unchanged for human verification (Issue #2586).
+
+v3.4.167 (2026-11-23): recruiter automation reads conversations in the platform's real chat-history shape, and system messages no longer look like candidate replies. Unconfirmed candidate conversation identities are no longer sent to the platform as `friend_id=0`; pending actions stay unchanged (Issues #2580, #2582).
+
+v3.4.166 (2026-11-23): recruiter automation checks existing local and shared-budget risk locks before marking actions as executing. A lock still stops the run and leaves pending actions unchanged; in-flight replay protection remains in place (Issue #2577).
+
+v3.4.165 (2026-11-23): privacy cleanup previews report unreadable subdirectories, and recursive statistics count nested file symlinks by link size, not target size; crawls ignore malformed deduplication keys and fill in missing detail identifiers when a page is fetched again; date-named directories no longer hide earlier chat snapshots (Issues #2572, #2574, #2575).
+
+v3.4.164 (2026-11-23): the risk-lock envelope's `persisted` flag now matches what actually reached disk (a successful main-lock or group-directory write reports true); deterministic 4xx responses on read requests are no longer reported as retryable `NETWORK_ERROR` (parameter-class 4xx report `INVALID_PARAM`, other 4xx report `INTERNAL_ERROR`, while 5xx and 408 stay retryable); exports and snapshots null only integers that truly exceed 4300 digits and cannot be stringified; `resume list` and the wizard's resume enumeration report `LOCAL_IO_ERROR` instead of an empty list when the resumes directory is unreadable (Issues #2566, #2567, #2568, #2569).
+
 v3.4.163 (2026-11-23): `chat` clamps pagination to the trusted page limit and no longer fails whole commands on timestamp boundaries; contact-identity checks are unified between the CLI and wizard, `preset add` / `watch add` share the read path's validation, `detail` / `show` classify channel fallbacks and identifier rendering as deterministic failures, `recommend` / `chatmsg` / `chat-summary` clamp page and count to trusted limits; MCP provides wizard recovery guidance by action, validates argument boundaries plus CLI envelope/exit-code consistency, cleans up the CLI subprocess after cancellation and validates host-appended arguments before launch; `doctor`'s browser-cache probe distinguishes unreadable caches from missing installs while reading environment variables in the same order as the patchright driver; and automation rejects drifted review linkage, keeps the original `crawl resume` preflight error when restoration fails, and stops stale snapshots from reviving a cleared stop latch (Issues #2542, #2543, #2545, #2546, #2548, #2549, #2550, #2552, #2553, #2555, #2556, #2558, #2559, #2562).
 
 v3.4.162 (2026-11-23): `agent` input-encoding and chat-snapshot lock timeouts are now reported for what they are. Unencodable `--reason` / `--run-id` values are no longer misreported as corrupt state files, and concurrent exports contending for the snapshot lock advise a retry instead of a disk fault (Issues #2537, #2538).

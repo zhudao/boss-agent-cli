@@ -19,6 +19,7 @@ from boss_agent_cli.api.models import (
 	scalar_or_none,
 )
 from boss_agent_cli.config import DEFAULT_REQUEST_DELAY
+from boss_agent_cli.automation.storage import AutomationStore
 from boss_agent_cli.auth.identity import account_scope
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.api.endpoints import CITY_CODES
@@ -37,6 +38,13 @@ from boss_agent_cli.services.candidate_actions import (
 	candidate_action_provably_unsent,
 	run_candidate_action,
 )
+from boss_agent_cli.services.chat_utils import (
+	FROM_FILTER,
+	RELATION_LABELS,
+	chat_cutoff_ts,
+	matches_chat_filters,
+	relation_text,
+)
 from boss_agent_cli.services.contact_lookup import (
 	FriendListShapeError,
 	FriendLookupLimitExceeded,
@@ -46,6 +54,7 @@ from boss_agent_cli.services.contact_lookup import (
 )
 from boss_agent_cli.services.friend_list_pages import collect_friend_list_page
 from boss_agent_cli.services.output_path import OutputPathProblem, inspect_output_path, prepare_output_path
+from boss_agent_cli.services.pagination import MAX_TRUSTED_COUNT, MAX_TRUSTED_PAGE, export_page_budget
 from boss_agent_cli.crawler.operations import crawl_status
 from boss_agent_cli.crawler.service import (
 	CrawlBudget,
@@ -72,7 +81,10 @@ from boss_agent_cli.crawler.hooks import HookRegistrationError, verify_hook_prof
 from boss_agent_cli.crawler.transport import DrissionCrawlerSession, ensure_crawl_runtime
 from boss_agent_cli.services.install_extras import extras_requirement
 from boss_agent_cli.services.labels import LABEL_MAP, brief_label, parse_label_id
+from boss_agent_cli.services.recommend_items import build_recommend_items
 from boss_agent_cli.services.saved_searches import validate_stored_search_params
+from boss_agent_cli.services.search_order import SEARCH_SORT_MODES, sort_search_items
+from boss_agent_cli.services.text_files import is_utf8_encodable
 from boss_agent_cli.digest import build_digest
 from boss_agent_cli.display import (
 	RISK_ERROR_CONTRACTS,
@@ -83,6 +95,7 @@ from boss_agent_cli.display import (
 	positional_hint,
 	shell_argument,
 )
+from boss_agent_cli.match_score import score_job_dict
 from boss_agent_cli.output import Logger
 from boss_agent_cli.pipeline_state import build_pipeline_items, select_follow_up_candidates
 from boss_agent_cli.resume.models import resume_to_text
@@ -93,6 +106,7 @@ from boss_agent_cli.search_filters import (
 	client_is_browser_only,
 	detail_filter_max_pages,
 	ensure_supported_city,
+	ensure_text_encodable,
 	resolve_active_level,
 	resolve_search_code_params,
 	resolve_welfare_keywords,
@@ -182,6 +196,36 @@ def _invalid_welfare_conditions(raw: Any) -> WorkflowActionError:
 	)
 
 
+def _parse_welfare_input(raw: Any) -> list[tuple[str, list[str]]]:
+	"""把 wizard 的 ``welfare`` 输入归一成 pipeline 的 ``(label, keywords)`` 形状。
+
+	数组元素必须是字符串：``str(item)`` 会把 123 / 嵌套数组变成 ``"123"`` /
+	``"['双休']"`` 这类永不命中的标签，搜索照常报成功（#2421 给 watch add 修过
+	同一模式；搜索 / 导出入口此前仍在静默转换，Issue #2654）。非字符串、非
+	数组的取值（false / 0 / 对象）也不能被入口的真值判断吞成「不筛选」。
+	"""
+	if isinstance(raw, str):
+		labels = [item.strip() for item in raw.split(",")]
+	elif isinstance(raw, (list, tuple)):
+		for index, item in enumerate(raw):
+			if not isinstance(item, str):
+				raise WorkflowActionError(
+					"INVALID_PARAM",
+					f"welfare 的第 {index} 个元素必须是字符串（收到 {type(item).__name__}）",
+					recoverable=True,
+					recovery_action='把 welfare 写成字符串数组（如 ["双休", "五险一金"]）后重试',
+				)
+		labels = [item.strip() for item in raw]
+	else:
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			f"welfare 必须是字符串或字符串数组（收到 {type(raw).__name__}）",
+			recoverable=True,
+			recovery_action="把 welfare 写成逗号分隔字符串或字符串数组后重试；不按福利筛选时省略该字段",
+		)
+	return [(label, resolve_welfare_keywords(label)) for label in labels if label]
+
+
 def _normalize_welfare_conditions(raw: Any) -> list[tuple[str, list[str]]] | None:
 	"""把 wizard 的 ``welfare_conditions`` 归一到 pipeline 的 ``(label, keywords)`` 形状。
 
@@ -225,20 +269,35 @@ def execute_candidate_search(
 	inputs: Mapping[str, Any],
 	*,
 	pipeline: Callable[..., Any] = run_search_pipeline,
+	limit: int | None = None,
+	continue_when_has_more_unknown: bool = False,
+	with_score: bool = False,
 ) -> Any:
-	"""Shared platform search call used by the command and workflow action."""
+	"""Shared platform search call used by the command and workflow action.
+
+	``with_score`` 与顶层 `boss search --with-score` 同口径：用同一次搜索的
+	criteria 重算分数并附加匹配原因（Issue #2665）。缺省保持管线原始 items，
+	命令层与向导都在此之后按自己的顺序排序 / 缓存。
+	"""
 	# query 类型错误不能经 str() 静默变成空关键词或容器的 repr 文本：
 	# false / 0 会变成无关键词搜索，对象会按字面去搜（Issue #2009）。
 	query = _optional_str_strict(inputs, "query") or ""
+	# 与 CLI `search` / `export` / `watch add` 同一入口判定（Issue #2528）：
+	# 孤立代理项进入 httpx 的 URL 参数时抛 UnicodeEncodeError，会被兜成带
+	# 磁盘指引的 LOCAL_IO_ERROR；同一条输入重试多少次都是同一个结果。
+	try:
+		ensure_text_encodable("搜索关键词", query)
+	except ValueError as exc:
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			str(exc),
+			recoverable=True,
+			recovery_action="换成只含普通 Unicode 文本的搜索关键词后重试",
+		) from exc
 	welfare_conditions = inputs.get("welfare_conditions")
-	if welfare_conditions is None and inputs.get("welfare"):
-		raw_welfare = inputs["welfare"]
-		labels = (
-			[str(item).strip() for item in raw_welfare]
-			if isinstance(raw_welfare, (list, tuple))
-			else [item.strip() for item in str(raw_welfare).split(",")]
-		)
-		welfare_conditions = [(label, resolve_welfare_keywords(label)) for label in labels if label]
+	raw_welfare = inputs.get("welfare")
+	if welfare_conditions is None and raw_welfare is not None and raw_welfare != "":
+		welfare_conditions = _parse_welfare_input(raw_welfare)
 	else:
 		welfare_conditions = _normalize_welfare_conditions(welfare_conditions)
 	try:
@@ -270,6 +329,11 @@ def execute_candidate_search(
 		raw_params=_mapping_input(inputs, "raw_params"),
 	)
 	extra: dict[str, Any] = {"active": active} if active else {}
+	if continue_when_has_more_unknown:
+		# 导出场景：平台缺失 hasMore 时按 count / max_pages 预算继续扫描，
+		# 与顶层 `boss export` 同口径（Issue #2657）。搜索类调用保持默认的
+		# 保守停止，不向测试替身传入陌生关键字。
+		extra["continue_when_has_more_unknown"] = True
 	account = str(inputs.get("account") or "")
 	if account:
 		extra["account"] = account
@@ -289,17 +353,24 @@ def execute_candidate_search(
 		):
 			budget = CrawlBudget(cache)
 			extra["before_detail_request"] = lambda: budget.wait("list")
-	return pipeline(
+	result = pipeline(
 		platform,
 		cache,
 		logger,
 		criteria=criteria,
-		start_page=_int_input(inputs, "page", 1, minimum=1),
+		start_page=_int_input(inputs, "page", 1, minimum=1, maximum=MAX_TRUSTED_PAGE),
 		max_pages=_int_input(inputs, "max_pages", detail_filter_max_pages(welfare_conditions, active), minimum=1),
 		welfare_conditions=welfare_conditions,
 		before_list_request=inputs.get("before_list_request"),
+		limit=limit,
 		**extra,
 	)
+	if with_score:
+		# 与命令层同一份评分实现（`score_job_dict`）：管线内嵌的 match_score
+		# 不带原因，命令层与向导都需要额外的 match_reasons / mismatch_reasons。
+		# 结果对象是本次调用新建的，就地替换 items 不会与调用方共享旧列表。
+		result.items = [score_job_dict(item, criteria=criteria, expect_data=None) for item in result.items]
+	return result
 
 
 def execute_recruiter_candidate_search(platform: Any, inputs: Mapping[str, Any]) -> dict[str, Any]:
@@ -434,6 +505,35 @@ def _optional_str_strict(inputs: Mapping[str, Any], name: str) -> str | None:
 	return raw
 
 
+def _optional_nonblank_str(
+	inputs: Mapping[str, Any],
+	name: str,
+	*,
+	recovery_action: str | None = None,
+) -> str | None:
+	"""读取可选的非空白字符串：缺省 / null 为空，显式空白按参数错误拒绝。
+
+	顶层 `hr candidates` / `hr applications` / `hr chat` / `hr last-messages`
+	已在平台调用前拒绝显式空筛选项（Issue #2600）；向导入口若把空串归一成
+	``None``，同一条件会静默按「不筛选」执行，Agent 会以为过滤已生效
+	（Issue #2618）。同样的口径适用于自由文本字段：`boss greet --message ""`
+	会报参数错误，向导 / MCP 不能静默退回默认招呼语（Issue #2623）。
+	非空白值原样透传，不 strip。
+	"""
+	raw = _optional_str_strict(inputs, name)
+	if raw is None:
+		return None
+	if not raw.strip():
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			f"wizard 输入 {name} 不能只有空白字符",
+			recoverable=True,
+			recovery_action=recovery_action
+			or f"在 inputs 中补上有效的 {name} 后重试；不按该条件筛选时省略该字段",
+		)
+	return raw
+
+
 def _validate_search_filters(params: Mapping[str, Any]) -> None:
 	"""按保存入口同口径校验搜索筛选（城市名 + 标签取值域）。
 
@@ -528,19 +628,61 @@ def _check_minimum(value: int, raw: Any, name: str, minimum: int) -> int:
 	return value
 
 
-def _int_input(inputs: Mapping[str, Any], name: str, default: int, *, minimum: int = 0) -> int:
-	"""读取整数输入并校验下界。
+def _check_maximum(value: int, raw: Any, name: str, maximum: int) -> int:
+	if value > maximum:
+		raise WorkflowInputError(f"wizard 输入 {name} 必须是不大于 {maximum} 的整数，收到 {_brief_value(raw)}")
+	return value
+
+
+def _int_input(
+	inputs: Mapping[str, Any],
+	name: str,
+	default: int,
+	*,
+	minimum: int = 0,
+	maximum: int | None = None,
+) -> int:
+	"""读取整数输入并校验下界（可选上界）。
 
 	下游把这些值直接当页码 / 翻页次数 / 条数用：`max_pages=-3` 会让
 	`range(max_pages)` 一次都不循环，workflow 以「成功」收尾但结果为空；
 	负数页码则会原样作为 page 参数发给平台。这类输入重试多少次都是同一个结果。
+
+	`maximum` 只在调用方对应的 CLI 选项本身有上限时传（如求职者分页命令的
+	`IntRange(max=MAX_TRUSTED_PAGE)`）：向导 / MCP 绕过 Click，不能把越界页码
+	原样发往平台（Issue #2625）。
 	"""
 	raw = inputs.get(name)
 	# 只有「没给」才用默认值；显式写的 0 不能被当成缺省悄悄换成默认值
 	# （`0 or default` 会让 `count: 0` 变成 20 条）。
 	if raw is None or raw == "":
 		return default
-	return _check_minimum(_coerce_int(raw, name), raw, name, minimum)
+	value = _check_minimum(_coerce_int(raw, name), raw, name, minimum)
+	if maximum is not None:
+		value = _check_maximum(value, raw, name, maximum)
+	return value
+
+
+def _optional_int_input(
+	inputs: Mapping[str, Any], name: str, *, minimum: int = 0, maximum: int | None = None
+) -> int | None:
+	"""读取可选整数游标：缺省 / null / 空串视为未提供，显式值仍按取值范围校验。
+
+	可选游标若用 `inputs.get(name)` 真值判断决定是否下发，显式 `0` 会被当成
+	「没给」静默丢弃（Issue #2621）：向导 / MCP 的 `recruiter_chat_history`
+	因此把 `max_msg_id: 0` 悄悄换成最新一页，而顶层 `hr chatmsg --max-msg-id 0`
+	由 Click `IntRange(min=1)` 报 `INVALID_PARAM`。两份实现必须同口径。
+
+	`maximum` 只在调用方对应的 CLI 选项本身有上限时传（如 `chat --days` 的
+	`IntRange(0, 36500)`），越界值不能原样进入筛选（Issue #2667）。
+	"""
+	raw = inputs.get(name)
+	if raw is None or raw == "":
+		return None
+	value = _check_minimum(_coerce_int(raw, name), raw, name, minimum)
+	if maximum is not None:
+		value = _check_maximum(value, raw, name, maximum)
+	return value
 
 
 def _require_run_id(inputs: Mapping[str, Any]) -> str:
@@ -716,6 +858,20 @@ def _write_call(
 
 	不经 runner 直接调用动作时没有步骤可记，直接执行。
 	"""
+	stop = AutomationStore.stop_reason_for(context.data_dir)
+	if stop is not None:
+		# 顶层 hr 写命令在派发前检查停止闩锁；wizard / MCP 走同一动作时不能例外
+		# （Issue #2612）。请求未发出，不写「结果未知」标记，也不自动重试。
+		raise WorkflowActionError(
+			"CIRCUIT_BREAKER_OPEN",
+			f"停止开关已打开（{stop}），本次不会发出写请求",
+			recoverable=True,
+			recovery_action=(
+				f"人工核对未确认动作后执行 {_hint_command(context, 'agent run --resume')} 关闭熔断，"
+				"再由操作者显式重试；不要自动重发"
+			),
+			auto_retry=False,
+		)
 	control = context.workflow_control
 	if control is not None:
 		control.begin_write(_unconfirmed_write_recovery(context, check_command))
@@ -748,6 +904,17 @@ def execute_candidate_detail(
 	greeted = False
 	if data_dir is not None:
 		with CacheStore(data_dir / "cache" / "boss_agent.db") as cache:
+			if not job_id:
+				# 与顶层 `detail` 同一优先级：显式 job_id > 缓存 job_id > 职位卡片。
+				# 缓存里的非字符串 / 空白 / 孤立代理项按未命中处理（Issue #1817 /
+				# #2549），不把坏值当参数发给平台。
+				cached = cache.get_job_id(security_id)
+				if (
+					isinstance(cached, str)
+					and cached.strip()
+					and is_utf8_encodable(cached)
+				):
+					job_id = cached
 			greeted = cache.is_greeted(security_id, job_id=job_id or "", account=account)
 
 	last_error: WorkflowActionError | None = None
@@ -883,15 +1050,38 @@ def _candidate_search(context: ActionContext, inputs: Mapping[str, Any], prior: 
 	# #2511、#2514）：`execute_candidate_search` 里 `_optional_str_strict(...) or ""`
 	# 会原样接受它，平台按「无关键词」返回推荐并向动作报成功。
 	_required_nonblank_str(inputs, "query")
+	# sort 与顶层 `search --sort` 同一枚举：缺省 / null 保持平台顺序；显式空串
+	# 或其他取值在平台请求前拒绝，不能静默按 relevance 返回（Issue #2660）。
+	raw_sort = _optional_str_strict(inputs, "sort")
+	sort_mode = "relevance" if raw_sort is None else raw_sort
+	if sort_mode not in SEARCH_SORT_MODES:
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			f"wizard 输入 sort 仅支持 {' / '.join(SEARCH_SORT_MODES)}，收到 {sort_mode!r}",
+			recoverable=True,
+			recovery_action="将 sort 改为 relevance 或 score 后重试；省略表示保持平台顺序",
+		)
+	# with_score 与顶层 `search --with-score` 同口径：向导此前完全不读该键，
+	# 传 true 仍只返回管线内嵌的 match_score、没有匹配原因（Issue #2665）。
+	# 类型错误同样在平台请求前拒绝。
+	with_score = _bool_input(inputs, "with_score")
 	account = account_scope(context.auth())
+	search_kwargs: dict[str, Any] = {}
+	if with_score:
+		# 只在需要时传入，保持既有测试替身 / Python API 的调用签名（同 #2657）。
+		search_kwargs["with_score"] = True
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		with context.candidate_platform() as platform:
-			result = execute_candidate_search(platform, cache, context.logger, {**inputs, "account": account})
+			result = execute_candidate_search(
+				platform, cache, context.logger, {**inputs, "account": account}, **search_kwargs
+			)
 	return StepResult(
 		{
-			"items": result.items,
+			# 先由 `execute_candidate_search` 评分、再排序：与命令层「先评分再
+			# sort」一致（匹配分类型漂移按 0 处理）。
+			"items": sort_search_items(list(result.items), sort_mode),
 			"pagination": {
-				"page": _int_input(inputs, "page", 1, minimum=1),
+				"page": _int_input(inputs, "page", 1, minimum=1, maximum=MAX_TRUSTED_PAGE),
 				# 与顶层 `boss search` 同一口径（Issue #887）：平台没说 hasMore 时为 null。
 				"has_more": result.has_more_reported,
 				"has_more_source": "platform_hasMore" if result.has_more_reported is not None else "unknown",
@@ -903,14 +1093,45 @@ def _candidate_search(context: ActionContext, inputs: Mapping[str, Any], prior: 
 
 
 def _candidate_recommend(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
+	# 页码在打开平台前校验：越界值不应先构造平台实例（Issue #2625）。
+	page = _int_input(inputs, "page", 1, minimum=1, maximum=MAX_TRUSTED_PAGE)
+	# with_score 与顶层 `recommend --with-score` 同口径：向导此前完全不读该键，
+	# 传 true 仍返回平台原始列表且报成功（Issue #2662）。类型错误同样在平台
+	# 请求前拒绝，避免先发一次注定无法用于评分的请求。
+	with_score = _bool_input(inputs, "with_score")
 	with context.candidate_platform() as platform:
+		expect_data: dict[str, Any] | None = None
+		if with_score:
+			try:
+				expect_resp = platform.resume_expect()
+			except NotImplementedError as exc:
+				recoverable, recovery = error_contract_for_code("NOT_SUPPORTED")
+				raise WorkflowActionError(
+					"NOT_SUPPORTED",
+					str(exc) or "当前平台不支持求职期望能力",
+					recoverable=recoverable,
+					recovery_action=recovery,
+				) from exc
+			unwrapped = _unwrap(platform, expect_resp, "求职期望获取失败", context=context)
+			# 与 CLI 同口径：求职期望不是对象时按空期望评分，不让结构漂移中断推荐。
+			expect_data = unwrapped if isinstance(unwrapped, dict) else {}
 		data = _unwrap(
 			platform,
-			platform.recommend_jobs(page=_int_input(inputs, "page", 1, minimum=1)),
+			platform.recommend_jobs(page=page),
 			"推荐职位获取失败",
 			context=context,
 		)
 	items = _extract_list_items(data, ("recommendList", "jobList", "list", "items", "result"))
+	if with_score:
+		# 归一、问候态与匹配分与 CLI `recommend` 共用一份实现（Issue #2662）。
+		with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
+			items = build_recommend_items(
+				items,
+				cache=cache,
+				account=account_scope(context.auth()),
+				with_score=True,
+				expect_data=expect_data,
+			)
 	return StepResult(_with_items({"result": data}, items))
 
 
@@ -920,8 +1141,13 @@ def _candidate_detail(context: ActionContext, inputs: Mapping[str, Any], prior: 
 	# 与 CLI `detail` 同口径：空 security_id 不是「查不到」，而是参数构造错了；
 	# 照常发请求只会换来一次注定失败的平台往返（Issue #2516）。
 	security_id = _required_nonblank_value(inputs, "security_id")
-	job_id = _optional_str(inputs.get("job_id"))
-	lid = str(inputs.get("lid") or "")
+	# job_id / lid 也是直接进平台参数与本地缓存的自由输入：非字符串不能经 str()
+	# 变成 repr，纯空白 job_id 按未提供处理（与顶层 --job-id 一致，Issue #1817）。
+	raw_job_id = _optional_str_strict(inputs, "job_id")
+	job_id = raw_job_id if raw_job_id is not None and raw_job_id.strip() else None
+	if job_id is not None and not is_utf8_encodable(job_id):
+		raise WorkflowInputError("wizard 输入 job_id 不能包含无法按 UTF-8 编码的字符")
+	lid = _optional_str_strict(inputs, "lid") or ""
 	with busy_status("正在读取职位详情…"):
 		with context.candidate_platform() as platform:
 			data = execute_candidate_detail(
@@ -968,7 +1194,8 @@ def _raise_candidate_action_blocked(
 def _candidate_apply(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	security_id = _required_nonblank_str(inputs, "security_id")
 	job_id = _required_nonblank_str(inputs, "job_id")
-	lid = str(inputs.get("lid") or "")
+	# lid 直接进入投递写请求：非字符串不能经 str() 变成 repr（与 candidate_detail 同口径）。
+	lid = _optional_str_strict(inputs, "lid") or ""
 	account = account_scope(context.auth())
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		if cache.is_applied(security_id, job_id, account=account):
@@ -1010,8 +1237,17 @@ def _candidate_greet(context: ActionContext, inputs: Mapping[str, Any], prior: M
 	security_id = _required_nonblank_str(inputs, "security_id")
 	job_id = _required_nonblank_str(inputs, "job_id")
 	# message 可选，但类型必须严格：0 / false 经 ``or ""`` 会静默变成平台默认
-	# 招呼，容器会被 str() 成 repr 发给真人（Issue #1906）。
-	message = _optional_str_strict(inputs, "message") or ""
+	# 招呼，容器会被 str() 成 repr 发给真人（Issue #1906）。显式空白同样不能
+	# 退化成默认招呼：顶层 `boss greet --message ""` 已报参数错误
+	# （Issue #2603），向导 / MCP 必须同口径（Issue #2623）。
+	message = (
+		_optional_nonblank_str(
+			inputs,
+			"message",
+			recovery_action="省略 message 使用默认招呼语，或传入非空内容后重试",
+		)
+		or ""
+	)
 	account = account_scope(context.auth())
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		if cache.is_greeted(security_id, job_id=job_id, account=account):
@@ -1179,21 +1415,57 @@ def _candidate_mark(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 
 
 def _candidate_chat(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
+	# 页码在打开平台前校验：越界值不应先构造平台实例（Issue #2625）。
+	page = _int_input(inputs, "page", 1, minimum=1, maximum=MAX_TRUSTED_PAGE)
+	# from / days 与顶层 `boss chat` 同口径：向导此前只读 page，传筛选条件仍
+	# 返回整页记录且报成功（Issue #2667）。取值与类型都在平台请求前拒绝。
+	from_who = _optional_str_strict(inputs, "from")
+	if from_who is not None and from_who not in FROM_FILTER:
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			f"wizard 输入 from 仅支持 {' / '.join(FROM_FILTER)}，收到 {from_who!r}",
+			recoverable=True,
+			recovery_action="将 from 改为 boss 或 me 后重试；不筛发起方时省略该字段",
+		)
+	days = _optional_int_input(inputs, "days", minimum=0, maximum=36500)
+	relation_filter = FROM_FILTER.get(from_who) if from_who is not None else None
+	relation_label = RELATION_LABELS.get(relation_filter) if relation_filter is not None else None
+	cutoff_ts = chat_cutoff_ts(days)
 	with context.candidate_platform() as platform:
 		data = _unwrap(
 			platform,
-			platform.friend_list(page=_int_input(inputs, "page", 1, minimum=1)),
+			platform.friend_list(page=page),
 			"沟通列表获取失败",
 			context=context,
 		)
 	items = _extract_list_items(data, ("result", "friendList", "list", "items"))
-	return StepResult(_with_items({"result": data}, items))
+	if relation_label is not None or cutoff_ts is not None:
+		# 判定与 CLI `chat` 共用 `matches_chat_filters`：只筛当前页（与 CLI 相同），
+		# 不额外翻页；lastTS 缺失 / 漂移与 CLI 一样按未知放行。
+		items = [
+			item
+			for item in items
+			if matches_chat_filters(
+				initiated_by=relation_text(item.get("relationType")),
+				last_ts=item.get("lastTS"),
+				relation_label=relation_label,
+				cutoff_ts=cutoff_ts,
+			)
+		]
+	merged = _with_items({"result": data}, items)
+	if from_who is not None or days is not None:
+		# 回显生效的筛选，Agent 才能区分「未筛选」与「筛选项被忽略」（Issue #2667）。
+		merged["filters"] = {"from": from_who, "days": days}
+	return StepResult(merged)
 
 
 def _candidate_chat_history(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	# 空白 gid 不可能命中联系人：CLI chatmsg 在 resolve_friend_or_emit 里直接报
 	# 参数错误，向导同样不能先翻一遍沟通列表再报 CONTACT_NOT_FOUND（Issue #2523）。
 	identifier = _required_nonblank_value(inputs, "gid")
+	# 页码在解析联系人之前校验：越界值不应先翻一遍沟通列表再拒绝（Issue #2625）。
+	page = _int_input(inputs, "page", 1, minimum=1, maximum=MAX_TRUSTED_PAGE)
+	count = _int_input(inputs, "count", 20, minimum=1, maximum=MAX_TRUSTED_COUNT)
 	with context.candidate_platform() as platform:
 		friend = _candidate_friend(platform, identifier, context=context)
 		gid = _candidate_current_uid(friend)
@@ -1201,8 +1473,8 @@ def _candidate_chat_history(context: ActionContext, inputs: Mapping[str, Any], p
 		response = platform.chat_history(
 			gid,
 			security_id,
-			page=_int_input(inputs, "page", 1, minimum=1),
-			count=_int_input(inputs, "count", 20, minimum=1),
+			page=page,
+			count=count,
 		)
 		data = _unwrap(platform, response, "聊天记录获取失败", context=context)
 	items = _extract_list_items(data, ("messageList", "messages", "list", "items", "result"))
@@ -1220,8 +1492,11 @@ def _candidate_chat_history(context: ActionContext, inputs: Mapping[str, Any], p
 
 
 def _candidate_pipeline_data(
-	context: ActionContext, inputs: Mapping[str, Any]
+	context: ActionContext, inputs: Mapping[str, Any], *, max_days_stale: int | None = None
 ) -> tuple[list[dict[str, Any]], int, bool]:
+	# 参数先于平台请求校验：非法输入不应消耗受节流约束的读取配额（Issue #2631）。
+	now_ts_ms = _int_input(inputs, "now_ts_ms", int(time.time() * 1000))
+	stale_days = _int_input(inputs, "days_stale", 3, maximum=max_days_stale)
 	with context.candidate_platform() as platform:
 		# 沟通列表是分页的：只看第 1 页会静默漏掉后续页里待跟进的沟通，
 		# 与顶层 `boss pipeline` / `boss digest` 的聚合结果不一致（Issue #881）。
@@ -1233,8 +1508,8 @@ def _candidate_pipeline_data(
 	items = build_pipeline_items(
 		chat_items=chat_items,
 		interview_items=interview_items,
-		now_ts_ms=_int_input(inputs, "now_ts_ms", int(time.time() * 1000)),
-		stale_days=_int_input(inputs, "days_stale", 3),
+		now_ts_ms=now_ts_ms,
+		stale_days=stale_days,
 	)
 	return items, pages_scanned, truncated
 
@@ -1252,7 +1527,8 @@ def _candidate_pipeline(context: ActionContext, inputs: Mapping[str, Any], prior
 
 
 def _candidate_digest(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
-	items, pages_scanned, truncated = _candidate_pipeline_data(context, inputs)
+	# 上限与顶层 `boss digest --days-stale` 一致。
+	items, pages_scanned, truncated = _candidate_pipeline_data(context, inputs, max_days_stale=36500)
 	follow_ups = select_follow_up_candidates(items)
 	data = build_digest(
 		new_matches=[item for item in items if item.get("source") == "chat" and item.get("stage") == "reply_needed"],
@@ -1407,6 +1683,25 @@ def _export_output_path(context: ActionContext, inputs: Mapping[str, Any], fmt: 
 	raise WorkflowActionError(code, message, recovery_action=recovery_action)
 
 
+_EXPORT_STOP_REASON_MAP = {
+	# 管线内部原因 → 顶层 `boss export` 信封的同一套词汇（Issue #907 / #2657）。
+	"limit_reached": "count_reached",
+	"has_more_false": "platform_has_more_false",
+}
+
+
+def _export_stop_reason(result: Any) -> str:
+	"""把管线终止原因映射成 CLI 导出的 ``stop_reason`` 词汇。
+
+	自定义管线（测试替身 / Python API）没有 ``stop_reason`` 时退回旧的
+	``has_more`` 判定：仍有下一页就按预算耗尽处理，不能静默当完整结果。
+	"""
+	raw = getattr(result, "stop_reason", "")
+	if not isinstance(raw, str) or not raw:
+		return "page_budget_exhausted" if getattr(result, "has_more", False) else ""
+	return _EXPORT_STOP_REASON_MAP.get(raw, raw)
+
+
 def _candidate_export(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
 	from boss_agent_cli.services.job_export import prepare_export_items, write_export_file
 
@@ -1417,21 +1712,52 @@ def _candidate_export(context: ActionContext, inputs: Mapping[str, Any], prior: 
 	# 导出文件照常生成并报成功（Issue #2519）。
 	_required_nonblank_str(inputs, "query")
 	include_private = _bool_input(inputs, "include_private")
+	# count 与 CLI `--count` 同口径：缺省 / null / 空串表示由默认页数预算
+	# 决定导出范围（保持旧行为）；显式值必须是 ≥ 1 的整数，显式 0 不能
+	# 被当成「没给」悄悄换成缺省（与 #2621 的游标口径一致）。
+	raw_count = inputs.get("count")
+	count: int | None = None
+	if raw_count is not None and raw_count != "":
+		count = _int_input(inputs, "count", 1, minimum=1, maximum=MAX_TRUSTED_COUNT)
 	fmt = str(inputs.get("format") or "json")
 	if fmt not in {"json", "csv"}:
 		raise WorkflowActionError("INVALID_PARAM", "wizard export format 仅支持 json/csv")
 	output_path = _export_output_path(context, inputs, fmt)
+	search_inputs = {**inputs, "account": account_scope(context.auth())}
+	if count is not None and search_inputs.get("max_pages") in (None, ""):
+		# 与顶层 `boss export` 同一页数口径：只给默认页数预算时按 count 估页，
+		# 否则默认 1 页会把 count=50 的请求截在首屏。用户显式给了 max_pages
+		# 时尊重其预算（结果仍按 count 截断）。
+		search_inputs["max_pages"] = export_page_budget(count)
 	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
 		with context.candidate_platform() as platform:
 			# 与 candidate_search / candidate_watch 一致：导出时的 greeted 标记
 			# 必须按当前账号计算，否则登录态下会把所有职位都标成未打招呼。
+			# 平台缺失 hasMore 时按导出语义继续扫描（受 count / max_pages /
+			# 空页约束），与顶层 `boss export` 的 #903 口径一致（Issue #2657）。
+			# 只在需要时传新关键字，保持现有测试替身 / Python API 的调用签名。
+			search_kwargs: dict[str, Any] = {"limit": count}
+			if count is not None:
+				search_kwargs["continue_when_has_more_unknown"] = True
 			result = execute_candidate_search(
-				platform, cache, context.logger, {**inputs, "account": account_scope(context.auth())}
+				platform,
+				cache,
+				context.logger,
+				search_inputs,
+				**search_kwargs,
 			)
 	output = prepare_output_path(output_path)
 	items = prepare_export_items(result.items, include_private=include_private)
 	write_export_file(items, fmt, str(output))
-	return StepResult({"path": str(output), "format": fmt, "count": len(items)}, artifacts=(str(output),))
+	data: dict[str, Any] = {"path": str(output), "format": fmt, "count": len(items)}
+	if count is not None:
+		# 少于请求条数时区分「平台已没有更多」「空页」「取满」与「页数预算
+		# 耗尽」：只有后者才是截断，调用方不能把前缀当完整结果（Issue #2657）。
+		stop_reason = _export_stop_reason(result)
+		data["requested"] = count
+		data["stop_reason"] = stop_reason
+		data["truncated"] = len(items) < count and stop_reason == "page_budget_exhausted"
+	return StepResult(data, artifacts=(str(output),))
 
 
 def _saved_search_invalid_error(context: ActionContext, name: str, detail: str) -> WorkflowActionError:
@@ -1510,19 +1836,38 @@ def _candidate_watch(context: ActionContext, inputs: Mapping[str, Any], prior: M
 						"INVALID_PARAM", f"watch 参数 {key} 必须是字符串（收到 {type(value).__name__}）"
 					)
 				params[key] = value
-			if inputs.get("active"):
+			# active 与 `boss_watch_add` 的 schema 同口径（string、minLength 1）：
+			# `false` / `0` / `[]` 曾被真值判断吞掉、按「不筛选」静默保存；
+			# 空串与空白同样拒绝，提示省略该字段表示不筛选（Issue #2645）。
+			raw_active = inputs.get("active")
+			if raw_active is not None:
+				if not isinstance(raw_active, str):
+					raise WorkflowActionError(
+						"INVALID_PARAM",
+						f"watch 参数 active 必须是字符串（收到 {type(raw_active).__name__}）",
+					)
+				if not raw_active.strip():
+					raise WorkflowActionError(
+						"INVALID_PARAM",
+						"watch 参数 active 不能为空白；不设筛选请省略该字段",
+					)
 				try:
-					params["active"] = resolve_active_level(str(inputs.get("active")))
+					params["active"] = resolve_active_level(raw_active)
 				except ValueError as exc:
 					raise WorkflowActionError("INVALID_PARAM", str(exc)) from exc
 			# 与 CLI `watch add` 同口径：纯空白关键词会让 run 发起空泛搜索并
 			# 返回成功，必须在写入前拒绝（Issue #1798、#2511）。
 			_required_nonblank_str(inputs, "query")
 			try:
-				_validate_search_filters(params)
+				# CLI 在写入前跑同一份存量校验，覆盖关键词 / 福利等全部参数的
+				# 类型与 UTF-8 可编码性（Issue #2528、#2543）。只用
+				# `_validate_search_filters` 会让向导存下永远跑不通的记录：
+				# 每次 run 报 SAVED_SEARCH_INVALID，删除后用同样输入重建仍成功
+				# （Issue #2651）。
+				validate_stored_search_params(params)
 			except ValueError as exc:
 				raise WorkflowActionError(
-					"INVALID_PARAM", str(exc), recovery_action="修正 watch 筛选参数后重试"
+					"INVALID_PARAM", str(exc), recoverable=True, recovery_action="修正 watch 筛选参数后重试"
 				) from exc
 			cache.save_saved_search(name, params)
 			return StepResult({"action": "add", "name": name, "params": params})
@@ -2331,6 +2676,10 @@ def _recruiter_call(
 
 
 def _recruiter_candidates(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
+	# 与 `hr candidates --city ""` / `--job-id ""` 同口径：显式空白筛选在
+	# 构造平台客户端之前按参数错误拒绝，不能静默按「不筛选」搜索（Issue #2618）。
+	_optional_nonblank_str(inputs, "city")
+	_optional_nonblank_str(inputs, "job_id")
 	return _recruiter_call(
 		context,
 		lambda platform: execute_recruiter_candidate_search(platform, inputs),
@@ -2340,12 +2689,15 @@ def _recruiter_candidates(context: ActionContext, inputs: Mapping[str, Any], pri
 
 
 def _recruiter_applications(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
+	# `hr applications` / `hr chat` 对显式空 --job-id 返回 INVALID_PARAM
+	# （Issue #2600），向导路径保持同一语义（Issue #2618）。
+	job_id = _optional_nonblank_str(inputs, "job_id")
 	return _recruiter_call(
 		context,
 		lambda platform: platform.friend_list(
 			page=_int_input(inputs, "page", 1, minimum=1),
 			label_id=_int_input(inputs, "label_id", 0),
-			job_id=_optional_str(inputs.get("job_id")),
+			job_id=job_id,
 		),
 		"投递申请获取失败",
 		list_keys=("friendList", "result", "list", "items"),
@@ -2358,7 +2710,9 @@ def _recruiter_resume(context: ActionContext, inputs: Mapping[str, Any], prior: 
 	# 之前按参数错误收口（Issue #2525）。
 	geek_id = _required_nonblank_value(inputs, "geek_id")
 	job_id = _required_nonblank_value(inputs, "job_id")
-	security_id = _optional_str(inputs.get("security_id"))
+	# 非字符串不能 str() 后发给平台：{"a": 1} 会变成它的 repr 进入一次
+	# effect: unknown 的请求（Issue #2633）。空串仍按未提供处理。
+	security_id = _optional_str_strict(inputs, "security_id") or None
 	return _recruiter_call(
 		context,
 		lambda platform: platform.view_geek(geek_id, job_id, security_id),
@@ -2373,6 +2727,8 @@ def _recruiter_chat(context: ActionContext, inputs: Mapping[str, Any], prior: Ma
 
 
 def _recruiter_last_messages(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping[str, Any]) -> StepResult:
+	# `hr last-messages --job-id ""` 在平台调用前拒绝（Issue #2600），向导同口径。
+	job_id = _optional_nonblank_str(inputs, "job_id")
 	with context.recruiter_platform() as platform:
 		friend_data = platform_data_dict(
 			_unwrap(
@@ -2380,7 +2736,7 @@ def _recruiter_last_messages(context: ActionContext, inputs: Mapping[str, Any], 
 				platform.friend_list(
 					page=_int_input(inputs, "page", 1, minimum=1),
 					label_id=_int_input(inputs, "label_id", 0),
-					job_id=_optional_str(inputs.get("job_id")),
+					job_id=job_id,
 				),
 				"沟通列表获取失败",
 				context=context,
@@ -2444,7 +2800,7 @@ def _recruiter_chat_history(context: ActionContext, inputs: Mapping[str, Any], p
 		lambda platform: platform.chat_history(
 			friend_id,
 			count=_int_input(inputs, "count", 20, minimum=1),
-			max_msg_id=_int_input(inputs, "max_msg_id", 0) if inputs.get("max_msg_id") else None,
+			max_msg_id=_optional_int_input(inputs, "max_msg_id", minimum=1),
 		),
 		"聊天记录获取失败",
 		list_keys=("messageList", "messages", "list", "items", "result"),

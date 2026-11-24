@@ -4,6 +4,154 @@
 
 ## [Unreleased]
 
+### Added
+- 向导 / MCP `communication`（`candidate_chat`）支持 `from` / `days` 筛选：`from` 只接受 `boss` / `me`，`days` 与 `boss chat --days` 同为 0–36500 的整数，非法值在平台请求前返回参数错误；筛选只作用于当前页，`lastTS` 缺失或类型漂移与 CLI 一样按未知放行，结果新增 `filters` 回显生效条件。谓词与命令层共用 `services/chat_utils.matches_chat_filters`（Issue #2667）。
+
+## [3.4.189] - 2026-11-24
+
+### Added
+- 向导 / MCP `recommendations`（`candidate_recommend`）支持 `with_score`：为 true 时按顶层 `boss recommend --with-score` 同一口径读取求职期望、把 `jobList` 归一为 `JobItem`（按当前账号计算 `greeted`）并附加 `match_score` / 匹配原因，平台不支持求职期望时返回 `NOT_SUPPORTED`；缺省保持原始列表且不额外请求，非布尔值在平台请求前返回参数错误。归一与评分实现与命令层共用 `services/recommend_items.py`（Issue #2662）。
+- 向导 / MCP `job_search`（`candidate_search`）支持 `with_score`：为 true 时按顶层 `boss search --with-score` 同一口径，用同一次搜索的筛选条件重算 `match_score` 并附加 `match_reasons` / `mismatch_reasons`，评分与命令层共用 `execute_candidate_search` 的同一条实现；缺省不附加任何字段，非布尔值在平台请求前返回参数错误（Issue #2665）。
+
+## [3.4.188] - 2026-11-24
+
+### Added
+- 向导 / MCP `job_search`（`candidate_search`）支持 `sort`：缺省保持平台顺序，`score` 按本地 `match_score` 降序（类型漂移按 0）；显式空串或其他取值在平台请求前返回 `INVALID_PARAM`，不再静默忽略。排序实现与顶层 `boss search --sort` 共用 `services/search_order.py`（Issue #2660）。
+
+## [3.4.187] - 2026-11-24
+
+### Fixed
+- 向导 / MCP `export` 在平台响应缺失 `hasMore`（或值不是布尔）时不再只导出首屏：`count` 请求按顶层 `boss export` 的 #903 口径继续扫描，仍受 count / `max_pages` / 空页约束；`data` 增加与顶层同词汇的 `stop_reason`（`count_reached` / `empty_page` / `platform_has_more_false` / `page_budget_exhausted`），`truncated` 只在页数预算耗尽时为 true（Issue #2657）。
+
+## [3.4.186] - 2026-11-24
+
+### Fixed
+- 向导 / MCP 的 `welfare` 输入要求字符串或字符串数组：数字 / 嵌套数组不再被 `str()` 转成永不命中的标签，显式 `false` / `0` / 对象也不再被真值判断吞成「不筛选」，在平台请求前返回 `INVALID_PARAM`；空串与空数组仍等同于不筛选（Issue #2654）。
+
+## [3.4.185] - 2026-11-24
+
+### Fixed
+- 向导 / MCP `candidate_watch` 的 add 动作在写库前复用 CLI 的存量校验，拒绝含孤立代理项的关键词 / 福利等参数，不再存下每次 run 都报 `SAVED_SEARCH_INVALID`、删除重建仍复现的记录；`candidate_search` / `candidate_export` 的搜索关键词也在平台请求前按 CLI 同一口径拒绝不可编码文本，避免把参数错误落成误导性的本地 IO 错误（Issue #2651）。
+
+## [3.4.184] - 2026-11-24
+
+### Added
+- 向导 / MCP `boss_wizard` 的 `export` goal 支持 `count`：显式传入时按顶层 `boss export` 同一页数预算（每页约 15 条估页 + 5 页筛选余量）扫描并最多导出该条数，`data` 增加 `requested` 与 `truncated`，少于请求条数时能区分平台已无更多与页数预算耗尽；不传 `count` 时保持原有导出范围，非法值在平台请求前返回 `INVALID_PARAM`（Issue #2648）。
+
+## [3.4.183] - 2026-11-24
+
+### Fixed
+- 向导 / MCP `boss_wizard` 的 `candidate_watch` 保存监控时，非字符串或纯空白的 `active` 不再被真值判断吞掉、按「不筛选」静默保存，改为在写库前返回 `INVALID_PARAM`；同时移除 `clean` 中未使用的预览集合（Issue #2645）。
+
+## [3.4.182] - 2026-11-24
+
+### Fixed
+- `crawl` 详情缓存不再把断点里显式 null 的 `job_id` 当成共享键，避免一个职位的描述被写进另一个职位；后台恢复的预检失败不再因还原写库失败而丢掉原始错误，第二个还原继续执行；执行器已持锁的 queued 任务不再报 `queue_overdue` 并引导并发恢复（Issue #2642）。
+
+## [3.4.181] - 2026-11-24
+
+### Fixed
+- `clean --risk-lock --privacy` 在清锁成功、隐私清理失败时，错误信封带回风控锁已清除的真实状态与恢复指引；`clean --privacy --dry-run` 不再把旧快照与导出文件统计两次，预览与实际执行的释放量一致（Issue #2639）。
+
+## [3.4.180] - 2026-11-24
+
+### Fixed
+- 向导 / MCP `boss_wizard` 的投递动作拒绝非字符串 `lid`：数字、布尔、数组、对象不再被转成字符串后进入投递写请求，在本地预约与平台调用之前返回 `INVALID_PARAM`（Issue #2636）。
+
+## [3.4.179] - 2026-11-24
+
+### Fixed
+- 向导 / MCP `boss_wizard` 的招聘者简历动作拒绝非字符串 `security_id`：数字、布尔、数组、对象不再被转成字符串后进入结果未知的简历请求，在任何平台调用之前返回 `INVALID_PARAM`（Issue #2633）。
+- 向导 / MCP `boss_wizard` 的 `candidate_pipeline` 与 `candidate_digest` 在任何平台请求之前校验 `days_stale` / `now_ts_ms`，非法输入不再先读取沟通列表与面试列表；digest 的 `days_stale` 上限与顶层 `boss digest` 一致为 36500（Issue #2631）。
+
+## [3.4.178] - 2026-11-24
+
+### Fixed
+- 向导 / MCP `boss_wizard` 的 `candidate_detail` 与顶层 `boss detail` 同口径：未提供 job_id 时从缓存取有效值走 `job_detail` 快速通道，缓存里的非字符串 / 空白 / 不可编码值按未命中处理；显式 job_id 的非字符串与不可编码值按 `INVALID_PARAM` 拒绝（Issue #2628）。
+
+## [3.4.177] - 2026-11-24
+
+### Fixed
+- 向导 / MCP `boss_wizard` 的 `recruiter_chat_history` 对显式 `max_msg_id: 0` / 负数按 `INVALID_PARAM` 拒绝，与顶层 `hr chatmsg --max-msg-id` 的 `IntRange(min=1)` 同口径，不再因真值判断静默丢弃游标、改读最新一页（Issue #2621）。
+- 向导 / MCP `boss_wizard` 的 `candidate_greet` 对显式空白 `message` 按 `INVALID_PARAM` 拒绝，与顶层 `boss greet --message` 同口径，不再静默退回平台默认招呼语（Issue #2623）。
+- 向导 / MCP `boss_wizard` 的求职者分页动作（`candidate_search` / `candidate_recommend` / `candidate_chat` / `candidate_chat_history`）拒绝超过 `MAX_TRUSTED_PAGE` 的显式页码、`candidate_chat_history` 拒绝超过 `MAX_TRUSTED_COUNT` 的 `count`，与顶层 `search` / `recommend` / `chat` / `chatmsg` 的 Click 上限同口径，不再把无界数值发往平台（Issue #2625）。
+
+## [3.4.176] - 2026-11-24
+
+### Fixed
+- 向导 / MCP `boss_wizard` 的招聘者动作对显式空白筛选项按 `INVALID_PARAM` 拒绝（`recruiter_candidates` 的 `city` / `job_id`、`recruiter_applications` / `recruiter_chat` / `recruiter_last_messages` 的 `job_id`），与顶层 `hr ...` 命令同口径，不再静默按「不筛选」执行（Issue #2618）。
+
+## [3.4.175] - 2026-11-24
+
+### Fixed
+- MCP 参数映射保留写工具的显式空串（`boss_greet` 的 `message`、`boss_batch_greet` 的筛选项、`boss_hr_candidates` 的 `city` / `job_id`），由 CLI 在平台调用前按 `INVALID_PARAM` 拒绝，不再静默改用默认招呼语或无筛选派发（Issue #2615）。
+
+## [3.4.174] - 2026-11-24
+
+### Fixed
+- 招聘写入口统一读取 `stop.json` 与 `state.json` 的熔断状态：`stop.json` 被移除但持久化熔断仍打开、状态损坏或 wizard / MCP 写动作都返回 `CIRCUIT_BREAKER_OPEN`，不再派发请求（Issue #2612）。
+
+## [3.4.173] - 2026-11-23
+
+### Fixed
+- 风控（`ACCOUNT_RISK` / `ENVIRONMENT_RISK`）落盘的 workflow 断点不再把 `--resume` 当作 `hints.next_actions`，改为按 `RISK_ERROR_CONTRACTS` 给出 `boss doctor` 与真人核对说明；操作者处理完官方页面并清除本地风险锁后的显式 `--resume` 保持不变（Issue #2608）。
+- `wizard --resume` 的写前标记判定补齐 run 级错误、`waiting_input` 步骤与错误码大小写漂移；这些结果未知的写步骤不再 fail-open 重放，提示层与执行层共用同一阻断口径（Issue #2609）。
+
+## [3.4.172] - 2026-11-23
+
+### Fixed
+- `batch-greet` 对显式传空的 `--city` / `--salary` / `--experience` / `--education` 按 `INVALID_PARAM` 拒绝，不再在未限定筛选范围的结果上批量发出招呼；空值判定从招聘者命令下沉到公共 CLI 参数守卫（Issue #2602）。
+- `greet --message ""` 不再退化为默认招呼语：自定义正文选项改为区分缺省与显式空值，空串与纯空白都在任何平台调用前拒绝，省略选项仍发送默认正文（Issue #2603）。
+- `agent crawl --query` 显式传空的 `--city` 单独提示「--city 的值不能为空」，不再误报为未提供城市（Issue #2604）。
+
+## [3.4.171] - 2026-11-23
+
+### Fixed
+- `hr greet` / `hr location` 遇到连接、代理、协议选择等确定未发出的异常时释放本地预约并按可重试的 `NETWORK_ERROR` 上报；招呼正文含不可编码字符时在入口按 `INVALID_PARAM` 拒绝，不再让一次断网或坏参数永久锁死候选人会话。可能已发出的读写超时仍保持结果未知、禁止自动重发（Issue #2596）。
+- `hr accept-resume` 的前置只读请求（`historyMsg` / `friendDetail`）失败时按只读错误契约输出，`accepted=false`，限流可重试；同意 POST 从未发出时不再让人去官方页面核对一个不存在的结果（Issue #2597）。
+- `hr applications` / `hr chat` / `hr last-messages` / `hr candidates` 对显式传空的 `--job-id` / `--city` 按 `INVALID_PARAM` 拒绝，不再静默退化为全职位或全国筛选；省略选项仍保持原语义（Issue #2598）。
+
+## [3.4.170] - 2026-11-23
+
+### Fixed
+- `chat --export` 遇到单个联系人含深嵌套字段时不再整份失败：快照与 JSON 导出在整体写入失败后按同一落盘栈深逐条判定并降级重写，只省略问题字段并标注 `snapshot_error` / `export_error`，其余联系人及 md / csv / html 导出照常完成；不再给出误导性的磁盘权限指引，非对象条目在 JSON 分支也与其他格式一样跳过（Issue #2593）。
+
+## [3.4.169] - 2026-11-23
+
+### Fixed
+- 读请求响应体在解压 / 解码阶段损坏时按确定性的 `INTERNAL_ERROR` 上报，不再让裸 `httpx.DecodingError` 兜成可重试的 `NETWORK_ERROR` 引导 Agent 反复打平台；写请求仍按结果未知收口（Issue #2590）。
+
+## [3.4.168] - 2026-11-23
+
+### Fixed
+- 待执行队列中同一候选人存在 `executing`（结果未知）行时，排在它前面的 `pending` 行不再派发消息；该 pending 保持原状等待人工核对，在途行照常转 `verification-required` 并熔断，其他候选人的动作不受影响（Issue #2586）。
+
+## [3.4.167] - 2026-11-23
+
+### Fixed
+- 招聘自动化不再把无法确认的候选人会话标识转成 `friend_id=0` 发给平台：读取历史直接返回空会话，问卷 / 跟进 / 交换联系方式按安全停止处理，待执行动作保持 `pending`、不落执行中标记；列表条目的主标识存在但不可信（布尔 / 容器 / 小数 / 非正数 / 非 ASCII 数字）时不会用展示名或低优先字段顶替为会话地址，只输出诊断（Issue #2580）。
+- 招聘自动化按平台真实的 `zpData.messages` 结构读取会话：`from.uid` 是候选人的记为候选人消息、`uid=0` 的系统消息不再被当成候选人回复，正文取 `body` / `pushText`；此前实时模式把每段会话读成空消息，问卷与跟进永远不会发出，字典发送者还会在列表键下触发 `TypeError`（Issue #2582）。
+
+## [3.4.166] - 2026-11-23
+
+### Fixed
+- 招聘自动化在写入「执行中」标记前检查本地及共享预算目录的已有风控锁：锁定时照常熔断，不派发请求，也不把原待执行动作误标为需要人工核对。底层风控检查与在途动作的重放保护保持不变（Issue #2577）。
+
+## [3.4.165] - 2026-11-23
+
+### Fixed
+- `clean --privacy --dry-run` 无法枚举子目录时返回 `LOCAL_IO_ERROR`，不再静默漏算数据；递归统计只计算嵌套文件链接本身的大小，不把未删除的目标文件计为已释放（Issue #2572）。
+- 采集不再把对象、布尔等异常职位 ID 当作去重键；重抓断点页时会为同一职位的待补记录填入新取得的详情标识，保留原列表数据和已完成详情（Issue #2574）。
+- 聊天快照对比会略过符合日期命名但并非普通文件的条目，较新的同名目录不再遮蔽有效基线（Issue #2575）。
+
+## [3.4.164] - 2026-11-23
+
+### Fixed
+- 风控信封的 `error.details.risk_lock.persisted` 与实际落盘一致：主锁位置与请求预算组目录任一写成功即报 `true` 并清掉进程内锁。此前主锁写失败但组锁写成功仍报 `false`（宣称「新进程不会再被阻止」，实际新进程仍被 `ACCOUNT_RISK` 拦住），主锁写成功而组锁失败时也被反向覆盖成 `false`（Issue #2566）。
+- 读请求的确定性 4xx（400 / 404 / 405 / 409 / 410 / 412 / 422 等，401 / 403 / 429 与暂时性的 408 除外）不再兜成可重试的 `NETWORK_ERROR` +「重试」：同一请求重试必然复现，只会白白消耗请求预算。参数类 4xx（400 / 406 / 409 / 410 / 422）与 `detail` / `show` / 向导同口径报 `INVALID_PARAM`，其余 4xx 报不可重试的 `INTERNAL_ERROR`；5xx 与 408 保持可重试，写请求 4xx 仍按结果未知（`ACTION_UNCONFIRMED`）收口（Issue #2567）。
+- 导出 / 快照的 `null_oversized_ints` 只把真正无法转字符串的整数（十进制超过 4300 位）归 `null`：位长度快速路径不变，超过阈值时用 `str()` 精确判定，`2**14284` 这类仍可被 `json.dumps` 序列化的 4300 位整数不再被静默丢弃（Issue #2568）。
+- `resume list` 与向导 `local_resumes` 在简历目录不可读时不再静默报告为空：枚举改用 `os.listdir`，只把 `FileNotFoundError` 当缺失，其余 `OSError` 由命令出口按不可重试的 `LOCAL_IO_ERROR` 收口，不再引导用户以为简历丢失并重建；单份坏文件仍进 `hints.corrupt`（Issue #2569）。
+
 ## [3.4.163] - 2026-11-23
 
 ### Fixed

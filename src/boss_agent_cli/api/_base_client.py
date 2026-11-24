@@ -69,6 +69,16 @@ _UNSENT_TRANSPORT_ERRORS: tuple[type[httpx.TransportError], ...] = (
 )
 
 
+def was_request_provably_unsent(exc: BaseException) -> bool:
+	"""异常是否证明 HTTP 请求尚未发出（一个字节都没送出，平台无副作用）。
+
+	只覆盖连接建立 / 代理 / 协议选择阶段的 ``httpx`` 传输异常；读 / 写超时与
+	远端协议错误可能发生在请求发出之后，不能据此释放写预约。供命令层区分
+	「确定未发出」与「结果未知」（Issue #2216、#2596）。
+	"""
+	return isinstance(exc, _UNSENT_TRANSPORT_ERRORS)
+
+
 class BrowserChannelRequired(RuntimeError):
 	"""CDP / 显式浏览器来源下，该操作只有 httpx 实现，拒绝用 httpx 携带浏览器凭据发送。"""
 
@@ -80,6 +90,20 @@ class PlatformResponseInvalid(ValueError):
 	不能兜成可重试的 ``NETWORK_ERROR``（Issue #1368）。子类化 ``ValueError`` 保留
 	旧调用方按 ``ValueError`` 捕获的兼容性。
 	"""
+
+
+class PlatformStatusRejected(ValueError):
+	"""读请求收到平台的确定性 4xx 状态（401/403/429 已在 ``_request`` 提前收口）。
+
+	同一请求重试必然得到同一状态，命令出口不能兜成可重试的
+	``NETWORK_ERROR`` +「重试」（Issue #2567）。子类化 ``ValueError`` 与
+	``PlatformResponseInvalid`` 同口径；``parameter_status_code`` 继续识别
+	参数类 4xx，detail / show / wizard 的「不换通道」判定保持不变。
+	"""
+
+	def __init__(self, status_code: int) -> None:
+		super().__init__(f"平台返回了未预期的 HTTP 状态（HTTP {status_code}）")
+		self.status_code = status_code
 
 
 class RequestTextEncodingError(ValueError):
@@ -104,6 +128,11 @@ def parameter_status_code(error: BaseException) -> int | None:
 	命令层据此拒绝「换了浏览器通道就能好」的假设：400 / 422 等是平台对同一组
 	参数的直接拒绝，回退只会白起一次浏览器（Issue #2548）。
 	"""
+	status = getattr(error, "status_code", None)
+	if type(status) is int and status in _PARAMETER_STATUS_CODES:
+		# 读请求的确定性 4xx 已由 ``_request`` 转成 ``PlatformStatusRejected``：
+		# 通道降级判定不能再看到裸 ``HTTPStatusError`` 才生效（Issue #2567）。
+		return status
 	response = getattr(error, "response", None)
 	status = getattr(response, "status_code", None)
 	if type(status) is int and status in _PARAMETER_STATUS_CODES:
@@ -255,6 +284,10 @@ class _BaseHttpClient:
 			return Path(data_dir)
 		return None
 
+	def check_local_risk(self) -> None:
+		"""只读验证本地风控状态；供流程在记录在途操作前停止。"""
+		self._check_cdp_risk_lock()
+
 	def _check_cdp_risk_lock(self, browser: Any = None) -> None:
 		"""仅查本地锁，不读 Cookie、不连接浏览器；摘要变化或换通道不能恢复。"""
 		from boss_agent_cli.api import cdp_risk_lock
@@ -301,6 +334,7 @@ class _BaseHttpClient:
 		self._unpersisted_risk_lock = lock
 		if data_dir is None:
 			return
+		persisted = False
 		try:
 			cdp_risk_lock.write_lock(
 				data_dir,
@@ -310,7 +344,7 @@ class _BaseHttpClient:
 				reason=lock.reason,
 				platform_code=lock.platform_code,
 			)
-			self._unpersisted_risk_lock = None
+			persisted = True
 		# UnicodeError 不在 OSError 之下：记录风控的分支里任何异常逃逸都会替换
 		# 原始 PlatformRiskError，把风控硬边界降级成可重试错误（Issue #1487）。
 		except (OSError, UnicodeError):
@@ -327,15 +361,20 @@ class _BaseHttpClient:
 			if not same_root:
 				try:
 					budget.record_risk(reason=lock.reason, platform_code=lock.platform_code)
+					persisted = True
 				except (OSError, UnicodeError):
-					self._unpersisted_risk_lock = lock
+					pass
+		if persisted:
+			# 任一位置落盘都足以阻止新进程（Issue #2566）：组目录写成功时不能再
+			# 报 persisted=false；主锁写成功而组锁失败时也不能反向覆盖成未持久化。
+			self._unpersisted_risk_lock = None
 		if error is not None:
 			error.details["risk_lock"] = {
 				"locked": True,
 				"reason": lock.reason,
 				"platform_code": lock.platform_code,
 				"explicit_resume_required": True,
-				"persisted": self._unpersisted_risk_lock is None,
+				"persisted": persisted,
 			}
 
 	def _raise_platform_risk_response(self, response: dict[str, Any], *, browser: Any = None) -> None:
@@ -506,8 +545,13 @@ class _BaseHttpClient:
 						# 已跟随重定向多次，写请求可能已在其中一次生效，读路径仍按
 						# 普通网络错误上抛（Issue #2396）。
 						return self._unconfirmed_http_response(url, "transport_error")
-					if write_possible and isinstance(error, httpx.DecodingError):
-						return self._unconfirmed_http_response(url, "invalid_response")
+					if isinstance(error, httpx.DecodingError):
+						if write_possible:
+							return self._unconfirmed_http_response(url, "invalid_response")
+						# 响应体在解压 / 解码阶段就损坏，走不到 resp.json() 的解析收口；
+						# 与无效 JSON 同口径按确定性失败上报，不能让 Agent 重试同一请求
+						# 白白消耗请求预算（Issue #2590）。
+						raise PlatformResponseInvalid("平台响应解码失败，无法解析") from error
 					raise
 				finally:
 					self._throttle.mark()
@@ -565,6 +609,12 @@ class _BaseHttpClient:
 						resp.raise_for_status()
 				except httpx.HTTPStatusError as exc:
 					if not write_possible:
+						status = exc.response.status_code
+						if 400 <= status < 500 and status != 408:
+							# 读请求的确定性 4xx（401/403/429 已提前收口；408 是暂时性
+							# 超时）：同一请求重试必然复现，不能兜成可重试的
+							# NETWORK_ERROR 让 Agent 反复消耗请求预算（Issue #2567）。
+							raise PlatformStatusRejected(status) from None
 						# 读路径原样上抛：重建异常文本，查询参数里的 __zp_stoken__ 不能
 						# 随 error.message 进入信封（Issue #2157）。
 						raise _status_error_without_query(exc) from None

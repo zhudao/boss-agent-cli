@@ -5,6 +5,7 @@ import errno
 import json
 import os
 import re
+import stat
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -13,7 +14,13 @@ from typing import Any
 
 from boss_agent_cli.services.chat_utils import contact_identity
 from boss_agent_cli.services.file_lock import exclusive_file_lock, run_lock_path
-from boss_agent_cli.services.json_files import read_bytes_if_regular, write_json_atomic
+from boss_agent_cli.services.json_files import (
+	degrade_unserializable_records,
+	JsonSerializationError,
+	path_mode,
+	read_bytes_if_regular,
+	write_json_atomic,
+)
 from boss_agent_cli.output import Logger
 
 _SNAPSHOT_NAME_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -25,6 +32,10 @@ _META_SUFFIX = ".meta"
 #: 当日快照锁被占用时的有限重试；锁只包住一次读-合并-写，正常持有时长是毫秒级。
 _LOCK_ATTEMPTS = 100
 _LOCK_RETRY_INTERVAL_SECONDS = 0.05
+
+#: 快照是本地状态，坏字段用独立的标记与导出产物区分（Issue #2593）。
+_DEGRADED_SNAPSHOT_MARKER = "snapshot_error"
+_DEGRADED_SNAPSHOT_MESSAGE = "该联系人包含无法序列化的字段（如嵌套过深），已省略问题字段"
 
 
 class ChatSnapshotBusyError(OSError):
@@ -101,6 +112,8 @@ def save_snapshot_and_diff(
 	# 服务边界过滤非对象条目：平台列表页混入 null / 字符串 / 数字时，
 	# contact_identity 会在 .get 上抛 AttributeError，整次快照与导出失败
 	# （与 chat_export 的渲染边界同口径，Issue #2221）。丢弃过条目即不完整。
+	# 深嵌套字段在 _merge_and_write 里按「整体写入失败再降级」处理：单条试写
+	# 的栈深与整份快照落盘不同，提前逐条判定会留下临界深度缺口（Issue #2593）。
 	usable_friends = [item for item in friends if isinstance(item, dict)]
 	dropped_entries = len(usable_friends) != len(friends)
 
@@ -242,7 +255,18 @@ def _merge_and_write(
 	meta_path = Path(_meta_path(snapshot_path))
 	write_json_atomic(meta_path, {"complete": False})
 	# 原子写避免中断后当日快照变成半截 JSON（下次读取会整个丢弃）。
-	write_json_atomic(Path(snapshot_path), merged, null_oversized_ints=True)
+	# 序列化失败只在写盘这一步判断：单条试写的递归余量与整份落盘不同，
+	# 提前降级会留下临界深度缺口；整体失败后按落盘栈深逐条判定再重写
+	# （Issue #2593）。
+	try:
+		write_json_atomic(Path(snapshot_path), merged, null_oversized_ints=True)
+	except JsonSerializationError:
+		merged = degrade_unserializable_records(
+			merged,
+			marker=_DEGRADED_SNAPSHOT_MARKER,
+			message=_DEGRADED_SNAPSHOT_MESSAGE,
+		)
+		write_json_atomic(Path(snapshot_path), merged, null_oversized_ints=True)
 	write_json_atomic(meta_path, {"complete": stored_complete})
 	return merged
 
@@ -314,7 +338,14 @@ def _find_previous_snapshot(snapshot_dir: str, today: str) -> str | None:
 		except ValueError:
 			continue
 		snapshots.append(fname)
-	if not snapshots:
-		return None
-	snapshots.sort(reverse=True)
-	return os.path.join(snapshot_dir, snapshots[0])
+	for fname in sorted(snapshots, reverse=True):
+		path = os.path.join(snapshot_dir, fname)
+		try:
+			mode = path_mode(Path(path))
+		except OSError:
+			# 类型未知不能当成目录并跳过；保留既有读失败告警，不使用更旧基线。
+			return path
+		if mode is not None and stat.S_ISREG(mode):
+			return path
+		# 日期同名目录等非文件不能遮蔽更早的有效快照（Issue #2575）。
+	return None

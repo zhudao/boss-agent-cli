@@ -22,6 +22,7 @@ from boss_agent_cli.crawler.service import CrawlOutcome, CrawlSettings, crawl_ex
 from boss_agent_cli.resume.models import ResumeData
 from boss_agent_cli.resume.store import ResumeStore
 from boss_agent_cli.search_filters import resolve_welfare_keywords
+from boss_agent_cli.services.pagination import MAX_TRUSTED_COUNT, MAX_TRUSTED_PAGE
 from boss_agent_cli.display import risk_error_message
 from boss_agent_cli.schema.error_codes import ERROR_CODES
 from boss_agent_cli.wizard.models import StepResult, WorkflowInputError, WorkflowPlan, WorkflowStatus, WizardInput
@@ -427,6 +428,52 @@ def test_candidate_pipeline_action_aggregates_every_friend_list_page(tmp_path):
 	assert truncated is False
 
 
+class _PipelinePlatform(_FakeCandidatePlatform):
+	def friend_list(self, *, page=1):
+		self.calls.append(("friend_list", page))
+		return {"code": 0, "data": {"result": [], "hasMore": False}}
+
+	def interview_data(self):
+		self.calls.append(("interview_data",))
+		return {"code": 0, "data": {"interviewList": []}}
+
+
+@pytest.mark.parametrize("action_name", ["candidate_pipeline", "candidate_digest"])
+@pytest.mark.parametrize(
+	"inputs",
+	[{"days_stale": -1}, {"days_stale": "abc"}, {"days_stale": True}, {"now_ts_ms": -1}, {"now_ts_ms": "x"}],
+)
+def test_candidate_pipeline_actions_validate_inputs_before_platform(tmp_path, action_name, inputs):
+	"""非法 days_stale / now_ts_ms 必须在任何平台请求之前被拒绝（Issue #2631）。"""
+	from boss_agent_cli.wizard.actions import DEFAULT_ACTIONS
+	from boss_agent_cli.wizard.models import WorkflowInputError
+
+	platform = _PipelinePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	with pytest.raises(WorkflowInputError):
+		DEFAULT_ACTIONS[action_name](context, inputs, {})
+
+	assert platform.calls == []
+
+
+def test_candidate_digest_action_caps_days_stale_like_cli(tmp_path):
+	"""digest 的 days_stale 上限与顶层命令一致，pipeline 保持无上限（Issue #2631）。"""
+	from boss_agent_cli.wizard.actions import DEFAULT_ACTIONS
+	from boss_agent_cli.wizard.models import WorkflowInputError
+
+	platform = _PipelinePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	with pytest.raises(WorkflowInputError):
+		DEFAULT_ACTIONS["candidate_digest"](context, {"days_stale": 36501}, {})
+	assert platform.calls == []
+
+	DEFAULT_ACTIONS["candidate_digest"](context, {"days_stale": 36500}, {})
+	DEFAULT_ACTIONS["candidate_pipeline"](context, {"days_stale": 36501}, {})
+	assert ("interview_data",) in platform.calls
+
+
 def test_candidate_write_actions_persist_idempotence_records(tmp_path):
 	platform = _FakeCandidatePlatform()
 	context = _action_context(tmp_path, candidate=platform)
@@ -444,6 +491,45 @@ def test_candidate_write_actions_persist_idempotence_records(tmp_path):
 		("apply", "sec-1", "job-1", "lid-1"),
 		("greet", "sec-2", "job-2", "你好"),
 	]
+
+
+@pytest.mark.parametrize("message", ["", "   ", "\t"])
+def test_candidate_greet_rejects_blank_message(tmp_path, message):
+	"""显式空白招呼语不能静默退回平台默认招呼（Issue #2623）。
+
+	顶层 `boss greet --message ""` 已在平台调用前报 `INVALID_PARAM`
+	（Issue #2603）；向导 / MCP 若把空串当「未提供」，Agent 会以为自定义
+	招呼已发出，实际发出的是平台默认招呼。
+	"""
+	platform = _FakeCandidatePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	with pytest.raises(WorkflowActionError) as exc_info:
+		DEFAULT_ACTIONS["candidate_greet"](
+			context,
+			{"security_id": "sec-9", "job_id": "job-9", "message": message},
+			{},
+		)
+
+	assert exc_info.value.code == "INVALID_PARAM"
+	assert "message" in str(exc_info.value)
+	assert platform.calls == []
+
+
+@pytest.mark.parametrize(
+	"inputs",
+	[
+		pytest.param({"security_id": "sec-9", "job_id": "job-9"}, id="omitted"),
+		pytest.param({"security_id": "sec-9", "job_id": "job-9", "message": None}, id="null"),
+	],
+)
+def test_candidate_greet_uses_default_message_only_when_omitted(tmp_path, inputs):
+	"""缺省 / null 才用平台默认招呼语（Issue #2623）。"""
+	platform = _FakeCandidatePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	assert DEFAULT_ACTIONS["candidate_greet"](context, inputs, {}).data["result"]["greeted"] is True
+	assert platform.calls == [("greet", "sec-9", "job-9", "")]
 
 
 def test_candidate_write_actions_mark_local_state_failure_as_not_retryable(tmp_path, monkeypatch):
@@ -517,8 +603,9 @@ def test_candidate_export_scopes_search_to_current_account(tmp_path):
 	class _Result:
 		items: list = []
 
-	def fake_search(platform_arg, cache, logger, inputs):
+	def fake_search(platform_arg, cache, logger, inputs, *, limit=None):
 		captured.update(inputs)
+		captured["limit"] = limit
 		return _Result()
 
 	with (
@@ -549,6 +636,48 @@ def test_candidate_export_expands_tilde_in_output_path(tmp_path, monkeypatch):
 	expected = tmp_path / "wizard" / "out.json"
 	assert result.data["path"] == str(expected)
 	assert expected.exists()
+
+
+@pytest.mark.parametrize(
+	("action", "inputs"),
+	[
+		("candidate_search", {"query": "Python", "page": MAX_TRUSTED_PAGE + 1}),
+		("candidate_recommend", {"page": MAX_TRUSTED_PAGE + 1}),
+		("candidate_chat", {"page": MAX_TRUSTED_PAGE + 1}),
+		("candidate_chat_history", {"gid": "10001", "page": MAX_TRUSTED_PAGE + 1}),
+	],
+)
+def test_candidate_paging_actions_reject_page_above_trusted_limit(tmp_path, action, inputs):
+	"""向导绕过 Click，也要与求职者分页命令的 IntRange(max=MAX_TRUSTED_PAGE) 同口径（Issue #2625）。"""
+	platform = _FakeCandidatePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	with pytest.raises(WorkflowInputError, match="page"):
+		DEFAULT_ACTIONS[action](context, inputs, {})
+
+	assert platform.calls == []
+
+
+def test_candidate_chat_accepts_trusted_page_limit(tmp_path):
+	"""边界值 MAX_TRUSTED_PAGE 仍正常下发（Issue #2625）。"""
+	platform = _FakeCandidatePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	DEFAULT_ACTIONS["candidate_chat"](context, {"page": MAX_TRUSTED_PAGE}, {})
+
+	assert platform.calls == [("friend_list", MAX_TRUSTED_PAGE)]
+
+
+@pytest.mark.parametrize("count", [MAX_TRUSTED_COUNT + 1, "1000001"])
+def test_candidate_chat_history_rejects_count_above_trusted_limit(tmp_path, count):
+	"""`chatmsg --count` 的 Click 上限不能被向导绕过（Issue #2625）。"""
+	platform = _FakeCandidatePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	with pytest.raises(WorkflowInputError, match="count"):
+		DEFAULT_ACTIONS["candidate_chat_history"](context, {"gid": "10001", "count": count}, {})
+
+	assert platform.calls == []
 
 
 def test_candidate_contact_actions_refresh_rotating_security_id(tmp_path):
@@ -637,6 +766,52 @@ def test_candidate_watch_stores_string_params(tmp_path):
 		DEFAULT_ACTIONS["candidate_watch"](context, {"action": "add", "name": "bad", "query": ["Python"]}, {})
 	assert exc_info.value.code == "INVALID_PARAM"
 	assert "query" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("value", [False, 0, [], {}, 1.5])
+def test_candidate_watch_rejects_non_string_active(tmp_path, value):
+	"""非字符串 active 不得被真值判断吞掉、按「不筛选」静默保存（Issue #2645）。"""
+	context = _action_context(tmp_path)
+
+	with pytest.raises(WorkflowActionError) as exc_info:
+		DEFAULT_ACTIONS["candidate_watch"](
+			context, {"action": "add", "name": "daily", "query": "Python", "active": value}, {}
+		)
+
+	assert exc_info.value.code == "INVALID_PARAM"
+	assert "active 必须是字符串" in str(exc_info.value)
+	with CacheStore(tmp_path / "cache" / "boss_agent.db") as cache:
+		assert cache.get_saved_search("daily") is None
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_candidate_watch_rejects_blank_active(tmp_path, value):
+	"""active 的 schema 是 minLength 1：空白应点名拒绝，而不是当作未设置（Issue #2645）。"""
+	context = _action_context(tmp_path)
+
+	with pytest.raises(WorkflowActionError) as exc_info:
+		DEFAULT_ACTIONS["candidate_watch"](
+			context, {"action": "add", "name": "daily", "query": "Python", "active": value}, {}
+		)
+
+	assert exc_info.value.code == "INVALID_PARAM"
+	assert "省略该字段" in str(exc_info.value)
+
+
+def test_candidate_watch_accepts_active_alias_and_omission(tmp_path):
+	"""合法 active 按标准键保存；缺省与 null 表示不筛选（Issue #2645）。"""
+	context = _action_context(tmp_path)
+	DEFAULT_ACTIONS["candidate_watch"](
+		context, {"action": "add", "name": "daily", "query": "Python", "active": "3day"}, {}
+	)
+	DEFAULT_ACTIONS["candidate_watch"](
+		context, {"action": "add", "name": "plain", "query": "Python", "active": None}, {}
+	)
+	with CacheStore(tmp_path / "cache" / "boss_agent.db") as cache:
+		record = cache.get_saved_search("daily")
+		plain = cache.get_saved_search("plain")
+	assert record is not None and record["params"]["active"] == "3d"
+	assert plain is not None and "active" not in plain["params"]
 
 
 def test_candidate_watch_corrupt_params_reports_recovery(tmp_path):
@@ -1071,6 +1246,77 @@ def test_recruiter_read_write_and_job_actions_preserve_arguments(tmp_path):
 		("job_online", "job-1"),
 		("job_offline", "job-1"),
 	]
+
+
+@pytest.mark.parametrize(
+	("action", "inputs", "blank"),
+	[
+		("recruiter_candidates", {"query": "Python", "city": ""}, "city"),
+		("recruiter_candidates", {"query": "Python", "city": "   "}, "city"),
+		("recruiter_candidates", {"query": "Python", "job_id": ""}, "job_id"),
+		("recruiter_applications", {"job_id": ""}, "job_id"),
+		("recruiter_chat", {"job_id": " "}, "job_id"),
+		("recruiter_last_messages", {"job_id": ""}, "job_id"),
+	],
+)
+def test_recruiter_actions_reject_blank_optional_filters(tmp_path, action, inputs, blank):
+	"""向导入口与顶层 `hr ...` 命令同口径：显式空筛选项不能静默按不筛选执行（Issue #2618）。"""
+	platform = _FakeRecruiterPlatform()
+	context = _action_context(tmp_path, role="recruiter", recruiter=platform)
+
+	with pytest.raises(WorkflowActionError) as exc_info:
+		DEFAULT_ACTIONS[action](context, inputs, {})
+
+	assert exc_info.value.code == "INVALID_PARAM"
+	assert blank in str(exc_info.value)
+	assert platform.calls == []
+
+
+def test_recruiter_actions_accept_omitted_or_null_optional_filters(tmp_path):
+	"""省略 / null 仍表示未提供；只有显式空白才是参数错误（Issue #2618）。"""
+	platform = _FakeRecruiterPlatform()
+	context = _action_context(tmp_path, role="recruiter", recruiter=platform)
+
+	DEFAULT_ACTIONS["recruiter_candidates"](context, {"query": "Python", "city": None}, {})
+	DEFAULT_ACTIONS["recruiter_applications"](context, {"job_id": None}, {})
+	DEFAULT_ACTIONS["recruiter_last_messages"](context, {"job_id": None}, {})
+
+	assert [call[0] for call in platform.calls] == ["search_geeks", "friend_list", "friend_list", "last_messages"]
+
+
+@pytest.mark.parametrize("max_msg_id", [0, -1, "0", "-3"])
+def test_recruiter_chat_history_rejects_non_positive_max_msg_id(tmp_path, max_msg_id):
+	"""显式 0 / 负数游标不能被真值判断吞成「未提供」（Issue #2621）。
+
+	顶层 `hr chatmsg --max-msg-id` 是 Click `IntRange(min=1)`，向导 / MCP 必须
+	同样拒绝，而不是静默回退最新一页——Agent 会以为游标翻页已生效。
+	"""
+	platform = _FakeRecruiterPlatform()
+	context = _action_context(tmp_path, role="recruiter", recruiter=platform)
+
+	with pytest.raises(WorkflowInputError, match="max_msg_id"):
+		DEFAULT_ACTIONS["recruiter_chat_history"](
+			context,
+			{"friend_id": 42, "max_msg_id": max_msg_id},
+			{},
+		)
+
+	assert platform.calls == []
+
+
+@pytest.mark.parametrize("max_msg_id", [None, ""])
+def test_recruiter_chat_history_treats_absent_max_msg_id_as_latest_page(tmp_path, max_msg_id):
+	"""省略 / null / 空串仍表示未提供游标，保持读最新一页（Issue #2621）。"""
+	platform = _FakeRecruiterPlatform()
+	context = _action_context(tmp_path, role="recruiter", recruiter=platform)
+
+	DEFAULT_ACTIONS["recruiter_chat_history"](
+		context,
+		{"friend_id": 42, "max_msg_id": max_msg_id},
+		{},
+	)
+
+	assert platform.calls == [("chat_history", 42, 20, None)]
 
 
 def test_recruiter_exchange_rejects_unknown_type(tmp_path):
@@ -2676,6 +2922,86 @@ def test_execute_candidate_detail_falls_back_to_job_card_when_detail_rejects_par
 	assert job["company"] == "示例公司"
 	assert job["channel"] == "job_card"
 	assert job["security_id"] == "sec-1"
+
+
+class _DetailCachePlatform:
+	def __init__(self):
+		self.calls = []
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *args):
+		return None
+
+	def job_detail(self, job_id):
+		self.calls.append(("job_detail", job_id))
+		return {
+			"code": 0,
+			"zpData": {"jobInfo": {"jobName": "职位甲", "encryptJobId": job_id}, "brandComInfo": {}, "bossInfo": {}},
+		}
+
+	def job_card(self, security_id, lid=""):
+		self.calls.append(("job_card", security_id, lid))
+		return {"code": 0, "zpData": {"jobCard": {"encryptJobId": "card-job", "jobName": "职位甲"}}}
+
+	def is_success(self, response):
+		return response.get("code") == 0
+
+	def unwrap_data(self, response):
+		return response.get("zpData") or {}
+
+
+def test_candidate_detail_uses_cached_job_id_before_job_card(tmp_path):
+	"""与顶层 `detail` 同口径：缓存命中走 job_detail，不消耗浏览器卡片通道（Issue #2628）。"""
+	platform = _DetailCachePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
+		cache.record_greet("sec-1", "cached-job")
+
+	result = DEFAULT_ACTIONS["candidate_detail"](context, {"security_id": "sec-1"}, {})
+
+	assert platform.calls == [("job_detail", "cached-job")]
+	assert result.data["job"]["channel"] == "job_detail"
+
+
+@pytest.mark.parametrize("cached", [None, 123, "   ", "\ud800"])
+def test_candidate_detail_ignores_invalid_cached_job_id(tmp_path, monkeypatch, cached):
+	"""缓存漂移 / 坏值按未命中继续走卡片通道，不当参数发给平台（Issue #1817 / #2549）。"""
+	platform = _DetailCachePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+	monkeypatch.setattr(CacheStore, "get_job_id", lambda self, security_id: cached)
+
+	result = DEFAULT_ACTIONS["candidate_detail"](context, {"security_id": "sec-1"}, {})
+
+	assert platform.calls == [("job_card", "sec-1", "")]
+	assert result.data["job"]["channel"] == "job_card"
+
+
+@pytest.mark.parametrize("job_id", [123, {"id": "x"}, "\ud800"])
+def test_candidate_detail_rejects_non_string_or_unencodable_job_id(tmp_path, job_id):
+	"""显式 job_id 不能经 str() 变成 repr 或把孤立代理项带进请求（Issue #2628）。"""
+	platform = _DetailCachePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+
+	with pytest.raises(WorkflowInputError, match="job_id"):
+		DEFAULT_ACTIONS["candidate_detail"](
+			context, {"security_id": "sec-1", "job_id": job_id}, {}
+		)
+
+	assert platform.calls == []
+
+
+def test_candidate_detail_blank_job_id_falls_back_to_cache(tmp_path):
+	"""显式空白 job_id 按未提供处理，与顶层 `--job-id "   "` 一致（Issue #1817）。"""
+	platform = _DetailCachePlatform()
+	context = _action_context(tmp_path, candidate=platform)
+	with CacheStore(context.data_dir / "cache" / "boss_agent.db") as cache:
+		cache.record_greet("sec-1", "cached-job")
+
+	DEFAULT_ACTIONS["candidate_detail"](context, {"security_id": "sec-1", "job_id": "   "}, {})
+
+	assert platform.calls == [("job_detail", "cached-job")]
 
 
 def test_error_message_prefers_platform_chinese_text():
