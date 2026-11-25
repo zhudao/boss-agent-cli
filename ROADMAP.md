@@ -4,6 +4,44 @@
 
 ## 已发布
 
+v3.4.208（2026-11-25）：沟通列表与职位收藏的多页聚合按条目去重，翻页期间列表前移不再让 `pipeline` / `follow-up` / `digest` 与 `favorites sync` 把同一条目算两次；终端一侧 `boss status` 不再显示 `logged in as None`，通用表格的 `None` / 列表 / 对象不再按 Python repr 显示，未知时间不再渲染成 1970 年；`RATE_LIMITED` 排障指引改为放慢请求，`config set request_delay` 接受 `config get` 展示的数组写法（Issue #2753、#2754、#2755、#2756、#2757）。
+
+v3.4.207（2026-11-25）：联系人显示名收口到 `contact_lookup.friend_display_name`，向导 `exchange` 不再把类型漂移的 `name` 以 Python repr 发进写请求，`mark` / `chat-summary` / `chatmsg` 不再把容器原样写进信封；`chatmsg` 的发送方 uid 与 `stable_uid` 同口径，顶层 `text` 不可用时不再吞掉 `body.text`；`hr resume` 教育经历按优先级逐键取第一个非空字符串（Issue #2748、#2749、#2750）。
+
+v3.4.206（2026-11-25）：`interviews` 的文本字段统一走 `field_text`，显式 null / 非有限数与容器不再进 JSON 信封与 TTY；`handle_auth_errors` 增加 `NotImplementedError` → `NOT_SUPPORTED` 分支，`digest` / `pipeline` / `follow-up` 不再把能力缺口报成可重试网络错误（Issue #2744、#2745）。
+
+v3.4.205（2026-11-25）：`pipeline` / `follow-up` / `digest` 的文本字段统一走 `field_text`，非有限数与容器不再写进产物；`recommend --with-score` 的求职期望回退链按优先级逐个键取第一个可用字符串，容器漂移不再吞掉合法回退键（Issue #2739、#2740）。
+
+v3.4.204（2026-11-25）：`hr chat` / 向导 communication 的最后一条消息不再把非有限浮点写成伪文本；`-o` 路径展开的裸 ValueError 归一为本地 IO 错误；导出整数归一只数数字位，4300 位负整数不再被静默写成 null；`safe_text` 不再把可转换的 4300 位整数抹成空串。（Issue #2730、#2732、#2733、#2736）。
+
+v3.4.203（2026-11-25）：`friend_security_id` 在 securityId 类型漂移时不再吞掉合法的 security_id 回退；MCP `boss_export` 带福利 / 活跃度筛选时按详情页估算超时，不再被 290s 误杀；`boss_wizard` schema 声明 run / resume 的 120 秒宿主默认超时。（Issue #2723、#2725、#2726）。
+
+v3.4.202（2026-11-25）：向导 / MCP `boss_wizard` 的 `export` goal 在 `welfare` / `active` 详情筛选下与顶层 `boss export` 对齐：未给 `count` 按 CLI 默认 50 扫描、`max_pages` 受详情上限钳制、`active` 统计写入 `data.active_filter`；向导 search 在 `active` 筛选下返回与 CLI 同口径的 `data.active_filter` 统计；`boss search --welfare` 的纯空白输入不再按详情筛选处理（Issue #2716、#2717、#2720）。
+
+v3.4.201（2026-11-25）：向导 / MCP `boss_wizard` 的 `export` goal 与顶层 `boss export` 共用同一份终止原因映射与截断判定：`--active` 筛选提前停止且没取满 `count` 时现在报 `truncated=true`，不再把不完整前缀报告为完整（Issue #2712）。
+
+v3.4.200（2026-11-25）：`boss export --active` 在活跃度筛选提前停止且未取满 `--count` 时现在报 `truncated=true` 与专用 `operator_actions`（`stop_reason=active_target_reached`），不再把不完整结果报告为完整；恰好取满时仍按 `count_reached` 处理，中英文命令文档同步该终止原因（Issue #2710）。
+
+v3.4.199（2026-11-25）：CLI `boss export` 与 MCP `boss_export` 新增 `--welfare` / `--active`（`welfare` / `active`），与 `search`、`watch add` 及向导 export 同口径：复用 `run_search_pipeline` 的详情探测、间隔预算、页数上限与风控停止语义，活跃度未知文案的职位被排除并计入 `hints.active_filter`；`boss schema` 与中英文命令文档同步（Issue #2706）。
+
+v3.4.198（2026-11-25）：CLI `boss watch add` 与 MCP `boss_watch_add` 新增 `active`（`--active`）活跃度下限，与 `search` / `preset add` 及向导 `watch` 的 `add` 动作同口径：别名归一化为档位、非法值写入前报 `INVALID_PARAM`、不设置时不落下该键；`boss schema` 与中英文命令文档同步（Issue #2704）。
+
+v3.4.197（2026-11-25）：向导的枚举型输入（`watch` 的 `action`、`export` 的 `format`、`crawl_start` 的 `hook_profile`）不再把 `false` / `0` / `[]` 等非字符串值静默当成默认值，改为在任何本地写入或平台请求前报输入错误并点名字段；缺省、`null` 与空串仍用默认值（Issue #2701）。
+
+v3.4.196（2026-11-25）：向导 `watch` goal 的 `run` 动作支持 `all=true`，与 CLI `watch run --all`、MCP `boss_watch_run` 同口径批量运行已保存 watch：损坏或并发删除的记录逐条列出并继续，命中平台风控立即停止后续 watch；`all` 只认 JSON 布尔值且与 `name` 互斥（Issue #2698）。
+
+v3.4.195（2026-11-24）：MCP 工具 `boss_watch_run` 新增 `all` 布尔参数，与 CLI `watch run --all` 同口径批量运行已保存 watch（部分记录损坏、命中风控的既有口径一并可用）；`name` 不再是 MCP 侧必填，由 CLI 判定二者互斥（Issue #2695）。
+
+v3.4.194（2026-11-24）：向导 / MCP 修复两处与 CLI 口径不一致的行为——`search_url` 展开时显式 `raw_params` 优先于链接里的同名 code 参数（与 `search --url` 的「显式选项覆盖链接参数」一致），`job_search` / `export` 的 `page`、`max_pages` 在构造平台实例前校验（与 #2625 口径一致，非法值不再先启动浏览器 / 登录探测）（Issue #2690、#2692）。
+
+v3.4.193（2026-11-24）：向导 / MCP 新增招聘者 `recommendations` goal（按 `job_id` 读取推荐牛人并回显 `pagination`）；`job_search` / `export` 支持 `search_url`，`job_search` 同时支持 `preset`，与顶层 `search --url` / `--preset`、`export --url` 同口径展开链接与本地预设，`wizard_catalog` 新增 `either_inputs` 声明「query / search_url / preset 至少一个」；`wizard --resume` 恢复历史 run 时校验 inputs 可存储性，坏记录统一报 `CACHE_RECORD_INVALID` 并给出重建指引（Issue #2682、#2685、#2687）。
+
+v3.4.192（2026-11-24）：向导 / MCP（招聘者）`last_messages` 补齐 `limit`（默认 100、上限 300）与 `friend_ids` 直查，请求按 friendSource 分组、每批 50 串行并回显 `skipped` / `requests`；`communication` 支持 `summary_limit`，给沟通列表补未读数 / 最近消息并在 `summary_sources` 回显请求统计。摘要与批量查询实现下沉 `services/recruiter_last_messages.py` 与 `services/recruiter_chat_summary.py` 与命令层共用（Issue #2675、#2679）。
+
+v3.4.191（2026-11-24）：其余列表类向导 goal（`chat_history`、`candidates`、`applications`、`communication`、`last_messages`、`jobs_list`）补齐与 CLI 同词汇的 `pagination` 分页证据；`jobs_list` 同时支持 `page` 输入（此前传入第 2 页仍返回第一页）。不新增平台请求（Issue #2672）。
+
+v3.4.190（2026-11-24）：向导 / MCP 的 `communication` goal 支持 `from` / `days` 筛选（与顶层 `chat` 同口径，只作用于当前页），并在结果中回显生效条件；`recommendations` 与 `communication` 的步骤 `data` 新增与 CLI 同词汇的 `pagination` 分页证据（`has_more` 只认平台布尔 `hasMore`）。非法取值在平台请求前返回参数错误，过滤谓词与命令层共用（Issue #2667、#2670）。
+
 v3.4.189（2026-11-24）：向导 / MCP 的 `recommendations` 与 `job_search` goal 支持 `with_score`，分别按顶层 `recommend` / `search` 同一口径读取求职期望或复用本次搜索条件重算匹配分并附加匹配原因；缺省保持原输出，非布尔值在平台请求前返回参数错误，评分实现与命令层共用（Issue #2662、#2665）。
 
 v3.4.188（2026-11-24）：向导 / MCP `job_search`（`candidate_search`）支持 `sort`，缺省保持平台顺序，`score` 按本地匹配分降序且类型漂移按 0；非法 / 显式空值在平台请求前返回 `INVALID_PARAM`，排序实现与顶层 `boss search --sort` 共用（Issue #2660）。

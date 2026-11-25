@@ -210,7 +210,7 @@ Follow-up hints from chat commands keep the current `--data-dir`. The `hints.nex
 | Command | Description |
 |---------|-------------|
 | `boss pipeline` / `boss follow-up` / `boss digest` | Build progress, follow-up, and daily views from conversations/interviews |
-| `boss watch add/list/remove/run` | Save, list, remove, or run incremental job watches (`run` takes either a name or `--all`, not both) |
+| `boss watch add/list/remove/run` | Save, list, remove, or run incremental job watches (`add` takes the same filters as `search`, including `--active`; `run` takes either a name or `--all`, not both) |
 | `boss shortlist add/list/annotate/compare/remove` | Local shortlist with tags, notes, and offline compare |
 | `boss favorites list/sync` | Read BOSS job favorites with validity status; sync imports only explicitly active jobs (deduplicates jobs, refreshes dynamic access IDs, preserves first-saved time) |
 | `boss preset add/list/remove` | Search presets |
@@ -326,7 +326,7 @@ AI commands likewise read the AI config, `resumes/`, shortlist and job-descripti
 | `boss config list/set/reset` | Configuration management |
 | `boss clean` | Clean caches; `--all` clears all caches (search cache, greeting/application records, recruiter greeting records, job description cache, and work-location send records); `--risk-lock` explicitly clears the local risk lock after the user confirms the intended official business page has recovered; `--dry-run` keeps the lock, and cleanup does not establish server recovery |
 | `boss stats` | Funnel stats from local state (greeted/applied/shortlist) |
-| `boss export <query>` | Export results (CSV/JSON/HTML, supports `--url` web filters) |
+| `boss export <query>` | Export results (CSV/JSON/HTML, supports `--url` web filters; `--welfare` / `--active` work like `search` and check job details before filtering) |
 
 The execution hint returned by `clean --dry-run` removes `--dry-run` and preserves the current `--data-dir`, `--all` / `--privacy`, and `--days`. Paths are quoted so following the hint uses the same data directory and cleanup scope as the preview. Login and diagnostic hints after cleanup also keep that directory. A preview with `--risk-lock` provides its scoped execution command only in `hints.operator_actions` for the operator.
 
@@ -375,7 +375,7 @@ HTTP `429` or business code `9` persists a shared cooldown. `Retry-After` accept
 
 Accounting covers integrated HTTP dispatches, browser fetches / home navigation / recruiter frontend actions, attachment downloads, and crawl navigation, pagination actions, page fetches and CDP fallback attempts; each separate attempt consumes a slot. This counts active operations: one page action may produce multiple website requests. Autonomous browser resources, polling, automatic redirects and authentication bootstrap requests are not counted packet by packet. The coordinator does not discover or group other processes by public IP. It limits local load and neither guarantees platform acceptance nor removes a server restriction.
 
-`--delay`, `request_delay` and `batch_greet_delay` require finite values satisfying `0 <= low <= high`. Invalid budget settings return `INVALID_PARAM` without writing configuration. `config set/reset` remains available to repair existing invalid settings. An explicit `--delay ""` / `--cdp-url ""` is rejected as a parameter error instead of falling back to the configuration file; only an omitted option uses the saved value.
+`--delay`, `request_delay` and `batch_greet_delay` require finite values satisfying `0 <= low <= high`. Invalid budget settings return `INVALID_PARAM` without writing configuration. For `request_delay` / `batch_greet_delay`, `config set` accepts both the comma form (`boss config set request_delay 60,120`) and the array form (`boss config set request_delay "[60, 120]"`, which is what `config get` / `config list` display), so a value you read can be written back as is. `config set/reset` remains available to repair existing invalid settings. An explicit `--delay ""` / `--cdp-url ""` is rejected as a parameter error instead of falling back to the configuration file; only an omitted option uses the saved value.
 
 ## Search filter parameters
 
@@ -400,7 +400,7 @@ boss search --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280
 boss export --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280100' --count 50 -o jobs.csv
 ```
 
-The `boss export` JSON envelope carries `truncated` and `stop_reason`, distinguishing "reached the requested count" from "hit the local page budget": `count_reached`, `platform_has_more_false`, and `empty_page` all mean the result is complete; with `page_budget_exhausted`, `truncated=true` means the internal page budget ran out and the result may be incomplete, and `hints.operator_actions` suggests narrowing the filters. `--format html` writes directly without an envelope, so the truncation notice goes to stderr.
+The `boss export` JSON envelope carries `truncated` and `stop_reason`, distinguishing "reached the requested count" from "hit the local page budget": `count_reached`, `platform_has_more_false`, and `empty_page` all mean the result is complete; with `page_budget_exhausted` (internal page budget ran out) or `active_target_reached` (the activity filter stopped early within the reliably classifiable range and `--count` was not reached), `truncated=true` means the result may be incomplete, and `hints.operator_actions` suggests narrowing the filters. `--format html` writes directly without an envelope, so the truncation notice goes to stderr.
 
 Follow-up and argument-error recovery hints from `export` keep the current `--data-dir` and platform: the `search` / `recommend` hints after writing a file, the `--format html --json` and CSV/stdout re-export examples, and the recovery commands for an empty query, empty `--url`, or unparsable URL all carry the shell-quoted absolute directory, so following them uses the same login state and caches.
 

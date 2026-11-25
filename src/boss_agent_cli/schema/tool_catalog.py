@@ -134,7 +134,15 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 						"description": "可选的 goal 内步骤子集；省略表示执行全部步骤，空数组非法",
 					},
 					"run_id": {"type": "string", "description": "resume/status/stop 的显式 workflow run_id"},
-					"timeout": {"type": "number", "minimum": 0.001, "description": "workflow 超时秒数"},
+					"timeout": {
+						"type": "number",
+						"minimum": 0.001,
+						"default": 120,
+						"description": (
+							"workflow 超时秒数；run / resume 省略时 MCP 宿主按 120 秒设置子进程截止，"
+							"CLI 直接调用不设截止"
+						),
+					},
 					"max_retries": {"type": "integer", "minimum": 0, "maximum": 10, "default": 0, "description": "可恢复步骤的最大重试次数"},
 				},
 				"required": [],
@@ -445,6 +453,8 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"scale": {"type": "string", "description": "公司规模，支持逗号分隔多选"},
 					"stage": {"type": "string", "description": "融资阶段，支持逗号分隔多选"},
 					"job_type": {"type": "string", "description": "职位类型，支持逗号分隔多选"},
+					"welfare": {"type": "string", "description": "福利筛选，逗号分隔 AND 逻辑（如 双休,五险一金）；需要逐个查详情，更慢、风控风险更高"},
+					"active": {"type": "string", "description": "只导出 HR 活跃度不低于该档的职位；标准值 online / today / 3d / week / 2w / month / half-year，也支持 3day、3日 等别名；活跃度未知的职位被排除并计入 hints.active_filter"},
 					"count": {"type": "integer", "minimum": 1, "description": "导出数量", "default": 50},
 					"format": {"type": "string", "enum": ["csv", "json", "html"], "description": "输出格式", "default": "csv"},
 					"output_file": {"type": "string", "description": "输出文件路径；不传时 csv/json 在信封内返回 jobs 列表，html 在 data.content 返回 HTML 正文"},
@@ -812,13 +822,16 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 		),
 		ToolDefinition(
 			name="boss_watch_run",
-			description="执行指定监控并返回新增职位列表",
+			description="执行监控并返回新增职位列表；name 与 all 互斥，必须且只能提供一个",
 			input_schema={
 				"type": "object",
 				"properties": {
-					"name": {"type": "string", "description": "监控名称"},
+					# 与 CLI `watch run` 同口径：`all=true` 跑全部已保存 watch，
+					# 部分记录损坏 / 命中风控时 CLI 有专门口径（Issue #2695）。
+					"name": {"type": "string", "description": "监控名称；与 all 互斥"},
+					"all": {"type": "boolean", "description": "运行所有已保存的监控；与 name 互斥"},
 				},
-				"required": ["name"],
+				"required": [],
 			},
 		),
 		ToolDefinition(
@@ -962,6 +975,8 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"stage": {"type": "string", "enum": list(STAGE_CODES), "description": "融资阶段（可选）"},
 					"job_type": {"type": "string", "enum": list(JOB_TYPE_CODES), "description": "职位类型（可选）"},
 					"welfare": {"type": "string", "description": "福利筛选（可选）"},
+					# 与 CLI `watch add --active` / 向导 add 动作同口径（Issue #2704）。
+					"active": {"type": "string", "minLength": 1, "description": "HR 活跃度下限：online / today / 3d / week / 2w / month / half-year（可选，也认 3day、3日 等写法）"},
 				},
 				"required": ["name", "query"],
 			},

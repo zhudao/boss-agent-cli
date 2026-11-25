@@ -208,7 +208,7 @@ boss crawl stop <run_id>
 | `boss pipeline` | 聚合会话和面试数据生成候选进度 |
 | `boss follow-up` | 筛选需要跟进的会话和面试项 |
 | `boss digest` | 汇总新增职位、待跟进会话和面试项 |
-| `boss watch add/list/remove/run` | 保存、列出、删除或执行增量职位监控（`run` 的点名与 `--all` 只能选一个） |
+| `boss watch add/list/remove/run` | 保存、列出、删除或执行增量职位监控（`add` 支持与 `search` 相同的筛选，含 `--active` 活跃度下限；`run` 的点名与 `--all` 只能选一个） |
 | `boss shortlist add/list/annotate/compare/remove` | 本地候选池：支持标签、备注和离线对比 |
 | `boss favorites list/sync` | 读取 BOSS 职位收藏并呈现有效状态；sync 只导入明确有效职位（按职位去重、刷新动态访问 ID，保留首次收藏时间） |
 | `boss preset add/list/remove` | 搜索预设 |
@@ -344,7 +344,7 @@ AI 命令同样读取 `--data-dir` 中的 AI 配置、`resumes/`、候选池与�
 | `boss config list/set/reset` | 配置管理 |
 | `boss clean` | 清理缓存；`--all` 清理全部缓存（含搜索缓存、打招呼/投递记录、招聘者打招呼记录、职位描述缓存和工作地点发送记录）；`--risk-lock` 在用户确认官方目标业务页恢复后显式清除本地风险锁，`--dry-run` 不解除锁，不宣称平台解封 |
 | `boss stats` | 投递转化漏斗统计（greeted/applied/shortlist） |
-| `boss export <query>` | 导出结果（CSV/JSON/HTML，支持 `--url` 网页筛选） |
+| `boss export <query>` | 导出结果（CSV/JSON/HTML，支持 `--url` 网页筛选；`--welfare` / `--active` 与 `search` 同口径，逐个查详情后过滤） |
 
 `clean --dry-run` 返回的执行提示会去掉 `--dry-run`，保留本次 `--data-dir`、`--all` / `--privacy` 与 `--days`；路径会正确转义，照提示执行时仍操作预演的数据目录与清理范围。清理后的登录、自检提示也沿用该目录。带 `--risk-lock` 的预演只在 `hints.operator_actions` 提供保留范围的人工执行命令。
 
@@ -393,7 +393,7 @@ HTTP `429` 或业务 code `9` 会保存共享冷却，支持 `Retry-After` 的�
 
 计量覆盖接入预算的 HTTP dispatch、浏览器 fetch / 首页导航 / 招聘者前端动作、附件下载，以及 crawl 的导航、分页动作、页面 fetch 和 CDP fallback；不同尝试分别计数。这是主动操作预算：一个页面动作可能产生多条网站请求，浏览器自主资源、轮询、自动重定向和认证启动内部请求未逐包计量，也不会按公网 IP 自动发现或合并其他进程。该机制限制本地负载，不保证平台接受访问，也不解除平台封禁。
 
-`--delay`、`request_delay` 和 `batch_greet_delay` 必须是有限数值且满足 `0 <= 下限 <= 上限`；非法预算配置返回 `INVALID_PARAM`，不会写入配置文件。已有非法配置仍可通过 `config set/reset` 修复。显式 `--delay ""` / `--cdp-url ""` 同样按参数错误拒绝，不会回落到配置文件；只有省略选项时才使用已保存的值。
+`--delay`、`request_delay` 和 `batch_greet_delay` 必须是有限数值且满足 `0 <= 下限 <= 上限`；非法预算配置返回 `INVALID_PARAM`，不会写入配置文件。`config set` 对 `request_delay` / `batch_greet_delay` 同时接受逗号写法（`boss config set request_delay 60,120`）与数组写法（`boss config set request_delay "[60, 120]"`，即 `config get` / `config list` 展示的形式），读到的值可以原样写回。已有非法配置仍可通过 `config set/reset` 修复。显式 `--delay ""` / `--cdp-url ""` 同样按参数错误拒绝，不会回落到配置文件；只有省略选项时才使用已保存的值。
 
 ## 搜索筛选参数详解
 
@@ -418,7 +418,7 @@ boss search --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280
 boss export --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280100' --count 50 -o jobs.csv
 ```
 
-`boss export` 的 JSON 信封带 `truncated` 与 `stop_reason`，用于区分「取满请求量」与「本地扫描到上限」：`count_reached`、`platform_has_more_false`、`empty_page` 都表示结果完整；`page_budget_exhausted` 时 `truncated=true`，表示内部页数预算已耗尽、结果可能不完整，同时 `hints.operator_actions` 给出缩小筛选条件的指引。`--format html` 直出没有信封，截断提示写到 stderr。
+`boss export` 的 JSON 信封带 `truncated` 与 `stop_reason`，用于区分「取满请求量」与「本地扫描到上限」：`count_reached`、`platform_has_more_false`、`empty_page` 都表示结果完整；`page_budget_exhausted`（内部页数预算耗尽）与 `active_target_reached`（活跃度筛选在可判定范围内提前停止、未取满 `--count`）时 `truncated=true`，结果可能不完整，并附带对应的 `operator_actions`，同时 `hints.operator_actions` 给出缩小筛选条件的指引。`--format html` 直出没有信封，截断提示写到 stderr。
 
 `export` 的成功后继与参数错误恢复提示保留本次 `--data-dir` 与平台：写完文件后的 `search` / `recommend`、`--format html --json` 与 CSV/stdout 的重导出示例，以及空 query / 空 `--url` / URL 解析失败的恢复命令都携带按 shell 参数转义的绝对目录，照抄提示仍使用同一登录态与缓存。
 

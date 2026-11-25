@@ -45,6 +45,7 @@ STEP_LABELS = {
 	"recruiter_resume": "读取候选人简历",
 	"recruiter_chat": "读取候选人沟通列表",
 	"recruiter_last_messages": "读取最近消息",
+	"recruiter_recommendations": "读取推荐牛人",
 	"recruiter_reply": "回复候选人",
 	"recruiter_exchange_contact": "请求交换联系方式",
 	"recruiter_request_resume": "请求附件简历",
@@ -971,6 +972,27 @@ def _render_management_result(
 				f"[green]已完成[/green] {goal_label(run.get('role'), goal)}，共 [bold]{count}[/bold] 条监控。"
 			)
 			_render_list_preview_if_any(run)
+			return True
+		if data.get("mode") == "all" and isinstance(data.get("watches"), list):
+			# 批量运行（Issue #2698）：逐条列出新发现数或失败原因，损坏记录单独提示。
+			batch = Table(box=None, pad_edge=False)
+			batch.add_column("监控名", style="bold", no_wrap=True)
+			batch.add_column("新发现", justify="right", no_wrap=True)
+			batch.add_column("状态", style="dim")
+			for entry in data["watches"]:
+				if not isinstance(entry, Mapping):
+					continue
+				failed = entry.get("error")
+				batch.add_row(
+					display.escape_markup(entry.get("name") or "—"),
+					"—" if failed else display.escape_markup(entry.get("new_count", "—")),
+					display.escape_markup(failed) if failed else "完成",
+				)
+			display.console.print(Panel(batch, title=f"批量监控结果（{len(data['watches'])} 条）", border_style="cyan"))
+			skipped = data.get("skipped")
+			if isinstance(skipped, list) and skipped:
+				names = "、".join(display.escape_markup(item) for item in skipped)
+				display.console.print(f"[yellow]以下监控的参数已损坏、本次未执行：[/yellow]{names}")
 			return True
 		action = str(data.get("action") or "")
 		name = str(data.get("name") or "")

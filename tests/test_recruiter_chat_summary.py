@@ -12,7 +12,12 @@ from boss_agent_cli.api import recruiter_client as rc
 from boss_agent_cli.api.client import EnvironmentRiskError
 from boss_agent_cli.api.recruiter_client import BossRecruiterClient
 from boss_agent_cli.api.request_budget import RequestBudgetExceeded
-from boss_agent_cli.commands.recruiter.chat import _merge_last_messages, _message_items, _normalize_last_message
+from boss_agent_cli.services.recruiter_chat_summary import (
+	merge_last_messages,
+	message_text,
+	normalize_last_message,
+)
+from boss_agent_cli.services.recruiter_last_messages import message_items
 from boss_agent_cli.main import cli
 
 UPDATE_TIME = 1791516891255
@@ -135,7 +140,7 @@ def test_last_messages_message_object_shape_maps_by_from_to_uid():
 	rows = [dict(LIVE_ITEM)]
 	message = {"mid": 1, "from": {"uid": 999}, "to": {"uid": 66001}, "body": {"type": 1, "text": "方便聊聊吗"},
 		"time": UPDATE_TIME, "status": 2}
-	counts = _merge_last_messages(rows, [message])
+	counts = merge_last_messages(rows, [message])
 	assert counts == {"last_messages": 1}
 	assert rows[0]["last_msg"] == "方便聊聊吗"
 	assert rows[0]["msg_status"] == "已读"
@@ -143,20 +148,20 @@ def test_last_messages_message_object_shape_maps_by_from_to_uid():
 
 
 def test_last_messages_map_shape():
-	items = _message_items({"66001": {"lastMsg": "好的"}, "66002": "收到", "hasMore": False})
+	items = message_items({"66001": {"lastMsg": "好的"}, "66002": "收到", "hasMore": False})
 	assert {item["friendId"]: item["lastMsg"] for item in items} == {66001: "好的", 66002: "收到"}
 
 
 def test_empty_summary_from_api_does_not_override_friend_fallback():
 	rows = [dict(LIVE_ITEM)]
-	_merge_last_messages(rows, [{"friendId": 66001}])
+	merge_last_messages(rows, [{"friendId": 66001}])
 	assert rows[0]["summary_source"] == "friend_list"
 	assert rows[0]["last_time_source"] == "updateTime"
 
 
 def test_normalize_unknown_status_is_null():
-	assert _normalize_last_message({"friendId": 1, "status": 42})["msg_status"] is None
-	assert _normalize_last_message({"friendId": 1, "lastTime": "0"})["last_time"] is None
+	assert normalize_last_message({"friendId": 1, "status": 42})["msg_status"] is None
+	assert normalize_last_message({"friendId": 1, "lastTime": "0"})["last_time"] is None
 
 
 # ── client.chat_list_snapshot ─────────────────────────────────
@@ -316,3 +321,23 @@ def test_total_unread_reported_even_with_empty_list():
 	hints = _run(platform)["hints"]
 	assert hints["total_unread"] == 7
 	platform.last_messages.assert_not_called()
+
+
+# ── #2730：非有限浮点不能被 str() 成 "inf"/"nan" 写进最后一条消息 ──────
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")], ids=["inf", "-inf", "nan"])
+def test_message_text_treats_nonfinite_floats_as_missing(value):
+	assert message_text({"lastMsg": value}) is None
+	assert message_text({"body": {"text": value}}) is None
+	assert message_text({"lastMsgInfo": {"showText": value}}) is None
+
+
+def test_message_text_keeps_finite_numbers_and_rejects_bool():
+	assert message_text({"lastMsg": 0}) == "0"
+	assert message_text({"lastMsg": 12.5}) == "12.5"
+	assert message_text({"lastMsg": True}) is None
+
+
+def test_merge_last_messages_ignores_nonfinite_text():
+	rows = [dict(LIVE_ITEM)]
+	merge_last_messages(rows, [{"friendId": 66001, "lastMsg": float("inf")}])
+	assert rows[0]["last_msg"] is None

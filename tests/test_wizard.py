@@ -1064,7 +1064,7 @@ class _FakeRecruiterPlatform:
 	def __exit__(self, *args):
 		return None
 
-	def list_jobs(self):
+	def list_jobs(self, page: int = 1):
 		self.calls.append(("list_jobs",))
 		return self._response({"jobs": [{"id": "job-1"}]})
 
@@ -1281,7 +1281,9 @@ def test_recruiter_actions_accept_omitted_or_null_optional_filters(tmp_path):
 	DEFAULT_ACTIONS["recruiter_applications"](context, {"job_id": None}, {})
 	DEFAULT_ACTIONS["recruiter_last_messages"](context, {"job_id": None}, {})
 
-	assert [call[0] for call in platform.calls] == ["search_geeks", "friend_list", "friend_list", "last_messages"]
+	assert [call[0] for call in platform.calls] == [
+		"search_geeks", "friend_list", "last_messages", "friend_list", "last_messages",
+	]
 
 
 @pytest.mark.parametrize("max_msg_id", [0, -1, "0", "-3"])
@@ -1341,7 +1343,7 @@ def test_platform_error_and_not_supported_are_not_reported_as_success(tmp_path):
 	assert risk.value.recoverable is False
 
 	class Unsupported(_FakeRecruiterPlatform):
-		def list_jobs(self):
+		def list_jobs(self, page: int = 1):
 			raise NotImplementedError("fixture platform does not implement jobs")
 
 	plan = WorkflowPlan(
