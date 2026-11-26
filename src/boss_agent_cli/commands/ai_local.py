@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import subprocess
 from dataclasses import asdict
 from typing import Any
@@ -28,6 +29,7 @@ from boss_agent_cli.ai.service import AIService, AIServiceError, recovery_action
 from rich.table import Table
 
 from boss_agent_cli import display
+from boss_agent_cli.api.models import safe_text
 from boss_agent_cli.display import (
 	boss_command_for_ctx,
 	error_contract_for_code,
@@ -44,17 +46,37 @@ def _hint_command(ctx: click.Context, command: str) -> str:
 	return boss_command_for_ctx(ctx, command, include_data_dir=True)
 
 
+def _config_scalar(value: Any) -> str:
+	"""本地 AI 配置的展示标量：配置可手改，容器 / 布尔 / 非有限数 / 超大整数按缺失处理。
+
+	``escape_markup`` 只负责 markup 与转义字节，不挡对象 repr，也不挡 ``str()``
+	对超大整数抛 ``ValueError``（Issue #2820）。
+	"""
+	if isinstance(value, bool) or value is None:
+		return "-"
+	if isinstance(value, str):
+		text = value.strip()
+	elif isinstance(value, (int, float)):
+		if isinstance(value, float) and not math.isfinite(value):
+			return "-"
+		text = safe_text(value)
+	else:
+		return "-"
+	return display.escape_markup(text) if text else "-"
+
+
 def _render_local_status(ctx: click.Context, data: dict[str, Any]) -> None:
 	"""本地模型配置 + 推荐清单（TTY 路径）。"""
 	state = "[green]已配置[/green]" if data.get("configured") else "[yellow]未配置[/yellow]"
 	display.console.print(f"本地模型：{state}")
 	# provider / model / base_url 是自由文本配置（`ai local configure --model` 不限
-	# 格式，配置文件也可手改）：不经 escape 直接拼进 Rich，含 `[/bold]` 的值会抛
-	# MarkupError 让整条 TTY 输出崩掉，含可解析标签的值会被吞成样式（Issue #964）。
-	esc = display.escape_markup
+	# 格式，配置文件也可手改）：展示前统一走安全标量，对象 / 超大整数不再显示
+	# repr 或让整条 TTY 输出崩掉（Issue #964 / #2820）。
 	if data.get("configured"):
-		display.console.print(f"  runtime: {esc(data.get('provider') or '-')}    model: {esc(data.get('model') or '-')}")
-		display.console.print(f"  base_url: {esc(data.get('base_url') or '-')}")
+		display.console.print(
+			f"  runtime: {_config_scalar(data.get('provider'))}    model: {_config_scalar(data.get('model'))}"
+		)
+		display.console.print(f"  base_url: {_config_scalar(data.get('base_url'))}")
 
 	rows = data.get("recommended_models") or []
 	if rows:
@@ -62,14 +84,15 @@ def _render_local_status(ctx: click.Context, data: dict[str, Any]) -> None:
 		table.add_column("模型", style="bold cyan")
 		table.add_column("runtime", style="green")
 		table.add_column("最低内存", justify="right", style="yellow")
-		table.add_column("说明", style="dim", max_width=40)
+		# 说明是不含空格的中文长句：默认的 ellipsis 会把后半句截掉（Issue #2761）。
+		table.add_column("说明", style="dim", max_width=40, overflow="fold")
 		for row in rows:
 			mark = " ★" if row.get("recommended") else ""
 			table.add_row(
-				f"{esc(row.get('name', '-'))}{mark}",
-				esc(row.get("runtime", "-")),
-				f"{esc(row.get('min_memory_gb', '-'))} GB",
-				esc(row.get("description", "")),
+				f"{_config_scalar(row.get('name', '-'))}{mark}",
+				_config_scalar(row.get("runtime", "-")),
+				f"{_config_scalar(row.get('min_memory_gb', '-'))} GB",
+				_config_scalar(row.get("description", "")),
 			)
 		display.console.print(table)
 
@@ -352,19 +375,32 @@ def local_smoke_cmd(ctx: click.Context) -> None:
 	try:
 		max_tokens = ai_int_setting(config, "ai_max_tokens", 512)
 		model_value = ai_text_setting(config, "ai_model")
-		model = model_value or ""
+		if not model_value or not model_value.strip():
+			# 空 / 纯空白模型名是确定性的本地配置错误（Issue #2862）：status 已按
+			# is_configured() 报 configured=false，这里再发请求只会拿到服务商 400
+			# 并被归成可重试的 AI_API_ERROR。与主命令 _create_ai_service 同口径拦截。
+			raise AIConfigValueError(
+				"AI 配置项 ai_model 未设置或为空",
+				recovery_hint="ai local configure --runtime ollama --model qwen3:14b",
+			)
+		model = model_value
 		base_url = normalize_base_url(base_url)
 	except (AIConfigValueError, ValueError) as exc:
+		# 字符串项带 recovery_hint 时给精确修复命令，数值项沿用通用提示。
+		hint = getattr(exc, "recovery_hint", None)
+		recovery_action = (
+			_hint_command(ctx, hint)
+			if hint
+			else _hint_command(ctx, "ai config --max-tokens 512")
+			+ " 或 " + _hint_command(ctx, "ai local configure --runtime ollama --model qwen3:14b")
+		)
 		handle_error_output(
 			ctx,
 			"ai.local.smoke",
 			code="CONFIG_INVALID",
 			message=str(exc),
 			recoverable=True,
-			recovery_action=(
-				_hint_command(ctx, "ai config --max-tokens 512")
-				+ " 或 " + _hint_command(ctx, "ai local configure --runtime ollama --model qwen3:14b")
-			),
+			recovery_action=recovery_action,
 		)
 		return
 	service = AIService(

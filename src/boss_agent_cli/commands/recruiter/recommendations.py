@@ -16,6 +16,7 @@ from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._recruiter_platform import get_recruiter_platform_instance
 from boss_agent_cli.commands._text_guard import reject_unencodable_params
 from boss_agent_cli.commands.recruiter._hints import blank_option_names, hint_command
+from boss_agent_cli.commands.recruiter._render import render_candidate_list
 from boss_agent_cli.display import (
 	RISK_ERROR_CONTRACTS,
 	handle_auth_errors,
@@ -24,6 +25,7 @@ from boss_agent_cli.display import (
 	handle_platform_error_output,
 	risk_error_contract,
 	shell_argument,
+	render_action_result,
 )
 from boss_agent_cli.services.candidate_actions import candidate_action_provably_unsent
 from boss_agent_cli.services.pagination import (
@@ -82,6 +84,7 @@ def recommendations_cmd(ctx: click.Context, job_id: str, page: int) -> None:
 			operator_actions.append(UNKNOWN_HAS_MORE_OPERATOR_ACTION)
 		handle_output(
 			ctx, "recruiter-recommendations", data,
+			render=lambda d: render_candidate_list(d, title="hr recommendations", next_steps=next_actions),
 			pagination=pagination,
 			hints={"next_actions": next_actions, "operator_actions": operator_actions},
 		)
@@ -151,7 +154,8 @@ def greet_cmd(
 	if not require_compliance_allowed(ctx, "recruiter-greet"):
 		return
 	data: dict[str, Any] = {"geek_id": geek_id, "job_id": job_id, "sent": False}
-	blank = blank_option_names(geek_id=geek_id, job_id=job_id, expect_id=expect_id, lid=lid, security_id=security_id)
+	# lid 是访问上下文而非目标标识：平台可能给空值，schema 也允许空串（Issue #2789）。
+	blank = blank_option_names(geek_id=geek_id, job_id=job_id, expect_id=expect_id, security_id=security_id)
 	if blank:
 		# 首次招呼是不可逆写入：空 ID 不能发给平台，也不能以空键写下预约 / 已发送记录
 		# （Issue #1782）。必须排在取凭据与 claim 之前，dry-run 同样拒绝。
@@ -194,6 +198,7 @@ def greet_cmd(
 		operator_actions = ["核对候选人和话术；明确批准后才可加 --yes 发送"]
 		handle_output(
 			ctx, "recruiter-greet", {**data, "dry_run": True, "message": message},
+			render=lambda d: render_action_result(d, title="hr greet", next_steps=[]),
 			hints={"operator_actions": operator_actions},
 		)
 		return
@@ -274,10 +279,12 @@ def greet_cmd(
 			return
 		# 招呼发出后 Agent 需要回到沟通列表跟进候选人：成功信封原先没有 hints，
 		# 终端也不渲染任何内容，整条链在「已发送」处断掉。
+		next_actions = [
+			hint_command(ctx, "hr chat"),
+			hint_command(ctx, "hr last-messages"),
+		]
 		handle_output(
 			ctx, "recruiter-greet", data,
-			hints={"next_actions": [
-				hint_command(ctx, "hr chat"),
-				hint_command(ctx, "hr last-messages"),
-			]},
+			render=lambda d: render_action_result(d, title="hr greet", next_steps=next_actions),
+			hints={"next_actions": next_actions},
 		)

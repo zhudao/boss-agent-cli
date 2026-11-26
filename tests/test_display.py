@@ -706,7 +706,9 @@ class TestRenderers:
 
 		output = stream.getvalue()
 		assert output.count("z") == 500, "描述应被截断到 500 字符"
-		assert "..." in output
+		# 截断不再是裸 "..."：写明省略了多少字、去哪里看全文（Issue #2768）。
+		assert "已省略 300 字" in output
+		assert "--json" in output
 		assert "description:" in output
 
 	def test_render_status_logged_in(self, monkeypatch):
@@ -872,8 +874,11 @@ class TestRenderers:
 
 		render_sectioned_record({"info": {"blob": ["z" * 400]}})
 
-		# 嵌套 list/dict 被 str() 后截到 200 字符，避免一条记录刷屏
-		assert stream.getvalue().count("z") == 198
+		# 嵌套 list/dict 有界展开：单段嵌套文本保留 200 字符，并提示完整内容在
+		# --json 里，避免一条记录刷屏（Issue #2762 之前是 str() 后整体截到 200 字符）。
+		output = stream.getvalue()
+		assert output.count("z") == 200
+		assert "--json" in output
 
 	def test_render_string_grid_empty(self, monkeypatch):
 		from boss_agent_cli.display import render_string_grid

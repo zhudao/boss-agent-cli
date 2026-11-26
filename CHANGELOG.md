@@ -4,6 +4,215 @@
 
 ## [Unreleased]
 
+## [3.4.238] - 2026-11-26
+
+### Fixed
+
+- HTML 导出的直接 API 路径与筛选管线路径统一按文本字段口径取值，容器 / 数字漂移不再以 JSON repr 写进表格（Issue #2895）。
+
+## [3.4.237] - 2026-11-26
+
+### Fixed
+
+- 私有目录权限收紧不再跟随符号链接，`write_private_bytes` 新建的各级父目录均为 0700；`prepare_output_path` 与路径预检共用 UTF-8 文件名守卫（Issue #2892）。
+
+## [3.4.236] - 2026-11-26
+
+### Fixed
+
+- 聊天导出的负 unread 统一按 0 处理（CSV 不再写出 `-1`），链接提取覆盖嵌套列表中的 URL（Issue #2886）。
+- 聊天快照跨天 diff 不再把当前记录里轮换的 security_id 当稳定身份：显式缺 uid 的观察降级为不完整，不再误报联系人新增 / 消失与丢失未读增量（Issue #2887）。
+
+## [3.4.235] - 2026-11-26
+
+### Fixed
+
+- 联系人查找的 securityId 匹配改为与下游写请求同口径（只认非空字符串的两种键），翻页去重签名带上职位 ID：漂移类型不再造成「找到却不能写」，同一联系人不同职位的后续页也不再被误判为重复页（Issue #2883）。
+
+## [3.4.234] - 2026-11-26
+
+### Fixed
+
+- 共享请求预算在数据库准备与预约回调完成后重新采样派发时间：本地准备耗时不再被算入下一次请求的间隔，分钟窗口也按新的时间登记（Issue #2880）。
+
+## [3.4.233] - 2026-11-26
+
+### Fixed
+
+- `search` 的下一页提示遇到以 `-` 开头的关键词时把关键词移到选项之后并用 `--` 隔开，照抄执行不再被 Click 当成选项（Issue #2874）。
+- `search` 命中缓存的 TTY 表尾恢复显示与信封同源的下一页提示，不再只在未命中时给出翻页命令（Issue #2875）。
+- `stats` 的累计与窗口计数共享同一 SQLite 读取快照：并发写入不再让窗口数大于累计数并触发错误的下一步建议（Issue #2876）。
+
+## [3.4.232] - 2026-11-26
+
+### Fixed
+
+- 沟通列表分页的整页判重改用与行去重一致的 `(uid, encryptJobId)` 身份：同一联系人对应不同职位的合法记录不再被当成重复页丢弃，也不会提前把结果标成完整（Issue #2872）。
+
+## [3.4.231] - 2026-11-26
+
+### Fixed
+
+- CDP 探测只接受 `ws://` / `wss://` 绝对地址：`webSocketDebuggerUrl` 是对象、布尔值或相对地址时按不可用处理，`doctor` 不再把它报成可用通道，也不再把对象写进检查 detail（Issue #2869）。
+
+## [3.4.230] - 2026-11-26
+
+### Fixed
+
+- 其余 AI 命令（analyze-jd / polish / optimize / suggest / reply / interview-prep / chat-coach / resume-optimize）按各自 prompt 的 JSON 示例校验已给出的顶层字段类型：类型漂移时按 `AI_PARSE_ERROR` 返回可重试信封，不再以 `ok=true` 透传错误形状；缺失字段不补键，成功信封形状不变（Issue #2865）。
+
+## [3.4.229] - 2026-11-26
+
+### Fixed
+
+- `ai local smoke` 遇到手工写入的空 / 纯空白 `ai_model` 时不再发出请求并把服务商 400 归成可重试 `AI_API_ERROR`：与主 AI 命令同口径在本地报 `CONFIG_INVALID` 并给出补模型名的修复命令（Issue #2862）。
+- `ai local status` 与 `is_configured()` 不再把纯空白的 provider / model 报成已配置：这些值在命令层会被拒绝，状态面板与实际可用性保持一致（Issue #2863）。
+
+## [3.4.228] - 2026-11-26
+
+### Fixed
+
+- `boss ai config` 回显的 `resolved_base_url` 与执行路径同口径：手工写进配置的非法地址（缺 scheme、非 http(s)、带 query / fragment）现在报 `CONFIG_INVALID` 并给出修复命令，不再把一个执行时必然失败的地址标成生效端点（Issue #2858）。
+- `boss ai fit` / `suggest-keywords` / `cover-letter` 校验模型输出已知字段的类型：`results` 等列表字段与 `greeting_opener` 等字符串字段漂移时按 `AI_PARSE_ERROR` 返回可重试信封，不再以 `ok=true` 把错误形状交给下游 Agent（Issue #2859）。
+
+## [3.4.227] - 2026-11-26
+
+### Fixed
+
+- MCP `boss_me` 不再被宿主的 120s 默认超时提前掐断：未指定 `section` 时按四段请求（用户信息、简历、求职期望、投递记录）估算 290s，指定 `section` 的调用仍保持 120s（Issue #2852）。
+- MCP `boss_agent_run` / `boss_agent_train` 不再被宿主的 120s 默认超时提前掐断：显式 `limit` 按「两次 tab 扫描 + 每会话读取与至多一次动作」估算，缺省 `limit` 时按估算封顶值给到 900s（Issue #2854）。
+
+## [3.4.226] - 2026-11-26
+
+### Fixed
+
+- MCP `batch-greet` 只读调用中断后不再建议「调整 `--count` / 筛选条件后重试」：未开启预览时增大零上限会变成真实写入，恢复指引改为保留原预览模式或零上限、按原参数重试（Issue #2847）。
+- 求职者侧 `exchange` / `mark` 的结果未知信封改用求职者核对指引：`ACTION_UNCONFIRMED` 不再指向招聘者的 `boss hr chatmsg <friend_id>`，而是用同一数据目录的 `boss chat` 核对会话 / 标签，并保留 `outcome_unknown` / `replay_safe=false`（Issue #2849）。
+
+## [3.4.225] - 2026-11-26
+
+### Fixed
+
+- MCP 只读命令中断后不再建议工具不支持的参数：通用指引允许按原参数重新调用，不带详情筛选的导出仅建议减小 `count` 或收窄筛选范围（Issue #2842）。
+- MCP 普通搜索、仅在线筛选和本地监控列表中断时不再误称逐条查详情；预设搜索按可能包含详情筛选提示，搜索与导出按归一化后的筛选值选择恢复指引（Issue #2844）。
+
+## [3.4.224] - 2026-11-26
+
+### Fixed
+
+- 向导「浏览采集结果」的职位行改用安全标量：本地采集载荷字段是对象 / 数组 / 布尔 / 非有限数或超过 4300 位转换上限的整数时按缺失处理，职位卡片不再显示 Python repr，也不会在裸 `str()` 处中断整条 TTY（Issue #2831）。
+- `boss agent crawl` 的本地采集职位映射按安全标量取字段：`title` / `company` / `city` / `salary` / `post_description` / `job_id` 是对象、数组、非有限数或超大整数时按缺失处理，描述不再以 Python repr 进入 AI 匹配提示，污染行也回到「缺详情」提示补详情；正常字符串路径不变（Issue #2833）。
+- 通用表格单元格的非有限浮点显示 `-`：`cell_text()` 与纯标量列表拼接不再把 `NaN` / `Infinity` 原样打给真人，招聘者列表、配置列表等 `render_simple_list()` 路径与非有限值按缺失的统一口径一致（Issue #2835）。
+- 向导结果菜单的标签与回填输入按安全标量处理：职位 / 简历 / 监控 / 联系人等条目字段漂移成对象、数组、非有限数或超大整数时不再显示 Python repr 或让菜单抛 `ValueError`，按「第一个可用值」回退，容器值不再吞掉后续合法字段；后续动作的 `security_id` / `job_id` / `gid` / `name` 同口径归一（Issue #2837）。
+- MCP 参数接缝修正：`boss_batch_greet` 的 `limit=0` 按只读处理，超时 / 取消不再误报 `outcome_unknown`；筛选枚举的大小写不敏感白名单纳入 `boss_batch_greet`，与 CLI 的 `case_sensitive=False` 一致；`boss_show.number` 的 schema 补上 `minimum: 1`（Issue #2839）。
+
+## [3.4.223] - 2026-11-26
+
+### Fixed
+
+- `escape_markup()` 与 `safe_text()` 同口径：超过 4300 位转换上限的整数或深嵌套容器按缺失处理为空串，AI 结果、批量问候结果等把原始值直接交给它的渲染入口不再让整条 TTY 输出抛 `ValueError` / `RecursionError`（Issue #2826）。
+- `render_message_panel()` / `render_sectioned_record()` / `render_ai_result()` 的 Panel 标题统一按外部值转义：分段名来自平台响应键、公共 helper 的标题参数不再让未配对 markup 打断整条 TTY，普通标题与正文渲染不变（Issue #2828）。
+
+## [3.4.222] - 2026-11-26
+
+### Fixed
+
+- 向导菜单的损坏断点提示按外部值转义 `run_id`：数据库损坏时含 `[/bold]` 等未配对标签的记录名不再让 `boss wizard` 的 TTY 抛 `MarkupError`，`[link=...]` 与 ESC / OSC 控制字符也不会被吞成样式或原样进终端（Issue #2823）。
+
+## [3.4.221] - 2026-11-26
+
+### Fixed
+
+- `boss ai local status` 的终端输出按安全标量渲染：`provider` / `model` / `base_url` 与推荐模型字段是对象、布尔、`NaN` / `Infinity` 或超大整数时显示 `-`，不再抛 `ValueError` 或显示 Python repr；正常字符串、整数与既有 markup 转义保持不变（Issue #2820）。
+
+## [3.4.220] - 2026-11-26
+
+### Fixed
+
+- `boss status` 的本地风控锁与通用键值面板按安全标量渲染：`locked_at` / `reason` 是对象、布尔、`NaN` / `Infinity` 或超大整数时回退 `unknown` / `ENVIRONMENT_RISK`，不再显示 repr 或中断；通用面板的 `NaN` / `Infinity` 显示 `-`，布尔沿用既有 `True` / `False` 写法（Issue #2817）。
+- `boss detail` 的终端详情面板按安全标量渲染：描述 / 技能 / 编号快照的 `count` / `page` / `source` / `index` 与 `security_id` / `job_id` 是对象、布尔、`NaN` / `Infinity` 或超大整数时按缺失处理，不再抛 `ValueError` 或显示 Python repr，`index` 也不再原样拼进 Rich 输出；正常值、`count=0` 与描述省略提示保持不变（Issue #2815）。
+- 向导职位详情面板、本地采集简报与聊天方向统一按安全标量渲染：标题 / 薪资 / 公司 / 城市 / 经验 / 学历 / 招聘者 / 标签 / 描述 / 地址 / 采集页码是对象、布尔、`NaN` / `Infinity` 或超大整数时按缺失处理，不再显示 Python repr 或让整个面板中断；聊天方向只认布尔自标识，超大整型 `uid` 回退「对方」（Issue #2812）。
+
+## [3.4.219] - 2026-11-26
+
+### Fixed
+
+- 向导非列表面板（日报摘要、AI 辅助、监控批量 / 单条、导出、等待继续、任务状态回退、采集状态与错误 / 状态标签）统一按安全标量渲染：对象 / 布尔 / `NaN` / `Infinity` / 超大整数按缺失处理，不再显示 Python repr、`nan` / `inf` / `True`，损坏的产物路径与错误包络也不会中断面板；正常字符串与数字保持不变（Issue #2809）。
+
+## [3.4.218] - 2026-11-26
+
+### Fixed
+
+- 向导其余面板补齐与 CLI / 向导菜单一致的取值：`jobs_list` 读 `jobStatusDesc / statusDesc`、`candidates` 读 `positionName`、无姓名的最近消息回退 `friendId`、简历 ISO 时间显示到分钟；表格文本统一按安全标量渲染，容器 / 布尔 / `NaN` / 超大整数不再显示 Python repr 或让整个面板中断，日报对象公司名与异常计数也不再原样输出（Issue #2807）。
+
+## [3.4.217] - 2026-11-25
+
+### Fixed
+
+- 向导 `chat_history` 的 TTY 预览优先使用归一化 `messages`，不再读裸平台 `items`：`from` 是对象时不会以 `TypeError: unhashable type: 'dict'` 中断整个面板，`body.text` 不再显示 Python 字典 repr；旧 checkpoint 无 `messages` 时仍可安全渲染（Issue #2804）。
+
+## [3.4.216] - 2026-11-25
+
+### Fixed
+
+- 向导 `recruiter_last_messages` / `candidate_chat_history` 复用 CLI 的消息归一化：`messages` 现在分别给出 `friendId / unread / msg_status / last_msg / last_time` 与 `from / type / text / time`，不再让 Agent 在向导与顶层命令之间自行猜测平台字段；原有 `items` / `result` 裸数据保持不变（Issue #2801）。
+
+## [3.4.215] - 2026-11-25
+
+### Fixed
+
+- `boss_agent_run` 的 MCP schema 编码「resume 必须显式 `dry_run=false`」：缺省 `dry_run=true` 时映射层与 CLI 都会拒绝 `--dry-run --resume`，此前 schema 却放行该组合，调用必然在映射层失败为 `INVALID_PARAM`；`{"resume": true, "dry_run": false}` 等合法恢复调用不受影响（Issue #2798）。
+
+## [3.4.214] - 2026-11-25
+
+### Fixed
+
+- `boss_watch_run` 的 MCP schema 编码「name 与 all 必须且只能提供一个」：新增 `anyOf` / `not` 约束，`name` 进入条件必填后自动补 `minLength`，与 `search` 等工具的既有口径一致；CLI 行为不变（Issue #2792）。
+- `boss_watch_run` / `boss_crawl_shortlist` 的 `not` 约束改为同时要求两个互斥键：此前只要求其中一个键，导致 name-only（或 selectors-only）这一主要合法用法被任何按 JSON Schema 校验的宿主误拒；修复后 `all=false` 与显式选择同时出现仍保持合法（Issue #2794）。
+- `boss_hr_jobs` / `boss_config` / `boss_wizard` 的 MCP schema 编码 action→参数矩阵：`list` 拒绝 `job_id`、`online` / `offline` 只容忍默认 `page=1`，非 `set` 拒绝 `value`，非 `run` 拒绝 `role` / `platform` / `goal` / `inputs` / `requested_steps`。此前这些组合在 schema 层合法，但映射层必然拒绝为 `INVALID_PARAM`（Issue #2795）。
+
+## [3.4.213] - 2026-11-25
+
+### Fixed
+
+- `hr greet` 允许空的 `--lid`：lid 是访问上下文而非目标标识，平台可能给空值，MCP schema 也已按此声明；此前 CLI 的空白校验必然拒绝该合法调用，dry-run 也会失败。空白校验现在只覆盖 `geek-id` / `job-id` / `expect-id` / `security-id`（Issue #2789）。
+
+## [3.4.212] - 2026-11-25
+
+### Fixed
+
+- `BossCliGroup.main` 的 14 条启动期错误路径（Click 用法错误、缓存错误、本地 IO / 配置错误等）改走统一的 TTY 错误渲染：终端不再把 JSON 信封打到 stdout，改为在 stderr 显示错误码、消息、恢复动作与真人指引；显式 `--json` 即使 stdout 是终端也仍输出信封，`--json` / 管道信封与退出码不变（Issue #2786）。
+
+## [3.4.211] - 2026-11-25
+
+### Fixed
+
+- `config get/set/reset` 的未知 key、非法取值与写入失败三条错误路径改走统一的 TTY 错误渲染：终端不再把 JSON 信封打到 stdout，改为在 stderr 显示错误码、消息、恢复动作与后继命令；`--json` / 管道信封与退出码不变（Issue #2781）。
+- `render_sectioned_record` 与 `render_batch_operation_summary` 统一在面板前打印命令标题（先做安全文本与 markup 转义，超大整数等值漂移回落 `info`），`me` / `agent stats` / `crawl start` / `resume show` / `batch-greet` 与 `hr resume` 等命令在终端不再只看到分段名或计数；`hr resume` 此前在调用点的局部补标题已移除（Issue #2783）。
+
+## [3.4.210] - 2026-11-25
+
+### Fixed
+
+- 职位详情与职位表的空字段显示 `-`：缺失 / 空串 / 纯空白统一走 `job_field_text`，不再出现 `exp:  | edu:  |` 与 `boss:  ()`，`boss_name` 为空时只显示 `boss: -` 或名字（Issue #2767）。
+- 职位描述超过 500 字时写明「已省略 N 字，完整描述用 --json 查看」，不再只留一个 `...` 让人误以为看到全文（Issue #2768）。
+- 「下一步」、错误恢复命令、`show` / `detail` 的后续命令与 `operator_actions` 按整行输出，Rich 不再把长命令在路径中间硬折行（Issue #2770）。
+- `login` / `logout` / `shortlist add|annotate|remove` / `favorites sync` / `digest --format md -o` 在终端渲染结果面板与后继命令，不再只打一行 JSON；`login` 失败时错误、恢复动作与 `operator_actions`（扫码 / 检查网络等真人指引）同样输出到终端。`logout` 失败的恢复文案按本次运行的数据目录改写，与其它命令同口径（Issue #2769）。
+- 招聘者读取类命令（`hr whoami`、`hr chat`、`hr applications`、`hr candidates`、`hr recommendations`、`hr jobs list`、`hr chatmsg`、`hr last-messages`、`hr resume`）在终端渲染结果表格 / 面板与后继命令，不再只打一行 JSON 信封；字段缺失或类型漂移显示 `-`，JSON 信封不变（Issue #2774）。
+- 招聘者写操作命令（`hr reply`、`hr request-resume`、`hr accept-resume`、`hr download-resume`、`hr location`、`hr greet` 的成功与 dry-run 路径）在终端渲染确认面板与后继命令，不再只打一行 JSON 信封；`hr reply` 仍不回显消息正文，JSON 信封不变（Issue #2774）。
+- `hr jobs detail` 在终端按字段面板展示职位信息（含完整 JD）与上下线 / 列表后继命令，JSON 信封不变（Issue #2774）。
+- `hr resume` 的终端分段面板补上 `hr resume` 标识：`render_sectioned_record` 不使用传入的 `title`，此前真人只看到 `basic` / `expectation` 等分段名（Issue #2778）。
+
+## [3.4.209] - 2026-11-25
+
+### Fixed
+
+- 终端表格按宽度折行，保留 `chatmsg` 的长消息和 `doctor` 修复命令中的完整路径（Issue #2761）。
+- 终端面板展开列表和对象，缺失值显示为 `-`，保留 `0` 与 `False`。分段面板的嵌套字段超出预览范围时会提示用 `--json` 查看完整内容（Issue #2762）。
+- `preset` 与 `watch` 的终端列表和新增确认只展示已设置的搜索条件。`preset list`、`watch list`、`resume list` 与 `resume applications` 的时间列显示本地时间（Issue #2763）。
+- `watch run --all` 在终端显示各监控的结果、失败原因和新增职位（Issue #2764）。
+- 终端成功结果在交给渲染函数前应用 JSON 信封的脱敏规则，包括 AI 配置 URL 中的口令（Issue #2765）。
+
 ## [3.4.208] - 2026-11-25
 
 ### Fixed

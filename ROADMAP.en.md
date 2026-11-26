@@ -4,6 +4,66 @@ This document tracks the medium-term and long-term direction of `boss-agent-cli`
 
 ## Released
 
+v3.4.238 (2026-11-26): Both HTML export mapping paths now share text-field normalization, keeping drifted values out of table cells (Issue #2895).
+
+v3.4.237 (2026-11-26): Private directory tightening no longer follows symlinks, new parents use 0700, and output paths reject non-UTF-8 names early (Issue #2892).
+
+v3.4.236 (2026-11-26): Unread and identity rules aligned across chat export and snapshots; links in nested message bodies are now extracted (Issue #2886, #2887).
+
+v3.4.235 (2026-11-26): Contact lookup now uses the same securityId rules as write requests and includes job IDs in page signatures (Issue #2883).
+
+v3.4.234 (2026-11-26): Request budget records dispatch time after local preparation, so setup work no longer shortens request intervals (Issue #2880).
+
+v3.4.233 (2026-11-26): Search next-page hints are replayable and identical on cache hits; stats counts share one read snapshot (Issue #2874 #2875 #2876).
+
+v3.4.232 (2026-11-26): Friend-list page signatures now use the same uid + job identity as row deduplication, so valid rows for different jobs of one contact are no longer dropped (Issue #2872).
+
+v3.4.231 (2026-11-26): CDP probing only accepts valid ws(s) endpoints, so diagnostics no longer report drifted values as an available channel (Issue #2869).
+
+v3.4.230 (2026-11-26): AI commands validate declared top-level model output field types and return a retryable parse error on drift (Issue #2865).
+
+v3.4.229 (2026-11-26): Blank local AI model names are rejected before any request and status now matches usability (Issues #2862, #2863).
+
+v3.4.228 (2026-11-26): AI config display now shares endpoint syntax validation with execution, and malformed model output fields return a retryable parse error (Issues #2858, #2859).
+
+v3.4.227 (2026-11-26): MCP timeout estimation now covers the four default `boss_me` sections and the conversation scan in `boss_agent_run` / `boss_agent_train`, so healthy calls are no longer cut off by the host's 120s default timeout (Issues #2852, #2854).
+
+v3.4.226 (2026-11-26): MCP `batch-greet` read-only interrupt guidance now keeps the original preview mode or zero limit and retries with the same arguments; candidate-side `exchange` / `mark` `ACTION_UNCONFIRMED` now verifies via `boss chat` in the same data directory instead of the recruiter-only `boss hr chatmsg <friend_id>` (Issues #2847, #2849).
+
+v3.4.225 (2026-11-26): interrupted MCP reads suggest only applicable options. Plain searches, online-only filters, and local watch lists no longer claim to fetch job details; preset searches and exports get recovery guidance based on their filters (Issues #2842 and #2844).
+
+v3.4.224 (2026-11-26): wizard crawl browsing rows and result menus, plus `boss agent crawl` job mapping, now use safe scalars (containers, booleans, non-finite numbers and huge integers treated as missing), so Python repr no longer reaches the TTY or AI prompts; generic table cells render `NaN` / `Infinity` as `-`; MCP entry treats batch-greet `limit=0` as read-only, covers the remaining case-insensitive filter enums, and declares a `boss_show` index lower bound (Issues #2831, #2833, #2835, #2837, #2839).
+
+v3.4.223 (2026-11-26): `escape_markup()` now follows the same contract as `safe_text()` for huge integers and deeply nested values, AI result object-list inline fields use safe text and cell normalization, and the panel titles of `render_message_panel()` / `render_sectioned_record()` / `render_ai_result()` are escaped as external values (Issues #2826, #2828).
+
+v3.4.222 (2026-11-26): the wizard menu's corrupt-task notice now escapes run IDs read from the database before handing them to Rich, so markup, links or control characters in a run ID no longer break the whole TTY render (Issue #2823).
+
+v3.4.221 (2026-11-26): the `boss ai local status` terminal output now renders through safe scalar normalization; local AI config and recommended-model fields that are objects, booleans, non-finite numbers or huge integers show `-` instead of raising `ValueError` or leaking Python reprs (Issue #2820).
+
+v3.4.220 (2026-11-26): CLI job detail, `boss status` risk lock and generic key-value panels now render through safe scalar normalization, with wizard job detail, local crawl brief and chat direction aligned; objects, booleans, non-finite numbers and huge integers no longer leak Python reprs or break the panel (Issues #2812, #2815, #2817).
+
+v3.4.219 (2026-11-26): wizard non-list panels now render through safe scalar normalization; objects, booleans, non-finite numbers and huge integers no longer leak Python reprs, nan / inf / True or break the panel (Issue #2809).
+
+v3.4.218 (2026-11-26): wizard panels now match CLI / menu field precedence and render table text through safe scalar normalization; containers, booleans, non-finite numbers and huge integers no longer leak Python reprs or break the panel (Issue #2807).
+
+v3.4.217 (2026-11-25): wizard `chat_history` TTY previews now prefer normalized `messages`; object-valued fields in raw `items` no longer crash rendering or leak dict reprs, while older checkpoints still render safely (Issue #2804).
+
+v3.4.216 (2026-11-25): wizard `recruiter_last_messages` / `candidate_chat_history` now reuse the CLI message normalization so `messages` matches the top-level commands, while raw `items` / `result` stay intact (Issue #2801).
+
+v3.4.215 (2026-11-25): the `boss_agent_run` MCP schema now encodes "resume requires an explicit `dry_run=false`", so the always-rejected `--dry-run --resume` combination is no longer schema-valid; legitimate resume calls are unaffected (Issue #2798).
+
+v3.4.214 (2026-11-25): MCP schemas now encode exclusivity constraints and fix `not` semantics — `boss_watch_run` requires exactly one of name / all; primary valid usages such as name-only and selectors-only are no longer rejected for `boss_crawl_shortlist`; `boss_hr_jobs` / `boss_config` / `boss_wizard` encode the action-to-parameter matrix so schema-valid calls no longer fail in the command layer (Issues #2792 / #2794 / #2795).
+
+v3.4.213 (2026-11-25): `hr greet` now accepts an empty `--lid` (an access-context value that the platform may leave blank) and only rejects blank `geek-id` / `job-id` / `expect-id` / `security-id`, aligning the MCP schema with the CLI dry-run behavior (Issue #2789).
+
+v3.4.212 (2026-11-25): startup errors from `BossCliGroup.main` render error codes and recovery guidance in the terminal instead of a raw JSON envelope, while `--json` / piped envelopes and exit codes stay unchanged (Issue #2786).
+
+v3.4.211 (2026-11-25): `config get/set/reset` error paths render error codes and recovery guidance in the terminal instead of printing a raw JSON envelope, and sectioned record panels consistently show an escaped command title while JSON envelopes stay unchanged (Issues #2781, #2783).
+
+v3.4.210 (2026-11-25): job detail blanks render as `-`, long descriptions state how much was omitted, and follow-up commands are emitted on one line; login / logout / shortlist writes / favorites sync / digest render readable panels and login failures surface operator guidance; `hr` read and write commands render tables, record panels, and action confirmations, with the `hr resume` sectioned panel showing its command label, while JSON envelopes remain unchanged (Issues #2767, #2768, #2770, #2769, #2774, #2778).
+
+v3.4.209 (2026-11-25): terminal tables wrap long unbroken text instead of truncating Chinese sentences and paths; panels expand lists and objects, keep `0` and `False`, and bound nested fields in sectioned records with a `--json` hint; `preset` / `watch` show only the filters that are set and format list timestamps in local time; `watch run --all` lists each watch's result and new jobs; successful terminal output is redacted with the same rules as the envelope (Issues #2761, #2762, #2763, #2764, #2765).
+
 v3.4.208 (2026-11-25): multi-page aggregation of the chat list and favorites deduplicates per entry, so a list that shifts between pages no longer makes `pipeline` / `follow-up` / `digest` and `favorites sync` count the same entry twice; on the terminal side `boss status` no longer prints `logged in as None`, generic tables no longer show the Python repr of `None` / lists / objects, and an unknown time is no longer rendered as 1970; the `RATE_LIMITED` troubleshooting guide now slows requests down, and `config set request_delay` accepts the array form that `config get` displays (Issues #2753, #2754, #2755, #2756, #2757).
 
 v3.4.207 (2026-11-25): contact display names go through one `contact_lookup.friend_display_name` helper, so the wizard `exchange` step no longer sends the Python repr of a drifted `name` in the write request and `mark` / `chat-summary` / `chatmsg` no longer pass containers into the envelope; `chatmsg` resolves the sender uid with `stable_uid`, and an unusable top-level `text` no longer shadows `body.text`; `hr resume` education entries pick the first non-empty string per field in priority order (Issues #2748, #2749, #2750).

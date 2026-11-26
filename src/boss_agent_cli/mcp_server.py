@@ -35,7 +35,7 @@ from boss_agent_cli.mcp_args import _build_args
 from boss_agent_cli.mcp_tools import TOOLS
 from boss_agent_cli.output import envelope_error, json_safe_value, serialization_failure_envelope
 from boss_agent_cli.services.friend_list_pages import MAX_FRIEND_LIST_PAGES
-from boss_agent_cli.search_filters import detail_filter_max_pages
+from boss_agent_cli.search_filters import detail_filter_max_pages, resolve_active_level
 
 # 向后兼容的再导出：这些符号在拆分前属于本模块，`mcp-server/server.py` wrapper
 # 与既有测试仍按 `boss_agent_cli.mcp_server.<name>` 取用。本模块自身不再使用它们，
@@ -120,6 +120,9 @@ _HR_BATCH_SIZE = 50
 #: pipeline / follow-up / digest 聚合好友列表的估算页数上限：与 collector
 #: 的真实翻页上限一致；按 5 页估算会让 8 页以上的账号被提前掐断（Issue #2024）。
 _FRIEND_LIST_ESTIMATE_PAGES = MAX_FRIEND_LIST_PAGES
+#: ``boss me`` 未指定 ``--section`` 时依次请求的四段：用户信息、简历基本信息、
+#: 求职期望、投递记录；相邻两次请求都要经过默认节流（Issue #2852）。
+_ME_FULL_SECTION_REQUESTS = 4
 #: batch-greet 的 CLI 默认值与上限（命令内会把 --count 截断到 10）。
 _BATCH_GREET_DEFAULT_COUNT = 10
 _BATCH_GREET_MAX_COUNT = 10
@@ -127,6 +130,12 @@ _BATCH_GREET_MAX_COUNT = 10
 _EXPORT_DEFAULT_COUNT = 50
 #: 招聘者聊天摘要与最近消息的 CLI 默认条数。
 _HR_DEFAULT_LIMIT = 100
+#: 招聘自动化一轮先扫描的 tab 数上界（新招呼 / 未读）。
+_AUTOMATION_SCAN_REQUESTS = 2
+#: 自动化每个会话最多一次历史读取 + 一次动作派发；``--limit`` 是本轮全局
+#: 会话上限，缺省时扫描量由本地 automation 配置决定，MCP 层无法预知
+#: （Issue #2854）。
+_AUTOMATION_REQUESTS_PER_CONVERSATION = 2
 
 
 def _default_boss_bin(*, executable: str | None = None, windows: bool | None = None) -> str:
@@ -275,14 +284,20 @@ _ACTION_DIMENSION_TOOL_NAMES = frozenset(
 _DRY_RUN_DEFAULT_TOOL_NAMES = frozenset({"boss_agent_run", "boss_agent_train"})
 
 _WRITE_INTERRUPT_RECOVERY = "检查本地 checkpoint 与平台实际结果，再显式恢复；未确认的写操作不要直接重试"
-_READ_INTERRUPT_RECOVERY = "只读命令已中断，不产生平台写入；先降低 limit/count 或改用 active=online 再重试"
-#: search / watch 没有 limit / count 参数，恢复文案不能提示不存在的选项（Issue #1860）。
+_READ_INTERRUPT_RECOVERY = "只读命令已中断，不产生平台写入；如仍需结果，可按原参数重新调用"
+_EXPORT_READ_INTERRUPT_RECOVERY = "导出已中断，不产生平台写入；可减少 count 或收窄筛选范围后重试"
 _FILTER_READ_INTERRUPT_RECOVERY = (
-	"只读命令已中断，不产生平台写入；该命令按福利 / 活跃度筛选逐条查详情，"
-	"改用 active=online 或缩小筛选范围后重试"
+	"只读命令已中断，不产生平台写入；福利 / 活跃度筛选可能逐条查详情，可缩小筛选范围后重试。"
+	"如需避免查详情，可停用福利筛选，并仅用 active=online 筛选在线职位"
+)
+_PRESET_READ_INTERRUPT_RECOVERY = (
+	"只读搜索已中断，不产生平台写入；若预设包含需查详情的福利 / 活跃度筛选，可缩小筛选范围；"
+	"如需避免查详情，可停用福利筛选，并仅用 active=online 筛选在线职位后重试"
 )
 #: agent train 的 MCP 映射固定演练，没有 active 等筛选参数（Issue #2454）。
 _DRY_RUN_INTERRUPT_RECOVERY = "演练命令已中断，不产生平台写入；可直接重试或降低 limit"
+#: 只读保证只适用于原参数：未开启预览时，增大零上限会变成真实写入（Issue #2847）。
+_BATCH_GREET_READ_INTERRUPT_RECOVERY = "只读调用已中断，未发出任何招呼；如仍需结果，请保留原来的预览模式或零上限，按原参数重试"
 
 
 def _write_interrupt_recovery(args: tuple[str, ...]) -> str:
@@ -291,20 +306,39 @@ def _write_interrupt_recovery(args: tuple[str, ...]) -> str:
 	return _WRITE_INTERRUPT_RECOVERY
 
 
+def _has_explicit_detail_filters(args: tuple[str, ...]) -> bool:
+	welfare = _option_value(args, "--welfare") or ""
+	if any(label.strip() for label in welfare.split(",")):
+		return True
+	try:
+		active = resolve_active_level(_option_value(args, "--active"))
+	except ValueError:
+		# 无效取值由 CLI 校验，不据此推断子进程已查详情。
+		return False
+	return active not in (None, "online")
+
+
 def _read_interrupt_recovery(args: tuple[str, ...]) -> str:
 	if args and args[0] == "wizard" and _option_value(args, "--status") is not None:
 		return "状态查询已中断，未更改任务；可重新查询同一 run_id"
 	if args[:2] == ("agent", "train"):
 		return _DRY_RUN_INTERRUPT_RECOVERY
-	if args and args[0] in {"search", "watch"}:
-		return _FILTER_READ_INTERRUPT_RECOVERY
-	if args and args[0] == "export":
-		welfare = _option_value(args, "--welfare") or ""
-		active = _option_value(args, "--active") or ""
-		# 带筛选的 export 与 search 一样逐条查详情：恢复文案要提示换
-		# active=online 或缩小范围，而不是让调用方直接重试同一段长扫描（Issue #2725）。
-		if welfare or active not in ("", "online"):
+	if args and args[0] == "search":
+		if _has_explicit_detail_filters(args):
 			return _FILTER_READ_INTERRUPT_RECOVERY
+		if _option_value(args, "--preset"):
+			# 恢复文案不读取本地预设，不把请求数估算的最坏情况当成已发生的事实。
+			return _PRESET_READ_INTERRUPT_RECOVERY
+	if args and args[0] == "batch-greet":
+		# 能走到只读分支的 batch-greet 只有 --dry-run 与 --count 0：候选在发出
+		# 招呼前被截断，没有写请求；通用文案里的 active=online 不是它的参数
+		# （Issue #2839）。
+		return _BATCH_GREET_READ_INTERRUPT_RECOVERY
+	if args and args[0] == "export":
+		# 与 search 共用归一化口径，让「在线」等别名不再误入详情筛选分支。
+		if _has_explicit_detail_filters(args):
+			return _FILTER_READ_INTERRUPT_RECOVERY
+		return _EXPORT_READ_INTERRUPT_RECOVERY
 	return _READ_INTERRUPT_RECOVERY
 #: 子进程没能启动：从未运行过，不可能有平台副作用。真正要处理的是安装 / 路径，
 #: 让 Agent 去核对 checkpoint 与平台结果只会把人引向不存在的现场（Issue #962）。
@@ -331,6 +365,13 @@ def _tool_may_write(tool_name: str, arguments: dict[str, Any] | None = None) -> 
 	if tool_name in _DRY_RUN_DEFAULT_TOOL_NAMES and "dry_run" not in arguments:
 		# schema 默认 dry_run=true：省略键与显式 true 的 argv 完全相同。
 		return False
+	if tool_name == "boss_batch_greet":
+		# limit=0：CLI 在收集候选之前判断上限，只做一次搜索、不发出任何招呼
+		# （commands/greet.py）。按 --dry-run 同口径归为只读，否则超时 / 取消会报
+		# outcome_unknown 并要求核对并不存在的平台写入（Issue #2839）。
+		limit = arguments.get("limit")
+		if isinstance(limit, int) and not isinstance(limit, bool) and limit <= 0:
+			return False
 	if tool_name not in _READ_ONLY_TOOL_NAMES:
 		return True
 	write_modes = _TOOL_WRITE_MODES.get(tool_name)
@@ -454,6 +495,30 @@ def _estimated_requests(args: tuple[str, ...]) -> int | None:
 		# 最坏情况与 search --welfare 共用同一翻页上限（Issue #1860）。
 		pages = detail_filter_max_pages("welfare", "today")
 		return pages * (_SEARCH_PAGE_SIZE + 1)
+	if command == "me":
+		# 不指定 --section 时四段信息各发一次请求；单段调用只有一次。
+		# 缺省 120s 只够一次请求加一次节流，四段全量会被宿主提前掐断
+		# （Issue #2852）。
+		return 1 if _option_value(args, "--section") is not None else _ME_FULL_SECTION_REQUESTS
+	if command == "agent" and len(args) > 1 and args[1] in {"run", "train"}:
+		# 一轮自动化先扫描 tab，再逐会话读取历史并在需要时派发一次动作；
+		# --limit 是本轮全局会话上限。缺省时扫描范围由本地 automation 配置
+		# 决定，MCP 层无法预知，按估算封顶值给满，避免默认 120s 杀掉一次正常
+		# 演练（Issue #2854）。
+		raw_limit = _option_value(args, "--limit")
+		if raw_limit is None:
+			return _MAX_ESTIMATED_REQUESTS
+		try:
+			limit = int(raw_limit)
+		except (TypeError, ValueError):
+			# 显式非法取值：CLI 会在发出任何请求前以 INVALID_PARAM 拒绝。
+			return None
+		if limit < 1:
+			return None
+		return min(
+			_AUTOMATION_SCAN_REQUESTS + _AUTOMATION_REQUESTS_PER_CONVERSATION * limit,
+			_MAX_ESTIMATED_REQUESTS,
+		)
 	if command in {"pipeline", "follow-up", "digest"}:
 		# 好友列表逐页聚合，再追加一次面试数据请求（Issue #2024）。
 		return _FRIEND_LIST_ESTIMATE_PAGES + 1
@@ -928,9 +993,11 @@ def _normalize_integral_numbers(tool_name: str, arguments: dict[str, Any]) -> No
 			]
 
 
-# 预设与订阅的四种筛选在 Click 中显式不区分大小写。schema 仍发布标准写法，
-# 入口不能因新增枚举检查而拒绝此前合法的大小写变体。
+# 预设 / 订阅 / 批量打招呼的四种筛选在 Click 中显式不区分大小写。schema 仍发布
+# 标准写法，入口不能因新增枚举检查而拒绝此前合法的大小写变体。工具名单必须与
+# CLI 的 click.Choice(..., case_sensitive=False) 对齐（Issue #1180、#2839）。
 _CASE_INSENSITIVE_FILTER_ENUMS = frozenset({"industry", "scale", "stage", "job_type"})
+_CASE_INSENSITIVE_ENUM_TOOLS = frozenset({"boss_preset_add", "boss_watch_add", "boss_batch_greet"})
 
 
 def _json_enum_allows(enum: list[Any], value: Any, *, case_insensitive: bool = False) -> bool:
@@ -1014,7 +1081,7 @@ def _argument_type_errors(tool_name: str, arguments: dict[str, Any]) -> list[str
 			continue
 		enum_values = prop.get("enum")
 		if isinstance(enum_values, list) and enum_values:
-			case_insensitive = tool_name in {"boss_preset_add", "boss_watch_add"} and key in _CASE_INSENSITIVE_FILTER_ENUMS
+			case_insensitive = tool_name in _CASE_INSENSITIVE_ENUM_TOOLS and key in _CASE_INSENSITIVE_FILTER_ENUMS
 			if not _json_enum_allows(enum_values, value, case_insensitive=case_insensitive):
 				errors.append(_enum_error(key, value, enum_values))
 				continue

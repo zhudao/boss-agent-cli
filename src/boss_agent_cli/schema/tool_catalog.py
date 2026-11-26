@@ -149,7 +149,20 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				# resume/status/stop 需要 run_id：缺参时映射层抛 KeyError 并返回
 				# INVALID_PARAM（Issue #1532）；不带 action 时映射层也拒绝（#1493）。
 				"if": {"properties": {"action": {"enum": ["resume", "status", "stop"]}}, "required": ["action"]},
-				"then": {"required": ["run_id"]},
+				"then": {
+					"required": ["run_id"],
+					# role/platform/goal/inputs/requested_steps 只属于 run（Issue #2795）；
+					# timeout / max_retries 对四种 action 都可用，不加限制。
+					"not": {
+						"anyOf": [
+							{"required": ["role"]},
+							{"required": ["platform"]},
+							{"required": ["goal"]},
+							{"required": ["inputs"]},
+							{"required": ["requested_steps"]},
+						]
+					},
+				},
 				# run（含省略 action）必须给出 role / platform / goal：否则调用方要连吃
 				# 三次各报一个缺失字段的 INVALID_PARAM 才能拼出合法调用（Issue #1775）。
 				# run_id 只属于 resume/status/stop：在 run 分支显式禁止，schema 与
@@ -432,7 +445,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 			input_schema={
 				"type": "object",
 				"properties": {
-					"number": {"type": "integer", "description": "职位编号（从搜索结果中获取）"},
+					"number": {"type": "integer", "minimum": 1, "description": "职位编号（从搜索结果中获取，从 1 开始）"},
 				},
 				"required": ["number"],
 			},
@@ -525,6 +538,11 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 						"if": {"properties": {"action": {"const": "set"}}, "required": ["action"]},
 						"then": {"required": ["key", "value"]},
 					},
+					# value 只属于 set（Issue #2795）：其它 action 下映射层必然拒绝。
+					{
+						"if": {"properties": {"action": {"enum": ["list", "get", "reset"]}}, "required": ["action"]},
+						"then": {"not": {"required": ["value"]}},
+					},
 				],
 			},
 		),
@@ -582,6 +600,11 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					},
 				},
 				"required": [],
+				# resume 必须显式 dry_run=false：缺省 true 时映射层（与 CLI）拒绝
+				# `--dry-run --resume`，schema 不能放行这个必失败组合（Issue #2798，
+				# 同 #1591 的保护）。
+				"if": {"properties": {"resume": {"const": True}}, "required": ["resume"]},
+				"then": {"properties": {"dry_run": {"const": False}}, "required": ["dry_run"]},
 			},
 		),
 		ToolDefinition(
@@ -832,6 +855,15 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"all": {"type": "boolean", "description": "运行所有已保存的监控；与 name 互斥"},
 				},
 				"required": [],
+				# CLI 用「name 或 all 恰好一个」拒绝缺省与同时给出；schema 必须
+				# 编码同一约束，否则「schema 合法但命令必失败」（Issue #2792）。
+				# all=false 等同省略，与 name 同时出现不算冲突。not 的子 schema 必须
+				# 同时要求两个键，否则 name-only 会被误拒（Issue #2794）。
+				"anyOf": [
+					{"required": ["name"]},
+					{"properties": {"all": {"const": True}}, "required": ["all"]},
+				],
+				"not": {"required": ["name", "all"], "properties": {"all": {"const": True}}},
 			},
 		),
 		ToolDefinition(
@@ -1200,8 +1232,11 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				},
 				"required": [],
 				# online/offline 需要 job_id：缺参时映射层返回 INVALID_PARAM（Issue #1532）。
+				# page 只属于 list，但显式 page=1 是默认值，映射层按 #2339 容忍；
+				# list 分支禁止 job_id，否则「schema 合法但命令必失败」（Issue #2795）。
 				"if": {"properties": {"action": {"enum": ["online", "offline"]}}, "required": ["action"]},
-				"then": {"required": ["job_id"]},
+				"then": {"required": ["job_id"], "properties": {"page": {"const": 1}}},
+				"else": {"not": {"required": ["job_id"]}},
 			},
 		),
 		ToolDefinition(
@@ -1246,7 +1281,9 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 
 
 #: 必填但允许空串的参数：CLI 不拒绝它们，声明 minLength 会挡掉当前合法的调用。
-#: `hr greet --lid` 是唯一一处「required 但平台可能给空值」的上下文字段。
+#: `hr greet --lid` 是唯一一处「required 但平台可能给空值」的上下文字段：
+#: lid 只作访问上下文，CLI 只拒绝空白目标 ID（geek_id / job_id / expect_id /
+#: security_id），lid 空串照常放行（Issue #2789）。
 _EMPTY_ALLOWED_REQUIRED: dict[str, frozenset[str]] = {
 	"boss_hr_greet": frozenset({"lid"}),
 	# 空串是显式清空备注（Issue #872 / #1607），不能因 anyOf 条件必填被加上 minLength。

@@ -8,14 +8,23 @@ from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.commands._recruiter_platform import get_recruiter_platform_instance
 from boss_agent_cli.commands._text_guard import reject_unencodable_params
 from boss_agent_cli.commands.recruiter._hints import hint_command, positional_hint
+from boss_agent_cli.commands.recruiter._render import render_job_list
 from boss_agent_cli.display import (
 	handle_auth_errors,
 	handle_error_output,
 	handle_output,
 	handle_platform_error_output,
 	render_action_result,
+	render_message_panel,
+	render_next_steps,
 )
 from boss_agent_cli.services.pagination import MAX_TRUSTED_PAGE, page_can_advance
+
+
+def _render_job_detail(data: dict[str, Any], *, next_steps: list[str]) -> None:
+	"""职位详情按分段面板展示，后继命令单列在面板下方。"""
+	render_message_panel(data, title="hr jobs detail")
+	render_next_steps(next_steps)
 
 
 @click.group("jobs")
@@ -94,6 +103,7 @@ def jobs_list_cmd(ctx: click.Context, page: int) -> None:
 			ctx,
 			"recruiter-jobs-list",
 			data,
+			render=lambda d: render_job_list(d, title="hr jobs list", next_steps=next_actions),
 			pagination=pagination,
 			hints=hints,
 		)
@@ -216,15 +226,15 @@ def jobs_detail_cmd(ctx: click.Context, enc_job_id: str) -> None:
 			handle_platform_error_output(ctx, "recruiter-jobs-detail", platform, result, fallback_message="职位详情获取失败")
 			return
 		data = platform_data_dict(platform.unwrap_data(result))
+		next_actions = [
+			hint_command(ctx, f"hr jobs offline {positional_hint(enc_job_id)}"),
+			hint_command(ctx, f"hr jobs online {positional_hint(enc_job_id)}"),
+			hint_command(ctx, "hr jobs list"),
+		]
 		handle_output(
 			ctx,
 			"recruiter-jobs-detail",
 			data,
-			hints={
-				"next_actions": [
-					hint_command(ctx, f"hr jobs offline {positional_hint(enc_job_id)}"),
-					hint_command(ctx, f"hr jobs online {positional_hint(enc_job_id)}"),
-					hint_command(ctx, "hr jobs list"),
-				]
-			},
+			render=lambda d: _render_job_detail(d, next_steps=next_actions),
+			hints={"next_actions": next_actions},
 		)

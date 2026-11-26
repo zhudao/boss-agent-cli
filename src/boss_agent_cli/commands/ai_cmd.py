@@ -49,6 +49,36 @@ from boss_agent_cli.resume.store import ResumeStore
 from boss_agent_cli.services.json_files import path_mode
 
 
+#: 各 prompt 的 JSON 示例承诺的顶层字段类型；只校验模型实际给出的字段，
+#: 不替模型补键、也不改变成功信封的形状（Issue #2865）。
+_AI_RESULT_TYPES: dict[str, dict[str, type]] = {
+	"analyze-jd": {
+		"match_score": int, "match_analysis": str, "matching_points": list,
+		"gap_points": list, "suggestions": list, "risk_factors": list,
+		"overall_recommendation": str,
+	},
+	"polish": {"polished_sections": list, "general_suggestions": list, "keyword_additions": list},
+	"optimize": {
+		"match_score_before": int, "match_score_after": int, "optimized_sections": list,
+		"key_adjustments": list, "warnings": list,
+	},
+	"suggest": {"suggestions": list, "short_term_plan": str, "long_term_plan": str},
+	"reply": {
+		"intent_analysis": str, "reply_drafts": list, "key_points": list, "avoid": list,
+	},
+	"interview-prep": {"job_summary": str, "questions": list, "preparation_tips": list},
+	"chat-coach": {
+		"stage_analysis": str, "recruiter_intent": str, "strengths": list,
+		"weaknesses": list, "next_action_recommendation": str,
+		"message_templates": list, "avoid_pitfalls": list,
+	},
+	"resume-optimize": {
+		"match_score": int, "key_suggestions": list, "keywords_to_add": list,
+		"sections_to_emphasize": list, "sections_to_reduce": list, "warnings": list,
+	},
+}
+
+
 def _get_ai_config_store(ctx: click.Context) -> AIConfigStore:
 	return AIConfigStore(ctx.obj["data_dir"])
 
@@ -86,6 +116,10 @@ def _strict_resolved_base_url(ctx: click.Context, store: Any) -> str | None:
 		config = store.load_config()
 		provider = ai_text_setting(config, "ai_provider")
 		base_url = ai_text_setting(config, "ai_base_url")
+		# 类型漂移（Issue #1967）与 URL 语法漂移都要在回显前拒绝：执行路径的
+		# _create_ai_service() 会先 normalize_base_url()，坏地址在真实调用时报
+		# CONFIG_INVALID，配置查看却回显成「生效端点」（Issue #2858）。
+		base_url = normalize_base_url(base_url) if base_url else None
 	except AIConfigValueError as exc:
 		_ai_config_invalid(ctx, exc)
 		raise
@@ -320,7 +354,7 @@ def _read_text_argument(ctx: click.Context, value: str) -> str | None:
 		return None
 
 
-def _call_ai(ctx: click.Context, svc: AIService, prompt: str) -> dict[str, Any] | None:
+def _call_ai(ctx: click.Context, svc: AIService, prompt: str, expected_types: dict[str, type] | None = None) -> dict[str, Any] | None:
 	"""调用 AI 并解析 JSON 结果，失败时输出错误信封。"""
 	try:
 		raw = svc.chat([
@@ -374,7 +408,54 @@ def _call_ai(ctx: click.Context, svc: AIService, prompt: str) -> dict[str, Any] 
 		)
 		ctx.exit(1)
 		return None
+	if expected_types and not _validate_present_ai_result(ctx, parsed, expected_types):
+		return None
 	return cast("dict[str, Any]", parsed)
+
+
+def _validate_present_ai_result(ctx: click.Context, result: dict[str, Any], expected: dict[str, type]) -> bool:
+	"""校验模型已给出的字段类型，缺失字段留给各命令自行补缺省（Issue #2865）。"""
+	for key, want in expected.items():
+		if key not in result:
+			continue
+		value = result[key]
+		if isinstance(value, want):
+			continue
+		handle_error_output(
+			ctx, "ai",
+			code="AI_PARSE_ERROR",
+			message=f"AI 返回结果字段 {key} 必须是 {want.__name__}（收到 {type(value).__name__}）",
+			recoverable=True,
+			recovery_action="重试（模型输出不稳定时可能发生）",
+		)
+		ctx.exit(1)
+		return False
+	return True
+
+
+def _fill_and_validate_ai_result(ctx: click.Context, result: dict[str, Any], defaults: dict[str, Any]) -> bool:
+	"""补齐缺省字段并校验已知字段类型（Issue #2859）。
+
+	``setdefault`` 只填缺失键：模型把 ``results`` 写成字符串、把
+	``greeting_opener`` 写成数字时，错误形状会以 ``ok=true`` 出信封，下游
+	Agent 直接迭代/展示时才会崩。与顶层非对象同口径按 ``AI_PARSE_ERROR``
+	返回可重试错误，不把坏值伪装成合法结果。
+	"""
+	for key, default in defaults.items():
+		result.setdefault(key, default)
+		value = result[key]
+		if isinstance(value, type(default)):
+			continue
+		handle_error_output(
+			ctx, "ai",
+			code="AI_PARSE_ERROR",
+			message=f"AI 返回结果字段 {key} 必须是 {type(default).__name__}（收到 {type(value).__name__}）",
+			recoverable=True,
+			recovery_action="重试（模型输出不稳定时可能发生）",
+		)
+		ctx.exit(1)
+		return False
+	return True
 
 
 def _fit_missing_detail_item(ctx: click.Context, item: dict[str, Any]) -> dict[str, Any]:
@@ -689,7 +770,7 @@ def ai_analyze_jd_cmd(ctx: click.Context, jd_text: str, resume_name: str) -> Non
 		return
 
 	prompt = JD_ANALYSIS_PROMPT.format(jd_text=jd_text, resume_text=resume_text)
-	result = _call_ai(ctx, svc, prompt)
+	result = _call_ai(ctx, svc, prompt, _AI_RESULT_TYPES["analyze-jd"])
 	if result is None:
 		return
 
@@ -717,7 +798,7 @@ def ai_polish_cmd(ctx: click.Context, resume_name: str) -> None:
 		return
 
 	prompt = RESUME_POLISH_PROMPT.format(resume_text=resume_text)
-	result = _call_ai(ctx, svc, prompt)
+	result = _call_ai(ctx, svc, prompt, _AI_RESULT_TYPES["polish"])
 	if result is None:
 		return
 
@@ -749,7 +830,7 @@ def ai_optimize_cmd(ctx: click.Context, resume_name: str, jd_text: str) -> None:
 		return
 
 	prompt = RESUME_OPTIMIZE_FOR_JD_PROMPT.format(jd_text=jd_text, resume_text=resume_text)
-	result = _call_ai(ctx, svc, prompt)
+	result = _call_ai(ctx, svc, prompt, _AI_RESULT_TYPES["optimize"])
 	if result is None:
 		return
 
@@ -784,7 +865,7 @@ def ai_suggest_cmd(ctx: click.Context, resume_name: str, jd_text: str) -> None:
 		return
 
 	prompt = RESUME_SUGGEST_PROMPT.format(jd_text=jd_text, resume_text=resume_text)
-	result = _call_ai(ctx, svc, prompt)
+	result = _call_ai(ctx, svc, prompt, _AI_RESULT_TYPES["suggest"])
 	if result is None:
 		return
 
@@ -860,7 +941,8 @@ def ai_fit_cmd(ctx: click.Context, resume_name: str, limit: int) -> None:
 	if result is None:
 		return
 
-	result.setdefault("results", [])
+	if not _fill_and_validate_ai_result(ctx, result, {"results": []}):
+		return
 	result["missing"] = missing
 	result["summary"] = {
 		"analyzed": len(jobs),
@@ -925,7 +1007,7 @@ def ai_reply_cmd(ctx: click.Context, recruiter_message: str, context: str, resum
 		resume_text=resume_text,
 		tone=tone,
 	)
-	result = _call_ai(ctx, svc, prompt)
+	result = _call_ai(ctx, svc, prompt, _AI_RESULT_TYPES["reply"])
 	if result is None:
 		return
 
@@ -975,7 +1057,7 @@ def ai_interview_prep_cmd(ctx: click.Context, jd_text: str, resume_name: str | N
 		resume_text=resume_text,
 		count=count,
 	)
-	result = _call_ai(ctx, svc, prompt)
+	result = _call_ai(ctx, svc, prompt, _AI_RESULT_TYPES["interview-prep"])
 	if result is None:
 		return
 
@@ -1025,7 +1107,7 @@ def ai_chat_coach_cmd(ctx: click.Context, chat_text: str, resume_name: str | Non
 		resume_text=resume_text,
 		style=style,
 	)
-	result = _call_ai(ctx, svc, prompt)
+	result = _call_ai(ctx, svc, prompt, _AI_RESULT_TYPES["chat-coach"])
 	if result is None:
 		return
 
@@ -1077,9 +1159,10 @@ def ai_suggest_keywords_cmd(ctx: click.Context, limit: int) -> None:
 	if result is None:
 		return
 
-	result.setdefault("keyword_groups", [])
-	result.setdefault("patterns", [])
-	result.setdefault("search_suggestions", [])
+	if not _fill_and_validate_ai_result(ctx, result, {
+		"keyword_groups": [], "patterns": [], "search_suggestions": [],
+	}):
+		return
 	handle_output(
 		ctx,
 		"ai-suggest-keywords",
@@ -1154,7 +1237,7 @@ def ai_resume_optimize_cmd(ctx: click.Context, resume_name: str, jd_text: str | 
 		return
 
 	prompt = RESUME_OPTIMIZE_SIMPLE_PROMPT.format(jd_text=jd_text, resume_text=resume_text)
-	result = _call_ai(ctx, svc, prompt)
+	result = _call_ai(ctx, svc, prompt, _AI_RESULT_TYPES["resume-optimize"])
 	if result is None:
 		return
 
@@ -1241,9 +1324,10 @@ def ai_cover_letter_cmd(
 	if result is None:
 		return
 
-	result.setdefault("greeting_opener", "")
-	result.setdefault("cover_letter", "")
-	result.setdefault("highlights", [])
+	if not _fill_and_validate_ai_result(ctx, result, {
+		"greeting_opener": "", "cover_letter": "", "highlights": [],
+	}):
+		return
 	handle_output(
 		ctx, "ai-cover-letter", result,
 		render=lambda d: render_ai_result(d, title="ai-cover-letter"),

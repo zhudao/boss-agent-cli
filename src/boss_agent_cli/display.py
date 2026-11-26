@@ -7,15 +7,18 @@ Pipe mode (Agent): JSON envelope to stdout.
 
 import datetime
 import json
+import math
 import re
 import sqlite3
 import sys
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from itertools import islice
 from pathlib import Path
 from typing import Any, Callable
 
 import click
+from rich.cells import cell_len
 from rich.console import Console, ConsoleOptions, RenderableType
 from rich.errors import MarkupError
 from rich.panel import Panel
@@ -37,13 +40,20 @@ from boss_agent_cli.cache.store import (
 	CacheWriteRejected,
 	is_cache_busy_error,
 )
-from boss_agent_cli.output import emit_success, exit_code_for_error, is_local_io_error, redact_sensitive_text
+from boss_agent_cli.output import (
+	emit_success,
+	exit_code_for_error,
+	is_local_io_error,
+	redact_sensitive,
+	redact_sensitive_text,
+)
 from boss_agent_cli.schema.error_codes import ERROR_CODES
 from boss_agent_cli.services.browser_runtime import (
 	is_browser_kernel_missing,
 	patchright_headless_shell_command,
 	patchright_install_command,
 )
+from boss_agent_cli.services.saved_searches import configured_search_params
 from boss_agent_cli.services.text_files import sanitize_surrogates
 
 #: C0（保留 ``\t`` / ``\n``）与 C1 控制字符。Rich 只处理 markup，不会剥离原始
@@ -114,6 +124,13 @@ def _is_plain_scalar(value: Any) -> bool:
 	return isinstance(value, str) or (isinstance(value, (int, float)) and not isinstance(value, bool))
 
 
+def _plain_scalar_text(value: Any) -> str:
+	"""纯标量列表元素：非有限浮点显示 ``-``，与 ``cell_text`` 的标量口径一致（Issue #2835）。"""
+	if isinstance(value, float) and not math.isfinite(value):
+		return "-"
+	return value if isinstance(value, str) else safe_text(value)
+
+
 def cell_text(value: Any) -> str:
 	"""把表格单元格的值转成给真人看的文本；未做 markup 转义，交给 ``escape_markup``。
 
@@ -124,17 +141,22 @@ def cell_text(value: Any) -> str:
 	- ``None`` 与空容器显示 ``-``，与键缺失同一写法；
 	- 元素全是字符串 / 数值的列表用 ``, `` 连接（与职位详情的 skills 同写法）；
 	- 其余容器输出 JSON 文本，与 ``--json`` 看到的一致；
-	- 标量保持原样，空字符串仍是空单元格。
+	- 非有限浮点（``NaN`` / ``Infinity``，平台 JSON 的 ``1e400`` / ``NaN``
+	  会解析成这类值）显示 ``-``，与 ``field_text`` / 通用面板同一缺失口径
+	  （Issue #2817、#2835）；
+	- 其余标量保持原样，空字符串仍是空单元格。
 	"""
 	if value is None:
 		return "-"
 	if isinstance(value, str):
 		return value
+	if isinstance(value, float) and not math.isfinite(value):
+		return "-"
 	if isinstance(value, (list, tuple, dict)):
 		if not value:
 			return "-"
 		if not isinstance(value, dict) and all(_is_plain_scalar(element) for element in value):
-			return ", ".join(element if isinstance(element, str) else safe_text(element) for element in value)
+			return ", ".join(_plain_scalar_text(element) for element in value)
 		try:
 			return json.dumps(value, ensure_ascii=False, default=str)
 		except (TypeError, ValueError, RecursionError):
@@ -161,8 +183,13 @@ def escape_markup(value: Any) -> str:
 	包进空样式标签 ``[none]…[/none]``：Rich 的标签正则不能跨越 ``[``，值内
 	悬空的 ``[`` 够不到值外的 ``]``；结尾反斜杠加倍后恰好还原成原数量，
 	闭合标签保持有效。
+
+	``str()`` 走 ``safe_text`` 同口径（Issue #2826）：调用点常把平台 / AI
+	返回的原始标量直接传进来，合法 JSON 的超大整数会让 ``str()`` 抛
+	``ValueError``、深嵌套容器抛 ``RecursionError``，异常发生在构造 markup
+	之前，渲染出口的 ``_SanitizingConsole`` 兜不住。这两种形状按缺失处理。
 	"""
-	text = strip_control(sanitize_surrogates(str(value)))
+	text = strip_control(sanitize_surrogates(safe_text(value)))
 	if "[" not in text and not text.endswith("\\"):
 		return text
 	parts: list[str] = []
@@ -540,7 +567,7 @@ def render_operator_actions(hints: dict[str, Any] | None) -> None:
 	console.print()
 	for index, action in enumerate(actions):
 		prefix = "↓ 你需要：" if index == 0 else "　　　　　"
-		console.print(f"[yellow]{prefix}[/yellow]{escape_markup(redact_sensitive_text(str(action)))}")
+		console.print(f"[yellow]{prefix}[/yellow]{escape_markup(redact_sensitive_text(str(action)))}", soft_wrap=True)
 
 
 def handle_output(
@@ -556,7 +583,8 @@ def handle_output(
 	if is_json_mode(ctx):
 		emit_success(command, data, pagination=pagination, hints=hints)
 	elif render:
-		render(data)
+		# 与信封共用脱敏规则。TTY 输出也会出现在日志和截图里（Issue #2765）。
+		render(redact_sensitive(data))
 		render_operator_actions(hints)
 	else:
 		# Fallback: no render function, emit JSON even in TTY
@@ -574,11 +602,14 @@ def handle_error_output(
 	details: dict[str, Any] | None = None,
 	hints: dict[str, Any] | None = None,
 	data: Any = None,
+	json_mode: bool | None = None,
 ) -> None:
 	"""Smart error output: TTY -> rich error, pipe -> JSON error envelope.
 
 	``data`` 只用于「部分完成」的失败：批量删除等操作需要把已完成项和失败项
 	带回给调用方，而不是只留 ``data=null``（Issue #1497）。默认仍是 None。
+	``json_mode`` 供入口层显式传入：启动期错误没有完整 ctx，但可能带了
+	``--json``，不能仅凭 stdout 是否 TTY 决定通道（Issue #2786）。
 	"""
 	from boss_agent_cli.output import emit_error
 
@@ -610,7 +641,8 @@ def handle_error_output(
 	# api/ 与 crawler/ 层没有 ctx，只能在出口按本次运行改写（Issue #1097）。
 	message = registry_recovery_for_ctx(ctx, message)
 
-	if is_json_mode(ctx):
+	use_json = is_json_mode(ctx) if json_mode is None else json_mode
+	if use_json:
 		emit_error(
 			command,
 			code=code,
@@ -635,7 +667,7 @@ def handle_error_output(
 		error_line.append(f" [{strip_control(str(code))}] {strip_control(safe_message)}")
 		console.print(error_line)
 		if safe_recovery:
-			console.print(f"  [dim]recovery: {escape_markup(safe_recovery)}[/dim]")
+			console.print(f"  [dim]recovery: {escape_markup(safe_recovery)}[/dim]", soft_wrap=True)
 		render_operator_actions(hints)
 		# TTY 与 JSON 出口同一退出码契约：--exit-codes sysexits 在终端下同样生效
 		# （此前硬编码 1，认证 / 限流 / 风控失败全部退 1，Issue #2051）。
@@ -770,6 +802,51 @@ def handle_platform_error_output(
 # ── Table builders ──────────────────────────────────────────────────
 
 
+def _detail_scalar(value: Any) -> str:
+	"""职位详情展示用安全标量：容器 / 布尔 / 非有限浮点 / 超大整数按缺失处理。
+
+	与向导职位详情同口径（Issue #2812 / #2815）：``str()`` 遇超大整数抛
+	``ValueError``，容器与布尔会把 Python repr / ``True`` 打进面板。
+	"""
+	if value is None or isinstance(value, bool):
+		return ""
+	if isinstance(value, str):
+		return value.strip()
+	if isinstance(value, (int, float)):
+		if isinstance(value, float) and not math.isfinite(value):
+			return ""
+		return safe_text(value)
+	return ""
+
+
+def job_field_text(data: dict[str, Any], *keys: str) -> str:
+	"""职位字段的终端文本：缺失 / 空串 / 纯空白都显示 ``-``（Issue #2767）。
+
+	``data.get(key, "-")`` 的默认值只挡键缺失，而上游 ``build_job_from_card``
+	用 ``field_text`` 把缺失归一成空串，于是详情里出现 ``exp:  | edu:  |``、
+	``boss:  ()``，表格里空单元格与其它列的 ``-`` 不一致。容器字段按
+	``cell_text`` 的口径转文本，不把 Python repr 打给用户。
+
+	布尔与非有限浮点按缺失处理：``cell_text`` 会把布尔原样给出 ``True``；
+	非有限浮点已由 ``cell_text`` 统一显示 ``-``（Issue #2835），这里仍显式
+	跳过这两类值，保持职位字段的入口契约（Issue #2815）。
+	"""
+	for key in keys:
+		if key not in data:
+			continue
+		value = data[key]
+		if isinstance(value, str):
+			if value.strip():
+				return escape_markup(value)
+			continue
+		if isinstance(value, bool) or (isinstance(value, float) and not math.isfinite(value)):
+			continue
+		text = cell_text(value)
+		if text and text != "-":
+			return escape_markup(text)
+	return "-"
+
+
 def render_job_table(
 	items: list[dict[str, Any]],
 	title: str,
@@ -793,35 +870,36 @@ def render_job_table(
 	# title 可能含外部输入（搜索词等）：整个标题按字面渲染，后缀是代码自己的文本。
 	table = Table(title=f"{escape_markup(title)} ({len(items)} results)", show_lines=True)
 	table.add_column("#", style="dim", width=3)
-	table.add_column("title", style="bold cyan", max_width=30)
-	table.add_column("company", style="green", max_width=20)
-	table.add_column("salary", style="yellow", max_width=12)
-	table.add_column("type", max_width=8)
-	table.add_column("exp", max_width=10)
-	table.add_column("edu", max_width=8)
-	table.add_column("city", style="blue", max_width=12)
+	# 列宽上限保持表格紧凑；超宽内容按字符折行而不是截成「…」（Issue #2761）。
+	table.add_column("title", style="bold cyan", max_width=30, overflow="fold")
+	table.add_column("company", style="green", max_width=20, overflow="fold")
+	table.add_column("salary", style="yellow", max_width=12, overflow="fold")
+	table.add_column("type", max_width=8, overflow="fold")
+	table.add_column("exp", max_width=10, overflow="fold")
+	table.add_column("edu", max_width=8, overflow="fold")
+	table.add_column("city", style="blue", max_width=12, overflow="fold")
 
 	for i, job in enumerate(items, 1):
 		table.add_row(
 			str(i),
-			escape_markup(job.get("title", job.get("jobName", "-"))),
-			escape_markup(job.get("company", job.get("brandName", "-"))),
-			escape_markup(job.get("salary", job.get("salaryDesc", "-"))),
-			escape_markup(job.get("employment_type") or "-"),
-			escape_markup(job.get("experience", job.get("jobExperience", "-"))),
-			escape_markup(job.get("education", job.get("jobDegree", "-"))),
-			escape_markup(job.get("city", job.get("cityName", "-"))),
+			job_field_text(job, "title", "jobName"),
+			job_field_text(job, "company", "brandName"),
+			job_field_text(job, "salary", "salaryDesc"),
+			job_field_text(job, "employment_type"),
+			job_field_text(job, "experience", "jobExperience"),
+			job_field_text(job, "education", "jobDegree"),
+			job_field_text(job, "city", "cityName"),
 		)
 
 	console.print(table)
 	if show_command:
-		console.print(f"  [dim]use: {escape_markup(show_command)} to view details[/dim]")
+		console.print(f"  [dim]use: {escape_markup(show_command)} to view details[/dim]", soft_wrap=True)
 	if hint_next:
-		console.print(f"  [dim]{escape_markup(hint_next)}[/dim]")
+		console.print(f"  [dim]{escape_markup(hint_next)}[/dim]", soft_wrap=True)
 
 
-def _snapshot_time_label(value: Any) -> str:
-	"""把索引快照的 Unix 秒渲染成本地时间；未知或损坏的时间按 "-" 处理。
+def unix_time_label(value: Any) -> str:
+	"""把 Unix 秒渲染成本地时间；未知或损坏的时间显示为 "-"。
 
 	``index_cache._saved_at`` 用 ``0`` 表示「保存时间未知」（旧版本写入的缓存、
 	被改坏的 ``saved_at``）。把这个哨兵交给 ``fromtimestamp`` 会显示成
@@ -838,19 +916,38 @@ def _snapshot_time_label(value: Any) -> str:
 		return "-"
 
 
+def iso_time_label(value: Any) -> str:
+	"""简历的 ISO 时间按本地时区显示到分钟。"""
+	if not isinstance(value, str):
+		return "-"
+	try:
+		stamp = datetime.datetime.fromisoformat(value)
+		if stamp.tzinfo is not None:
+			stamp = stamp.astimezone()
+		return stamp.strftime("%Y-%m-%d %H:%M")
+	except (OverflowError, OSError, ValueError):
+		return "-"
+
+
 def render_job_detail(data: dict[str, Any], *, greet_command: str | None = None) -> None:
 	"""Render job detail as a rich panel."""
-	title = escape_markup(data.get("title", "-"))
-	salary = escape_markup(data.get("salary", "-"))
-	exp = escape_markup(data.get("experience", "-"))
-	edu = escape_markup(data.get("education", "-"))
-	city = escape_markup(data.get("city", "-"))
-	company = escape_markup(data.get("company", "-"))
-	boss = escape_markup(data.get("boss_name", "-"))
-	boss_title = escape_markup(data.get("boss_title", "-"))
-	desc = str(data.get("description", ""))
+	title = job_field_text(data, "title")
+	salary = job_field_text(data, "salary")
+	exp = job_field_text(data, "experience")
+	edu = job_field_text(data, "education")
+	city = job_field_text(data, "city")
+	company = job_field_text(data, "company")
+	boss = job_field_text(data, "boss_name")
+	boss_title = job_field_text(data, "boss_title")
+	desc = _detail_scalar(data.get("description"))
+	if boss == "-":
+		boss_line = boss_title if boss_title != "-" else "-"
+	elif boss_title == "-":
+		boss_line = boss
+	else:
+		boss_line = f"{boss} ({boss_title})"
 
-	skills = label_items(data.get("skills"))
+	skills = [text for item in label_items(data.get("skills")) if (text := _detail_scalar(item))]
 	skill_str = ", ".join(escape_markup(skill) for skill in skills) if skills else "-"
 
 	text = (
@@ -860,14 +957,18 @@ def render_job_detail(data: dict[str, Any], *, greet_command: str | None = None)
 		f"\n"
 		f"[bold green]company:[/bold green] {company}\n"
 		f"\n"
-		f"[bold magenta]boss:[/bold magenta] {boss} ({boss_title})\n"
+		f"[bold magenta]boss:[/bold magenta] {boss_line}\n"
 	)
 
 	if desc:
+		omitted = ""
 		if len(desc) > 500:
-			desc = desc[:500] + "..."
+			# 只留一个 "..." 会让真人以为那就是全文；明确写出省略了多少字以及
+			# 去哪里看完整内容（Issue #2768）。
+			omitted = f"\n[dim]…… 已省略 {len(desc) - 500} 字，完整描述用 --json 查看[/dim]"
+			desc = desc[:500]
 		# 先截断再转义：截断可能落在转义序列中间。
-		text += f"\n[bold]description:[/bold]\n{escape_markup(desc)}"
+		text += f"\n[bold]description:[/bold]\n{escape_markup(desc)}{omitted}"
 
 	panel = Panel(text, title="job detail", border_style="cyan")
 	console.print(panel)
@@ -876,21 +977,37 @@ def render_job_detail(data: dict[str, Any], *, greet_command: str | None = None)
 	# 重搜之后一眼就能看出这条编号是不是已经指向另一次搜索。
 	snapshot = data.get("index_snapshot")
 	if isinstance(snapshot, dict):
-		source = escape_markup(snapshot.get("source") or "-")
-		count = snapshot.get("count")
-		count_label = str(count) if isinstance(count, int) and not isinstance(count, bool) else "-"
-		page = snapshot.get("page")
-		page_label = f"第 {page} 页 · " if isinstance(page, int) and not isinstance(page, bool) else ""
-		index = data.get("index", "-")
+		source = escape_markup(_detail_scalar(snapshot.get("source")) or "-")
+		count_label = escape_markup(_detail_scalar(snapshot.get("count")) or "-")
+		page_text = _detail_scalar(snapshot.get("page"))
+		page_label = f"第 {escape_markup(page_text)} 页 · " if page_text else ""
+		index = escape_markup(_detail_scalar(data.get("index")) or "-")
 		console.print(
-			f"  [dim]#{index} · {page_label}{source} · 共 {count_label} 条 · 保存于 {_snapshot_time_label(snapshot.get('saved_at'))}[/dim]"
+			f"  [dim]#{index} · {page_label}{source} · 共 {count_label} 条 · 保存于 {unix_time_label(snapshot.get('saved_at'))}[/dim]"
 		)
 
-	sid = data.get("security_id", "")
-	jid = data.get("job_id", "")
+	sid = _detail_scalar(data.get("security_id"))
+	jid = _detail_scalar(data.get("job_id"))
 	if sid and jid:
 		greet_command = greet_command or "boss greet <security_id> <job_id>"
-		console.print(f"  [dim]next: {escape_markup(greet_command)}[/dim]")
+		console.print(f"  [dim]next: {escape_markup(greet_command)}[/dim]", soft_wrap=True)
+
+
+def _status_lock_text(value: Any, default: str) -> str:
+	"""风控锁字段的安全文本：容器 / 布尔 / 非有限浮点 / 超大整数回退默认值。
+
+	``lock.get(key) or default`` 只挡假值：对象会显示 repr，超大整数在
+	``escape_markup`` 内 ``str()`` 时抛 ``ValueError``（Issue #2817）。
+	"""
+	if isinstance(value, str):
+		text = value.strip()
+	elif isinstance(value, (int, float)) and not isinstance(value, bool):
+		if isinstance(value, float) and not math.isfinite(value):
+			return default
+		text = safe_text(value)
+	else:
+		return default
+	return escape_markup(text) if text else default
 
 
 def render_status(
@@ -917,11 +1034,11 @@ def render_status(
 			console.print("[green]logged in[/green]")
 	else:
 		# 登录命令可能带自定义 --data-dir：方括号目录名不能被当作样式吞掉。
-		console.print(f"[yellow]not logged in[/yellow] - run: {escape_markup(login_action)}")
+		console.print(f"[yellow]not logged in[/yellow] - run: {escape_markup(login_action)}", soft_wrap=True)
 	lock = data.get("cdp_risk_lock")
 	if isinstance(lock, dict) and lock.get("locked"):
-		since = escape_markup(lock.get("locked_at") or "unknown")
-		reason = escape_markup(lock.get("reason") or "ENVIRONMENT_RISK")
+		since = _status_lock_text(lock.get("locked_at"), "unknown")
+		reason = _status_lock_text(lock.get("reason"), "ENVIRONMENT_RISK")
 		console.print(
 			f"[yellow]BOSS 本地风控锁定中[/yellow]（{since} 起，{reason}）：确认官方目标业务页已恢复后，"
 			f"由用户执行 {escape_markup(clean_action)} 再显式恢复任务；令牌变化不会自动解锁"
@@ -947,7 +1064,8 @@ def render_simple_list(
 	table = Table(title=f"{escape_markup(title)} ({len(items)})", show_lines=True)
 	table.add_column("#", style="dim", width=3)
 	for header, _, style in columns:
-		table.add_column(header, style=style, max_width=25)
+		# 不设列宽上限：Rich 按终端宽度分配，超宽内容按字符折行（Issue #2761）。
+		table.add_column(escape_markup(header), style=style, overflow="fold")
 
 	for i, item in enumerate(items, 1):
 		row = [str(i)]
@@ -962,17 +1080,103 @@ def render_simple_list(
 # ── Additional renderers ────────────────────────────────────────────
 
 
+_PANEL_INLINE_LIST_WIDTH = 60
+_PANEL_MAX_DEPTH = 4
+_PANEL_FIELD_MAX_LINES = 12
+_PANEL_NESTED_TEXT_LIMIT = 200
+
+
+def _panel_scalar_text(value: Any) -> str:
+	"""通用键值面板的安全标量：非有限浮点按缺失处理。
+
+	``safe_text`` 会把 ``nan`` / ``inf`` 原样打给真人，既不是 JSON 口径也不是
+	可用值（Issue #2817）。布尔仍按既有 TTY 契约显示 ``True`` / ``False``，
+	大量既有命令的输出与测试依赖该写法。
+	"""
+	if value is None:
+		return "-"
+	if isinstance(value, float) and not math.isfinite(value):
+		return "-"
+	return safe_text(value) or "-"
+
+
+def _panel_inline_text(value: Any, depth: int) -> str | None:
+	"""返回能在字段名后直接显示的值；需要逐项展开时返回 ``None``。"""
+	if not isinstance(value, (list, tuple, dict)):
+		return _panel_scalar_text(value)
+	if not value:
+		return "-"
+	if depth >= _PANEL_MAX_DEPTH:
+		return cell_text(value)
+	if isinstance(value, dict) or len(value) > _PANEL_INLINE_LIST_WIDTH:
+		return None
+	if all(isinstance(item, (str, int, float)) or item is None for item in value):
+		parts = [_panel_scalar_text(item) for item in value]
+		if all("," not in part and "\n" not in part for part in parts):
+			text = ", ".join(parts)
+			if cell_len(text) <= _PANEL_INLINE_LIST_WIDTH:
+				return text
+	return None
+
+
+def _panel_field_lines(key: Any, value: Any, *, bounded: bool = False) -> list[str]:
+	"""保留标量，逐项展开容器。分段面板对嵌套字段保留有界预览（#2762）。"""
+	label = f"[bold]{escape_markup(safe_text(key))}:[/bold]"
+	inline = _panel_inline_text(value, 0)
+	if inline is not None:
+		return [f"{label} {escape_markup(inline)}"]
+	clipped = False
+
+	def block(container: Any, depth: int) -> Iterator[str]:
+		nonlocal clipped
+		pad = "  " * depth
+		entries = container.items() if isinstance(container, dict) else ((None, item) for item in container)
+		for child_key, child in entries:
+			if isinstance(container, dict):
+				prefix = f"{pad}[bold]{escape_markup(safe_text(child_key))}:[/bold]"
+			else:
+				prefix = f"{pad}·"
+			text = _panel_inline_text(child, depth)
+			if text is None:
+				yield prefix
+				yield from block(child, depth + 1)
+				continue
+			if bounded and len(text) > _PANEL_NESTED_TEXT_LIMIT:
+				text = f"{text[:_PANEL_NESTED_TEXT_LIMIT]}…"
+				clipped = True
+			yield f"{prefix} {escape_markup(text)}"
+
+	body = block(value, 1)
+	if not bounded:
+		return [label, *body]
+	preview = list(islice(body, _PANEL_FIELD_MAX_LINES + 1))
+	if len(preview) > _PANEL_FIELD_MAX_LINES:
+		preview.pop()
+		clipped = True
+	if clipped:
+		preview.append("  [dim]… 完整内容用 --json 查看[/dim]")
+	return [label, *preview]
+
+
 def render_message_panel(data: dict[str, Any], *, title: str = "result") -> None:
 	"""Render a simple key-value result as a panel."""
-	lines = []
+	lines: list[str] = []
 	for k, v in data.items():
-		lines.append(f"[bold]{escape_markup(k)}:[/bold] {escape_markup(v)}")
-	panel = Panel("\n".join(lines), title=title, border_style="green")
+		lines.extend(_panel_field_lines(k, v))
+	# 标题按外部值转义：公共 helper 的调用方可能传平台 / 记录里的原始文本（Issue #2828）。
+	panel = Panel("\n".join(lines), title=escape_markup(title), border_style="green")
 	console.print(panel)
+
+
+def _print_render_title(title: Any) -> None:
+	"""面板标题统一走安全文本与 markup 转义，外部值不能把 TTY 打崩。"""
+	text = escape_markup(safe_text(title)) or "info"
+	console.print(f"[bold cyan]{text}[/bold cyan]")
 
 
 def render_batch_operation_summary(data: dict[str, Any], *, title: str = "batch result") -> None:
 	"""Render batch operation summary (greeted/failed counts + items)."""
+	_print_render_title(title)
 	greeted = data.get("greeted", [])
 	failed = data.get("failed", [])
 	dry_run = data.get("dry_run", False)
@@ -981,14 +1185,14 @@ def render_batch_operation_summary(data: dict[str, Any], *, title: str = "batch 
 		candidates = data.get("candidates", [])
 		console.print(f"[yellow]dry run[/yellow] — {len(candidates)} candidates")
 		if candidates:
-			render_job_table(candidates, f"{title} (dry run)")
+			render_job_table(candidates, "dry run candidates")
 		return
 
 	console.print(f"[green]success: {len(greeted)}[/green]  [red]failed: {len(failed)}[/red]")
 	if greeted:
 		table = Table(title="greeted", show_lines=True)
-		table.add_column("title", style="cyan", max_width=25)
-		table.add_column("company", style="green", max_width=20)
+		table.add_column("title", style="cyan", max_width=25, overflow="fold")
+		table.add_column("company", style="green", max_width=20, overflow="fold")
 		for item in greeted:
 			table.add_row(escape_markup(item.get("title", "-")), escape_markup(item.get("company", "-")))
 		console.print(table)
@@ -998,17 +1202,25 @@ def render_batch_operation_summary(data: dict[str, Any], *, title: str = "batch 
 
 def render_sectioned_record(data: dict[str, Any], *, title: str = "info") -> None:
 	"""Render multi-section record (e.g., me command) as panels."""
+	# 分段名只说明记录结构，标题才是命令标识；外部 title 必须转义后再交给 Rich。
+	_print_render_title(title)
 	for section, content in data.items():
 		if isinstance(content, dict):
-			lines = []
+			lines: list[str] = []
 			for k, v in content.items():
-				if isinstance(v, (list, dict)):
-					v = str(v)[:200]
-				lines.append(f"[bold]{escape_markup(k)}:[/bold] {escape_markup(v or '-')}")
-			panel = Panel("\n".join(lines) if lines else "[dim]empty[/dim]", title=section, border_style="cyan")
+				# 嵌套的列表 / 对象有界展开，避免一条记录刷屏；0 / False 不再被当成缺失。
+				lines.extend(_panel_field_lines(k, v, bounded=True))
+			# 分段名来自 data 的键（招聘者侧直接是平台响应），按外部值转义（Issue #2828）。
+			panel = Panel(
+				"\n".join(lines) if lines else "[dim]empty[/dim]",
+				title=escape_markup(section),
+				border_style="cyan",
+			)
 			console.print(panel)
 		else:
-			console.print(f"[bold]{escape_markup(section)}:[/bold] {escape_markup(content)}")
+			# 顶层段落（resume show 的 modules 等）本身就是这条记录的正文，完整展开。
+			for line in _panel_field_lines(section, content):
+				console.print(line)
 
 
 def render_string_grid(items: list[str], title: str, *, columns: int = 4) -> None:
@@ -1020,7 +1232,7 @@ def render_string_grid(items: list[str], title: str, *, columns: int = 4) -> Non
 	# title 可能含外部输入：整个标题按字面渲染。
 	table = Table(title=f"{escape_markup(title)} ({len(items)})", show_header=False)
 	for _ in range(columns):
-		table.add_column(max_width=20)
+		table.add_column(max_width=20, overflow="fold")
 
 	for i in range(0, len(items), columns):
 		row = items[i : i + columns]
@@ -1062,7 +1274,8 @@ def render_next_steps(actions: "Sequence[str] | None") -> None:
 	for action in actions:
 		# 命令里带数据目录等用户可控文本：不转义时 `[bold]` 会被 Rich 吞掉，
 		# 未配对的 `[/bold]` 直接抛 MarkupError，整个人工提示都打不出来。
-		console.print(f"    [dim]{escape_markup(action)}[/dim]")
+		# soft_wrap：Rich 的硬折行会把命令断成两行，照抄后无法执行（Issue #2770）。
+		console.print(f"    [dim]{escape_markup(action)}[/dim]", soft_wrap=True)
 
 
 def render_action_result(
@@ -1091,6 +1304,31 @@ def render_list_result(
 	render_next_steps(next_steps)
 
 
+def render_saved_search_list(
+	items: list[dict[str, Any]],
+	title: str,
+	*,
+	next_steps: Sequence[str],
+) -> None:
+	"""在终端列表中展示已保存的筛选条件与本地创建时间。"""
+	rows = [
+		{
+			"name": item["name"],
+			"params": "\n".join(
+				f"{key}: {cell_text(value)}" for key, value in configured_search_params(item["params"]).items()
+			) or "-",
+			"created_at": unix_time_label(item.get("created_at")),
+		}
+		for item in items
+	]
+	render_list_result(
+		rows,
+		title,
+		[("名称", "name", "bold cyan"), ("条件", "params", "green"), ("创建时间", "created_at", "dim")],
+		next_steps=next_steps,
+	)
+
+
 def render_record_result(
 	data: dict[str, Any],
 	*,
@@ -1108,7 +1346,9 @@ def _ai_value_lines(value: Any) -> list[str]:
 		lines = []
 		for item in value:
 			if isinstance(item, dict):
-				inline = "  ".join(f"{k}={v}" for k, v in item.items())
+				# 直接 f-string 插值会让超大整数在 ``str()`` 上限处抛 ValueError，
+				# 容器还会漏出 Python repr；键值分别走安全文本与单元格归一（Issue #2826）。
+				inline = "  ".join(f"{safe_text(key)}={cell_text(child)}" for key, child in item.items())
 				lines.append(f"  · {escape_markup(inline)}")
 			else:
 				lines.append(f"  · {escape_markup(item)}")
@@ -1135,7 +1375,10 @@ def render_ai_result(
 		body.append(f"[bold cyan]{escape_markup(key)}[/bold cyan]")
 		body.extend(_ai_value_lines(value))
 		body.append("")
-	console.print(Panel("\n".join(body).rstrip() or "[dim]empty[/dim]", title=title, border_style="magenta"))
+	# 标题按外部值转义，与正文同一口径（Issue #2828）。
+	console.print(
+		Panel("\n".join(body).rstrip() or "[dim]empty[/dim]", title=escape_markup(title), border_style="magenta")
+	)
 	render_next_steps(next_steps)
 
 
