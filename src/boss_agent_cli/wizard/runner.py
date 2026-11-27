@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from boss_agent_cli.api._base_client import PlatformStatusRejected, RequestTextEncodingError, parameter_status_code
-from boss_agent_cli.api.browser_client import BrowserNavigationError, ChatTabCdpUnreachable
+from boss_agent_cli.api.browser_client import (
+	BrowserNavigationError,
+	ChatTabCdpUnreachable,
+	RecruiterChatTabRequired,
+)
 from boss_agent_cli.api.browser_source import BrowserSourceUnavailable, BrowserSourceUnsupported
 from boss_agent_cli.api.client import PlatformRiskError
 from boss_agent_cli.api.proxy import ProxyConfigurationError
@@ -52,6 +56,9 @@ WorkflowEvent = Callable[[str, str, Mapping[str, Any] | None], None]
 #: 命中即停止、且不允许重试的账号 / 环境风控码。
 _RISK_CODES = frozenset({"ACCOUNT_RISK", "ENVIRONMENT_RISK"})
 
+#: 认证失败可能发生在写请求已经发出之后，不能仅凭错误码判定可重放。
+_AUTH_FAILURE_CODES = frozenset({"AUTH_REQUIRED", "AUTH_EXPIRED", "TOKEN_REFRESH_FAILED"})
+
 #: 带 ``replay_safe: false`` 时必须阻断重放的步骤状态。``waiting_input``
 #: 也可能带着写前标记（旧数据 / 手工漂移）：执行器自身会清空它，但读到就不能放行。
 _REPLAY_BLOCKING_STATUSES = frozenset({
@@ -81,6 +88,7 @@ class WorkflowActionError(Exception):
 		details: dict[str, Any] | None = None,
 		replay_safe: bool = True,
 		auto_retry: bool = True,
+		platform_rejected: bool = False,
 	) -> None:
 		super().__init__(message)
 		self.code = code
@@ -96,6 +104,9 @@ class WorkflowActionError(Exception):
 		# recoverable 表示修正后可重新执行；auto_retry=False 的确定性失败
 		# （如本地配置损坏）不进入同一次运行的自动重试循环（Issue #1525）。
 		self.auto_retry = auto_retry
+		# 只由写响应解包设置，供预约释放失败分类；本地停止不能凭错误码冒充平台拒绝。
+		# 这是本次调用的内部证据，不写入对外信封或断点（Issue #2944）。
+		self.platform_rejected = platform_rejected
 
 	def to_dict(self) -> dict[str, Any]:
 		result: dict[str, Any] = {
@@ -211,7 +222,7 @@ def _search_pipeline_error(
 			recovery_action=recovery_action,
 		)
 	message = platform_error_message(code, exc.message, "搜索结果获取失败")
-	if code in {"AUTH_EXPIRED", "AUTH_REQUIRED", "TOKEN_REFRESH_FAILED"}:
+	if code in _AUTH_FAILURE_CODES:
 		recoverable, _ = error_contract_for_code(code)
 		return WorkflowActionError(
 			code,
@@ -630,11 +641,22 @@ class WorkflowRunner:
 					except WorkflowActionError as exc:
 						if not exc.recoverable or not exc.auto_retry or not exc.replay_safe or attempt >= max_retries:
 							raise
+						# 认证失败可能发生在写请求已经发出之后；没有显式「未发出」
+						# 证据时不能清标记自动重试，否则同一写请求会被派发两次
+						# （Issue #2913）。限流等平台明确拒绝仍按既有契约重放。
+						write_marker = (
+							self._persisted_write_marker(run_id, step_name)
+							if exc.code in _AUTH_FAILURE_CODES
+							else None
+						)
+						if write_marker is not None:
+							raise self._unconfirmed_error(exc.code, write_marker) from exc
 						attempt += 1
-						control.raise_if_requested()
-						# 动作明确报告了可以重放的失败：这次尝试在写请求前预先落盘的「结果未知」
-						# 随之作废。留着它，下一次尝试还没发出请求就被终止也会被当成结果未知。
+						# 动作明确报告了可以重放的失败：先撤销这次尝试的写前标记，
+						# 再检查下一次尝试是否允许开始。否则此处截止／停止会把已知的
+						# 平台拒绝误判成结果未知，永久禁止恢复（Issue #3020）。
 						self._store.set_step_error(run_id, step_name, None)
+						control.raise_if_requested()
 						# 动作可能在失败前已保存内部任务绑定；自动重试也要读取最新断点，
 						# 否则 crawl_start 会另建任务并丢开原任务的进度与预算（Issue #972）。
 						persisted = self._store.get_checkpoint(run_id) or {}
@@ -663,7 +685,7 @@ class WorkflowRunner:
 				)
 			except WorkflowActionError as exc:
 				if (
-					exc.code in {"AUTH_REQUIRED", "AUTH_EXPIRED", "TOKEN_REFRESH_FAILED"}
+					exc.code in _AUTH_FAILURE_CODES
 					and exc.recoverable
 					and exc.replay_safe
 					and exc.recovery_action == error_contract_for_code(exc.code)[1]
@@ -742,13 +764,35 @@ class WorkflowRunner:
 			except ChatTabCdpUnreachable as exc:
 				# 脚本未发送，动作没有平台写入：按可重试的 CDP 不可用收口，
 				# 不进入「结果未知」分支（Issue #1455）。
-				recoverable, recovery = error_contract_for_code("CDP_UNAVAILABLE")
-				error = WorkflowActionError(
-					"CDP_UNAVAILABLE",
-					f"CDP 调试端点不可达，聊天页动作尚未发送: {exc}",
-					recoverable=recoverable,
-					recovery_action=recovery,
-				)
+				# 但只有异常类型、没有 request_sent=False 证据时不能覆盖已落盘的
+				# 写标记：那可能是一次已经发出、结果未知的写（Issue #2904）。
+				write_marker = self._persisted_write_marker(run_id, step_name)
+				if write_marker is not None:
+					error = self._unconfirmed_error("CDP_UNAVAILABLE", write_marker)
+				else:
+					recoverable, recovery = error_contract_for_code("CDP_UNAVAILABLE")
+					error = WorkflowActionError(
+						"CDP_UNAVAILABLE",
+						f"CDP 调试端点不可达，聊天页动作尚未发送: {exc}",
+						recoverable=recoverable,
+						recovery_action=recovery,
+					)
+			except RecruiterChatTabRequired as exc:
+				# 招聘者聊天页不存在，脚本未发送。与 CLI 的 display 分支同码：
+				# 不能落成可重试的 NETWORK_ERROR，更不能按结果未知拦住恢复
+				# （Issue #2898）。有写标记且无显式未发出证据时仍须 fail-closed
+				# （Issue #2904）。
+				write_marker = self._persisted_write_marker(run_id, step_name)
+				if write_marker is not None:
+					error = self._unconfirmed_error("RECRUITER_CHAT_TAB_REQUIRED", write_marker)
+				else:
+					recoverable, recovery = error_contract_for_code("RECRUITER_CHAT_TAB_REQUIRED")
+					error = WorkflowActionError(
+						"RECRUITER_CHAT_TAB_REQUIRED",
+						str(exc),
+						recoverable=recoverable,
+						recovery_action=recovery,
+					)
 			except BrowserSourceUnavailable as exc:
 				# 策略表的 doctor / status --live 读的是 <data_dir> 里的登录态与风险锁，
 				# 这里补上本次运行的数据目录与平台（Issue #980）。
@@ -1025,6 +1069,14 @@ class WorkflowRunner:
 					# 终止，不再把 action 已声明的失败当成成功继续。
 					return self._finish_declared_status(run_id, step_name, result, result_data, declared_marker)
 				continue
+
+			# 认证类失败是写后也可能出现的响应（登录态在派发后才失效），不能
+			# 凭错误码就判定可重放；其他平台明确拒绝的码（如 RATE_LIMITED）
+			# 仍按既有契约放行恢复（Issue #2910）。
+			if error.replay_safe and error.code in _AUTH_FAILURE_CODES:
+				write_marker = self._persisted_write_marker(run_id, step_name)
+				if write_marker is not None:
+					error = self._unconfirmed_error(error.code, write_marker)
 
 			error_data = error.to_dict()
 			failed_status = (

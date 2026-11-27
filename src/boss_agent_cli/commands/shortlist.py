@@ -86,7 +86,10 @@ def shortlist_group() -> None:
 @click.option("--company", default="", help="公司名称")
 @click.option("--city", default="", help="城市")
 @click.option("--salary", default="", help="薪资")
-@click.option("--source", default="manual", help="来源，如 search/recommend/show/manual")
+@click.option(
+	"--source", default=None,
+	help="来源，如 search/recommend/show/manual；省略时新记录记为 manual，重复加入保留原来源",
+)
 @click.option("--lid", default="", help="与 security_id 同一列表项的访问上下文（可选；不推断有效期）")
 @click.option("--tags", default="", help="本地标签，逗号分隔")
 @click.option("--note", default="", help="本地备注")
@@ -99,7 +102,7 @@ def shortlist_add_cmd(
 	company: str,
 	city: str,
 	salary: str,
-	source: str,
+	source: str | None,
 	lid: str,
 	tags: str,
 	note: str,
@@ -119,6 +122,24 @@ def shortlist_add_cmd(
 			hints={"next_actions": [search_cmd]},
 		)
 		return
+	# 空白 --source 是「没设值」的脚本变量，不是一条来源：落库后 list/compare
+	# 显示为空白来源，且 #2960 的保留语义会让它永久粘在记录上（Issues #2960 #2970）。
+	# 与 `shortlist compare --tag ""` 等空白参数同口径，在写盘前按 INVALID_PARAM
+	# 拒绝；省略 --source 才是「未指定」。
+	if source is not None and not source.strip():
+		list_cmd = _hint_command(ctx, "shortlist list")
+		handle_error_output(
+			ctx,
+			"shortlist",
+			code="INVALID_PARAM",
+			message="--source 不能为空或只含空白字符",
+			recovery_action=(
+				"省略 --source 表示未指定来源（新记录记为 manual，重复加入保留原来源），"
+				f"或传入非空来源后重试；用 {list_cmd} 查看已有条目"
+			),
+			hints={"next_actions": [list_cmd]},
+		)
+		return
 	if not _reject_unencodable_fields(
 		ctx,
 		(
@@ -128,7 +149,7 @@ def shortlist_add_cmd(
 			("--company", company),
 			("--city", city),
 			("--salary", salary),
-			("--source", source),
+			("--source", source or ""),
 			("--lid", lid),
 			("--tags", tags),
 			("--note", note),

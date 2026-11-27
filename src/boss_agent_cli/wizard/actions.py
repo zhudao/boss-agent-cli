@@ -35,7 +35,10 @@ from boss_agent_cli.platforms.factory import build_platform_instance, build_recr
 from boss_agent_cli.services.candidate_actions import (
 	CandidateActionBlocked,
 	CandidateActionNotRecorded,
+	CandidateActionReleaseFailed,
 	candidate_action_provably_unsent,
+	candidate_release_recovery_action,
+	exception_reports_request_unsent,
 	run_candidate_action,
 )
 from boss_agent_cli.services.chat_utils import (
@@ -43,6 +46,7 @@ from boss_agent_cli.services.chat_utils import (
 	RELATION_LABELS,
 	chat_cutoff_ts,
 	matches_chat_filters,
+	message_list,
 	normalize_chat_message,
 	relation_text,
 )
@@ -61,6 +65,7 @@ from boss_agent_cli.services.pagination import (
 	MAX_TRUSTED_COUNT,
 	MAX_TRUSTED_PAGE,
 	export_page_budget,
+	list_pagination,
 )
 from boss_agent_cli.crawler.operations import crawl_status
 from boss_agent_cli.crawler.service import (
@@ -114,7 +119,7 @@ from boss_agent_cli.match_score import score_job_dict
 from boss_agent_cli.output import Logger
 from boss_agent_cli.pipeline_state import build_pipeline_items, select_follow_up_candidates
 from boss_agent_cli.resume.models import resume_to_text
-from boss_agent_cli.resume.store import ResumeStore
+from boss_agent_cli.resume.store import ResumeStore, resume_name_input_error
 from boss_agent_cli.schema.error_codes import ERROR_CODES
 from boss_agent_cli.search_filters import (
 	SearchFilterCriteria,
@@ -476,20 +481,17 @@ def _with_items(data: Mapping[str, Any], items: list[dict[str, Any]]) -> dict[st
 
 
 def _pagination_evidence(data: Any, page: int, items: list[dict[str, Any]]) -> dict[str, Any]:
-	"""步骤 data 的分页证据：与 CLI 信封同词汇（Issue #2670）。
+	"""步骤 data 的分页证据：与 CLI 信封同词汇、同实现（Issue #2670 / #2900）。
 
-	平台只给真正的布尔 ``hasMore`` 才认定有 / 没有下一页；缺失或类型漂移
-	（字符串 ``"true"``、数字 ``1``）都是 ``null``，不能据此停止翻页。
+	直接复用 ``services.pagination.list_pagination``：平台返回有效 ``page`` 时
+	以平台为准（并钳制到可信上限），否则回显钳制后的请求页；``has_more`` 只认
+	真正的布尔 ``hasMore``，缺失或类型漂移（字符串 ``"true"``、数字 ``1``）都是
+	``null``，不能据此停止翻页；``total`` 是本次返回条数。
+
+	此前这里是固定回显请求页的本地副本，平台纠正页码后向导仍报请求页，与 CLI
+	信封产生两套证据（Issue #2900）。
 	"""
-	raw_has_more = data.get("hasMore") if isinstance(data, dict) else None
-	has_more = raw_has_more if isinstance(raw_has_more, bool) else None
-	return {
-		"page": page,
-		"has_more": has_more,
-		"has_more_source": "platform_hasMore" if has_more is not None else "unknown",
-		"total": len(items),
-		"total_kind": "returned_page_count",
-	}
+	return list_pagination(data, page=page, rows=items)
 
 
 def _optional_str(value: Any) -> str | None:
@@ -528,6 +530,33 @@ def _required_nonblank_value(inputs: Mapping[str, Any], name: str) -> str:
 			recovery_action=f"在 inputs 中提供有效的 {name} 后重试",
 		)
 	return value
+
+
+def _reject_unencodable_inputs(**fields: str | None) -> None:
+	"""标识 / 自由文本必须能按严格 UTF-8 编码（Issue #3017）。
+
+	客户端在发出第一个字节之前就会因孤立代理项抛 ``RequestTextEncodingError``，
+	但写动作的「结果未知」标记已经落盘，runner 的通用异常分支会先把确定未发出的
+	请求报成 ``NETWORK_ERROR`` 结果未知并禁止 ``--resume`` 重放。与 CLI 命令入口
+	同口径，在构造平台与 ``begin_write`` 之前按参数错误拒绝。
+	"""
+	bad = [
+		name
+		for name, value in fields.items()
+		if value is not None and not is_utf8_encodable(value)
+	]
+	if not bad:
+		return
+	raise WorkflowActionError(
+		"INVALID_PARAM",
+		f"{' / '.join(bad)} 含有无法按 UTF-8 编码的字符（如孤立代理项），请求未发出",
+		recoverable=True,
+		recovery_action=(
+			"去掉无效字符后新建 workflow（同一 run 的输入已绑定，不能原地改写）；"
+			"编号建议重新从 HR 沟通列表输出中取"
+		),
+		replay_safe=True,
+	)
 
 
 def _required_nonblank_str(inputs: Mapping[str, Any], name: str) -> str:
@@ -739,11 +768,12 @@ def _exchange_type(inputs: Mapping[str, Any]) -> int:
 	wizard inputs 来自 ``--input-json`` / MCP，不经过 Click 的 ``Choice``，catalog
 	也只检查必填项。原先除 ``wechat`` 外的任何值都会静默按手机号处理（`"wecaht"`、
 	`"PHONE"`、`"phone "`），发出与用户意图不同的隐私授权请求（Issue #905）。
-	未提供类型时按 schema 默认 ``phone``。
+	未提供类型时按 schema 默认 ``phone``；显式空串 / ``null`` 与 CLI 的
+	``--type ""`` 同口径，必须报参数错误，绝不能静默按默认发出授权请求（Issue #2943）。
 	"""
-	raw = inputs.get("type")
-	if raw is None or raw == "":
+	if "type" not in inputs:
 		return 1
+	raw = inputs["type"]
 	if raw == "wechat":
 		return 2
 	if raw == "phone":
@@ -990,6 +1020,7 @@ def _unwrap(
 		recovery_action=recovery,
 		details=details if isinstance(details, dict) and details else None,
 		replay_safe=replay_safe,
+		platform_rejected=write and replay_safe and code not in RISK_ERROR_CONTRACTS,
 	)
 
 
@@ -1015,10 +1046,12 @@ def _write_call(
 	``--resume`` 凭这条记录拒绝重放（Issue #1019）。``call`` 只负责发请求：参数的
 	校验与前置读取放在调用之前，那时被终止的步骤没有记录，恢复后照常重跑。
 
-	``provably_unsent`` 只由**单请求**写动作传入：异常命中判定时撤销预落的
-	「结果未知」标记，让 ``--resume`` 能重试一次从未发出的写请求（与
-	greet / apply 的 #2298 同口径）。复合动作（写后还有读取，例如
-	``view_geek`` 或聊天页发送）不得传入：同一异常类型可能发生在写请求之后。
+	``provably_unsent`` 命中时撤销预落的「结果未知」标记，让 ``--resume`` 能重试
+	一次从未发出的写请求（与 greet / apply 的 #2298 同口径）。单请求写可以直接
+	传 ``candidate_action_provably_unsent``；复合动作（写后还有读取，例如
+	``view_geek`` 或聊天页发送）只能传 ``exception_reports_request_unsent``
+	这类**只认底层显式证据**的判定——同一个异常类型可能发生在写请求之后
+	（Issue #2898）。
 
 	不经 runner 直接调用动作时没有步骤可记，直接执行。
 	"""
@@ -1367,6 +1400,24 @@ def _raise_local_state_write_failed(message: str, details: dict[str, Any]) -> No
 	)
 
 
+def _raise_candidate_release_failed(
+	context: ActionContext, label: str, details: dict[str, Any], reference: str | None
+) -> NoReturn:
+	"""请求可证明未发出或平台明确拒绝，但预约没释放：不可重试，避免下一次撞 ACTION_UNCONFIRMED。"""
+	if context.workflow_control is not None:
+		# 请求没有被平台接受，撤销预落的「结果未知」标记（与派发前失败同口径）。
+		context.workflow_control.clear_write()
+	raise WorkflowActionError(
+		"LOCAL_STATE_WRITE_FAILED",
+		f"本次{label}未产生平台记录，但本地预约未释放；清理本地预约后再重试",
+		recoverable=False,
+		recovery_action=candidate_release_recovery_action(reference, lambda command: _hint_command(context, command)),
+		details={"request_sent": False, "recorded": False, "claim_reference": reference, **details},
+		replay_safe=False,
+		auto_retry=False,
+	)
+
+
 def _raise_candidate_action_blocked(
 	context: ActionContext, blocked: CandidateActionBlocked, *, check_command: str
 ) -> NoReturn:
@@ -1415,6 +1466,15 @@ def _candidate_apply(context: ActionContext, inputs: Mapping[str, Any], prior: M
 				_raise_local_state_write_failed(
 					"投递/立即沟通已提交，但本地状态保存失败；不要自动重发",
 					{"security_id": security_id, "job_id": job_id, "applied": True, "recorded": False},
+				)
+			except CandidateActionReleaseFailed as release_failed:
+				# 请求可证明未发出或平台明确拒绝，但 pending 没释放；照原提示
+				# 重试会撞结果未知（Issues #2944 #2971）。
+				_raise_candidate_release_failed(
+					context,
+					"投递/立即沟通",
+					{"security_id": security_id, "job_id": job_id, "lid": lid},
+					release_failed.claim_reference,
 				)
 			except BaseException as exc:
 				# 派发前失败：撤销 _write_call 预落的「结果未知」写标记，让 --resume
@@ -1466,6 +1526,12 @@ def _candidate_greet(context: ActionContext, inputs: Mapping[str, Any], prior: M
 				_raise_local_state_write_failed(
 					"已向该招聘者打招呼，但本地状态保存失败；不要自动重发",
 					{"security_id": security_id, "job_id": job_id, "greeted": True, "recorded": False},
+				)
+			except CandidateActionReleaseFailed as release_failed:
+				# 请求可证明未发出或平台明确拒绝，但 pending 没释放；照原提示
+				# 重试会撞结果未知（Issues #2944 #2971）。
+				_raise_candidate_release_failed(
+					context, "打招呼", {"security_id": security_id, "job_id": job_id}, release_failed.claim_reference
 				)
 			except BaseException as exc:
 				# 派发前失败：撤销 _write_call 预落的「结果未知」写标记，让 --resume
@@ -1676,7 +1742,9 @@ def _candidate_chat_history(context: ActionContext, inputs: Mapping[str, Any], p
 			count=count,
 		)
 		data = _unwrap(platform, response, "聊天记录获取失败", context=context)
-	items = _extract_list_items(data, ("messageList", "messages", "list", "items", "result"))
+	# 与 CLI `chatmsg` 共用容器的唯一真源：同一响应在两个入口必须读出同样的
+	# 消息集合，不能再让一侧认 ``messageList``、另一侧只认 ``historyMsgList``（Issue #2962）。
+	items = message_list(data)
 	# 与 CLI `chatmsg` 同一份归一化；items 仍保留平台原值供后续步骤使用（Issue #2801）。
 	messages = [normalize_chat_message(item, gid=gid, friend_name=friend_display_name(friend)) for item in items]
 	return StepResult(
@@ -1764,6 +1832,17 @@ def _ai_assist(context: ActionContext, inputs: Mapping[str, Any], prior: Mapping
 	# 空白简历名在 CLI 由 `_load_resume_text` 报 INVALID_PARAM，不能落到
 	# RESUME_NOT_FOUND 把参数错误伪装成「简历不存在」（Issue #2523）。
 	resume_name = _required_nonblank_value(inputs, "resume")
+	# 超长名同口径，且必须早于路径读取：ENAMETOOLONG 会被报成「简历损坏」，
+	# 指引里的 resume delete 也无法执行（Issue #2969）。
+	resume_name_error = resume_name_input_error(resume_name)
+	if resume_name_error is not None:
+		message, recovery = resume_name_error
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			message,
+			recoverable=True,
+			recovery_action=f"{recovery}；用 {_hint_command(context, 'resume list')} 查看已有简历",
+		)
 	resume, load_error = ResumeStore(context.data_dir / "resumes").get_with_error(resume_name)
 	if resume is None and load_error is not None:
 		# 文件存在但读不出来：报「不存在」会让 Agent 去 resume init，又被同名
@@ -2964,6 +3043,7 @@ def _recruiter_call(
 	fallback: str,
 	*,
 	list_keys: tuple[str, ...] = (),
+	list_extractor: Callable[[Any], list[dict[str, Any]]] | None = None,
 	write: bool = False,
 	check_command: str | None = None,
 	provably_unsent: Callable[[BaseException], bool] | None = None,
@@ -2983,7 +3063,12 @@ def _recruiter_call(
 			data = _unwrap(platform, call(platform), fallback, context=context, check_command=check_command)
 	payload: dict[str, Any] = {"result": data}
 	items: list[dict[str, Any]] = []
-	if list_keys:
+	if list_extractor is not None:
+		# 有共享解析器时不再走通用键猜测：聊天历史这类有明确容器集合的
+		# 数据必须与 CLI 读出同一结果（Issue #2962）。
+		items = list_extractor(data)
+		payload = _with_items(payload, items)
+	elif list_keys:
 		items = _extract_list_items(data, list_keys)
 		payload = _with_items(payload, items)
 	if page is not None:
@@ -3057,6 +3142,8 @@ def _recruiter_resume(context: ActionContext, inputs: Mapping[str, Any], prior: 
 	# 非字符串不能 str() 后发给平台：{"a": 1} 会变成它的 repr 进入一次
 	# effect: unknown 的请求（Issue #2633）。空串仍按未提供处理。
 	security_id = _optional_str_strict(inputs, "security_id") or None
+	# 编码失败发生在请求发出之前；必须在写标记落盘前拒绝（Issue #3017）。
+	_reject_unencodable_inputs(geek_id=geek_id, job_id=job_id, security_id=security_id)
 	return _recruiter_call(
 		context,
 		lambda platform: platform.view_geek(geek_id, job_id, security_id),
@@ -3098,14 +3185,15 @@ def _recruiter_last_messages(context: ActionContext, inputs: Mapping[str, Any], 
 				(value for key in ("friendList", "result", "list") if isinstance((value := friend_data.get(key)), list)),
 				[],
 			)
+			# total 按实际提取出的联系人行计数；非对象元素与 CLI `friend_items`
+			# 一样被过滤，不能虚增本页条数（Issue #2900）。
+			extracted = [item for item in friend_items if isinstance(item, dict)]
 			# 与 CLI `hr last-messages` 同口径：分页证据来自沟通列表页，而不是
 			# 逐个会话的最近消息响应（Issue #2672）。
-			pagination = _pagination_evidence(friend_data, page, friend_items)
-			sources = friend_sources([item for item in friend_items if isinstance(item, dict)])
+			pagination = _pagination_evidence(friend_data, page, extracted)
+			sources = friend_sources(extracted)
 			friend_ids = []
-			for item in friend_items:
-				if not isinstance(item, dict):
-					continue
+			for item in extracted:
 				fid = friend_id_for(item)
 				if fid is not None and fid not in friend_ids:
 					friend_ids.append(fid)
@@ -3157,12 +3245,17 @@ def _recruiter_reply(context: ActionContext, inputs: Mapping[str, Any], prior: M
 	# 纯空白消息与 CLI `hr reply` 同口径拒绝：它会被当成一条空消息真正发给
 	# 候选人（Issue #2516）。
 	message = _required_nonblank_value(inputs, "message")
+	# 编码失败发生在请求发出之前；必须在写标记落盘前拒绝（Issue #3017）。
+	_reject_unencodable_inputs(message=message)
 	return _recruiter_call(
 		context,
 		lambda platform: platform.send_message_by_friend(friend_id, message),
 		"消息发送失败",
 		write=True,
 		check_command=f"hr chatmsg {friend_id}",
+		# 复合动作不按异常类型推断；只认客户端在写前读取 / 脚本发送前标注的
+		# request_sent=False（Issue #2898）。
+		provably_unsent=exception_reports_request_unsent,
 	)
 
 
@@ -3176,7 +3269,7 @@ def _recruiter_chat_history(context: ActionContext, inputs: Mapping[str, Any], p
 			max_msg_id=_optional_int_input(inputs, "max_msg_id", minimum=1),
 		),
 		"聊天记录获取失败",
-		list_keys=("messageList", "messages", "list", "items", "result"),
+		list_extractor=message_list,
 	)
 
 
@@ -3190,6 +3283,9 @@ def _recruiter_request_resume(
 		"附件简历请求失败",
 		write=True,
 		check_command=f"hr chatmsg {friend_id}",
+		# 写前读取 / 脚本发送前失败带显式 request_sent=False 时才撤销写标记；
+		# 写后回读失败没有该证据，继续按结果未知保护（Issue #2898）。
+		provably_unsent=exception_reports_request_unsent,
 	)
 
 
@@ -3204,6 +3300,8 @@ def _recruiter_exchange_contact(
 		"联系方式交换请求失败",
 		write=True,
 		check_command=f"hr chatmsg {friend_id}",
+		# 同 recruiter_request_resume：只认显式写前证据（Issue #2898）。
+		provably_unsent=exception_reports_request_unsent,
 	)
 
 

@@ -96,7 +96,9 @@ def collect_friend_list_page(
 
 	返回 (items, error_response, pages_scanned, truncated)：
 
-	- 翻到平台 ``hasMore=False``、重复页或空页：``truncated=False``，结果完整；
+	- 翻到平台 ``hasMore=False``、重复页或可识别的空列表容器：``truncated=False``，
+	  结果完整；成功响应缺少列表容器时无法证明列表结束，继续翻页（Issue #2927）；
+	  重复页仍明确声明有后续时保留早停，但标记 ``truncated=True``（Issue #2956）；
 	- 翻满 ``max_pages`` 且平台仍声称有下一页：``truncated=True``，items 只是前
 	  ``max_pages`` 页。调用方必须把这一点告诉 Agent / 用户，不能当成完整统计
 	  （Issue #885）。
@@ -121,11 +123,14 @@ def collect_friend_list_page(
 			platform_data = {}
 		# 列表元素混入 null / 数字 / 字符串时只跳过坏元素（Issue #1141 同一口径），
 		# 否则下游 build_pipeline_items / _friend_record 读键会整条命令崩溃。
-		page_items = friend_list_page_items(platform_data)
+		# 同时保留完整性信号：没有可识别列表容器的成功页不能证明列表结束
+		# （Issue #2927），只有平台明确给出空列表或 hasMore=False 才能停。
+		page_items, page_complete = friend_list_page_observation(platform_data)
 		if not page_items:
-			if platform_data.get("hasMore") is not False and friend_list_page_has_content(platform_data):
-				# 整页元素被跳过：不是空页，继续翻页（Issue #1878）。翻满上限时
-				# 同样是截断，否则坏元素页会让调用方把前缀当完整结果（Issue #2006）。
+			if platform_data.get("hasMore") is not False and not page_complete:
+				# 整页元素被跳过，或根本没有列表容器：不是「平台确认的空页」，
+				# 继续翻页（Issue #1878、#2927）。翻满上限时同样要标记截断，
+				# 否则调用方会把前缀当完整结果（Issue #2006）。
 				if pages_scanned >= max_pages:
 					truncated = True
 				page += 1
@@ -147,6 +152,10 @@ def collect_friend_list_page(
 		if any(uid for uid, _ in identities):
 			signature = tuple(identities)
 			if signature in seen_signatures:
+				# 重复页仍明确声明有后续时无法证明列表完整：保留早停避免重复请求，
+				# 但结果只是前缀，必须与联系人查找同口径标记不完整（Issue #2956）。
+				if platform_data.get("hasMore") is True:
+					truncated = True
 				break
 			seen_signatures.add(signature)
 		# 整页签名只挡「整页重复」。沟通列表按最近消息排序、按页码取数：翻页期间

@@ -139,6 +139,8 @@ boss crawl stop <run_id>
 | `boss crawl stop <run_id>` | 请求运行中任务在下一个安全点停止并保留 checkpoint；仅对 queued / running 生效。执行器已退出（执行锁空闲）时按断点结算 `stopped` 并回报 `stale_recovered`；向导与 MCP 的 `crawl_stop` 步骤同口径。已结束的任务返回 `CRAWL_RUN_FINISHED` |
 | `boss crawl shortlist <run_id> (--all \| --selector <csel_...>)` | 将 crawl 结果导入原项目的本地候选池；不请求平台，保留内部职位关联和详情缓存供 `boss ai fit` 使用 |
 
+MCP 的 `boss_crawl_shortlist.selectors` 与 `boss_wizard.requested_steps` 若显式提供，必须是非空数组，元素为非空且互不重复的字符串。工具 schema 声明这些约束，入口在启动 CLI 子进程前按 `INVALID_PARAM` 拒绝非法值。
+
 同一采集 `run_id` 同时只允许一个执行器。重叠的前台恢复返回 `CRAWL_BUSY`（`recoverable: true`，`--exit-codes sysexits` 下为 75），不发出请求、不修改断点或清除停止请求；`hints.next_actions` 只给原数据目录的 `crawl status <run_id>`，等当前执行结束后再恢复。新建采集、后台 worker 与向导采集步骤共用这项互斥；向导的失败信封与该失败任务的状态查询同样只建议查看内部采集状态。`--background` 对有待恢复工作的非排队任务先探测执行锁，再立即返回供轮询：仍被占用时返回 `running`，不另起 worker，也不清除停止请求；原 worker 已退出、锁已释放但记录仍为 `running` 时，会启动恢复并返回 `queued`。父进程在启动前释放探测锁，worker 重新取得执行权后才读取最新断点，保留已提交页面和累计预算。刚进入 `queued` 的任务继续等待原 worker；排队超过 30 秒仍未被接手（后台进程被强制终止等）时，同样先探测执行锁——仍被占用返回 `running`，空闲则重新启动 worker，此时 `crawl status` 的 `hints.next_actions` 也会给出 `crawl resume <run_id> --background`。`status` / `results` / `stop` 在执行期间照常可用；锁按 `run_id` 隔离，进程退出后由操作系统释放，不需手工删除锁文件。同一数据目录的采集共用一个 Chrome 配置目录（`crawl/chrome-profile`）：另一个 run 的采集 Chrome 仍在运行时，新 run 不会删除它的 `SingletonLock`，而是返回 `CRAWL_PROFILE_BUSY`（`recoverable: true`），不发出请求；只有锁里记录的进程已不存在或 pid 无法解析（如超大数值）时才按陈旧锁清理。附着已有调试端口前，会用配置目录 `SingletonLock` 记录的 Chrome 主进程 pid 与 CDP 报告的浏览器进程比对；Windows 没有该锁时退回读进程命令行的 `--user-data-dir`。确认不了归属（例如端口被日常 Chrome 占用）时返回 `CRAWL_PROFILE_BUSY`，不注入 boss login 的 Cookie、不注册 Hook，也不会退出对方的浏览器。同一配置目录的打开流程另有一把跨进程锁，两个 run 同时启动时只有一个能进入。无法准备执行锁时返回 `LOCAL_IO_ERROR`，不发出请求。Python API 的 `CrawlService.resume()` 在任务被占用时抛出 `CrawlBusyError`，可在当前执行结束后再次恢复。
 
 后台 worker 的输出不回传给调用方，所以登录态由父进程先查：`crawl start` 与需要启动 worker 的 `crawl resume --background` 在本地登录态缺失、没有 Cookie 或缺少 `wt2` 时直接返回 `AUTH_REQUIRED`，不创建任务、不解除停止请求、不启动进程；参数错误仍先于登录检查报出，已完成或仍在排队的任务不受影响。worker 若在接手之前退出（登录态在启动瞬间失效、风险锁等），而任务仍显示 `queued` 或 `running`，会把它落为 `stopped` 并在 `error` 写明「后台任务未能开始执行」与错误码，`crawl status` 可见，登录或解除阻断后用 `crawl resume` 重新启动；任务已处于终态（上一次执行的结果）或另一个执行器持有执行权时不改写，此时再次执行 `crawl resume --background` 会由父进程报出原因。
@@ -197,7 +199,7 @@ boss crawl stop <run_id>
 
 `history` 的详情、投递、打招呼与下一页提示保留本次 `--data-dir` 与平台：`hints.next_actions` 与终端表尾的 `more:` 命令都携带按 shell 参数转义的绝对目录，换工作目录照抄提示时仍读取同一登录态与浏览记录。目录中的空格、引号与 Rich 标签按字面显示。
 
-`boss chatmsg <uid> --page N` 与 `boss chat-summary <uid> --page N` 同样返回所读消息页的分页证据：`page` 优先使用平台返回的有效页码，否则回显请求页；`has_more` 仅在平台返回布尔 `hasMore` 时为 `true` / `false`，缺失或类型不明确时为 `null`（`has_more_source=unknown`）；`total` 是本页消息条数（`total_kind=returned_page_count`），不代表会话消息总数。仅 `has_more=true` 时附加下一页命令并保留本次 `--count`；`chatmsg --raw` 的翻页命令同时保留 `--raw`，下一页继续输出保真字段。`null` 时 `operator_actions` 说明不能凭本页数量判断。`messages` 缺失或类型不符时按 `historyMsgList` 回退，两者都不可用时按空列表处理、`total=0`。
+`boss chatmsg <uid> --page N` 与 `boss chat-summary <uid> --page N` 同样返回所读消息页的分页证据：`page` 优先使用平台返回的有效页码，否则回显请求页；`has_more` 仅在平台返回布尔 `hasMore` 时为 `true` / `false`，缺失或类型不明确时为 `null`（`has_more_source=unknown`）；`total` 是本页消息条数（`total_kind=returned_page_count`），不代表会话消息总数。仅 `has_more=true` 时附加下一页命令并保留本次 `--count`；`chatmsg --raw` 的翻页命令同时保留 `--raw`，下一页继续输出保真字段。`null` 时 `operator_actions` 说明不能凭本页数量判断。`messages` 缺失或类型不符时依次按 `historyMsgList` / `messageList` 回退，三组都不可用时按空列表处理、`total=0`；向导的 `candidate_chat_history` / `recruiter_chat_history` 与 `chatmsg` 共用同一解析。
 
 沟通类命令的后继提示保留本次 `--data-dir`：`chat` / `chatmsg` / `chat-summary` / `mark` / `exchange` 的 `hints.next_actions`（`detail`、`chatmsg`、下一页等）、`CONTACT_NOT_FOUND` 的 `boss chat` 以及 `chat --export` 的 `config reset export_dir` 恢复命令都携带经过 shell 参数转义的绝对目录与平台；换工作目录执行提示时仍使用同一登录态、缓存与快照。
 
@@ -221,11 +223,15 @@ boss crawl stop <run_id>
 
 `favorites` 与 `shortlist` 的 `hints.next_actions` 保留原 `--data-dir` 与平台：从收藏预览继续翻页、同步，再读取或比较候选池时，始终使用同一账号与本地目录。`shortlist` 参数错误时的恢复命令也保留目录；加入后的删除提示和缺失条目的重建提示会对两个标识按 shell 参数转义，可直接复制执行。
 
-`boss shortlist add <sid> <jid> --lid <lid>` 可保存与 `sid` 同一列表项的访问上下文，`list` / `compare` 会返回该值；crawl 和 favorites 导入也保留对应上下文，favorites 预览继续脱敏。`lid` 可省略，保存不代表其仍有效，不推断有效期或跨账号身份。
+`boss shortlist add <sid> <jid> --lid <lid>` 可保存与 `sid` 同一列表项的访问上下文，`list` / `compare` 会返回该值；crawl 和 favorites 导入也保留对应上下文，favorites 预览继续脱敏。`lid` 可省略，保存不代表其仍有效，不推断有效期或跨账号身份。`--source` 省略时新记录记为 `manual`；重复加入同一职位时保留已有来源，显式传入 `--source` 才会覆盖。空白 `--source`（空串或只含空白）按 `INVALID_PARAM` 拒绝，避免把未设值的脚本变量写成一条来源。
 
 `boss shortlist annotate` 至少需要一个非空 `--add-tag` / `--remove-tag` 或 `--note`；空标签与空 `--tag` 会返回 `INVALID_PARAM`，不会静默变成「没有过滤」或 `updated: true`。`--note ""` 仍表示清空备注。
 
 `history` / `favorites list` 的 `pagination.has_more` 与 `recommend` / `chat` 同一口径：只有平台返回布尔 `hasMore` 时才是 `true` / `false`；缺失或类型不明确时为 `null`、`has_more_source=unknown`，不会默认成 `false`，也不提示下一页。`total` 始终是本页返回条数（`total_kind=returned_page_count`）。`favorites` 的成功包络里 `cardList` 只有 `null` / 缺失才按空列表处理；`{}` / `""` / `0` 这类假值非列表、以及页内全为非对象元素同样按可重试 `NETWORK_ERROR` 上报，不会伪装成「没有收藏」或翻满上限后的数量超限。
+
+`favorites sync` 批量导入时会把空串或纯空白的访问标识 / 职位 ID 计入 `skipped_count`，不会落库，也不会覆盖同一职位原有的有效访问标识。`crawl shortlist` 从本地断点导入时执行同一规则：这类记录计入 `skipped_count`，不写入候选池。
+
+`favorites sync` 的 `data.pages_scanned` 记录已请求页数，`data.truncated` 标记是否因「重复页仍明确声明有后续」而早停。此时保留已导入的有效职位，但同步不完整、计数仅覆盖已扫描前缀；信封 `hints.warnings` 与终端真人指引会说明重复页原因。正常末页或重复页未明确声明有后续时 `truncated=false`；达到安全分页上限仍报 `RESULT_LIMIT_REACHED`，不写入不完整结果。
 
 ## 招聘者模式
 
@@ -252,15 +258,15 @@ boss crawl stop <run_id>
 
 招聘者命令的后继与恢复提示显式携带原 `--data-dir`：`hr whoami` / `applications` / `resume` / `chat` / `chatmsg` / `last-messages` / `jobs` / `candidates` / `recommendations` / `greet` / `reply` / `request-resume` / `accept-resume` / `download-resume` / `location` 的 `hints.next_actions`、终端 `next_steps`、失败与空结果的 `recovery_action`，以及嵌入 `operator_actions` 的核对命令都指回同一份登录态与本地缓存。`hr` 组自身会设置 recruiter 角色，照抄提示无需再补 `--role`，也不会读取默认目录中另一套账号状态；当前平台不支持招聘者模式时，恢复命令固定 `--platform zhipin` 并保留原目录。
 
-`boss hr resume` 默认返回结构化简历；`data.basic.gender` 仅转换已识别的整数编码，字段缺失、`null` 或未知值保留为空字符串，不推断候选人的性别。加 `--raw` 可读取原始响应。
+`boss hr resume` 默认返回结构化简历；`data.basic.gender` 仅转换已识别的整数编码，字段缺失、`null` 或未知值保留为空字符串，不推断候选人的性别。加 `--raw` 可读取原始响应。查看路径同时传 `--friend-id` 却漏了 `--exchange` 时仍按查看成功返回，但 `hints` 会说明该参数本次未使用，并给出 `hr resume --friend-id <friend_id> --exchange` 后继命令。
 
 先在同一组候选人参数和话术后加 `--dry-run` 预览；操作者明确批准该候选人和话术后，才改为 `--yes` 发送。MCP 的 `yes` 默认不传，Agent 不得自行确认；预览本身不构成人工批准。
 
 `greet` 按候选人和招聘职位的加密 ID 在本地原子预约，成功后记录已发送；响应丢失、进程退出或限流时保留预约，禁止自动重发。使用 `boss hr chat --job-id <id>` 核对会话，必要时在官方页面处理，不要删除记录来重发。
 
-`hr chat` 的沟通列表接口只返回基础会话信息（friendId、姓名、updateTime 等），未读数、最后一条消息和时间按以下顺序补全：CDP 模式下先读聊天页里已加载的会话列表（geek-list 组件的 vue-rx 订阅 `list$` / `allList$`，只读页面内存，不发请求；只覆盖页面已滚动加载的会话，`hints.summary_sources.page_snapshot` 给出条数和 `has_more`，未读数只能从这里拿到）；页面里没有覆盖到的会话再调用最近消息接口 `userLastMsg`：按 friendSource 分组、每批 50 个串行请求，默认只补列表前 100 个会话（最多 2 次请求），`--summary-limit <n>`（0–300，0=不请求）可调整，任一批失败即停止；超出上限的会话按下面的兜底处理，`hints.summary_sources.last_messages_skipped` 标明条数。`last_time` 取消息的毫秒时间戳；`msg_status`（未读/已读）只对自己发出的最后一条消息有值，候选人发来的为 `null`。`hr last-messages` 同样分批，`--limit` 默认 100；都拿不到时 `unread` / `msg_status` / `last_msg` 为 `null`，`last_time` 退回会话的 `updateTime` 并标注 `last_time_source: "updateTime"`（这是会话更新时间，不一定是最后一条消息的时间）。每条记录的 `summary_source` 标明来源（`page` / `last_messages` / `friend_list`），`hints.summary_sources` 给出各来源条数和最近消息接口的错误（如有）。不再输出 `-`、`未知` 这类占位。`hints.total_unread` 是聊天页显示的未读总数（页面 `uncountTab$` 第 1 项，覆盖全部会话），`hints.unread_by_tab` 是原始分项计数（第 2、3 项含义未确认），`hints.total_unread_source` 标明来源；只读页面内存，页面不可用时均为 `null`。
+`hr chat` 的沟通列表接口只返回基础会话信息（friendId、姓名、updateTime 等），未读数、最后一条消息和时间按以下顺序补全：CDP 模式下先读聊天页里已加载的会话列表（geek-list 组件的 vue-rx 订阅 `list$` / `allList$`，只读页面内存，不发请求；只覆盖页面已滚动加载的会话，`hints.summary_sources.page_snapshot` 给出条数和 `has_more`，未读数只能从这里拿到）；页面里没有覆盖到的会话再调用最近消息接口 `userLastMsg`：按 friendSource 分组、每批 50 个串行请求，默认只补列表前 100 个会话（单来源最多 2 次最近消息请求，混合来源最多 3 次），`--summary-limit <n>`（0–300，0=不请求）可调整，任一批失败即停止；超出上限的会话按下面的兜底处理，`hints.summary_sources.last_messages_skipped` 标明条数。`last_time` 取消息的毫秒时间戳；`msg_status`（未读/已读）只对自己发出的最后一条消息有值，候选人发来的为 `null`。`hr last-messages` 同样分批，`--limit` 默认 100；都拿不到时 `unread` / `msg_status` / `last_msg` 为 `null`，`last_time` 退回会话的 `updateTime` 并标注 `last_time_source: "updateTime"`（这是会话更新时间，不一定是最后一条消息的时间）。每条记录的 `summary_source` 标明来源（`page` / `last_messages` / `friend_list`），`hints.summary_sources` 给出各来源条数和最近消息接口的错误（如有）。不再输出 `-`、`未知` 这类占位。`hints.total_unread` 是聊天页显示的未读总数（页面 `uncountTab$` 第 1 项，覆盖全部会话），`hints.unread_by_tab` 是原始分项计数（第 2、3 项含义未确认），`hints.total_unread_source` 标明来源；只读页面内存，页面不可用时均为 `null`。
 
-`hr applications` / `hr chat` / `hr candidates` / `hr recommendations` / `hr last-messages` 的列表响应在信封 `pagination` 给出分页证据：`has_more` 只在平台返回布尔 `hasMore` 时为 `true` / `false`，缺失或类型不明确时为 `null`（`has_more_source=unknown`）；`total` 是本页返回条数（`total_kind=returned_page_count`），不代表平台全集。只有 `has_more=true` 才在 `hints.next_actions` 附加保留筛选条件的下一页命令；`null` 时 `hints.operator_actions` 说明不能仅凭本页条数判断是否还有记录。`hr last-messages` 用 `--friend-id` 直查时没有列表页，`pagination` 为 `null`。
+`hr applications` / `hr chat` / `hr candidates` / `hr recommendations` / `hr last-messages` 的列表响应在信封 `pagination` 给出分页证据：`has_more` 只在平台返回布尔 `hasMore` 时为 `true` / `false`，缺失或类型不明确时为 `null`（`has_more_source=unknown`）；`total` 是本页返回条数（`total_kind=returned_page_count`），按实际提取出的联系人行计数（识别 `friendList` / `result` / `list` 三种容器），不代表平台全集。只有 `has_more=true` 才在 `hints.next_actions` 附加保留筛选条件的下一页命令；`null` 时 `hints.operator_actions` 说明不能仅凭本页条数判断是否还有记录。`hr last-messages` 用 `--friend-id` 直查时没有列表页，`pagination` 为 `null`。
 
 `hr chatmsg` 用 `--max-msg-id` 游标向更早消息翻页，信封 `pagination` 相应给出游标证据：`has_more` 只在平台返回布尔 `hasMore` 时取 `true` / `false`，缺失或类型不明确时为 `null`（`has_more_source=unknown`）；`total` 是本页消息条数（`total_kind=returned_page_count`）；`next_max_msg_id` 是本页最旧的可用 `mid`，没有可解析的消息 ID 时为 `null`。只有 `has_more=true` 且存在游标时，`hints.next_actions` 才附加保留本次 `--count` 的下一页命令；`null` 时 `hints.operator_actions` 说明不能凭本页条数判断。游标分页没有页码，因此该命令的 `pagination` 不含 `page`。
 
@@ -273,7 +279,7 @@ boss hr location 10001 --dry-run
 boss hr location 10001 --yes
 ```
 
-`request-resume` 与 `resume --exchange` 在聊天页里调用官方组件完成动作，只点击本次动作新弹出的确认框。成功需要动作后回读聊天记录看到自己新发出的已知请求文案或已识别类型的动作卡片。只有 outgoing WS 帧、页面调用返回成功或未知手机号动作编号时不能确认发送；这些情况返回 `ACTION_UNCONFIRMED`（`recoverable=false`），`error.details` 附带页面日志、确认按钮状态、WS 统计与历史回读核对结果（`history_checked` / `history_matched_count` / `history_attempts` / `history_new_count` / `history_self_count` / `history_recipient_count`）。此时动作可能已经生效，先用 `boss hr chatmsg <friend_id>` 核实，不要直接重试。聊天记录证据也不证明接收方已收到或已读。换手机或微信时如果同时看到了求简历消息，成功结果会带 `side_effects: ["resume_request_detected"]`。`boss agent stop` 打开的 `automation/stop.json` 会在任何请求之前拒绝本次请求；请求抛出异常且无法证明未发出时返回不可重试的 `ACTION_UNCONFIRMED`，能证明未发出的异常保留原有可重试契约。动作前或回读时首次命中风险立即停止，不继续轮询；禁用或仍在加载的编辑器不会被强制开启，目标好友必须唯一匹配。
+`request-resume` 与 `resume --exchange` 在聊天页里调用官方组件完成动作，只点击本次动作新弹出的确认框。成功需要动作后回读聊天记录看到自己新发出的已知请求文案或已识别类型的动作卡片。只有 outgoing WS 帧、页面调用返回成功或未知手机号动作编号时不能确认发送；这些情况返回 `ACTION_UNCONFIRMED`（`recoverable=false`），`error.details` 附带页面日志、确认按钮状态、WS 统计与历史回读核对结果（`history_checked` / `history_matched_count` / `history_attempts` / `history_new_count` / `history_self_count` / `history_recipient_count`）。此时动作可能已经生效，先用 `boss hr chatmsg <friend_id>` 核实，不要直接重试。聊天记录证据也不证明接收方已收到或已读。换手机或微信时如果同时看到了求简历消息，成功结果会带 `side_effects: ["resume_request_detected"]`。`boss agent stop` 打开的 `automation/stop.json` 会在任何请求之前拒绝本次请求；请求抛出异常且无法证明未发出时返回不可重试的 `ACTION_UNCONFIRMED`，能证明未发出的异常按原错误码（参数 / 网络 / CDP 等）输出。动作前或回读时首次命中风险立即停止，不继续轮询；禁用或仍在加载的编辑器不会被强制开启，目标好友必须唯一匹配。
 
 ### 自动化停止与显式恢复
 
@@ -287,7 +293,7 @@ boss hr location 10001 --yes
 
 在同一浏览器、同一账号完成官方验证并确认原先受阻页面正常后，由操作者明确恢复：`boss --role recruiter agent run --resume`。该选项解除本地停止状态并复用已确认动作与队列，不代表平台风险已经解除；普通 `agent run` 不解锁。MCP `boss_agent_run` 的 `resume` 默认 `false`，Agent 只有收到操作者明确恢复指令后才可设置为 `true`；恢复必须显式传 `dry_run=false`，与预览（默认 `dry_run=true`）同时给出会在入口返回 `INVALID_PARAM`。wizard 和 crawl 的可恢复 run 继续使用各自的 `--resume <run_id>` / `crawl resume <run_id>`；已被 `wizard --stop` 置为 `stopped` 的 run 保持终止，应新建 workflow 或恢复其内部任务。`wizard --stop <run_id>` 可重复执行：外层停止已经落盘、内部采集停止尚未写完时，重试会补齐停止传播，不会恢复或重跑业务步骤；不存在的任务仍返回 `WORKFLOW_NOT_FOUND`；已完成的任务返回 `WORKFLOW_ALREADY_FINISHED`，给出 `wizard --status <run_id>` 的结果读取指引。结果未知的写动作（`ACTION_UNCONFIRMED`，或平台已成功但本地记账失败）会把 `replay_safe: false` 写入步骤错误；`--resume` 不会重跑该步骤，只返回原失败与核对指引，确认平台实际状态后应新建 workflow。写请求发出之前，该动作的「结果未知」与核对命令就已经落在执行中的步骤上：执行进程在结果确认前被终止（被 kill、终端关闭、断电）时，步骤会停在 `running` 但带有这条记录，`--resume` 同样不重放，而是把步骤与 run 记为失败并返回 `ACTION_UNCONFIRMED`；只读步骤与尚未走到写请求的中断照常重跑。执行期间查询 `--status` 看到 `running` 步骤带 `ACTION_UNCONFIRMED` 即表示该写请求在途。失败的 run 若待执行步骤的结果无法重放（`replay_safe: false`），`--status` / `--stop` 的 `hints.next_actions` 不再给 `--resume`，只给 `--status` 与新建 workflow；与 TTY「恢复已有任务」列表的筛选口径一致。同一数据目录上的并发 `agent run` 由执行锁串行化：另一个进程正在执行时，本次调用在发出任何请求前返回 `AUTOMATION_RUN_BUSY`；`agent review approve|reject` 同样与执行中的周期互斥，避免整文件回写的旧快照吞掉刚入队的动作。执行周期内若控制锁被 `agent stop` 等命令占用，平台动作可能已经发出：此时返回 `LOCAL_STATE_WRITE_FAILED`（`replay_safe: false`），恢复指引为先核对官方页面、不自动重发；队列里已确认的动作不会重发，但熔断状态可能落后。`--dry-run` 与 `--resume` 入口的冲突没有产生平台动作，仍返回 `AUTOMATION_BUSY`。风控（`ACCOUNT_RISK` / `ENVIRONMENT_RISK`）落盘的 workflow 断点不再把 `--resume` 交给 Agent：`--status` 的 `hints.next_actions` 只给 `boss doctor`，`hints.operator_actions` 按 `RISK_ERROR_CONTRACTS` 给出真人核对说明；操作者处理完官方页面并清除本地风险锁后仍可显式 `--resume`，锁未清除时请求在发出前被拦下（Issue #2608）。run 级或在途步骤的写前标记漂移（步骤停在 `waiting_input`、run 级 `ACTION_UNCONFIRMED`、错误码大小写变化）同样按结果未知阻断，不再 fail-open 重发写请求（Issue #2609）。
 
-MCP 的长运行使用异步子进程，运行期间仍能调用停止/状态工具。取消或超时会尝试中断并回收子进程；写操作被强制终止后可能有未知副作用，`error.details.outcome_unknown=true` 时不可自动重试；只读工具（如 search / show / status）返回 `outcome_unknown=false` 与 `replay_safe=true`，确认子进程已退出后可直接重试。`CLI_ERROR` 同样带这组字段：底层 `boss` 没能启动（不在 MCP server 的 `PATH` 中、`--boss-bin` 路径有误）时进程从未运行，返回 `outcome_unknown=false` 并提示修正安装或 `boss-mcp --boss-bin`；子进程运行后没有输出 JSON 信封时，写工具按结果未知处理（`outcome_unknown=true`），只读工具为 `outcome_unknown=false`；输出的对象缺键、`ok` 不是布尔、`ok` 与退出码矛盾或失败信封缺错误码时同样按 `CLI_ERROR` 收口。宿主追加的可执行文件路径与全局选项在启动前校验，含 NUL / 孤立代理项时返回 `INVALID_PARAM`（`outcome_unknown=false`），子进程不会启动。正常返回的 wizard 超时保留可恢复结果，MCP 等待覆盖其显式超时及保存进度的宽限期，并按 900 秒封顶；太长的 wizard 超时不会让宿主无限期等待。工具入口还会按 `inputSchema` 校验条件必填字符串、数值上下界与数组元素长度，空 `run_id` / `job_id` / 标签、越界数值都在调用 CLI 之前返回 `INVALID_PARAM`。工具参数映射保留写工具的显式空串（如 `boss_greet` 的 `message`、`boss_batch_greet` 的筛选项、`boss_hr_candidates` 的 `city` / `job_id`），由 CLI 在平台调用前按 `INVALID_PARAM` 拒绝，不再静默按未传处理（Issue #2615）。
+MCP 的长运行使用异步子进程，运行期间仍能调用停止/状态工具。取消或超时会尝试中断并回收子进程；写操作被强制终止后可能有未知副作用，`error.details.outcome_unknown=true` 时不可自动重试；只读工具（如 search / show / status）返回 `outcome_unknown=false` 与 `replay_safe=true`，确认子进程已退出后可直接重试。`CLI_ERROR` 同样带这组字段：底层 `boss` 没能启动（不在 MCP server 的 `PATH` 中、`--boss-bin` 路径有误）时进程从未运行，返回 `outcome_unknown=false` 并提示修正安装或 `boss-mcp --boss-bin`；子进程运行后没有输出 JSON 信封时，写工具按结果未知处理（`outcome_unknown=true`），只读工具为 `outcome_unknown=false`；输出的对象缺键、`ok` 不是布尔、`ok` 与退出码矛盾或失败信封缺错误码时同样按 `CLI_ERROR` 收口。宿主追加的可执行文件路径与全局选项在启动前校验，含 NUL / 孤立代理项时返回 `INVALID_PARAM`（`outcome_unknown=false`），子进程不会启动。正常返回的 wizard 超时保留可恢复结果，MCP 等待覆盖其显式超时及保存进度的宽限期；显式超时上限为 900 秒，超过上限的取值在启动子进程前以 `INVALID_PARAM` 拒绝。`--status` / `--stop` 不接受 `--timeout`。工具入口还会按 `inputSchema` 校验条件必填字符串、数值上下界与数组元素长度，空 `run_id` / `job_id` / 标签、越界数值都在调用 CLI 之前返回 `INVALID_PARAM`。工具参数映射保留写工具的显式空串（如 `boss_greet` 的 `message`、`boss_batch_greet` 的筛选项、`boss_hr_candidates` 的 `city` / `job_id`），由 CLI 在平台调用前按 `INVALID_PARAM` 拒绝，不再静默按未传处理（Issue #2615）。
 
 平台要求招聘者先在会话里发过消息，换电话/换微信按钮才会解锁（求简历不受限）。交换前会先看按钮组件是否处于禁用状态（`disabled` 属性、`aria-disabled`、`disabled`/`gray` 等 class、`pointer-events: none`，或组件 props/data 里的禁用标记）；页面上判断不了时，再看动作前读到的完整聊天记录里有没有你发出的消息。确定未解锁时不调用页面交换动作，直接返回 `EXCHANGE_NOT_AVAILABLE`（`recoverable=true`），先回复候选人再试即可；信号拿不准时不拦截，按原流程执行。
 
@@ -333,7 +339,7 @@ boss hr download-resume <friend_id> --message-id <attachment_mid> --output ./res
 
 > 支持 Claude 4.7 / GPT-5 / DeepSeek-V3 / Qwen3 等最新模型，详见 [推荐模型与入口](integrations/ai-models.md)。
 
-简历名是自由文本，可含空格、引号与 shell 元字符。所有以简历名为参数的后继提示（`resume show` / `edit` / `export` / `delete`，含错误消息正文）都按 POSIX shell 规则转义，`shlex.split` 后还原为同一个名字；`resume list` 与 `resume show` / `clone` 遇到损坏文件返回 `RESUME_FILE_INVALID`，给出的 `resume delete` 提示同样可直接复制执行。
+简历名是自由文本，可含空格、引号与 shell 元字符。所有以简历名为参数的后继提示（`resume show` / `edit` / `export` / `delete`，含错误消息正文）都按 POSIX shell 规则转义，`shlex.split` 后还原为同一个名字；`resume list` 与 `resume show` / `clone` 遇到损坏文件返回 `RESUME_FILE_INVALID`，给出的 `resume delete` 提示同样可直接复制执行。空名以及拼成 `<name>.json` 后超过文件系统文件名上限的名称，在 `resume`、`ai`、`agent crawl` 与向导入口都按 `INVALID_PARAM` 拒绝，不会先访问路径再把 ENAMETOOLONG 报成「简历损坏」或带出本机绝对路径。
 
 本地简历全部存放在 `--data-dir` 的 `resumes/` 下，因此简历族的后继与恢复提示都显式携带该目录：`resume init` / `list` / `show` / `edit` / `delete` / `export` / `import` / `clone` / `diff` / `link` / `applications` 的 `hints.next_actions`、终端 `next_steps`、错误的 `recovery_action`，以及损坏文件的 `operator_actions` 都指回产生这份简历的目录；`resume link` 后继的 `apply`、取参用的 `search` 与 `init` 后的 `me` 也在同一目录。换一个工作目录照抄提示时，仍操作同一份简历与职位关联，而不会在默认目录另建一份或读取另一个账号的缓存。
 
@@ -344,11 +350,13 @@ AI 命令同样读取 `--data-dir` 中的 AI 配置、`resumes/`、候选池与�
 | 命令 | 说明 |
 |------|------|
 | `boss config list/set/reset` | 配置管理 |
-| `boss clean` | 清理缓存；`--all` 清理全部缓存（含搜索缓存、打招呼/投递记录、招聘者打招呼记录、职位描述缓存和工作地点发送记录）；`--risk-lock` 在用户确认官方目标业务页恢复后显式清除本地风险锁，`--dry-run` 不解除锁，不宣称平台解封 |
+| `boss clean` | 清理缓存；`--all` 清理全部缓存（含搜索缓存、打招呼/投递记录、招聘者打招呼记录、职位描述缓存和工作地点发送记录）；`--risk-lock` 在用户确认官方目标业务页恢复后显式清除本地风险锁，`--dry-run` 不解除锁，不宣称平台解封；`--pending-claims <reference>` 按释放失败信封中的标识清除本次 greet/apply 预约 |
 | `boss stats` | 投递转化漏斗统计（greeted/applied/shortlist） |
 | `boss export <query>` | 导出结果（CSV/JSON/HTML，支持 `--url` 网页筛选；`--welfare` / `--active` 与 `search` 同口径，逐个查详情后过滤） |
 
 `clean --dry-run` 返回的执行提示会去掉 `--dry-run`，保留本次 `--data-dir`、`--all` / `--privacy` 与 `--days`；路径会正确转义，照提示执行时仍操作预演的数据目录与清理范围。清理后的登录、自检提示也沿用该目录。带 `--risk-lock` 的预演只在 `hints.operator_actions` 提供保留范围的人工执行命令。
+
+`clean --pending-claims <reference>` 只清除释放失败信封中 `error.details.claim_reference` 指定的本次 greet/apply 预约；该标识仅在请求可证明未发出或平台明确拒绝、但本地预约释放失败时返回。其他账号、其他动作、在途或结果未知的预约以及成功记录均保留。每次新建预约使用不同标识，因此旧指引无法删除后续新预约；该选项不并入 `--all`。`--dry-run` 只预览指定预约，执行指引保留标识与数据目录。若本地状态无法读取而拿不到标识，信封会要求备份缓存并联系维护者，不提供批量清理或直接重发指引。
 
 `config list` / `get` / `set` / `reset` 的后继命令与 `INVALID_PARAM` 恢复提示保留本次 `--data-dir` 与平台：未知配置项、非法取值与写入成功后的 `config get` / `config list` / `config set` 示例都携带经过 shell 参数转义的绝对目录，照抄即读写同一份 `config.json`，不会在默认目录另建配置。TTY 的「下一步」列表按字面渲染命令文本，目录含 `[bold]` 等 Rich 标签时不会被改写或中断输出。
 

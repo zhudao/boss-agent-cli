@@ -4,6 +4,200 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 自动化的批准队列与直接扫描共同消费招聘者客户端标注的严格布尔 `request_sent=False`，写前读取失败会释放本次在途标记、恢复队列为 pending 并保留原异常；无证据、非布尔值及风控仍保留重放保护（Issue #3019）。
+- wizard 在明确可重放的失败之后，先清除本次已失效的写标记再检查重试前的截止／停止，避免把平台已拒绝的请求误报为结果未知并永久禁止恢复；认证未知结果保护和停止终态语义保持不变（Issue #3020）。
+
+## [3.9.5] - 2026-11-27
+
+### Fixed
+
+- wizard 的 `recruiter_resume` / `recruiter_reply` 在构造平台与写标记落盘之前拒绝无法按 UTF-8 编码的标识 / 消息文本：此前孤立代理项会让客户端在发出请求前抛错，但「结果未知」标记已写入，runner 把确定未发出的请求报成 `NETWORK_ERROR` 并禁止 `--resume` 重放（Issue #3017）。
+
+## [3.9.4] - 2026-11-27
+
+### Fixed
+
+- `boss wizard --status / --stop` 明确拒绝 `--timeout`：这两个控制动作在进入 runner 前返回，此前 CLI 静默忽略该参数，MCP 宿主却把它当作等待预算，stop 可能在停止标记写入前被提前杀掉并报成 `outcome_unknown=true`。MCP 映射层与工具 schema 同步声明该参数仅用于 run / resume，宿主等待回落到默认 120s（Issue #3013）。
+- MCP `boss_wizard` 的 `timeout` 声明宿主等待上限 900 秒；超过上限的取值在启动子进程前以 `INVALID_PARAM` 拒绝，不再静默截断到 900 秒（Issue #3013）。
+
+## [3.9.3] - 2026-11-27
+
+### Fixed
+
+- MCP `boss_hr_accept_resume` / `boss_hr_download_resume` 的宿主超时覆盖命令内部固定请求：同意附件简历按 3 次（历史、好友详情、同意 POST）、下载按 4 次（再含预览检查与附件下载）估算，`accept-resume --dry-run` 不请求平台，仍用默认 120s（Issue #3009）。
+- MCP `boss_hr_reply` / `boss_hr_exchange` / `boss_hr_request_resume` / `boss_hr_location` 的宿主超时覆盖聊天页动作的固定请求：前三条最坏 7 次（好友详情、动作前历史快照、browser-action 窗口、动作后首次回读，再加首次未命中时的 3 次确认重读；预算与客户端重读常量共用），`hr location` 为 2 次（好友详情、发送工作地点）；`location --dry-run` 不请求平台，`hr resume` 非 `--exchange` 形态仍用默认 120s（Issue #3010）。
+
+## [3.9.2] - 2026-11-27
+
+### Fixed
+
+- MCP 招聘者沟通摘要的宿主预算纳入 `friendSource` 分组后的额外批次，默认 100 个混合来源会话按最多 4 次请求估算；显式 `--friend-id` 直查保留单来源预算，双语命令说明同步实际请求上限（Issue #3006）。
+- 招聘者摘要补齐 `from/to.uid` 消息对象的发送方向识别，候选人来信不再误标为“发送中”；`hr chat`、`hr last-messages` 与 communication 向导共用修复，保留已有方向字段优先级与发出消息状态（Issue #3003）。
+
+## [3.9.1] - 2026-11-27
+
+### Fixed
+
+- MCP 超时或取消的清理阶段收到完整风控错误信封时，保留原错误码、人工恢复动作与断点，不再把只读调用改成可自动重试；联系人扫描命令的宿主超时预算覆盖分页查找，`chatmsg --friend-uid` 直读仍按单次请求估算（Issue #3000、#3001）。
+
+## [3.9.0] - 2026-11-27
+
+### Added
+
+- `boss schema --format mcp-tools` 导出的每个工具补充 `annotations.readOnlyHint`，与运行时 `tools/list` 共用同一份只读白名单与判定，离线注册工具定义时也能区分只读与写入（Issue #2997）。
+
+## [3.8.0] - 2026-11-27
+
+### Added
+
+- `tools/list` 为每个 MCP 工具补充 `ToolAnnotations.readOnlyHint`：静态只读工具可被宿主自动放行；带 action 维度或本地输出参数的工具保持 `false`，`destructiveHint` / `idempotentHint` / `openWorldHint` 维持规范默认值（Issue #2993）。
+
+## [3.7.0] - 2026-11-27
+
+### Added
+
+- MCP 工具目录新增 `boss_resume_export`、`boss_resume_import`、`boss_resume_edit`：仅使用 MCP 的宿主可以导出简历文件、从 JSON 导入简历并编辑文本字段；三个入口都只操作本机，`import --force` 会丢弃本地已有编辑，`export` 的 `pdf` 格式需要本机浏览器内核，中断恢复指引先核对本地文件，不产生平台写入（Issue #2991）。
+
+## [3.6.0] - 2026-11-27
+
+### Added
+
+- MCP 工具目录新增 `boss_resume_clone`、`boss_resume_diff`、`boss_resume_link`、`boss_resume_applications`：仅使用 MCP 的宿主可以复制简历版本、对比两份本地简历、把职位关联到简历并查询关联记录；四个入口都只操作本机，`clone` / `link` 的中断恢复指引先核对本地状态，不产生平台写入（Issue #2988）。
+
+## [3.5.0] - 2026-11-27
+
+### Added
+
+- MCP 工具目录新增 `boss_favorites_sync`、`boss_resume_init`、`boss_resume_delete`：仅使用 MCP 的宿主可以同步职位收藏、创建与删除本地简历；本地维护工具中断后的恢复指引先核对本机状态，不再把 Agent 引向不存在的平台写入（Issue #2975）。
+
+### Fixed
+
+- `crawl shortlist` 从本地断点导入候选池时，空串或纯空白的访问标识 / 职位 ID 与 `shortlist add` 同口径计入 `skipped_count`，不再写入无法使用的主键，也不会占住唯一键挡住同一职位的有效记录（Issue #2984）。
+
+## [3.4.254] - 2026-11-27
+
+### Fixed
+
+- `favorites sync` 遇重复页且平台仍明确声明有后续时保留早停，并返回 `pages_scanned` / `truncated` 和信封、终端警告；计数不再把已扫描前缀伪装成完整同步，正常末页与分页上限错误语义保持不变（Issue #2979）。
+- 收藏批量导入在刷新或写入候选池前跳过纯空白访问标识 / 职位 ID，并计入 `skipped_count`；不再导入无法使用的主键或用空白值覆盖同一职位的有效访问标识（Issue #2981）。
+
+## [3.4.253] - 2026-11-27
+
+### Changed
+
+- MCP 双语文档明确工具目录与 CLI 子命令的覆盖关系、`next_actions` 的 CLI 契约，并补充通过 `boss_wizard` 恢复已有采集任务的参数示例，区分采集任务与向导 workflow 的 `run_id`（Issue #2975，文档部分）。
+
+### Fixed
+
+- `boss_crawl_shortlist.selectors` 与 `boss_wizard.requested_steps` 的 MCP schema 补齐非空字符串和元素唯一性约束，入口在启动 CLI 子进程前按 `INVALID_PARAM` 拒绝空串或重复项；类型错误优先报告，大数组的错误条数保持有界（Issue #2976）。
+- `boss_shortlist_add` 的工具 schema 不再声明 `source` 默认 `manual`，与 `SCHEMA_DATA` / CLI 的「省略时新记录记为 manual、重复加入保留原来源」一致；宿主按 schema 注入默认值不再覆盖候选池里的既有来源（Issue #2968）。
+- 超长简历名在 `ai`、`agent crawl` 与向导 `ai_assist` 入口按 `INVALID_PARAM` 拒绝，不再把 ENAMETOOLONG 报成 `RESUME_FILE_INVALID`、带出本机绝对路径或给出必然被拒的 `resume delete` 恢复命令；判定下沉到 `resume/store.py` 共享（Issue #2969）。
+- `shortlist add` 拒绝空白 `--source`（空串或只含空白），不再把未设值的脚本变量写成一条来源并被后续省略参数永久保留；省略 `--source` 仍是「未指定来源」（Issue #2970）。
+- 「请求可证明未发出 + 本地预约释放失败」在单次 `greet` / `apply`、向导与 `batch-greet` 统一报不可重试的 `LOCAL_STATE_WRITE_FAILED`，不再保留可重试的原错误让 Agent 照指引重试后撞 `ACTION_UNCONFIRMED`（Issues #2315 #2944 #2971）。
+- 新增 `clean --pending-claims <reference>` 按释放失败信封标识清除本次 greet/apply 预约，保留其他在途 / 结果未知预约与成功记录；每次新预约使用独立标识，旧恢复指引不会清掉新预约；释放失败信封的恢复指引改为「确认目录可写 → 清理残留预约 → 重试」，恢复路径不再被残留 pending 挡住（Issue #2971）。
+- `batch-greet` 在请求停止点释放失败时把已尝试的候选人记入 `failed` / `total_failed`，与其余三个释放点同形（Issue #2972）。
+
+## [3.4.252] - 2026-11-27
+
+### Fixed
+
+- `favorites sync` 只用非空字符串职位 ID 判断重复页，类型漂移或纯空白标识不再提前结束分页并漏掉后续有效收藏（Issue #2954）。
+- `history` 在可信页码上限处仅当平台明确还有下一页时显示上限指引，末页不再误报「平台仍报告有更多记录」（Issue #2955）。
+- 沟通列表重复页仍声明有后续时，聚合结果保留早停但标记为不完整，`pipeline` / `follow-up` / `digest` 与向导步骤不再把前缀当全量；Markdown 日报提示改为描述扫描不完整，而非误称页数上限（Issue #2956）。
+- `resume` 对拼成 `<name>.json` 后超过文件系统文件名上限的名称按 `INVALID_PARAM` 拒绝，不再把 ENAMETOOLONG 误报成简历损坏或本地磁盘错误；`resume import` 的 JSON `name` 同样提示名称过长（Issue #2959）。
+- `shortlist add` 省略 `--source` 时不再用默认 `manual` 覆盖既有来源：新记录仍记为 `manual`，重复加入保留原来源，显式传入才覆盖；收藏 / 采集导入后的轮换标识刷新不再因一次手工重加而失效（Issue #2960）。
+- `chatmsg` / `chat-summary` / 招聘者聊天与向导的 `candidate_chat_history` / `recruiter_chat_history` 共用同一消息容器解析：`messages` 为空时依次回退 `historyMsgList` / `messageList`，同一响应不再出现 CLI 读到 0 条、向导读到 1 条（Issue #2962）。
+- `batch-greet` 在平台明确拒绝（限流 / 重试耗尽）或请求可证明未发出、但本地预约释放失败时改报不可重试的 `LOCAL_STATE_WRITE_FAILED`，不再误报 `ACTION_UNCONFIRMED` 或 `INTERNAL_ERROR`，并停止剩余候选人（Issue #2964）。
+
+## [3.4.251] - 2026-11-27
+
+### Fixed
+
+- `clean` 打开共享缓存库前检查数据目录以下的所有祖先链接，搜索缓存、历史记录和采集清理不再经 `cache` 目录链接改写目录外的数据库（Issue #2946）。
+- `clean --privacy` 在开始删除前递归检查真实目录树的权限和可枚举性，嵌套目录不可处理时保留登录会话及其他本地数据，并报告具体失败路径（Issue #2947）。
+- `export -o` 终端汇总改由后继指引统一显示截断原因，活跃度筛选提前停止时不再误报页数上限，也不再重复显示警告（Issue #2949）。
+- `crawl status` 在任务不存在或断点损坏时给出的重建提示补齐必填 `--city`，Agent 可直接回放（Issue #2941）。
+- 向导 / MCP 的 `candidate_exchange` 不再把显式空串或 `null` 的交换类型当成缺省手机号，改为在写请求前报 `INVALID_PARAM`，与 CLI `--type ""` 同口径（Issue #2943）。
+- 向导求职者写动作遇到「平台明确拒绝、本地预约释放失败」时改报不可重试的 `LOCAL_STATE_WRITE_FAILED`，不再提示重试后撞上 `ACTION_UNCONFIRMED`；派发前失败的原有恢复动作保持不变（Issue #2944）。
+
+## [3.4.250] - 2026-11-27
+
+### Fixed
+
+- `chatmsg` 成功后的 `detail` 后继命令改用 `positional_hint()` 保护位置参数，以 `-` 开头或含空白的 security_id 也能原样回放（Issue #2938）。
+
+## [3.4.249] - 2026-11-26
+
+### Fixed
+
+- `boss doctor` 在已有本地风险锁时不再把 `login` / `status --live` 等必然被锁拒绝的命令写进 `hints.next_actions`，真人解锁步骤前置（Issue #2935）。
+
+## [3.4.248] - 2026-11-26
+
+### Fixed
+
+- `boss export` 快路径不再把元素全漂移的 `jobList` 当完整空页；后续页继续翻取，预算耗尽时明确标记 `truncated`（Issue #2932）。
+
+## [3.4.247] - 2026-11-26
+
+### Fixed
+
+- 聊天快照跨天 diff 与同日合并不再把显式空 uid 的旧记录按轮换 `security_id` 当稳定身份，仍在列表里的联系人不再被误报「已消失」（Issue #2929）。
+
+## [3.4.246] - 2026-11-26
+
+### Fixed
+
+- 沟通列表成功响应缺少 `result` / `friendList` 列表容器时不再被当成完整空页：翻页聚合继续取后续页或显式标记 `truncated`，`pipeline` / `digest` 不再静默丢数据（Issue #2927）。
+
+## [3.4.245] - 2026-11-26
+
+### Fixed
+
+- 向导 `--status` / `--stop` / `--resume` 对漂移成容器的 `result.inner_run_id` / `error.details.run_id` 不再生成带 Python repr 的不可执行提示，改为跳过该条后继命令（Issue #2924）。
+
+## [3.4.244] - 2026-11-26
+
+### Fixed
+
+- `ACTION_UNCONFIRMED` 的登记表文案改为角色中立，共享错误出口按当前角色注入核对命令：求职者不再收到 `boss hr chatmsg <friend_id>`，而是候选侧 `chat` 与 `hints.next_actions`；招聘者仍保留 `hr chatmsg`（Issue #2921）。
+
+## [3.4.243] - 2026-11-26
+
+### Fixed
+
+- AI 结果的终端渲染统一走 `cell_text`：`None` 显示 `-`，数组 / 对象按可读文本展示，不再泄漏 Python repr；`--json` 信封中的原始值保持不变（Issue #2915）。
+- 联系人列表出现重复页但仍声明有后续时不再返回确定的「未找到」：`exchange` 与向导联系人查找改报不可重放的读取错误，避免漏掉后续页中的真实联系人（Issue #2916）。
+
+## [3.4.242] - 2026-11-26
+
+### Fixed
+
+- 向导写步骤遇到认证类可重放失败时，自动重试不再清掉已落盘的写请求在途标记并二次派发同一写请求；只有异常带 `request_sent=false` 显式证据才撤销标记后重试（Issue #2913）。
+
+## [3.4.241] - 2026-11-26
+
+### Fixed
+
+- 向导写后遇到认证类失败（`AUTH_REQUIRED` / `AUTH_EXPIRED` / `TOKEN_REFRESH_FAILED`）时不再把已有写前标记改成可重放：`--resume` 保持结果未知与核对指引；限流等平台明确拒绝的码仍可按既有契约恢复重跑（Issue #2910）。
+
+## [3.4.240] - 2026-11-26
+
+### Fixed
+
+- 向导的 `ChatTabCdpUnreachable` / `RecruiterChatTabRequired` 分支不再仅凭异常类型放行重放：没有 `request_sent=false` 显式证据且已有写前标记时保留结果未知与核对指引，有证据时仍按原错误码恢复重跑（Issue #2904）。
+- `hr resume` 查看简历参数齐全却同时传了 `--friend-id` 时不再静默忽略该选项：成功信封的 `hints` 明确说明它未用于交换，并给出 `hr resume --friend-id <friend_id> --exchange` 后继命令（Issue #2905）。
+
+## [3.4.239] - 2026-11-26
+
+### Fixed
+
+- `hr request-resume` 在写前读取 / 浏览器会话建立 / 聊天页脚本发送前失败时不再误报 `ACTION_UNCONFIRMED`：复合动作由客户端在写入边界标注 `request_sent=false`，命令与向导只消费显式证据，分别输出 `INVALID_PARAM` / `BROWSER_NAV_TIMEOUT` / `CDP_UNAVAILABLE` / `RECRUITER_CHAT_TAB_REQUIRED`；写后失败仍按结果未知保护（Issue #2898）。
+- `hr resume --friend-id` 漏加 `--exchange` 时在提示与下一步命令中点明该开关，不再只让人补查看简历的 geek_id / job-id / security-id（Issue #2899）。
+- `hr chat` / `hr last-messages` 的分页 `total` 改为按实际提取出的联系人行计数（`friendList` / `result` / `list` 三种容器均识别），整页记录不再报成 `null`；向导步骤的分页证据改为复用与 CLI 相同的共享实现，平台纠正页码时采信平台值并钳制不可信页码（Issue #2900）。
+
 ## [3.4.238] - 2026-11-26
 
 ### Fixed

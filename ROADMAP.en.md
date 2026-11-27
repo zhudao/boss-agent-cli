@@ -4,6 +4,58 @@ This document tracks the medium-term and long-term direction of `boss-agent-cli`
 
 ## Released
 
+v3.9.5 (2026-11-27): wizard's recruiter_resume / recruiter_reply now reject inputs that cannot be encoded as UTF-8 before the write marker is persisted, so an encoding failure no longer leaves an "outcome unknown" marker and a request that was provably never sent is reported as an invalid parameter (Issue #3017).
+
+v3.9.4 (2026-11-27): wizard control actions now share the MCP host's timeout semantics — --status / --stop no longer accept a --timeout that was never executed, and boss_wizard declares its host timeout cap and rejects out-of-range values before launch (Issue #3013).
+
+v3.9.3 (2026-11-27): MCP host timeouts for recruiter attachment-resume and chat-page actions now cover their fixed internal requests, so accept, download, reply, contact exchange and job-location sends are no longer cut off during pre-submit checks (Issue #3009, #3010).
+
+v3.9.2 (2026-11-27): Recognize sender direction in recruiter message objects so incoming candidate messages do not show send status; include source-grouped summary batches in MCP timeout budgets and document the actual request limits in both languages (Issue #3003, #3006).
+
+v3.9.1 (2026-11-27): Preserve completed platform-risk errors and manual recovery instructions during MCP interruption cleanup, and include contact lookup in host timeout budgets while direct history reads keep a single-request budget (Issue #3000, #3001).
+
+v3.9.0 (2026-11-27): Add `annotations.readOnlyHint` to every tool exported by `boss schema --format mcp-tools`, sharing the same read-only policy as runtime `tools/list` (Issue #2997).
+
+v3.8.0 (2026-11-27): Add `ToolAnnotations.readOnlyHint` to every MCP tool so hosts can auto-approve statically read-only calls while parameter-dependent writes stay false (Issue #2993).
+
+v3.7.0 (2026-11-27): Expose resume export/import/edit as MCP tools so hosts that only speak MCP can complete local resume maintenance (Issue #2991).
+
+v3.6.0 (2026-11-27): Expose resume clone/diff/link/applications as MCP tools so hosts that only speak MCP can manage resume versions (Issue #2988).
+
+v3.5.0 (2026-11-27): Expose favorites sync plus resume init/delete as MCP tools, and skip whitespace-only identifiers when importing crawl checkpoints into the shortlist (Issues #2975, #2984).
+
+v3.4.254 (2026-11-27): Report incomplete favorites syncs when repeated pages still advertise more results, and skip whitespace-only keys before batch imports to protect existing valid access identifiers (Issues #2979, #2981).
+
+v3.4.253 (2026-11-27): Fix MCP tool schema and parameter contracts (resume name length, shortlist source, nonempty and unique array items), recovery scoped to a single failed reservation release, and the batch-greet failed-result shape (Issues #2968, #2969, #2970, #2971, #2972, #2976).
+
+v3.4.252 (2026-11-27): Fix favorites/history pagination duplicate-page and last-page detection, incomplete friend-list aggregation markers, resume name length, shortlist source preservation, chat-history container parsing, and batch-greet release-failure semantics (Issues #2954, #2955, #2956, #2959, #2960, #2962, #2964).
+
+v3.4.251 (2026-11-27): Fix crawl recovery hints, wizard exchange-type validation and reservation failures, cleanup path checks and privacy preflight, and export terminal stop reasons (Issues #2941, #2943, #2944, #2946, #2947, #2949).
+
+v3.4.250 (2026-11-27): The `chatmsg` detail follow-up now uses `positional_hint()` so special security IDs replay verbatim (Issue #2938).
+
+v3.4.249 (2026-11-26): `boss doctor` no longer suggests login / status follow-ups that a local risk lock will reject; manual unlock steps come first (Issue #2935).
+
+v3.4.248 (2026-11-26): The `boss export` fast path no longer treats a fully drifted `jobList` as a complete empty page; later pages are still scanned and budget exhaustion is marked as truncated (Issue #2932).
+
+v3.4.247 (2026-11-26): Chat-snapshot cross-day diff no longer treats explicit empty-uid baseline rows as stable identities via rotated `security_id`, so present contacts are not reported as removed (Issue #2929).
+
+v3.4.246 (2026-11-26): A successful friend-list page without a list container is no longer treated as a complete empty page; aggregation keeps paging or reports truncation explicitly (Issue #2927).
+
+v3.4.245 (2026-11-26): wizard status hints skip drifted container-shaped internal run identifiers instead of generating unusable `crawl resume` / `wizard --status` commands (Issue #2924).
+
+v3.4.244 (2026-11-26): the `ACTION_UNCONFIRMED` registry entry is role-neutral and shared error exits inject the verification command by role, so candidates no longer receive the recruiter-only `hr chatmsg` guidance (Issue #2921).
+
+v3.4.243 (2026-11-26): AI result rendering now uses the shared cell text rules instead of showing `None` / container reprs; repeated contact pages with more results report an incomplete traversal instead of a definitive not-found (Issues #2915, #2916).
+
+v3.4.242 (2026-11-26): wizard authentication failures no longer clear the in-flight write marker and auto-redispatch a write; explicit rejections and failures carrying `request_sent=false` keep their existing retry contract (Issue #2913).
+
+v3.4.241 (2026-11-26): post-write authentication failures in the wizard keep the persisted write marker, so `--resume` cannot replay a dispatched write; explicit platform rejections such as rate limiting remain replayable (Issue #2910).
+
+v3.4.240 (2026-11-26): wizard chat-tab errors without explicit unsent evidence no longer bypass the persisted write marker, so `--resume` cannot replay an unknown write; `hr resume` now states when an explicit `--friend-id` was unused on the view path and offers the exchange follow-up (Issues #2904, #2905).
+
+v3.4.239 (2026-11-26): recruiter composite actions distinguish unknown outcomes using write-boundary evidence, so pre-write failures no longer report `ACTION_UNCONFIRMED`; `hr resume --friend-id` hints now mention `--exchange`; `hr chat` / `hr last-messages` pagination totals and wizard pagination evidence count actually extracted rows through the shared implementation (Issues #2898, #2899, #2900).
+
 v3.4.238 (2026-11-26): Both HTML export mapping paths now share text-field normalization, keeping drifted values out of table cells (Issue #2895).
 
 v3.4.237 (2026-11-26): Private directory tightening no longer follows symlinks, new parents use 0700, and output paths reject non-UTF-8 names early (Issue #2892).

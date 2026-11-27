@@ -752,6 +752,7 @@ class CacheStore:
 				security_id TEXT NOT NULL DEFAULT '',
 				status TEXT NOT NULL,
 				updated_at REAL NOT NULL,
+				recovery_id TEXT NOT NULL DEFAULT '',
 				PRIMARY KEY (account, job_id, action)
 			);
 			CREATE TABLE IF NOT EXISTS shortlist_records (
@@ -858,6 +859,17 @@ class CacheStore:
 		self._migrate_crawl_runs()
 		self._migrate_crawl_jobs()
 		self._migrate_dedupe_keys()
+		self._migrate_candidate_action_claims()
+
+	def _migrate_candidate_action_claims(self) -> None:
+		"""为新预约保存独立恢复标识；历史 pending 不具备可自动清理的证据。"""
+		columns = {row[1] for row in self._conn.execute("PRAGMA table_info(candidate_action_claims)")}
+		if "recovery_id" in columns:
+			return
+		with self._migration_write_transaction():
+			columns = {row[1] for row in self._conn.execute("PRAGMA table_info(candidate_action_claims)")}
+			if "recovery_id" not in columns:
+				self._conn.execute("ALTER TABLE candidate_action_claims ADD COLUMN recovery_id TEXT NOT NULL DEFAULT ''")
 
 	@contextmanager
 	def _migration_write_transaction(self) -> Iterator[None]:
@@ -2142,9 +2154,9 @@ class CacheStore:
 		with self._conn:
 			cursor = self._conn.execute(
 				"INSERT OR IGNORE INTO candidate_action_claims "
-				"(account, job_id, action, security_id, status, updated_at) "
-				"VALUES (?, ?, ?, ?, 'pending', ?)",
-				(_text_key(account), _text_key(job_id), action, _text_key(security_id), time.time()),
+				"(account, job_id, action, security_id, status, updated_at, recovery_id) "
+				"VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+				(_text_key(account), _text_key(job_id), action, _text_key(security_id), time.time(), secrets.token_hex(16)),
 			)
 			if cursor.rowcount:
 				return None
@@ -2190,6 +2202,17 @@ class CacheStore:
 			)
 			return bool(cursor.rowcount)
 
+	def candidate_action_release_reference(
+		self, job_id: str, action: Literal["greet", "apply"], *, account: str = ""
+	) -> str | None:
+		"""仅在调用方已证明未发送且释放失败时取恢复标识，不公开枚举 pending。"""
+		row = self._conn.execute(
+			"SELECT recovery_id FROM candidate_action_claims "
+			"WHERE account = ? AND job_id = ? AND action = ? AND status = 'pending'",
+			(_text_key(account), _text_key(job_id), action),
+		).fetchone()
+		return str(row[0]) if row is not None and row[0] else None
+
 	def is_shortlisted(self, security_id: str, job_id: str) -> bool:
 		row = self._conn.execute(
 			"SELECT 1 FROM shortlist_records WHERE security_id = ? AND job_id = ?",
@@ -2204,12 +2227,18 @@ class CacheStore:
 		首次加入时间一起清空。重新 `shortlist add` 同一职位（脚本重跑、换设备后
 		再导一次）就会静默丢掉这些本地数据。这里改成冲突时按字段更新：本次没给
 		空值的列保留原值，`created_at` 始终保留首次加入时间。
+
+		``source`` 缺失（``None``）表示调用方没有指定来源：新记录仍记为
+		``manual``，重复加入时保留原来源（Issue #2960）；显式给值仍可覆盖。
 		"""
 		security_id = str(item.get("security_id") or "")
 		job_id = str(item.get("job_id") or "")
 		if not is_utf8_encodable(security_id) or not is_utf8_encodable(job_id):
 			raise CacheWriteRejected(self._db_path, "security_id 与 job_id 必须可按 UTF-8 编码")
-		source = _shortlist_display_text(item.get("source"))
+		raw_source = item.get("source")
+		source = _shortlist_display_text(raw_source)
+		source_unspecified = raw_source is None
+		insert_source = "manual" if source_unspecified else source
 		lid_value = item.get("lid")
 		lid = lid_value if isinstance(lid_value, str) and is_utf8_encodable(lid_value) else ""
 		if not lid:
@@ -2224,7 +2253,8 @@ class CacheStore:
 			"company = COALESCE(NULLIF(excluded.company, ''), shortlist_records.company), "
 			"city = COALESCE(NULLIF(excluded.city, ''), shortlist_records.city), "
 			"salary = COALESCE(NULLIF(excluded.salary, ''), shortlist_records.salary), "
-			"source = COALESCE(NULLIF(excluded.source, ''), shortlist_records.source), "
+			"source = CASE WHEN ? = 1 THEN shortlist_records.source "
+			"ELSE COALESCE(NULLIF(excluded.source, ''), shortlist_records.source) END, "
 			"tags = COALESCE(NULLIF(excluded.tags, ''), shortlist_records.tags), "
 			"note = COALESCE(NULLIF(excluded.note, ''), shortlist_records.note), "
 			"lid = excluded.lid",
@@ -2235,13 +2265,14 @@ class CacheStore:
 				_shortlist_text(item.get("company", "")),
 				_shortlist_text(item.get("city", "")),
 				_shortlist_text(item.get("salary", "")),
-				source,
+				insert_source,
 				self._serialize_shortlist_tags(item.get("tags", [])),
 				_shortlist_text(item.get("note", "")),
 				lid,
 				security_id,
 				job_id,
 				time.time(),
+				1 if source_unspecified else 0,
 			),
 		)
 		self._conn.commit()
@@ -2298,8 +2329,14 @@ class CacheStore:
 				job_id = str(item.get("job_id") or "")
 				lid_value = item.get("lid")
 				lid = lid_value if isinstance(lid_value, str) and is_utf8_encodable(lid_value) else ""
+				# 空白主键与 CLI 的缺失标识同口径；不能用空白值刷新既有访问标识。
 				# 转义标识可能与已有合法标识相同，导致更新错误的条目。
-				if not security_id or not job_id or not is_utf8_encodable(security_id) or not is_utf8_encodable(job_id):
+				if (
+					not security_id.strip()
+					or not job_id.strip()
+					or not is_utf8_encodable(security_id)
+					or not is_utf8_encodable(job_id)
+				):
 					skipped_count += 1
 					continue
 				if job_id in existing_by_job_id:

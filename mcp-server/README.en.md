@@ -1,6 +1,6 @@
 # boss-agent-cli MCP Server
 
-Expose the full candidate, recruiter, local, AI, and workflow surface of `boss-agent-cli` to Claude Desktop, Cursor, and other MCP-compatible hosts. Historical assisted/research settings have identical capability access; missing platform implementations still return `NOT_SUPPORTED`.
+Connect candidate, recruiter, local, AI, and workflow capabilities of `boss-agent-cli` to Claude Desktop, Cursor, and other MCP-compatible hosts through registered MCP tools. MCP `tools/list` defines the callable surface. Historical assisted/research settings have identical capability access; missing platform implementations still return `NOT_SUPPORTED`.
 
 Related docs:
 - [Agent Quickstart](../docs/agent-quickstart.en.md)
@@ -49,7 +49,17 @@ Add the server in Cursor Settings -> MCP Servers:
 
 ## Available tools
 
-The current MCP server exposes **80 implemented tools**.
+The current MCP server exposes **90 implemented tools**.
+
+### Capability scope and recovery hints
+
+Call `boss_schema` with `{"format":"mcp-tools"}` to inspect tool schemas; the `native` format describes the full CLI command surface and `wizard_catalog`. CLI subcommands and MCP tools do not correspond one for one: local resumes expose `boss_resume_list` / `boss_resume_show` / `boss_resume_init` / `boss_resume_delete` / `boss_resume_clone` / `boss_resume_diff` / `boss_resume_link` / `boss_resume_applications` / `boss_resume_export` / `boss_resume_import` / `boss_resume_edit`, and job favorites expose `boss_favorites_list` / `boss_favorites_sync`; other maintenance steps still require the CLI. `boss_resume_delete` removes a local resume file irreversibly; `boss_resume_clone` / `boss_resume_link` / `boss_resume_import` / `boss_resume_edit` write only local state and make no platform requests, and `import` with `force=true` discards local edits; `boss_resume_diff` / `boss_resume_applications` read only local state; `boss_resume_export` reads a resume and writes a local file, with `pdf` requiring a local browser runtime; `boss_favorites_sync` reads the platform and writes the local shortlist.
+
+The envelope's `hints.next_actions` contains follow-up CLI commands, which cannot be called directly as MCP tool names. A host using only MCP should look for an equivalent tool or a registered `boss_wizard` goal first; when none exists, explain the required CLI step without claiming it has completed. `hints.operator_actions` remains for human instructions such as scanning a QR code or operating a browser.
+
+### Tool annotations
+
+`tools/list` attaches MCP `ToolAnnotations` to every tool: statically read-only tools (such as `boss_schema`, `boss_search`, and `boss_resume_show`) carry `readOnlyHint: true` so hosts can auto-approve read-only calls. Tools whose writes depend on parameters stay `false`: action-driven tools (`boss_config` / `boss_hr_jobs` / `boss_wizard`) and tools with local output arguments (`boss_chat` / `boss_export` / `boss_digest` / `boss_stats`). Annotations are host hints only and do not replace the confirmation and error contracts; `destructiveHint` / `idempotentHint` / `openWorldHint` keep their specification defaults. Every tool exported by `boss schema --format mcp-tools` carries the same `annotations.readOnlyHint`, so registering tool definitions offline gets the same read/write distinction.
 
 ### Shared workflow
 
@@ -101,6 +111,20 @@ The current MCP server exposes **80 implemented tools**.
 | `boss_crawl_shortlist` | Import one run's jobs into the local shortlist without a platform call |
 
 Fine-grained crawl tools read or import existing tasks; `boss_wizard` goals `crawl_start/crawl_resume/crawl_stop` can start, resume, or stop the shared workflow. The default Hook is `none`; local Hook directories must contain `SHA256SUMS`. This project does not redistribute third-party scripts.
+
+After the operator explicitly decides to resume an existing crawl, call `boss_wizard` with these arguments, replacing `<crawl_run_id>` with the crawl task ID used by `boss_crawl_status`:
+
+```json
+{
+  "action": "run",
+  "role": "candidate",
+  "platform": "zhipin",
+  "goal": "crawl_resume",
+  "inputs": {"run_id": "<crawl_run_id>"}
+}
+```
+
+Here, `inputs.run_id` identifies the crawl task; the top-level `run_id` for `action="resume"` identifies a wizard workflow. Keep these IDs distinct. If platform risk stopped the task, follow the error envelope's recovery guidance and let the operator explicitly resume only after the risk has cleared.
 
 ### User and resume
 

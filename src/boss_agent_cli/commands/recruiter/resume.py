@@ -94,19 +94,44 @@ def resume_cmd(ctx: click.Context, geek_id: str | None, job_id: str, security_id
 				missing.append("--security-id")
 			if job_missing or security_missing:
 				sources.append(f"--job-id 与 --security-id 可从 {apps_cmd} 的结果中取到")
+			# --friend-id 只服务于「交换联系方式」路径；给出它却漏了 --exchange 时
+			# 要直接点明缺的开关，而不是让 Agent 去补查看简历的参数原地打转
+			# （Issue #2899）。
+			exchange_hint = (
+				hint_command(ctx, f"hr resume --friend-id {friend_id} --exchange")
+				if friend_id is not None and not exchange_contact
+				else None
+			)
+			message = f"查看简历缺少参数：{', '.join(missing)}"
+			recovery_action = f"补上 {' 与 '.join(missing)} 后重试；{'；'.join(sources)}"
+			next_actions = [apps_cmd if (job_missing or security_missing) else candidates_cmd]
+			if exchange_hint is not None:
+				message += "；已提供 --friend-id，如需交换联系方式请加 --exchange"
+				recovery_action = f"如需交换联系方式，执行 {exchange_hint}；否则{recovery_action}"
+				next_actions.insert(0, exchange_hint)
 			handle_error_output(
 				ctx, "recruiter-resume",
 				code="INVALID_PARAM",
-				message=f"查看简历缺少参数：{', '.join(missing)}",
+				message=message,
 				recoverable=False,
-				recovery_action=f"补上 {' 与 '.join(missing)} 后重试；{'；'.join(sources)}",
-				hints={"next_actions": [apps_cmd if (job_missing or security_missing) else candidates_cmd]},
+				recovery_action=recovery_action,
+				hints={"next_actions": next_actions},
 			)
 			return
 
 		next_actions = [hint_command(ctx, "hr applications")]
+		hints: dict[str, list[str]] = {"next_actions": next_actions}
+		if friend_id is not None and not exchange_contact:
+			# --friend-id 只服务于交换路径：参数齐全时也不能静默吞掉它。
+			# 保持查看简历的成功契约，但把真正的后续动作递给 Agent / 真人
+			# （Issue #2905）。
+			exchange_hint = hint_command(ctx, f"hr resume --friend-id {friend_id} --exchange")
+			next_actions.insert(0, exchange_hint)
+			hints["operator_actions"] = [
+				f"本次只查看了简历，--friend-id {friend_id} 未用于交换联系方式；如需交换请执行 {exchange_hint}"
+			]
 		handle_output(
 			ctx, "recruiter-resume", data,
 			render=lambda d: render_resume(d, title="hr resume", next_steps=next_actions),
-			hints={"next_actions": next_actions},
+			hints=hints,
 		)

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "boss-agent-cli"
-version = "3.4.238"
+version = "3.9.5"
 description = "AI Agent 专用的 BOSS 直聘求职 CLI 工具"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -301,6 +301,7 @@ module = [
 	"boss_agent_cli.schema.error_codes",
 	"boss_agent_cli.schema.formats",
 	"boss_agent_cli.schema.tool_catalog",
+	"boss_agent_cli.schema.tool_policy",
 	"boss_agent_cli.services",
 	"boss_agent_cli.services.browser_runtime",
 	"boss_agent_cli.services.candidate_actions",

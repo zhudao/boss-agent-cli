@@ -26,6 +26,7 @@ from boss_agent_cli.commands import clean as clean_cmd_module
 from boss_agent_cli.commands import detail as detail_cmd_module
 from boss_agent_cli.commands import digest as digest_cmd_module
 from boss_agent_cli.commands import export as export_cmd_module
+from boss_agent_cli.commands import favorites as favorites_cmd_module
 from boss_agent_cli.commands import greet as greet_cmd_module
 from boss_agent_cli.commands import mark as mark_cmd_module
 from boss_agent_cli.commands import me as me_cmd_module
@@ -33,6 +34,7 @@ from boss_agent_cli.commands import pipeline as pipeline_cmd_module
 from boss_agent_cli.commands import stats as stats_cmd_module
 from boss_agent_cli.commands import preset as preset_cmd_module
 from boss_agent_cli.commands import recommend as recommend_cmd_module
+from boss_agent_cli.commands import resume_cmd as resume_cmd_module
 from boss_agent_cli.commands import search as search_cmd_module
 from boss_agent_cli.commands import shortlist as shortlist_cmd_module
 from boss_agent_cli.commands import status as status_cmd_module
@@ -86,8 +88,10 @@ def _sample_value(prop: dict[str, Any], name: str = "") -> Any:
 #: 条件校验拒绝。与 mcp_args 的实现独立维护，避免测试跟着实现一起漂移。
 _ACTION_SCOPED_KEYS: dict[str, dict[str, set[str]]] = {
 	"boss_wizard": {
-		"run": {"role", "platform", "goal", "inputs", "requested_steps"},
-		"resume": {"run_id"},
+		# timeout 只对 run / resume 生效（Issue #3013）；status / stop 带该键会被
+		# 映射层与 CLI 入口拒绝，样例不能补上。
+		"run": {"role", "platform", "goal", "inputs", "requested_steps", "timeout"},
+		"resume": {"run_id", "timeout"},
 		"status": {"run_id"},
 		"stop": {"run_id"},
 	},
@@ -103,7 +107,7 @@ _ACTION_SCOPED_KEYS: dict[str, dict[str, set[str]]] = {
 		"offline": {"job_id"},
 	},
 }
-_ACTION_SHARED_KEYS = {"action", "timeout", "max_retries"}
+_ACTION_SHARED_KEYS = {"action", "max_retries"}
 
 #: schema 用 ``not`` 声明互斥的键：按全部 properties 生成的样例必须二选一，
 #: 否则映射层按互斥约束拒绝（Issue #2175），测试会在入口就撞上 ValueError。
@@ -344,6 +348,26 @@ _LOCAL_SINGLE_COMMAND_TOOLS = {
 	"boss_preset_add": (preset_cmd_module.preset_add_cmd, {}, set()),
 	"boss_watch_add": (watch_cmd_module.watch_add_cmd, {}, set()),
 	"boss_shortlist_add": (shortlist_cmd_module.shortlist_add_cmd, {}, set()),
+	# 本地维护入口（Issue #2975）：同步 / 初始化 / 删除均无 CLI 侧可选参数
+	# 被有意隐藏，参数面与 CLI 完全一致。
+	"boss_favorites_sync": (favorites_cmd_module.favorites_sync_cmd, {}, set()),
+	"boss_resume_init": (resume_cmd_module.resume_init_cmd, {}, set()),
+	"boss_resume_delete": (resume_cmd_module.resume_delete_cmd, {}, set()),
+	# 简历版本与职位关联（Issue #2988）：clone / diff / link / applications
+	# 同样只在 MCP 侧做位置参数与选项映射，不隐藏 CLI 参数。
+	"boss_resume_clone": (resume_cmd_module.resume_clone_cmd, {}, set()),
+	"boss_resume_diff": (resume_cmd_module.resume_diff_cmd, {}, set()),
+	"boss_resume_link": (resume_cmd_module.resume_link_cmd, {}, set()),
+	"boss_resume_applications": (resume_cmd_module.resume_applications_cmd, {}, set()),
+	# 简历导出 / 导入 / 字段编辑（Issue #2991）：CLI 选项名 fmt / output_path
+	# 在 MCP 侧与既有导出工具统一为 format / output_file。
+	"boss_resume_export": (
+		resume_cmd_module.resume_export_cmd,
+		{"fmt": "format", "output_path": "output_file"},
+		set(),
+	),
+	"boss_resume_import": (resume_cmd_module.resume_import_cmd, {}, set()),
+	"boss_resume_edit": (resume_cmd_module.resume_edit_cmd, {}, set()),
 	"boss_shortlist_annotate": (
 		shortlist_cmd_module.shortlist_annotate_cmd,
 		{"add_tag": "add_tags", "remove_tag": "remove_tags"},

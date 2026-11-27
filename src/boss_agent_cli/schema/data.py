@@ -116,7 +116,7 @@ SCHEMA_DATA = {
 				},
 				"--status": {"type": "string", "default": None, "description": "查询指定 workflow run_id"},
 				"--stop": {"type": "string", "default": None, "description": "停止指定 workflow run_id"},
-				"--timeout": {"type": "float", "default": None, "minimum": 0.001, "description": "workflow 超时秒数"},
+				"--timeout": {"type": "float", "default": None, "minimum": 0.001, "description": "workflow 超时秒数；仅 --input-json（run）/ --resume 生效，--status / --stop 不接受该参数"},
 				"--max-retries": {"type": "int", "default": 0, "minimum": 0, "maximum": 10, "description": "可恢复步骤的最大重试次数"},
 			},
 		},
@@ -790,9 +790,10 @@ SCHEMA_DATA = {
 							"run_id": {"type": "string", "description": "crawl run 标识，由 boss crawl start 返回"},
 							"selectors": {
 								"type": "array",
-								"items": {"type": "string"},
+								"items": {"type": "string", "minLength": 1},
 								"minItems": 1,
-								"description": "要导入的职位 selector 列表，取自 boss_crawl_results 的返回；与 all 必须且只能选一个",
+								"uniqueItems": True,
+								"description": "要导入的职位 selector 列表，取自 boss_crawl_results 的返回；元素不能为空或重复；与 all 必须且只能选一个",
 							},
 							"all": {
 								"type": "boolean",
@@ -925,7 +926,7 @@ SCHEMA_DATA = {
 					"--company": {"type": "string", "default": "", "description": "公司名称"},
 					"--city": {"type": "string", "default": "", "description": "城市"},
 					"--salary": {"type": "string", "default": "", "description": "薪资"},
-					"--source": {"type": "string", "default": "manual", "description": "来源，如 search/recommend/show/manual"},
+					"--source": {"type": "string", "default": None, "description": "来源，如 search/recommend/show/manual；省略时新记录记为 manual，重复加入保留原来源；不能为空白"},
 					"--lid": {"type": "string", "default": "", "description": "与 security_id 同一列表项的访问上下文（可选；不推断有效期）"},
 					"--tags": {"type": "string", "default": "", "description": "本地标签，逗号分隔"},
 					"--note": {"type": "string", "default": "", "description": "本地备注"},
@@ -972,7 +973,7 @@ SCHEMA_DATA = {
 			},
 			"subcommands": {
 				"list": "预览职位收藏单页及有效状态（不落库）",
-				"sync": "同步明确有效的职位收藏到本地候选池（远端只读拉取，本地 upsert；刷新动态访问 ID 并保留首次收藏时间）",
+				"sync": "同步明确有效的职位收藏到本地候选池（远端只读拉取，本地 upsert；刷新动态访问 ID 并保留首次收藏时间）；data.pages_scanned 为请求页数，重复页仍有后续时 data.truncated=true，计数仅覆盖已扫描前缀",
 			},
 		},
 		"digest": {
@@ -1041,6 +1042,11 @@ SCHEMA_DATA = {
 					"type": "bool",
 					"default": False,
 					"description": "用户确认 BOSS 官方目标业务页风险解除后显式清除本地风险锁；不解除服务器风险，Agent 不应自行执行",
+				},
+				"--pending-claims": {
+					"type": "string",
+					"default": None,
+					"description": "释放失败信封中的 claim_reference；仅清除对应的本次 greet/apply 预约，其他预约保持不变",
 				},
 			},
 		},

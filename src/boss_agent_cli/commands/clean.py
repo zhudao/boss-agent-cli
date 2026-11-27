@@ -46,9 +46,33 @@ from boss_agent_cli.display import (
 	default=False,
 	help="用户确认官方目标业务页恢复后显式清除 BOSS 本地风控锁；不解除服务器风险",
 )
+@click.option(
+	"--pending-claims",
+	"pending_claims",
+	default=None,
+	metavar="REFERENCE",
+	help="按释放失败信封中的 claim_reference 清除该次 greet/apply 预约；不清除其他预约",
+)
 @click.pass_context
-def clean_cmd(ctx: click.Context, dry_run: bool, clean_all: bool, privacy: bool, days: int, risk_lock: bool) -> None:
+def clean_cmd(
+	ctx: click.Context,
+	dry_run: bool,
+	clean_all: bool,
+	privacy: bool,
+	days: int,
+	risk_lock: bool,
+	pending_claims: str | None,
+) -> None:
 	"""清理过期缓存和临时文件。"""
+	if pending_claims is not None and (
+		len(pending_claims) != 32 or any(c not in "0123456789abcdef" for c in pending_claims)
+	):
+		handle_error_output(
+			ctx, "clean", code="INVALID_PARAM",
+			message="--pending-claims 必须是释放失败信封中的 32 位 claim_reference",
+			recovery_action="从 LOCAL_STATE_WRITE_FAILED 信封复制完整 claim_reference；不要猜测其他预约的标识",
+		)
+		return
 	data_dir = ctx.obj["data_dir"]
 	results: list[dict[str, Any]] = []
 	total_freed = 0
@@ -65,7 +89,7 @@ def clean_cmd(ctx: click.Context, dry_run: bool, clean_all: bool, privacy: bool,
 	# _clean_search_cache 打开库时按同一口径报错。
 	db_path = data_dir / "cache" / "boss_agent.db"
 	if privacy and _cache_db_present(db_path):
-		_open_cache_db(db_path).close()
+		_open_cache_db(db_path, root=data_dir).close()
 
 	# 隐私清理的只读预检必须发生在任何删除之前：否则登录态先被删掉，随后
 	# 在某个目录链接 / 不可写目录上失败，用户既看不到已完成项，也无法判断
@@ -233,6 +257,14 @@ def clean_cmd(ctx: click.Context, dry_run: bool, clean_all: bool, privacy: bool,
 			results.append(_clean_result("职位描述缓存", freed, count))
 			total_freed += freed
 
+		# 7) 仅清除释放失败信封指定的预约。每次预约的随机标识独立，旧指引
+		# 不能删除新建预约；其他在途 / 结果未知预约与 sent 行始终保留。
+		if pending_claims is not None:
+			current_target = "未完成的动作预约"
+			freed, count = _clean_pending_action_claims(data_dir, pending_claims, dry_run=dry_run)
+			results.append(_clean_result("未完成的动作预约", freed, count))
+			total_freed += freed
+
 	except CacheDatabaseInvalid as exc:
 		# 缓存库损坏是确定性本地失败；已完成项照样带回（Issue #1831）。
 		_emit_clean_partial_failure(
@@ -304,6 +336,8 @@ def clean_cmd(ctx: click.Context, dry_run: bool, clean_all: bool, privacy: bool,
 			clean_args.append("--all")
 		if privacy:
 			clean_args.append("--privacy")
+		if pending_claims is not None:
+			clean_args.extend(("--pending-claims", pending_claims))
 		clean_args.extend(("--days", str(days)))
 		if risk_lock:
 			clean_args.append("--risk-lock")
@@ -385,16 +419,20 @@ def _cache_db_present(db_path: Path) -> bool:
 	return True
 
 
-def _open_cache_db(db_path: Path) -> sqlite3.Connection:
+def _open_cache_db(db_path: Path, *, root: Path) -> sqlite3.Connection:
 	"""打开缓存库，并把内容损坏的 sqlite3.DatabaseError 归一成 CacheDatabaseInvalid。
 
 	clean 直接操作 SQLite，不经过 CacheStore 的启动校验；库文件损坏时若把
 	DatabaseError 抛给顶层，只会得到 traceback 而不是信封。锁冲突与本地 IO
 	错误不是内容损坏，原样上抛交给 main 分流成 CACHE_BUSY / LOCAL_IO_ERROR。
 
-	打开前确认是普通文件：符号链接（含悬空链接）会让 SQLite 在链接目标处
-	创建或改写数据目录之外的文件，clean 的 DELETE / VACUUM 不能写穿链接。
+	打开前确认是普通文件，且数据目录以下没有祖先链接：符号链接（含悬空链接）
+	会让 SQLite 在链接目标处创建或改写数据目录之外的文件，clean 的 DELETE /
+	VACUUM 不能写穿链接（Issue #2946）。root 本身仍允许是用户选择的目录链接。
 	"""
+	link = _first_symlink_component(root, db_path)
+	if link is not None:
+		raise OSError(errno.EINVAL, "缓存库路径包含符号链接，拒绝打开", str(link))
 	try:
 		mode = db_path.lstat().st_mode
 	except FileNotFoundError:
@@ -438,7 +476,7 @@ def _clean_search_cache(data_dir: Path, *, dry_run: bool, clean_all: bool) -> tu
 	if not _cache_db_present(db_path):
 		return 0, 0
 
-	conn = _open_cache_db(db_path)
+	conn = _open_cache_db(db_path, root=data_dir)
 	try:
 		try:
 			if not _table_exists(conn, "search_cache"):
@@ -557,8 +595,8 @@ def _privacy_preflight(data_dir: Path, targets: list[tuple[str, Path]]) -> list[
 	"""只读预检隐私清理目标，返回不可处理项。
 
 	不创建、不删除任何路径。符号链接（目标本身或祖先）按「跳过并报告」处理，
-	属于可安全完成的目标；其余已存在目标要求父目录可写，目录自身还要可写
-	（``shutil.rmtree`` 需要先删掉子项）。
+	属于可安全完成的目标；其余已存在目标要求父目录可写，整棵真实目录树都要
+	可写、可进入且可枚举（``shutil.rmtree`` 需要先删掉子项），不跟随嵌套链接。
 	"""
 	problems: list[dict[str, str]] = []
 	for target, path in targets:
@@ -579,8 +617,28 @@ def _privacy_preflight(data_dir: Path, targets: list[tuple[str, Path]]) -> list[
 		if not _is_writable(path.parent):
 			problems.append({"target": target, "path": str(path), "reason": "父目录不可写"})
 			continue
-		if stat.S_ISDIR(mode) and not _is_writable(path):
-			problems.append({"target": target, "path": str(path), "reason": "目录不可写"})
+		if not stat.S_ISDIR(mode):
+			continue
+		directories = [path]
+		while directories:
+			directory = directories.pop()
+			if not _is_writable(directory):
+				problems.append({"target": target, "path": str(directory), "reason": "目录不可写或不可进入"})
+				continue
+			try:
+				items = list(directory.iterdir())
+			except OSError as exc:
+				problems.append({"target": target, "path": str(directory), "reason": f"无法枚举目录: {exc}"})
+				continue
+			for item in items:
+				try:
+					item_mode = _lstat_mode(item)
+				except OSError as exc:
+					problems.append({"target": target, "path": str(item), "reason": f"无法读取路径状态: {exc}"})
+					continue
+				# 只按 lstat 类型递归真实目录，目录链接和悬空链接都不进入。
+				if item_mode is not None and stat.S_ISDIR(item_mode):
+					directories.append(item)
 	db_path = data_dir / "cache" / "boss_agent.db"
 	# 文件只需要写权限；X_OK 对普通文件恒为假，不能复用目录的 W_OK|X_OK 判断。
 	try:
@@ -875,6 +933,34 @@ def _clean_location_records(data_dir: Path, *, dry_run: bool) -> tuple[int, int]
 	return _clean_table(data_dir, "recruiter_location_records", dry_run=dry_run)
 
 
+def _clean_pending_action_claims(data_dir: Path, reference: str, *, dry_run: bool) -> tuple[int, int]:
+	"""仅清除指定版本的 pending 预约，其他账号、动作与后续新预约均保留。
+
+	恢复标识只在已证明未发送且释放失败时输出；历史预约不补发标识。
+	"""
+	db_path = data_dir / "cache" / "boss_agent.db"
+	if not _cache_db_present(db_path):
+		return 0, 0
+	conn = _open_cache_db(db_path, root=data_dir)
+	try:
+		if not _table_exists(conn, "candidate_action_claims"):
+			return 0, 0
+		columns = {row[1] for row in conn.execute("PRAGMA table_info(candidate_action_claims)")}
+		if "recovery_id" not in columns:
+			return 0, 0
+		where = "status = 'pending' AND action IN ('greet', 'apply') AND recovery_id = ?"
+		if dry_run:
+			row = conn.execute(f"SELECT COUNT(*) FROM candidate_action_claims WHERE {where}", (reference,)).fetchone()
+			count = int(row[0])
+		else:
+			cursor = conn.execute(f"DELETE FROM candidate_action_claims WHERE {where}", (reference,))
+			count = cursor.rowcount
+			conn.commit()
+		return count * 100, count
+	finally:
+		conn.close()
+
+
 def _clean_job_desc_cache(data_dir: Path, *, dry_run: bool) -> tuple[int, int]:
 	"""清理职位描述缓存。
 
@@ -891,7 +977,7 @@ def _clean_crawl_data(data_dir: Path, *, dry_run: bool) -> tuple[int, int, int]:
 	db_path = data_dir / "cache" / "boss_agent.db"
 	rows_removed = 0
 	if _cache_db_present(db_path):
-		conn = _open_cache_db(db_path)
+		conn = _open_cache_db(db_path, root=data_dir)
 		try:
 			if _table_exists(conn, "crawl_runs"):
 				row = conn.execute("SELECT COUNT(*) FROM crawl_runs").fetchone()
@@ -913,7 +999,7 @@ def _clean_table(data_dir: Path, table: str, *, dry_run: bool) -> tuple[int, int
 	if not _cache_db_present(db_path):
 		return 0, 0
 
-	conn = _open_cache_db(db_path)
+	conn = _open_cache_db(db_path, root=data_dir)
 	try:
 		if not _table_exists(conn, table):
 			return 0, 0

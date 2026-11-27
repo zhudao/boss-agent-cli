@@ -26,6 +26,8 @@ _ENUM_KEYS: frozenset[str] = frozenset(
 		"lang",
 		"tone",
 		"type",
+		# resume init 的 --template 目前仅接受 default；显式空串原样下发由 CLI 拒绝。
+		"template",
 		# preset / watch / batch-greet 的筛选键是 Click Choice（Issue #1180）。
 		"industry",
 		"scale",
@@ -84,14 +86,15 @@ _EXPLICIT_EMPTY_KEYS: frozenset[tuple[str, str]] = frozenset(
 #: action → 该 action 实际会下发的键（Issue #1493）。
 #: 矩阵之外的键若带非空值，`_build_args` 直接拒绝而不是静默丢弃：越界参数被
 #: 忽略后调用仍会成功，调用方会以为过滤、恢复或写入已经生效。
-#: 键集合以 CLI 为准：wizard 的 --timeout / --max-retries 对四种 action 都可用，
+#: 键集合以 CLI 为准：wizard 的 --timeout 只对 run / resume 生效（status / stop
+#: 在 CLI 入口拒绝，Issue #3013），--max-retries 对四种 action 都可用，
 #: config 的 key 对应 get/set/reset 三个子命令（没有 unset），hr jobs 的 page
 #: 只属于 list、job_id 只属于 online/offline。
 _WIZARD_ACTION_KEYS: dict[str, frozenset[str]] = {
 	"run": frozenset({"action", "role", "platform", "goal", "inputs", "requested_steps", "timeout", "max_retries"}),
 	"resume": frozenset({"action", "run_id", "timeout", "max_retries"}),
-	"status": frozenset({"action", "run_id", "timeout", "max_retries"}),
-	"stop": frozenset({"action", "run_id", "timeout", "max_retries"}),
+	"status": frozenset({"action", "run_id", "max_retries"}),
+	"stop": frozenset({"action", "run_id", "max_retries"}),
 }
 _WIZARD_KEY_USAGE = {
 	"role": "仅用于 action=run",
@@ -100,6 +103,7 @@ _WIZARD_KEY_USAGE = {
 	"inputs": "仅用于 action=run",
 	"requested_steps": "仅用于 action=run",
 	"run_id": "仅用于 action=resume/status/stop",
+	"timeout": "仅用于 action=run/resume",
 }
 _CONFIG_ACTION_KEYS: dict[str, frozenset[str]] = {
 	"list": frozenset({"action"}),
@@ -517,6 +521,8 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 			args.append("--all")
 		if arguments.get("days") is not None:
 			args.extend(_option_pair("--days", str(arguments["days"])))
+		if "pending_claims" in arguments:
+			args.extend(_option_pair("--pending-claims", str(arguments["pending_claims"])))
 		return args
 
 	if name == "digest":
@@ -567,6 +573,60 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 
 	if name == "resume_show":
 		return _literal_positionals(["resume", "show", arguments["name"]], start=2)
+
+	if name == "resume_init":
+		args = ["resume", "init"]
+		# 键存在且不为 None 就原样下发：显式空串在 CLI 会被按 INVALID_PARAM
+		# 拒绝，真值判断会把它换成默认简历名，调用方以为指定名称已生效。
+		if arguments.get("name") is not None:
+			args.extend(_option_pair("--name", str(arguments["name"])))
+		if arguments.get("template") is not None:
+			args.extend(_option_pair("--template", str(arguments["template"])))
+		return args
+
+	if name == "resume_delete":
+		return _literal_positionals(["resume", "delete", arguments["name"]], start=2)
+
+	if name == "resume_clone":
+		return _literal_positionals(
+			["resume", "clone", arguments["name"], arguments["new_name"]], start=2, count=2
+		)
+
+	if name == "resume_diff":
+		return _literal_positionals(
+			["resume", "diff", arguments["name1"], arguments["name2"]], start=2, count=2
+		)
+
+	if name == "resume_link":
+		args = ["resume", "link", arguments["name"], arguments["security_id"], arguments["job_id"]]
+		if arguments.get("title") is not None:
+			args.extend(_option_pair("--title", str(arguments["title"])))
+		if arguments.get("company") is not None:
+			args.extend(_option_pair("--company", str(arguments["company"])))
+		return _literal_positionals(args, start=2, count=3)
+
+	if name == "resume_applications":
+		return _literal_positionals(["resume", "applications", arguments["name"]], start=2)
+
+	if name == "resume_export":
+		args = ["resume", "export", arguments["name"]]
+		if arguments.get("format") is not None:
+			args.extend(_option_pair("--format", str(arguments["format"])))
+		if arguments.get("output_file") is not None:
+			args.extend(_option_pair("--output", str(arguments["output_file"])))
+		return _literal_positionals(args, start=2)
+
+	if name == "resume_import":
+		args = ["resume", "import", arguments["file_path"]]
+		if arguments.get("force") is True:
+			args.append("--force")
+		return _literal_positionals(args, start=2)
+
+	if name == "resume_edit":
+		args = ["resume", "edit", arguments["name"]]
+		args.extend(_option_pair("--field", str(arguments["field"])))
+		args.extend(_option_pair("--value", str(arguments["value"])))
+		return _literal_positionals(args, start=2)
 
 	if name == "ai_analyze_jd":
 		return _literal_positionals(
@@ -641,6 +701,9 @@ def _build_args(tool_name: str, arguments: dict[str, Any]) -> list[str]:
 		if arguments.get("page") is not None:
 			args.extend(_option_pair("--page", str(arguments["page"])))
 		return args
+
+	if name == "favorites_sync":
+		return ["favorites", "sync"]
 
 	if name == "history":
 		args = ["history"]

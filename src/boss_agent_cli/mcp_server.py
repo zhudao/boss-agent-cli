@@ -28,13 +28,21 @@ from mcp.types import (
 	ListToolsResult,
 	PaginatedRequestParams,
 	TextContent,
+	Tool,
+	ToolAnnotations,
 )
 
 from boss_agent_cli.api.browser_source import POLICIES as BROWSER_SOURCES
+from boss_agent_cli.api.recruiter_client import CHAT_ACTION_MAX_REQUESTS
+from boss_agent_cli.display import RISK_ERROR_CONTRACTS
 from boss_agent_cli.mcp_args import _build_args
 from boss_agent_cli.mcp_tools import TOOLS
 from boss_agent_cli.output import envelope_error, json_safe_value, serialization_failure_envelope
+from boss_agent_cli.schema.tool_policy import READ_ONLY_TOOL_NAMES as _READ_ONLY_TOOL_NAMES
+from boss_agent_cli.schema.tool_policy import static_read_only
+from boss_agent_cli.services.contact_lookup import MAX_FRIEND_LOOKUP_PAGES
 from boss_agent_cli.services.friend_list_pages import MAX_FRIEND_LIST_PAGES
+from boss_agent_cli.services.recruiter_last_messages import max_last_messages_requests
 from boss_agent_cli.search_filters import detail_filter_max_pages, resolve_active_level
 
 # 向后兼容的再导出：这些符号在拆分前属于本模块，`mcp-server/server.py` wrapper
@@ -115,8 +123,6 @@ _REQUEST_MARGIN_SECONDS = 30.0
 _MAX_CLI_TIMEOUT_SECONDS = 900.0
 #: 搜索结果页固定 15 条；详情筛选要逐条请求。
 _SEARCH_PAGE_SIZE = 15
-#: 招聘者聊天摘要 / 最近消息按每批 50 条请求估算。
-_HR_BATCH_SIZE = 50
 #: pipeline / follow-up / digest 聚合好友列表的估算页数上限：与 collector
 #: 的真实翻页上限一致；按 5 页估算会让 8 页以上的账号被提前掐断（Issue #2024）。
 _FRIEND_LIST_ESTIMATE_PAGES = MAX_FRIEND_LIST_PAGES
@@ -130,6 +136,20 @@ _BATCH_GREET_MAX_COUNT = 10
 _EXPORT_DEFAULT_COUNT = 50
 #: 招聘者聊天摘要与最近消息的 CLI 默认条数。
 _HR_DEFAULT_LIMIT = 100
+#: ``hr accept-resume``：只读预检（历史 + 好友详情）+ 一次同意 POST；``--dry-run``
+#: 不请求平台。默认 120s 只够一次请求，健康调用会在预检阶段被宿主掐断
+#: （Issue #3009）。
+_HR_ACCEPT_RESUME_REQUESTS = 3
+#: ``hr download-resume``：历史 + 好友详情 + 预览检查 + 附件下载各一次
+#: （Issue #3009）。
+_HR_DOWNLOAD_RESUME_REQUESTS = 4
+#: ``hr reply`` / ``hr resume --exchange`` / ``hr request-resume`` 的最坏请求数：
+#: 好友详情、动作前历史快照、browser-action 窗口、动作后历史回读各一次，再加
+#: 首次回读未命中时的 3 次确认重读（Issue #3010）。常量与客户端回读行为共用，
+#: 回读次数调整时预算自动跟随。
+_HR_CHAT_ACTION_REQUESTS = CHAT_ACTION_MAX_REQUESTS
+#: ``hr location``：好友详情 + 发送工作地点（Issue #3010）。
+_HR_LOCATION_REQUESTS = 2
 #: 招聘自动化一轮先扫描的 tab 数上界（新招呼 / 未读）。
 _AUTOMATION_SCAN_REQUESTS = 2
 #: 自动化每个会话最多一次历史读取 + 一次动作派发；``--limit`` 是本轮全局
@@ -199,55 +219,8 @@ def _configure_boss_invocation(
 	_BOSS_GLOBAL_ARGS = args
 
 
-# 子进程超时 / 取消时，只有明确只读的工具才能声明「可重放」。未列出的工具
-# （包括未来新增的）一律按「可能已产生平台副作用」处理：漏判只读只是保守，
-# 漏判写操作会让 Agent 直接重试一个可能已经生效的动作。
-_READ_ONLY_TOOL_NAMES = frozenset({
-	"boss_status",
-	"boss_doctor",
-	"boss_schema",
-	"boss_search",
-	"boss_recommend",
-	"boss_detail",
-	"boss_show",
-	"boss_history",
-	"boss_chat",
-	"boss_chatmsg",
-	"boss_me",
-	"boss_interviews",
-	"boss_cities",
-	"boss_pipeline",
-	"boss_follow_up",
-	"boss_digest",
-	"boss_stats",
-	"boss_export",
-	"boss_resume_list",
-	"boss_resume_show",
-	"boss_watch_list",
-	"boss_preset_list",
-	"boss_shortlist_list",
-	"boss_shortlist_compare",
-	"boss_favorites_list",
-	"boss_crawl_status",
-	"boss_crawl_results",
-	"boss_chat_summary",
-	"boss_agent_stats",
-	"boss_agent_pending",
-	"boss_agent_review",
-	"boss_config",
-	"boss_hr_whoami",
-	"boss_hr_applications",
-	"boss_hr_candidates",
-	"boss_hr_recommendations",
-	"boss_hr_chat",
-	"boss_hr_chatmsg",
-	"boss_hr_last_messages",
-	"boss_hr_resume",
-	"boss_hr_jobs",
-	"boss_hr_jobs_detail",
-	# wizard 只有 status 是纯读取，其余 action 按写操作处理（Issue #2552）。
-	"boss_wizard",
-})
+# 子进程超时 / 取消时，只有 `schema.tool_policy.READ_ONLY_TOOL_NAMES` 里的工具
+# 才能声明「可重放」。白名单与静态只读注解共用同一份规则（Issue #2997）。
 
 #: 工具名整体只读、但个别参数会把调用变成平台写操作。判定必须看参数：
 #: `boss_hr_jobs` 的 `action=online|offline` 会 POST 上线/下线，超时后若按只读
@@ -271,6 +244,28 @@ _DEFAULT_ACTION_BY_TOOL: dict[str, str] = {"boss_wizard": "run"}
 _ACTION_DIMENSION_TOOL_NAMES = frozenset(
 	tool.name for tool in TOOLS if "action" in tool.input_schema.get("properties", {})
 )
+
+def _static_read_only(tool: Tool) -> bool:
+	"""返回工具在所有参数组合下是否都只读（供 MCP ``ToolAnnotations`` 使用）。
+
+	规则与 ``boss schema --format mcp-tools`` 导出共用
+	``schema.tool_policy.static_read_only``，避免两处注解漂移（Issue #2997）。
+	动态写判定仍由 ``_tool_may_write`` 按参数负责，两者互不替代。
+	"""
+	return static_read_only(tool.name, tool.input_schema)
+
+
+#: ``tools/list`` 返回带 ``ToolAnnotations`` 的副本：``readOnlyHint`` 规范缺省
+#: 为 false，不注明会让宿主对 ``boss_schema``、``boss_search`` 这类只读调用也
+#: 逐个确认。``destructiveHint`` / ``idempotentHint`` / ``openWorldHint`` 保持
+#: 规范默认值，避免误标（Issue #2993）。延迟到请求时构造：mock 环境下的
+#: ``mcp.types.Tool`` 替身没有 ``model_copy``，模块导入不能依赖它。
+def _annotated_tools() -> list[Tool]:
+	return [
+		tool.model_copy(update={"annotations": ToolAnnotations(read_only_hint=_static_read_only(tool))})
+		for tool in TOOLS
+	]
+
 
 #: schema 缺省 ``dry_run=true`` 的工具：省略该键时 ``mcp_args._build_args`` 仍会
 #: 生成 ``--dry-run``，实际语义是只预览。不能按「未显式声明只读」归为写，否则
@@ -298,9 +293,51 @@ _PRESET_READ_INTERRUPT_RECOVERY = (
 _DRY_RUN_INTERRUPT_RECOVERY = "演练命令已中断，不产生平台写入；可直接重试或降低 limit"
 #: 只读保证只适用于原参数：未开启预览时，增大零上限会变成真实写入（Issue #2847）。
 _BATCH_GREET_READ_INTERRUPT_RECOVERY = "只读调用已中断，未发出任何招呼；如仍需结果，请保留原来的预览模式或零上限，按原参数重试"
+#: 本地维护工具只写本机文件：中断后不能按通用写文案让 Agent 去核对平台结果，
+#: 那会把恢复引向不存在的平台写入（Issue #2975）。
+_LOCAL_RESUME_INIT_INTERRUPT_RECOVERY = (
+	"初始化已中断；本地简历文件可能已写入。先运行 boss_resume_list 确认名称，再决定是否重试；不产生平台写入"
+)
+_LOCAL_RESUME_DELETE_INTERRUPT_RECOVERY = (
+	"删除已中断；本机删除可能已生效。先运行 boss_resume_list 确认，再决定是否重试；不产生平台写入"
+)
+_LOCAL_FAVORITES_SYNC_INTERRUPT_RECOVERY = (
+	"同步已中断；本地候选池可能已部分更新，重新执行会按当前收藏继续 upsert；平台侧只读"
+)
+_LOCAL_RESUME_CLONE_INTERRUPT_RECOVERY = (
+	"复制已中断；目标简历可能已写入。先运行 boss_resume_list 核对，再决定是否重试；不产生平台写入"
+)
+_LOCAL_RESUME_LINK_INTERRUPT_RECOVERY = (
+	"职位关联已中断；本机关联表可能已写入。先用 boss_resume_applications 核对，再决定是否重试；不产生平台写入"
+)
+_LOCAL_RESUME_EXPORT_INTERRUPT_RECOVERY = (
+	"导出已中断；目标文件可能已部分写入或尚未生成。先核对输出目录中的文件，再决定是否重试；不产生平台写入"
+)
+_LOCAL_RESUME_IMPORT_INTERRUPT_RECOVERY = (
+	"导入已中断；本地简历文件可能已写入。先运行 boss_resume_list 核对，再决定是否重试；不产生平台写入"
+)
+_LOCAL_RESUME_EDIT_INTERRUPT_RECOVERY = (
+	"编辑已中断；本地简历可能已保存新值。先用 boss_resume_show 核对，再决定是否重试；不产生平台写入"
+)
 
 
 def _write_interrupt_recovery(args: tuple[str, ...]) -> str:
+	if args[:2] == ("resume", "init"):
+		return _LOCAL_RESUME_INIT_INTERRUPT_RECOVERY
+	if args[:2] == ("resume", "delete"):
+		return _LOCAL_RESUME_DELETE_INTERRUPT_RECOVERY
+	if args[:2] == ("resume", "clone"):
+		return _LOCAL_RESUME_CLONE_INTERRUPT_RECOVERY
+	if args[:2] == ("resume", "link"):
+		return _LOCAL_RESUME_LINK_INTERRUPT_RECOVERY
+	if args[:2] == ("resume", "export"):
+		return _LOCAL_RESUME_EXPORT_INTERRUPT_RECOVERY
+	if args[:2] == ("resume", "import"):
+		return _LOCAL_RESUME_IMPORT_INTERRUPT_RECOVERY
+	if args[:2] == ("resume", "edit"):
+		return _LOCAL_RESUME_EDIT_INTERRUPT_RECOVERY
+	if args[:2] == ("favorites", "sync"):
+		return _LOCAL_FAVORITES_SYNC_INTERRUPT_RECOVERY
 	if args and args[0] == "wizard" and _option_value(args, "--stop") is not None:
 		return "先用 wizard --status 查询同一 run_id 的当前状态；确认仍需停止后再发出 stop，不要自动重试"
 	return _WRITE_INTERRUPT_RECOVERY
@@ -427,6 +464,18 @@ def _estimated_requests(args: tuple[str, ...]) -> int | None:
 	返回 None 表示这条命令不做参数估算（保持默认 120s 超时）。
 	"""
 	command = args[0]
+	if command in {"chatmsg", "chat-summary", "mark", "exchange"}:
+		if command == "chatmsg" and _option_value(args, "--friend-uid") is not None:
+			# 显式稳定 uid 直接读取历史，不扫描联系人列表。
+			return 1
+		# 先逐页找联系人，再读历史或派发一次操作。漏算查找会在默认节流下
+		# 提前杀掉健康调用；页数与查找服务共用常量，仍受 900s 封顶（Issue #3001）。
+		return min(MAX_FRIEND_LOOKUP_PAGES + 1, _MAX_ESTIMATED_REQUESTS)
+	if command == "favorites" and len(args) > 1 and args[1] == "sync":
+		# 收藏同步逐页拉取且没有可拆分的分页参数：只按默认 120s 估算，收藏较多的
+		# 账号必然在同步中途被掐断（本地可能已部分 upsert）。直接给满估算封顶，
+		# 超时仍受 _MAX_CLI_TIMEOUT_SECONDS 约束。
+		return _MAX_ESTIMATED_REQUESTS
 	if command == "batch-greet":
 		# 只看 ``--`` 之前的选项：关键词恰好是 "--dry-run" 时不能把预算当成预览
 		# （Issue #2176）。
@@ -476,19 +525,37 @@ def _estimated_requests(args: tuple[str, ...]) -> int | None:
 			summary_limit = _int_option(args, "--summary-limit", _HR_DEFAULT_LIMIT)
 			if summary_limit is None:
 				return None
-			# 1 次好友列表 + 每 50 条摘要一批。整数除法避免超大整数在
-			# 浮点除法时抛 OverflowError（Issue #1612）。
-			batches = -(-max(summary_limit, 0) // _HR_BATCH_SIZE)
+			# 好友列表带 friendSource，分组后各自分批，不能只按总数分页（Issue #3006）。
+			batches = max_last_messages_requests(summary_limit, grouped_by_source=True)
 			return min(1 + batches, _MAX_ESTIMATED_REQUESTS)
 		if subcommand == "last-messages":
 			limit = _int_option(args, "--limit", _HR_DEFAULT_LIMIT)
 			if limit is None or limit < 1:
 				return None
-			# 与 summary-limit 分支同口径：整数分页并封顶（Issue #1612）。
-			batches = -(-limit // _HR_BATCH_SIZE)
-			# 无 --friend-id 时命令先取一页沟通列表再分批拉消息（Issue #2025）。
-			base = 0 if "--friend-id" in _option_region(args) else 1
-			return min(base + batches, _MAX_ESTIMATED_REQUESTS)
+			# 无 --friend-id 时先取列表及来源（Issue #2025），之后可能分成两组。
+			# 显式 ID 没有来源信息，仍是单组；估算共用服务的默认批次大小。
+			from_list = "--friend-id" not in _option_region(args)
+			batches = max_last_messages_requests(limit, grouped_by_source=from_list)
+			return min(int(from_list) + batches, _MAX_ESTIMATED_REQUESTS)
+		if subcommand == "accept-resume":
+			# --dry-run 只预览本地参数，不请求平台（Issue #3009）。
+			if "--dry-run" in _option_region(args):
+				return None
+			return _HR_ACCEPT_RESUME_REQUESTS
+		if subcommand == "download-resume":
+			return _HR_DOWNLOAD_RESUME_REQUESTS
+		if subcommand in {"reply", "request-resume"}:
+			return _HR_CHAT_ACTION_REQUESTS
+		if subcommand == "resume":
+			# 只有 --exchange 走聊天页动作；其余形态只查一次在线简历。
+			if "--exchange" in _option_region(args):
+				return _HR_CHAT_ACTION_REQUESTS
+			return None
+		if subcommand == "location":
+			# --dry-run 只预览目标，不请求平台（Issue #3010）。
+			if "--dry-run" in _option_region(args):
+				return None
+			return _HR_LOCATION_REQUESTS
 		return None
 	if command == "watch" and len(args) > 1 and args[1] == "run":
 		# watch run 对保存的搜索应用福利 / 活跃度筛选，逐条查详情；
@@ -529,6 +596,18 @@ def _estimated_requests(args: tuple[str, ...]) -> int | None:
 _MAX_ESTIMATED_REQUESTS = int(_MAX_CLI_TIMEOUT_SECONDS // _REQUEST_BUDGET_SECONDS) + 1
 
 
+def _is_wizard_control_args(args: tuple[str, ...]) -> bool:
+	"""``wizard --status`` / ``--stop`` 不执行 ``--timeout``（Issue #3013）。
+
+	控制动作在进入 runner 前返回，CLI 入口会拒绝该参数；宿主预算必须回落到
+	默认值，不能让一个从未生效的小 timeout 先杀掉本应返回 INVALID_PARAM 的子进程。
+	"""
+	if not args or args[0] != "wizard":
+		return False
+	region = _option_region(args)
+	return "--status" in region or "--stop" in region
+
+
 def _cli_timeout(args: tuple[str, ...]) -> float:
 	# 超时按最坏情况下的平台请求数估算（Issue #1491 / #1492）：
 	#   默认节流 DEFAULT_REQUEST_DELAY = (30.0, 60.0)，高斯均值 45s、上界 60s；
@@ -540,13 +619,24 @@ def _cli_timeout(args: tuple[str, ...]) -> float:
 	#       按 900s 封顶；普通 search 只有 1 次列表请求 → 95s，仍取默认 120s。
 	# A wizard deadline belongs to the child. The host allows bounded extra
 	# time for that child to commit its result/checkpoint and emit the envelope.
-	requested_timeout = _option_value(args, "--timeout") if args and args[0] == "wizard" else None
+	requested_timeout = (
+		_option_value(args, "--timeout")
+		if args and args[0] == "wizard" and not _is_wizard_control_args(args)
+		else None
+	)
 	if requested_timeout is not None:
 		try:
 			requested = float(requested_timeout)
 		except ValueError:
 			return _CLI_TIMEOUT_SECONDS
 		if math.isfinite(requested) and requested > 0:
+			if requested > _MAX_CLI_TIMEOUT_SECONDS:
+				# schema 已声明宿主等待上限；超过时 CLI 仍会按请求值运行，宿主却
+				# 先杀子进程。拒绝比静默截断更可预期（Issue #3013）。
+				raise ValueError(
+					f"timeout 最大为 {_MAX_CLI_TIMEOUT_SECONDS:g} 秒（MCP 宿主等待上限），"
+					f"收到 {requested:g} 秒"
+				)
 			# wizard 子进程自己的 --timeout 没有上限：宿主若按任意大值等待，
 			# 客户端一次超时调用会把 MCP server 挂到近似无界（Issue #1594）。
 			return min(requested + _CHECKPOINT_GRACE_SECONDS, _MAX_CLI_TIMEOUT_SECONDS)
@@ -706,7 +796,7 @@ def _run_boss(*args: str, may_write: bool = True) -> dict[str, Any]:
 		# envelope_error 会从登记表补齐 recovery_action；本地参数错误未启动子进程，
 		# 不能沿用其它 INVALID_PARAM 来源的「修正参数」笼统文案。
 		estimate_error["error"]["recovery_action"] = (
-			"减小 --summary-limit / --limit / --count 后重试；本次未启动子进程。"
+			"减小 --summary-limit / --limit / --count 或 --timeout 后重试；本次未启动子进程。"
 			"参数提示由 --help 给出，输入未进入 CLI"
 		)
 		return estimate_error
@@ -788,6 +878,12 @@ def _interrupted_failure(
 	except (ValueError, RecursionError):
 		# ValueError 已覆盖 JSONDecodeError / UnicodeDecodeError 与超长整数。
 		checkpoint_result = None
+	if isinstance(checkpoint_result, dict) and _is_cli_envelope(checkpoint_result, None):
+		child_error = checkpoint_result.get("error")
+		if isinstance(child_error, dict) and child_error.get("code") in RISK_ERROR_CONTRACTS:
+			# 清理阶段已经收到风控终止信封：保留人工恢复动作、hints 与断点，
+			# 不能用可重试的超时 / 取消覆盖平台硬边界（Issue #3000）。
+			return checkpoint_result
 	return _cli_failure(
 		args,
 		code,
@@ -812,7 +908,7 @@ async def _run_boss_async(*args: str, may_write: bool = True) -> dict[str, Any]:
 			"INVALID_PARAM",
 			f"参数超出本地估算范围：{exc}",
 			outcome_unknown=False,
-			recovery_action="减小 count / summary-limit 后重试；本次子进程未启动",
+			recovery_action="调整 count / summary-limit / timeout 后重试；本次子进程未启动",
 		)
 	cmd = [_BOSS_BIN, "--json", *_BOSS_GLOBAL_ARGS, *args]
 	# handler 校验工具参数；实际启动前还要覆盖宿主注入的全局选项和可执行文件名。
@@ -876,7 +972,7 @@ async def _run_boss_async(*args: str, may_write: bool = True) -> dict[str, Any]:
 
 
 async def list_tools(ctx: Any, params: "PaginatedRequestParams | None" = None) -> ListToolsResult:
-	return ListToolsResult(tools=TOOLS)
+	return ListToolsResult(tools=_annotated_tools())
 
 
 def _tool_argument_error(tool_name: str, message: str) -> CallToolResult:
@@ -1122,6 +1218,17 @@ def _argument_type_errors(tool_name: str, arguments: dict[str, Any]) -> list[str
 			errors.append(f"{key} 另有 {len(invalid) - _MAX_ELEMENT_TYPE_ERRORS} 个元素类型错误")
 		if not isinstance(items, dict):
 			return errors
+		if item_type == "string" and prop.get("uniqueItems") is True:
+			# 目前仅 selectors / requested_steps 声明字符串去重（Issue #2976）。
+			# 类型错误先报；重复项最多报一条，避免错误数随数组大小增长。
+			seen: set[str] = set()
+			for index, item in enumerate(value):
+				if not isinstance(item, str):
+					continue
+				if item in seen:
+					errors.append(f"{key}[{index}] 与前面的元素重复")
+					break
+				seen.add(item)
 		item_min_length = items.get("minLength")
 		item_minimum = items.get("minimum")
 		item_maximum = items.get("maximum")

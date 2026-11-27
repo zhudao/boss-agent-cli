@@ -24,6 +24,9 @@ _mcp_server.Server = MagicMock()
 _mcp_stdio.stdio_server = MagicMock()
 _mcp_types.TextContent = MagicMock()
 _mcp_types.Tool = type("Tool", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+_mcp_types.ToolAnnotations = type(
+	"ToolAnnotations", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}
+)
 # mcp 2.x 的 handler 收 (ctx, params) 并返回 Result 对象，故 mcp_server 还需要这四个类型。
 # 用能接受任意关键字的轻量替身即可——本文件不断言它们的行为，只需让 import 成立。
 for _name in ("CallToolRequestParams", "CallToolResult", "ListToolsResult", "PaginatedRequestParams"):
@@ -309,7 +312,7 @@ def test_crawl_tools_only_read_or_locally_shortlist_existing_runs():
 
 def test_tool_count():
 	"""工具总数应与当前注册一致。"""
-	assert len(TOOLS) == 80
+	assert len(TOOLS) == 90
 
 
 def test_mcp_tool_count_matches_readme():
@@ -1309,7 +1312,7 @@ def test_run_boss_timeout(mock_run):
 		(("export", "golang", "--active", "3day"), 600, 900),
 		(("export", "golang", "--active", "online"), 200, 400),
 		(("export", "golang", "--count", "300"), 600, 900),
-		# hr chat = 1 次好友列表 + ceil(summary_limit/50) 批。
+		# hr chat = 1 次好友列表 + 来源 0/1 分组后的最大摘要批次。
 		(("hr", "chat"), 200, 300),
 		(("hr", "chat", "--summary-limit", "300"), 400, 600),
 		(("hr", "last-messages"), 120, 300),
@@ -2063,7 +2066,7 @@ def test_build_args_favorites_list_omits_page_when_absent():
 
 def test_tool_count_after_pr41():
 	"""协议服务工具总数应与当前 MCP 暴露能力完全一致。"""
-	assert len(TOOLS) == 80
+	assert len(TOOLS) == 90
 
 
 def test_build_args_shortlist_add():

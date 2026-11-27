@@ -12,6 +12,7 @@ from boss_agent_cli.api.endpoints import INDUSTRY_CODES, JOB_TYPE_CODES, SCALE_C
 from boss_agent_cli.platforms import list_platforms, list_recruiter_platforms
 from boss_agent_cli.schema.availability import availability_note, inject_availability
 from boss_agent_cli.schema.data import SCHEMA_DATA
+from boss_agent_cli.schema.tool_policy import static_read_only
 
 
 @dataclass(frozen=True)
@@ -95,10 +96,16 @@ def native_crawl_mcp_tools(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 	`boss schema` 的 `commands.crawl.mcp_tools` 与 `--format mcp-tools` 导出的是
 	同一批工具：内嵌版本先前缺少 `additionalProperties: false` 与可用性说明，
-	只读 native 的调用方会拿到一份更宽松的契约。这里复用同一份规范化逻辑。
+	只读 native 的调用方会拿到一份更宽松的契约。这里复用同一份规范化逻辑，
+	只读注解也取自同一份 ``tool_policy`` 判定（Issue #2997）。
 	"""
 	return [
-		{"name": tool.name, "description": tool.description, "inputSchema": tool.input_schema}
+		{
+			"name": tool.name,
+			"description": tool.description,
+			"inputSchema": tool.input_schema,
+			"annotations": {"readOnlyHint": static_read_only(tool.name, tool.input_schema)},
+		}
 		for tool in build_tool_catalog(data)
 		if tool.name in _CRAWL_TOOL_NAMES
 	]
@@ -127,20 +134,25 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"inputs": {"type": "object", "description": "goal 所需的 JSON 参数"},
 					"requested_steps": {
 						"type": "array",
-						"items": {"type": "string"},
+						"items": {"type": "string", "minLength": 1},
 						# 空数组会在 plan 层被折叠成全量步骤（含真实写操作），
 						# 与「不传」语义不同，必须在入口拒绝（Issue #1236）。
 						"minItems": 1,
-						"description": "可选的 goal 内步骤子集；省略表示执行全部步骤，空数组非法",
+						# 空串与重复步骤会被 plan 层按 INVALID_PARAM 拒绝（Issue #2976）：
+						# schema 必须提前声明同一约束，宿主才能在发送前拦下。
+						"uniqueItems": True,
+						"description": "可选的 goal 内步骤子集；省略表示执行全部步骤，空数组非法，元素不能为空串或重复",
 					},
 					"run_id": {"type": "string", "description": "resume/status/stop 的显式 workflow run_id"},
 					"timeout": {
 						"type": "number",
 						"minimum": 0.001,
+						"maximum": 900,
 						"default": 120,
 						"description": (
-							"workflow 超时秒数；run / resume 省略时 MCP 宿主按 120 秒设置子进程截止，"
-							"CLI 直接调用不设截止"
+							"workflow 超时秒数（仅 action=run / resume；status / stop 不接受该参数）；"
+							"run / resume 省略时 MCP 宿主按 120 秒设置子进程截止，CLI 直接调用不设截止；"
+							"MCP 宿主等待上限为 900 秒"
 						),
 					},
 					"max_retries": {"type": "integer", "minimum": 0, "maximum": 10, "default": 0, "description": "可恢复步骤的最大重试次数"},
@@ -152,7 +164,7 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 				"then": {
 					"required": ["run_id"],
 					# role/platform/goal/inputs/requested_steps 只属于 run（Issue #2795）；
-					# timeout / max_retries 对四种 action 都可用，不加限制。
+					# max_retries 对四种 action 都可用，不加限制。
 					"not": {
 						"anyOf": [
 							{"required": ["role"]},
@@ -162,6 +174,11 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 							{"required": ["requested_steps"]},
 						]
 					},
+					# timeout 只属于 run / resume：resume 允许，status / stop 在 CLI
+					# 入口会拒绝该参数（Issue #3013），schema 提前声明同一约束。
+					"if": {"properties": {"action": {"const": "resume"}}, "required": ["action"]},
+					"then": {},
+					"else": {"not": {"required": ["timeout"]}},
 				},
 				# run（含省略 action）必须给出 role / platform / goal：否则调用方要连吃
 				# 三次各报一个缺失字段的 INVALID_PARAM 才能拼出合法调用（Issue #1775）。
@@ -561,6 +578,11 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 						"description": "清理超过指定天数的快照和导出文件",
 						"default": 30,
 					},
+					"pending_claims": {
+						"type": "string",
+						"minLength": 32,
+						"description": "释放失败信封中的 claim_reference；仅清除对应的本次 greet/apply 预约，其他预约保持不变",
+					},
 				},
 				"required": [],
 			},
@@ -733,6 +755,149 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 			},
 		),
 		ToolDefinition(
+			name="boss_resume_init",
+			description="从默认模板初始化一份本地简历；同名简历已存在时拒绝，不覆盖现有内容。只写本机，不访问平台。",
+			input_schema={
+				"type": "object",
+				"properties": {
+					"name": {"type": "string", "minLength": 1, "description": "简历名称（省略时为 default）"},
+					"template": {
+						"type": "string",
+						"enum": ["default"],
+						"default": "default",
+						"description": "模板名称；当前仅提供 default",
+					},
+				},
+				"required": [],
+			},
+		),
+		ToolDefinition(
+			name="boss_resume_delete",
+			description=(
+				"删除一份本地简历及其职位关联；不可恢复，只影响本机文件。"
+				"删除前先用 boss_resume_list 核对简历名称。"
+			),
+			input_schema={
+				"type": "object",
+				"properties": {
+					"name": {"type": "string", "minLength": 1, "description": "要删除的简历名称"},
+				},
+				"required": ["name"],
+			},
+		),
+		ToolDefinition(
+			name="boss_resume_clone",
+			description=(
+				"把一份本地简历复制成新版本；目标名称已存在时拒绝，不覆盖现有内容。"
+				"只写本机文件，不访问平台。"
+			),
+			input_schema={
+				"type": "object",
+				"properties": {
+					"name": {"type": "string", "minLength": 1, "description": "源简历名称"},
+					"new_name": {"type": "string", "minLength": 1, "description": "新简历名称"},
+				},
+				"required": ["name", "new_name"],
+			},
+		),
+		ToolDefinition(
+			name="boss_resume_diff",
+			description="对比两份本地简历的字段差异，返回字段级差异列表；只读本机文件，不访问平台。",
+			input_schema={
+				"type": "object",
+				"properties": {
+					"name1": {"type": "string", "minLength": 1, "description": "第一份简历名称"},
+					"name2": {"type": "string", "minLength": 1, "description": "第二份简历名称"},
+				},
+				"required": ["name1", "name2"],
+			},
+		),
+		ToolDefinition(
+			name="boss_resume_link",
+			description=(
+				"把职位关联到本地简历，写本机关联表，不产生平台请求；"
+				"之后可用 boss_resume_applications 查看关联与状态。"
+			),
+			input_schema={
+				"type": "object",
+				"properties": {
+					"name": {"type": "string", "minLength": 1, "description": "简历名称"},
+					"security_id": {"type": "string", "minLength": 1, "description": "职位访问标识（从搜索结果获取）"},
+					"job_id": {"type": "string", "minLength": 1, "description": "职位 ID（从搜索结果获取）"},
+					"title": {"type": "string", "description": "职位名称（可选，仅用于本地展示）"},
+					"company": {"type": "string", "description": "公司名称（可选，仅用于本地展示）"},
+				},
+				"required": ["name", "security_id", "job_id"],
+			},
+		),
+		ToolDefinition(
+			name="boss_resume_applications",
+			description="查看指定本地简历关联的所有职位及状态；只读本机关联表，不访问平台。",
+			input_schema={
+				"type": "object",
+				"properties": {
+					"name": {"type": "string", "minLength": 1, "description": "简历名称"},
+				},
+				"required": ["name"],
+			},
+		),
+		ToolDefinition(
+			name="boss_resume_export",
+			description=(
+				"把本地简历导出为 JSON / HTML / PDF 文件；PDF 需要本机浏览器内核（与 CLI 一致）。"
+				"只读本机简历文件，不访问平台；json 省略 output_file 时在 data 中返回简历 JSON，"
+				"html / pdf 省略时保存到默认导出路径。"
+			),
+			input_schema={
+				"type": "object",
+				"properties": {
+					"name": {"type": "string", "minLength": 1, "description": "简历名称"},
+					"format": {
+						"type": "string",
+						"enum": ["pdf", "json", "html"],
+						"default": "json",
+						"description": "导出格式；pdf 需要本机安装浏览器内核",
+					},
+					"output_file": {"type": "string", "description": "输出文件路径（不指定则保存到默认导出目录）"},
+				},
+				"required": ["name"],
+			},
+		),
+		ToolDefinition(
+			name="boss_resume_import",
+			description=(
+				"从 JSON 文件导入本地简历；force=true 覆盖同名简历并丢弃本地已有编辑。"
+				"只写本机文件，不访问平台。"
+			),
+			input_schema={
+				"type": "object",
+				"properties": {
+					"file_path": {"type": "string", "minLength": 1, "description": "要导入的 JSON 文件路径"},
+					"force": {"type": "boolean", "default": False, "description": "覆盖同名简历"},
+				},
+				"required": ["file_path"],
+			},
+		),
+		ToolDefinition(
+			name="boss_resume_edit",
+			description=(
+				"编辑本地简历的一个文本叶子字段（如 title、personal_info.layout）；"
+				"字段路径与取值由 CLI 校验。只写本机文件，不访问平台。"
+			),
+			input_schema={
+				"type": "object",
+				"properties": {
+					"name": {"type": "string", "minLength": 1, "description": "简历名称"},
+					"field": {"type": "string", "minLength": 1, "description": "字段路径（如 title、personal_info.layout）"},
+					"value": {
+						"type": "string",
+						"description": "新值；MCP 侧必须非空，清空字段请使用 CLI 的 resume edit --value \"\"",
+					},
+				},
+				"required": ["name", "field", "value"],
+			},
+		),
+		ToolDefinition(
 			name="boss_ai_analyze_jd",
 			description="分析职位描述并评估简历匹配度，输出匹配分数和差距分析",
 			input_schema={
@@ -888,6 +1053,15 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 			},
 		),
 		ToolDefinition(
+			name="boss_favorites_sync",
+			description=(
+				"把 BOSS 职位收藏同步到本地候选池：远端只读拉取，本地按 job_id upsert 并刷新访问 ID。"
+				"分页受安全上限约束，data.pages_scanned / truncated 报告完整性，"
+				"重复页仍声明有后续时计数只覆盖已扫描前缀。"
+			),
+			input_schema={"type": "object", "properties": {}, "required": []},
+		),
+		ToolDefinition(
 			name="boss_shortlist_add",
 			description="将职位加入本地候选池，可附加本地标签和备注",
 			input_schema={
@@ -899,7 +1073,14 @@ def _tool_definitions(data: dict[str, Any]) -> list[ToolDefinition]:
 					"company": {"type": "string", "default": "", "description": "公司名称（可选）"},
 					"city": {"type": "string", "default": "", "description": "城市（可选）"},
 					"salary": {"type": "string", "default": "", "description": "薪资（可选）"},
-					"source": {"type": "string", "default": "manual", "description": "来源，如 search/recommend/show/manual"},
+					"source": {
+						"type": "string",
+						"default": None,
+						"description": (
+							"来源，如 search/recommend/show/manual；省略时新记录记为 manual，"
+							"重复加入保留原来源；不能为空白"
+						),
+					},
 					"lid": {"type": "string", "default": "", "description": "与 security_id 同一列表项的访问上下文（可选；不推断有效期）"},
 					"tags": {"type": "string", "description": "本地标签，逗号分隔"},
 					"note": {"type": "string", "description": "本地备注"},

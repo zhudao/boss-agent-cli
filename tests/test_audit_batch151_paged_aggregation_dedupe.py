@@ -227,7 +227,9 @@ def test_identical_page_still_ends_the_scan() -> None:
 
 	assert error is None
 	assert platform.calls == [1, 2]
-	assert (pages_scanned, truncated) == (2, False)
+	# 第 2 页仍声明 hasMore=true，聚合只是前缀；早停保留但必须标记不完整
+	# （Issue #2956）。
+	assert (pages_scanned, truncated) == (2, True)
 	assert [item["uid"] for item in items] == [1, 2]
 
 
@@ -446,6 +448,8 @@ def test_favorites_sync_counts_each_job_once(tmp_path: Path) -> None:
 		"active_count": 5,
 		"inactive_count": 0,
 		"unknown_count": 0,
+		"pages_scanned": 2,
+		"truncated": False,
 	}
 	assert sorted(row["job_id"] for row in _shortlist_rows(tmp_path)) == [f"job_{job}" for job in (1, 2, 3, 4, 5)]
 

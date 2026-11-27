@@ -4,6 +4,10 @@ from boss_agent_cli.services.chat_utils import stable_uid
 from boss_agent_cli.services.friend_list_pages import friend_list_page_has_content, friend_list_page_items
 
 
+# 联系人扫描与 MCP 超时估算共用同一页数上限（Issue #3001）。
+MAX_FRIEND_LOOKUP_PAGES = 50
+
+
 def friend_security_id(item: Mapping[str, Any]) -> str:
 	"""读取本次列表返回的 securityId；类型漂移按缺失处理。
 
@@ -77,7 +81,7 @@ def find_friend(
 	identifier: str | int,
 	*,
 	start_page: int = 1,
-	max_pages: int = 50,
+	max_pages: int = MAX_FRIEND_LOOKUP_PAGES,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
 	"""分页遍历沟通列表，按 ``uid`` 或 ``security_id`` 查找联系人。
 
@@ -129,14 +133,21 @@ def find_friend(
 		# 签名全为空时无法判断是否重复页，继续翻页，避免把缺字段的新页面
 		# 当成重复页提前结束（与 services/friend_list_pages 的聚合守卫一致）。
 		identities = [_lookup_identity(item) for item in page_items]
+		has_more = platform_data.get("hasMore")
 		if any(identity[0] or identity[1] for identity in identities):
 			signature = tuple(identities)
 			if signature in seen_signatures:
+				if has_more is True:
+					# 重复页仍明确声明有后续时遍历结果不可信：保留早停，
+					# 但不能落成确定的「不存在」（Issue #2916）。
+					raise FriendLookupLimitExceeded(
+						"沟通列表出现重复页但仍声明有后续，无法确认联系人是否存在；"
+						"请先用 boss chat 取到稳定 uid 再查询，不要重放同一 security_id 查询"
+					)
 				terminated = True
 				break
 			seen_signatures.add(signature)
 
-		has_more = platform_data.get("hasMore")
 		if not page_items:
 			# 形状守卫先于内容守卫：没有可识别的列表容器时，兄弟键是字符串 /
 			# 对象这类真值也不能当成「整页元素被跳过」继续翻页，否则单个畸形
