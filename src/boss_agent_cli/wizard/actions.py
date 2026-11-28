@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, NoReturn, cast
 
 from boss_agent_cli.api._base_client import parameter_status_code
+from boss_agent_cli.api.cdp_risk_lock import unlock_operator_actions
 from boss_agent_cli.api.client import PlatformRateLimitError, PlatformRiskError
 from boss_agent_cli.api.models import (
 	dict_items,
@@ -142,14 +143,17 @@ from boss_agent_cli.wizard.runner import Action, WorkflowActionError, WorkflowCo
 PlatformFactory = Callable[[str, AuthManager, tuple[float, float], str | None, str | None], Any]
 
 
-def _hint_command(context: ActionContext, command: str) -> str:
+def _hint_command(context: ActionContext, command: str, *, role: str | None = None) -> str:
 	"""动作层恢复命令必须定位触发它的数据目录与平台。
 
 	wizard 的 headless / MCP 调用可以带 ``--data-dir``：恢复指引写成裸 ``boss ...``
 	时，Agent 照抄会把新 AI 密钥、``config reset``、watch 删除重建或 crawl 重建
 	落到默认目录，原目录的问题原样保留（与 #913 / #919 的命令层迁移同一接缝）。
+
+	``role`` 只给不在所属组内的命令（如 agent 组）：招聘者照抄不带角色的
+	``agent run --resume`` 会在默认候选人角色下读取另一套本地状态（Issue #3061）。
 	"""
-	return boss_command(command, platform_name=context.platform, data_dir=context.data_dir)
+	return boss_command(command, platform_name=context.platform, data_dir=context.data_dir, role=role)
 
 
 @dataclass(frozen=True)
@@ -1059,12 +1063,17 @@ def _write_call(
 	if stop is not None:
 		# 顶层 hr 写命令在派发前检查停止闩锁；wizard / MCP 走同一动作时不能例外
 		# （Issue #2612）。请求未发出，不写「结果未知」标记，也不自动重试。
+		resume_command = _hint_command(
+			context,
+			"agent run --resume",
+			role="recruiter" if context.role == "recruiter" else None,
+		)
 		raise WorkflowActionError(
 			"CIRCUIT_BREAKER_OPEN",
 			f"停止开关已打开（{stop}），本次不会发出写请求",
 			recoverable=True,
 			recovery_action=(
-				f"人工核对未确认动作后执行 {_hint_command(context, 'agent run --resume')} 关闭熔断，"
+				f"人工核对未确认动作后执行 {resume_command} 关闭熔断，"
 				"再由操作者显式重试；不要自动重发"
 			),
 			auto_retry=False,
@@ -1290,18 +1299,20 @@ def _candidate_search(context: ActionContext, inputs: Mapping[str, Any], prior: 
 			result = execute_candidate_search(
 				platform, cache, context.logger, {**inputs, "account": account}, **search_kwargs
 			)
+	items = sort_search_items(list(result.items), sort_mode)
+	# 与顶层 `boss search` 同源：平台纠正页码时步骤数据也必须报平台页
+	# （Issue #3118）；旧 test double 没有新字段时回退到最后扫描页 / 请求页。
+	reported_page = getattr(result, "last_page_reported", None)
+	last_scanned = getattr(result, "last_page", 0) or page
 	data: dict[str, Any] = {
 		# 先由 `execute_candidate_search` 评分、再排序：与命令层「先评分再
 		# sort」一致（匹配分类型漂移按 0 处理）。
-		"items": sort_search_items(list(result.items), sort_mode),
-		"pagination": {
-			"page": page,
-			# 与顶层 `boss search` 同一口径（Issue #887）：平台没说 hasMore 时为 null。
-			"has_more": result.has_more_reported,
-			"has_more_source": "platform_hasMore" if result.has_more_reported is not None else "unknown",
-			"total": result.total or len(result.items),
-			"total_kind": "returned_page_count",
-		},
+		"items": items,
+		"pagination": _pagination_evidence(
+			{"page": reported_page, "hasMore": result.has_more_reported},
+			page=last_scanned,
+			items=items,
+		),
 	}
 	if active_level:
 		# CLI search 把同一份统计写进 hints.active_filter；向导步骤没有 hints
@@ -1938,8 +1949,16 @@ def _export_output_path(context: ActionContext, inputs: Mapping[str, Any], fmt: 
 	写文件前的 `prepare_output_path` 创建。
 	"""
 	raw = inputs.get("output")
-	if raw is None or raw == "":
+	if raw is None:
+		# 只有缺键或显式 null 才落默认路径；显式空串照命令行 `-o` 的口径
+		# 拒绝（Issue #1501 / #3098），否则调用方会以为没指定输出却落了一个文件。
 		raw = context.data_dir / "exports" / f"wizard-jobs.{fmt}"
+	elif isinstance(raw, str) and not raw.strip():
+		raise WorkflowActionError(
+			"INVALID_PARAM",
+			"wizard export 的 output 不能为空；省略 output 才会写到默认位置",
+			recovery_action="去掉空的 output，或给出完整文件路径后重试",
+		)
 	elif not isinstance(raw, (str, os.PathLike)):
 		raise WorkflowActionError(
 			"INVALID_PARAM",
@@ -2069,6 +2088,11 @@ def _candidate_export(context: ActionContext, inputs: Mapping[str, Any], prior: 
 		# 耗尽 / 活跃度提前停止」：只有后两者才是截断，调用方不能把前缀当
 		# 完整结果（Issue #2657 / #2710）。判定与顶层 `boss export` 共用。
 		stop_reason = _export_stop_reason(result)
+		# 与顶层 `boss export` 同口径：取满请求条数时无论管线因何停止，都按
+		# count_reached 报告；用管线 items 而不是导出文件行数，避免
+		# include_private 过滤让口径再次漂移（Issue #3119）。
+		if len(getattr(result, "items", ())) >= count:
+			stop_reason = "count_reached"
 		data["requested"] = count
 		data["stop_reason"] = stop_reason
 		data["truncated"] = export_is_truncated(stop_reason, item_count=len(items), requested=count)
@@ -2923,6 +2947,16 @@ def _crawl_status(context: ActionContext, inputs: Mapping[str, Any], prior: Mapp
 					"或用 boss crawl start <query> 新建任务"
 				),
 			) from exc
+	# 风控暂停时 CLI `boss crawl status` 只给人工解锁步骤，不放 resume 到
+	# next_actions：风险锁会先于浏览器构造阻断恢复，直接照 resume 重试只会
+	# 再次撞锁（Issue #3053，与 #1405 同口径）。
+	if data.get("status") == "risk_stopped":
+		checkpoint = data.get("checkpoint")
+		resume_command = checkpoint.get("resume_command") if isinstance(checkpoint, Mapping) else None
+		operator_actions = list(unlock_operator_actions(_hint_command(context, "clean --risk-lock")))
+		if isinstance(resume_command, str) and resume_command:
+			operator_actions.append(f"完成人工恢复后，显式执行 {resume_command} 从原断点继续")
+		return StepResult(data, operator_actions=tuple(operator_actions))
 	# 执行器已退出 / 排队超时的任务只轮询状态永远等不到结果：与 `boss crawl status`
 	# 一样把后台恢复作为下一步，数据里的 executor_active 供调用方判定（Issue #2479）。
 	# 已受理的停止请求还没被消费时改为按断点结算 stop：resume --background 会先
@@ -3032,9 +3066,17 @@ def _crawl_stop(context: ActionContext, inputs: Mapping[str, Any], prior: Mappin
 		if final_status is None:
 			raise WorkflowActionError("CRAWL_RUN_NOT_FOUND", f"未找到 crawl run: {run_id}")
 		raise _crawl_run_finished_error(context, run_id, final_status)
+	# 与 CLI `boss crawl stop` 的 next_actions 同口径：停止请求被受理或按
+	# 断点结算后，都要用 crawl status 确认最终进度（Issue #3053）。
+	status_command = _hint_command(context, f"crawl status {shell_argument(run_id)}")
 	if settle_reason is not None:
-		return StepResult({"run_id": run_id, "status": "stopped", "stale_recovered": True})
-	return StepResult({"run_id": run_id, "status": "stop_requested"})
+		return StepResult(
+			{"run_id": run_id, "status": "stopped", "stale_recovered": True},
+			next_action=status_command,
+		)
+	return StepResult(
+		{"run_id": run_id, "status": "stop_requested"}, next_action=status_command
+	)
 
 
 def _recruiter_call(

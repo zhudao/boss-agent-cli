@@ -6,6 +6,142 @@
 
 ### Fixed
 
+- AI 配置里手工写入的非字符串 `ai_base_url`（`0` / `False` / 空容器 / 数字）不再被真值判断当成未设置并静默回落到 provider 默认端点；读取时统一报带修复指引的本地配置错误，显式空串仍按未设置处理（Issue #3123）。
+
+## [3.9.24] - 2026-11-28
+
+### Fixed
+
+- `search` 与向导 `candidate_search` 的页码证据改为采信平台响应 / 管线最后扫描页：信封、下一页命令、索引快照与步骤数据同源，缓存命中后也按缓存页码生成提示；旧缓存因 schema 升到 7 自动失效（Issue #3118）。
+- 向导 `candidate_export` 在取满请求条数时统一报 `stop_reason=count_reached`，与顶层 `boss export` 同口径；不再因为平台同时返回 `hasMore=false` 或活跃度提前达标而报 `platform_has_more_false` / `active_target_reached`，`truncated` 仍为 `false`（Issue #3119）。
+
+## [3.9.23] - 2026-11-28
+
+### Fixed
+
+- `chat` 的分页证据改用与 `recommend` / `history` / `chatmsg` 共用的 `list_pagination`：平台纠正页码时信封页码与下一页命令采用有效页码，不再按请求页提示翻到已看过的页；`hasMore` 仍只认布尔，`total` 仍等于本次渲染行数（Issue #3115）。
+
+## [3.9.22] - 2026-11-28
+
+### Fixed
+
+- `hr greet` 的本地状态边界改为实际结果口径：请求证明未发出但预约释放失败、平台权益拒绝后记账失败、平台确认发出后记账失败，统一返回不可重试 `LOCAL_STATE_WRITE_FAILED`（`replay_safe=false` / 结果已知者 `outcome_unknown=false`），不再静默留下无 TTL 的 pending 或把已发出的招呼报成结果未知；恢复提示改为先备份再用 `clean --pending-recruiter-greet <geek_id> <job_id>` 定向清理该次预约（Issue #3110）。
+- `hr location` 的预约释放失败不再被吞掉：明确未发出的请求（读会话失败、预算 / 通道 / 编码错误、平台明确拒绝）释放失败时返回不可重试 `LOCAL_STATE_WRITE_FAILED`，风控触发的读失败仍保留原风控码并附带本地清理指引；恢复提示先备份再用 `clean --pending-recruiter-location <friend_id>` 只清该会话 pending；已发送后本地记账失败改为结果已知的 `LOCAL_STATE_WRITE_FAILED`，不再用「核对是否已生效」引导重发（Issue #3111）。
+
+## [3.9.21] - 2026-11-28
+
+### Fixed
+
+- `export` 的列表快路径改用与 `search` / 向导导出共用的 `prefilter_job`：平台返回不满足城市 / 薪资 / 经验 / 学历的条目时按本地判定剔除，不再照单导出（Issue #3097）。
+- 向导 `candidate_export` 的显式空 `output`（空串或纯空白）改为在平台请求与写文件之前返回 `INVALID_PARAM`，与命令层 `-o ""` 同口径；只有缺键或显式 `null` 才落默认路径（Issue #3098）。
+- `batch-greet` 的候选预筛改用与 `search` / 向导共用的 `prefilter_job`：平台返回不满足 `--city` / `--salary` / `--experience` / `--education` 的条目不再进入候选，避免非 dry-run 时向错误职位真实发出招呼（Issue #3099）。
+- `recommend` 的分页证据改用与向导共用的 `list_pagination`：平台纠正页码时索引快照、翻页提示与表格页码都采用有效页码，不再把 Agent 导回已取过的页；列表容器按同一口径识别 `recommendList` / `jobList` / `list` / `items` / `result`，不再返回空页并覆盖编号索引（Issue #3101）。
+- AI 配置的字符串项在 `is_configured()` 真值判断前统一校验类型：空 list / dict / 0 / False 不再被吞成「未配置」并误导用户重填密钥，改为精确 `CONFIG_INVALID`；`ai local configure` 改为先确认旧配置可读、再写密钥、最后写配置，密钥不可写时不再留下半截的本地端点更新（Issue #3103）。
+- `apply` / `batch-greet` 采信浏览器响应上的严格 `request_sent=false` 证据：写出前中断的写请求按可重试失败处理并释放预约，不再报自相矛盾的 `ACTION_UNCONFIRMED` 让同一职位被无 TTL 的 pending 永久挡住（Issue #3105）。
+- `history` 的分页证据改用共享 `list_pagination`：平台纠正页码时信封、下一页提示与 TTY 表格统一采用有效页码，可信上限仍停止翻页；`favorites sync` 的远端只读取数失败归一为可重试 `NETWORK_ERROR`，不再提示核对不存在的写操作（Issue #3107）。
+
+## [3.9.20] - 2026-11-28
+
+### Fixed
+
+- MCP 宿主提示的 JSON 信封改为与运行时一致的七键（补上 `schema_version` 与 `command`），并加一条与信封构造同源的契约测试防止再次漂移（Issue #3094）。
+
+## [3.9.19] - 2026-11-28
+
+### Fixed
+
+- 代理绕过列表的域名匹配与 httpx 对齐：`NO_PROXY=api.test` 现在同时生成 `api.test` 与 `*.api.test` 的 Chromium bypass，子域不再在浏览器侧走代理；IP / localhost / CIDR / `*` 保持精确语义（Issue #3091）。
+
+## [3.9.18] - 2026-11-28
+
+### Fixed
+
+- 代理环境变量解析与 httpx 统一为 urllib 两遍算法：小写拼写覆盖大写、小写空值清除该 scheme，`NO_PROXY` 同理；消除 API 与浏览器通道走不同代理 / 不同绕过边界的出口分叉（Issue #3084）。
+- 向导输入边界拒绝超出解释器位数上限的整数：CLI / MCP / Python API 共用的 `ensure_storable_inputs` 不再让超长整数落到 `json.dumps` 抛裸 `ValueError`，改为带路径的 `INVALID_PARAM` 诊断（Issue #3085）。
+- 向导采集状态面板的本地产物与内部任务绑定按真实类型判定：`jobs.json` 为目录 / `jobs.csv` 为悬空链接时不再报告「产物存在」；断点里的容器 `run_id` 不再以 repr 截断 `params.inputs.run_id` 回退，合法的内部任务绑定重新可见（Issue #3081）。
+
+## [3.9.17] - 2026-11-28
+
+### Fixed
+
+- 风控锁写入后的陈旧锁清理不再顺着符号链接删掉刚写入的锁：`data_dir/cache` 指向数据目录自身（如符号链接 `cache -> .`）时，`write_lock` 原本会返回成功而磁盘上的锁已被当作「另一位置」清掉，新进程读到无锁（风控 fail-open）；现在按 `(st_dev, st_ino)` 识别路径别名并跳过清理，无法判定时保留陈旧锁（Issue #3080）。
+- `mark` 成功信封的 `security_id` 改用共享归一：camelCase `securityId` 漂移成容器 / 数字 / 纯空白字符串时继续读合法的 snake_case `security_id` 回退，不再返回空标识；与 `chat` / 向导共用 `services.contact_lookup.friend_security_id`（Issue #3079）。
+- 自动化闩锁状态按权威 `stop.json` 判定：`state.json` 快照写入失败（如指向普通文件的符号链接）时，`risk_latch_persisted` 不再把已经打开的停止闩锁误报成 false，`state.json` 的失败原因仍保留在 `risk_latch_error`（Issue #3077）。
+- `chat` 与 `chatmsg --raw` 的联系人标识 / 展示字段按可用类型归一：`name` / `title` / `brand_name` / `last_msg` / `last_time` 只接受非空字符串，`uid` / `security_id` / `job_id` 拒绝容器 / 布尔 / falsy 漂移值并继续读合法回退；CSV 的 `unread` 与 Markdown / HTML 共用同一归一，`initiated_by` 为 `null` 时按「未知」分组（Issue #3075）。
+
+## [3.9.16] - 2026-11-28
+
+### Fixed
+
+- 向导停止展示回退只把字符串 `error.code` 当作风控码：控制器字段漂移成数组 / 对象时，已落盘的 `wizard --stop` 不再报 `INTERNAL_ERROR`，而是按最小停止记录返回 `ok=true`；`--status` 仍按 `CACHE_RECORD_INVALID` 报告记录损坏（Issue #3072）。
+
+## [3.9.15] - 2026-11-28
+
+### Fixed
+
+- 共享错误出口的后继命令改为跟随命令族：求职者侧 `exchange` / `mark` / `chat` 即使在 `--role recruiter` 下也给出 `boss chat`，不再被引向招聘者专属的 `hr chat`；招聘者命令仍保留 `hr chat` / `hr chatmsg`（Issue #3065）。
+- 自动化周期停止时分别判定熔断闩锁与事件日志写入：闩锁已成功落盘、仅日志追加失败时 `risk_latch_persisted` 不再误报为 false，原始风控 / 预算异常与本地停止保护保持不变（Issue #3067）。
+- `search` 命中本地缓存时按本页 `data` 重算派生分页计数：缓存行里的 `pagination.total` 与行数不一致或为 `null` 时，成功信封不再声明 `total_kind=returned_page_count` 却给出错误的 `total`；平台证据（`page` / `has_more`）仍取缓存（Issue #3069）。
+
+## [3.9.14] - 2026-11-27
+
+### Fixed
+
+- 向导 / MCP 的招聘者写动作命中停止开关时，`CIRCUIT_BREAKER_OPEN` 的恢复命令补上 `--role recruiter`：照抄 `agent run --resume` 不再落到默认候选人角色读取另一套本地状态；求职者角色输出不变（Issue #3061）。
+- 向导 TTY 的 `CIRCUIT_BREAKER_OPEN` 失败面板改为采用动作层的完整恢复指引，不再用静态文案覆盖掉 `--role recruiter`；静态兜底路径按当前运行角色生成，候选人不会被误切到招聘者（Issue #3063）。
+
+## [3.9.13] - 2026-11-27
+
+### Fixed
+
+- 向导采集 / 导出面板按真实状态展示：`crawl status` 查询不再把仍在运行或风控暂停的采集显示成「采集已完成」，`running_stale` 的下一步与风控解锁指引重新可见；`stop_requested` / `queued` / `budget_stopped` 等采集状态有可读标签，`crawl stop` 受理后会给出 `crawl status` 后继指引。导出结果 `truncated=true` 时改为黄色「导出结果被截断」，展示请求条数与原因说明；等待继续面板不再重复打印同一条恢复命令（Issue #3053、#3054）。
+- `hr chatmsg` 的方向列优先显示平台发送人姓名（姓名缺失时把 `boss` / `geek` 归一为「我 / 对方」），不再直接打印机器码；`hr location` / `hr request-resume` 的熔断恢复命令补上 `--role recruiter`，照抄后不会按候选人角色读取另一套本地状态（Issue #3057、#3058）。
+
+## [3.9.12] - 2026-11-27
+
+### Fixed
+
+- 招聘者与求职者两侧的时间列不再把秒级 / 过小时间戳画成 1970 年：`safe_local_time` 增加 2000-01-01 的可信下界，低于下界的值与越界值同口径按「无时间」处理；`hr candidates` / `hr recommendations` 的 `activeTime` 为数字时按可读时间显示，不再原样打印 13 位毫秒数（Issue #3044、#3045）。
+- 窄终端下列表不再丢业务字段：`render_simple_list` 在表格可读宽度不足时降级为逐条纵向布局，CJK 字段不会因列被压到 1 格而整列消失（Issue #3046）。
+- 聊天记录的行号列按条数自适应，`chatmsg --count 1000+` 不再把 1000 / 1001 截成同一个 `10…` 编号；消息 `type` 为 `null` 或容器时显示「其他」，不再打印 `其他(None)` / `其他({'a': 1})` 这类 Python repr（Issue #3049、#3050）。
+
+## [3.9.11] - 2026-11-27
+
+### Fixed
+
+- `boss export --welfare` / `--active`（以及共用 `run_search_pipeline` 的 `search` / `watch`）不再把缺失、`null` 或非列表的 `jobList` 当成平台确认的空页：管线与无筛选快路径同口径，只有显式空列表才结束扫描；缺容器时按平台布尔 `hasMore` 继续或停止，翻满页数预算会报 `page_budget_exhausted` 并标记 `truncated=true`，后续页不会再被静默丢掉（Issue #3042）。
+
+## [3.9.10] - 2026-11-27
+
+### Fixed
+
+- `hr applications` / `hr recommendations` / `hr jobs list` / `hr candidates` 的 `pagination.total` 与终端渲染共用同一份行提取口径：`null` 等非对象元素不再被计为一行，平台把载荷换成顶层列表时 `total` 不再是 `null`，`hr candidates` 也识别 items/list/result 替代容器；平台载荷仍原样透传（Issue #3037）。
+- `hr chatmsg` 的 `pagination.total` 与终端渲染共用同一份消息容器提取：`msgList` / `list` / `result` 载荷不再出现「屏幕有消息、total 为 0」，`historyMsgList` 载荷两侧都按 1 条展示与计数；平台载荷仍原样透传（Issue #3038）。
+
+## [3.9.9] - 2026-11-27
+
+### Fixed
+
+- `favorites list` 不再把超大页码造成的本地整数溢出兜成可重试的 `NETWORK_ERROR`：`--page` 与信封分页页码都按可信上限钳制，翻页提示只在可前进时生成，原生 schema 与 MCP 工具的数值边界同步（Issue #3032）。
+- `hr applications` / `hr recommendations` / `hr jobs list` 的 `pagination.total` 改为与终端渲染共用同一组列表容器（friendList/result/list、geekList/items/list/result、jobList/items/list/data），平台改用替代容器时不再把实际返回的记录报成 `total=null` / `0`；平台载荷仍原样透传（Issue #3034）。
+
+## [3.9.8] - 2026-11-27
+
+### Fixed
+
+- 修正两个 doctor 测试的数据目录隔离：此前直接使用默认 `~/.boss-agent`，命中过平台风控、本地存在风险锁的机器上 `next_actions` 会被正确清空，导致本地门禁假红（CI 等干净环境不受影响）。测试改用临时数据目录运行（Issue #3027）。
+- 测试套件不再写真实 `~/.boss-agent`：`tests/conftest.py` 在会话开始时把家目录隔离到临时目录，未显式传 `--data-dir` 的 CLI 测试（如 search / recommend 写搜索索引缓存）不会再污染开发者本机缓存，也不再依赖本机风险锁等状态（Issue #3028）。
+
+## [3.9.7] - 2026-11-27
+
+### Fixed
+
+- `hr download-resume` / `hr accept-resume` 不再把写前只读请求的确定性解析失败与参数类 4xx 兜成可重试的 `NETWORK_ERROR` 或「同意结果未知」：前者会让 Agent 无界重试，后者会让人去核对一个从未发出的写请求。下载命令改按 `INTERNAL_ERROR` / `INVALID_PARAM` 上报；同意路径在客户端写前读取失败时标注显式 `request_sent=False`，命令层据此按确定性错误分类，不再携带 `outcome_unknown` 标记（Issue #3024）。
+
+## [3.9.6] - 2026-11-27
+
+### Fixed
+
 - 自动化的批准队列与直接扫描共同消费招聘者客户端标注的严格布尔 `request_sent=False`，写前读取失败会释放本次在途标记、恢复队列为 pending 并保留原异常；无证据、非布尔值及风控仍保留重放保护（Issue #3019）。
 - wizard 在明确可重放的失败之后，先清除本次已失效的写标记再检查重试前的截止／停止，避免把平台已拒绝的请求误报为结果未知并永久禁止恢复；认证未知结果保护和停止终态语义保持不变（Issue #3020）。
 

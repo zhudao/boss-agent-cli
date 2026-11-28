@@ -1,5 +1,6 @@
 import json
 import shlex
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
@@ -440,11 +441,17 @@ def test_doctor_command(mock_auth_cls, mock_probe_cdp, mock_httpx_get, mock_extr
 	mock_httpx_get.return_value = MagicMock(status_code=200)
 
 	runner = CliRunner()
-	result = runner.invoke(cli, ["doctor"])
+	# doctor 读取数据目录里的风险锁：不隔离时，命中过风控的本机真实
+	# ~/.boss-agent 会让 risk_locked 为真、按 #2935 清空 next_actions，
+	# 本地门禁在干净机器之外假红（Issue #3027）。
+	with tempfile.TemporaryDirectory() as data_dir:
+		result = runner.invoke(cli, ["--data-dir", data_dir, "doctor"])
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
 	assert parsed["ok"] is True
 	assert parsed["command"] == "doctor"
+	# 守卫：doctor 必须真的使用隔离数据目录，否则本机风险锁会再次改变 hints（Issue #3027）。
+	assert Path(parsed["data"]["data_dir"]).resolve() == Path(data_dir).resolve()
 	assert parsed["data"]["check_count"] >= 8
 	assert "checks" in parsed["data"]
 	assert any(item["name"] == "network" for item in parsed["data"]["checks"])
@@ -468,9 +475,13 @@ def test_doctor_with_partial_token_quality_warn(mock_auth_cls, mock_probe_cdp, m
 	mock_httpx_get.return_value = MagicMock(status_code=200)
 
 	runner = CliRunner()
-	result = runner.invoke(cli, ["doctor"])
+	# 与 test_doctor_command 同口径：隔离数据目录，避免本机风险锁改变 hints（Issue #3027）。
+	with tempfile.TemporaryDirectory() as data_dir:
+		result = runner.invoke(cli, ["--data-dir", data_dir, "doctor"])
 	assert result.exit_code == 0
 	parsed = json.loads(result.output)
+	# 守卫：doctor 必须真的使用隔离数据目录，否则本机风险锁会再次改变 hints（Issue #3027）。
+	assert Path(parsed["data"]["data_dir"]).resolve() == Path(data_dir).resolve()
 	quality = next(item for item in parsed["data"]["checks"] if item["name"] == "auth_token_quality")
 	assert quality["status"] == "warn"
 	assert "stoken 缺失" in quality["detail"]
@@ -856,7 +867,7 @@ def test_search_cache_key_includes_current_result_schema(mock_client_cls, mock_a
 
 	assert result.exit_code == 0
 	cache_params = mock_cache.get_search.call_args.args[0]
-	assert cache_params["cache_schema"] == 6
+	assert cache_params["cache_schema"] == 7
 	assert "account" in cache_params
 	mock_pipeline.assert_not_called()
 
@@ -884,8 +895,8 @@ def test_search_cache_schema_bump_invalidates_pre_887_entries(
 		result = CliRunner().invoke(cli, ["--json", "search", "产品"])
 
 	assert result.exit_code == 0, result.output
-	# 缓存键必须带新版本：旧条目（schema 5）不会再被 get_search 命中。
-	assert _SEARCH_CACHE_SCHEMA >= 6
+	# 缓存键必须带新版本：旧条目（schema < 7）不会再被 get_search 命中。
+	assert _SEARCH_CACHE_SCHEMA >= 7
 	assert mock_cache.get_search.call_args.args[0]["cache_schema"] == _SEARCH_CACHE_SCHEMA
 	assert json.loads(result.stdout)["pagination"]["has_more"] is None
 

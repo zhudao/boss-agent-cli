@@ -4,6 +4,44 @@ This document tracks the medium-term and long-term direction of `boss-agent-cli`
 
 ## Released
 
+v3.9.24 (2026-11-28): `search` and wizard `candidate_search` now trust the platform / last-scanned page so the envelope, next-page command, index snapshot and step data share one source, including cache hits; wizard `candidate_export` reports `count_reached` when the requested count is filled, matching the CLI (Issue #3118 #3119).
+
+v3.9.23 (2026-11-28): `chat` pagination now trusts the platform's valid page number, so the envelope page and next-page hint no longer fall back to the requested page; `hasMore` stays boolean-only and `total` still matches the rendered row count (Issue #3115).
+
+v3.9.22 (2026-11-28): recruiter greeting and work-location local-state boundaries now report the actual outcome; claim release / recording failures no longer masquerade as outcome-unknown or silently leave TTL-free pending rows, with targeted cleanup entries for the affected candidate or conversation (Issue #3110 #3111).
+
+v3.9.21 (2026-11-28): export and batch-greet now reuse the same local prefilter as search and the wizard, so jobs failing city / salary / experience / education filters are neither exported nor greeted; recommend pagination, alternate list containers and the index snapshot follow the shared wizard implementation; wizard export rejects an explicitly empty output; falsy AI config type drift now reports a precise error and local configuration writes no longer leave a half-updated state; provably unsent writes release their claim instead of being reported as outcome-unknown; history pagination and favorites-sync read-stage errors follow the shared contract (Issue #3097 #3098 #3099 #3101 #3103 #3105 #3107).
+
+v3.9.20 (2026-11-28): MCP host instructions now list the full seven-key runtime envelope, including `schema_version` and `command`, guarded by a contract test (Issue #3094).
+
+v3.9.19 (2026-11-28): NO_PROXY domains map to Chromium bypass entries covering both root and subdomains, keeping API and browser egress consistent (Issue #3091).
+
+v3.9.18 (2026-11-28): wizard crawl panel shows only real artifacts with usable run IDs (Issue #3081), proxy environment parsing follows urllib two-pass semantics for one egress (Issue #3084), and wizard inputs reject oversized integers at the boundary (Issue #3085).
+
+v3.9.17 (2026-11-28): chat / mark field-drift normalization (Issues #3075, #3079), automation latches judged by the authoritative `stop.json` (Issue #3077), and risk-lock cleanup that no longer unlinks the freshly written lock through a symlink alias (Issue #3080).
+
+v3.9.16 (2026-11-28): wizard stop display contract — when `error.code` has drifted in type, an already-persisted `wizard --stop` returns success with the minimal stopped record, while `--status` still rejects the record as corrupt (Issue #3072).
+
+v3.9.15 (2026-11-28): local recovery contract consistency — recovery commands follow the candidate or recruiter command family, while shared wizard and automation entries retain their runtime role; an event-log failure preserves the successful stop-latch persistence status and reports the log error separately; cached search pagination totals are recomputed from the returned page (Issues #3065, #3067, #3069).
+
+v3.9.14 (2026-11-27): recovery-hint role consistency — wizard / MCP recruiter write actions now include `--role recruiter` in `agent run --resume` when the stop latch is open, and the TTY failure panel uses the action's full recovery text instead of dropping the role under the default candidate profile (Issues #3061, #3063).
+
+v3.9.13 (2026-11-27): wizard and recruiter display consistency — crawl panels no longer report running or risk-stopped tasks as completed, export truncation evidence and recovery guidance stay visible, `hr chatmsg` direction shows sender names, and `hr location` / `hr request-resume` breaker recovery commands carry `--role recruiter` (Issues #3053, #3054, #3057, #3058).
+
+v3.9.12 (2026-11-27): terminal display reliability — seconds / implausibly small timestamps no longer render as 1970, numeric `activeTime` no longer prints raw milliseconds, narrow-terminal tables fall back to a vertical layout instead of dropping fields, and chat row indexes / type labels no longer show truncated numbers or Python reprs (Issues #3044, #3045, #3046, #3049, #3050).
+
+v3.9.11 (2026-11-27): export completeness — the `export --welfare` / `--active` search pipeline no longer treats a missing `jobList` as a platform-confirmed empty page, later pages are not silently dropped, and budget exhaustion is reported as truncated (Issue #3042).
+
+v3.9.10 (2026-11-27): pagination evidence parity — recruiter lists and chat history derive `pagination.total` from the same row extraction as the terminal renderer, so non-object elements, top-level lists, and alternate containers no longer disagree with what users see (Issue #3037, #3038).
+
+v3.9.9 (2026-11-27): pagination evidence completed — `favorites list` clamps oversized pages to the trusted limit instead of reporting a local integer overflow as a retryable network error (Issue #3032); recruiter applications now derive `pagination.total` from the same containers as the rendered rows, so alternate payload containers no longer undercount (Issue #3034).
+
+v3.9.8 (2026-11-27): test isolation completed — doctor tests now run against an isolated data directory, so the local gate no longer false-reds on machines that carry a risk lock from a previous platform risk hit (Issue #3027); the test session now isolates HOME to a temporary directory, so CLI tests without `--data-dir` no longer write the real `~/.boss-agent` (Issue #3028).
+
+v3.9.7 (2026-11-27): attachment-resume commands classify deterministic pre-write read failures; an acceptance request that was provably never sent no longer reports an unknown outcome, and download parse failures or parameter 4xx responses no longer invite unbounded retries (Issue #3024).
+
+v3.9.6 (2026-11-27): automation consumes explicit client evidence that a write was never sent and releases its in-flight marker; wizard clears a rejected attempt's write marker before checking the next retry deadline, preserving recovery while retaining platform-risk and unknown-result protections (Issues #3019, #3020).
+
 v3.9.5 (2026-11-27): wizard's recruiter_resume / recruiter_reply now reject inputs that cannot be encoded as UTF-8 before the write marker is persisted, so an encoding failure no longer leaves an "outcome unknown" marker and a request that was provably never sent is reported as an invalid parameter (Issue #3017).
 
 v3.9.4 (2026-11-27): wizard control actions now share the MCP host's timeout semantics — --status / --stop no longer accept a --timeout that was never executed, and boss_wizard declares its host timeout cap and rejects out-of-range values before launch (Issue #3013).

@@ -545,6 +545,10 @@ class SearchPipelineResult:
 	stop_reason: str = ""
 	total: int | None = None
 	last_page: int = 0
+	# 最后一次扫描页在平台响应里报告的 page：只有有效整数才记录，否则由调用方
+	# 回退到请求页。与 has_more_reported 同为「平台原样证据」，不能由本地
+	# current_page 冒充（Issue #3118）。
+	last_page_reported: int | None = None
 	stats: SearchPipelineStats = field(default_factory=SearchPipelineStats)
 	# 活跃度文案不认识或拿不到而被排除的职位（文案 → 次数），供命令层写进 hints。
 	active_unknown_descs: dict[str, int] = field(default_factory=dict)
@@ -1119,6 +1123,7 @@ def run_search_pipeline(
 	active_level = resolve_active_level(active)
 	current_page = start_page
 	last_page_scanned = 0
+	last_page_reported: int | None = None
 	has_more = False
 	has_more_reported: bool | None = None
 	# 循环自然跑完 max_pages 才算预算耗尽；下面每个 break 覆盖成具体原因。
@@ -1164,14 +1169,38 @@ def run_search_pipeline(
 					details = error["details"]
 			raise SearchPipelinePlatformError(code, message or "搜索结果获取失败", details=details)
 		platform_data = _unwrap_platform_data(client, raw)
+		raw_page = platform_data.get("page")
+		last_page_reported = (
+			raw_page
+			if isinstance(raw_page, int) and not isinstance(raw_page, bool) and 1 <= raw_page <= MAX_TRUSTED_PAGE
+			else None
+		)
+		raw_job_list = platform_data.get("jobList")
 		job_list = field_list(platform_data, "jobList")
 		last_page_scanned = current_page
 		stats.pages_scanned += 1
 		stats.jobs_seen += len(job_list)
 
 		if not job_list:
-			stop_reason = "empty_page"
-			break
+			if isinstance(raw_job_list, list):
+				# 显式空列表是平台确认的空页：既有契约（Issue #2657）。
+				stop_reason = "empty_page"
+				break
+			# 缺容器 / null / 非列表不能证明列表结束。与顶层 export 快路径同口径
+			# （Issue #2932、#3042）：只有平台明确 hasMore=false 才停止；未知时
+			# 按 continue_when_has_more_unknown 决定是否继续，翻满预算由循环末尾
+			# 的默认原因报 page_budget_exhausted（导出侧据此标 truncated）。
+			raw_has_more = platform_data.get("hasMore")
+			has_more = raw_has_more is True
+			has_more_reported = raw_has_more if isinstance(raw_has_more, bool) else None
+			if raw_has_more is False:
+				stop_reason = "has_more_false"
+				break
+			if raw_has_more is not True and not continue_when_has_more_unknown:
+				stop_reason = "has_more_unknown"
+				break
+			current_page += 1
+			continue
 
 		# Phase 1: list-page prefilter
 		survivors = []
@@ -1317,6 +1346,7 @@ def run_search_pipeline(
 		stop_reason=stop_reason,
 		total=len(matched),
 		last_page=last_page_scanned,
+		last_page_reported=last_page_reported,
 		stats=stats,
 		active_unknown_descs=unknown_descs,
 	)

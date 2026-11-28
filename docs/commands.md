@@ -103,9 +103,9 @@ pbpaste | boss login --curl-file -
 
 `recommend` 的 `pagination.has_more` 只在平台返回布尔 `hasMore` 时取 `true` 或 `false`；缺失或类型不明确时为 `null`，`has_more_source=unknown`，不会给出下一页执行提示。仅 `true` 提示翻页；`false` 与 `null` 不触发额外探测。兼容字段 `total` 仍是本次返回条数，`total_kind=returned_page_count`，不代表全量职位数。下一页命令保留本次的 `--with-score`，翻页后仍返回 `match_score`。
 
-`search` 与 `recommend` 同一口径：信封 `pagination.has_more` 只在平台返回布尔 `hasMore` 时是 `true` / `false`，缺失或类型不明确时为 `null`、`has_more_source=unknown`，并在 `hints.operator_actions` 说明不能仅凭本页条数判断是否还有结果。`total_kind=returned_page_count`。向导 `candidate_search` 步骤的内嵌分页结构相同。
+`search` 与 `recommend` 同一口径：信封 `pagination.has_more` 只在平台返回布尔 `hasMore` 时是 `true` / `false`，缺失或类型不明确时为 `null`、`has_more_source=unknown`，并在 `hints.operator_actions` 说明不能仅凭本页条数判断是否还有结果。`pagination.page` 优先使用平台响应里的有效 `page`（管线扫描多页时取最后扫描页），否则回显并钳制请求页；信封、下一页命令、索引快照与向导 `candidate_search` 步骤同源（Issue #3118）。`total_kind=returned_page_count`。向导 `candidate_search` 步骤的内嵌分页结构相同。
 
-`search` 的下一页命令（信封 `hints.next_actions` 与终端 `more:` 提示是同一条）保留本次调用生效的全部条件：位置参数关键词、`--url`、城市 / 薪资 / 经验 / 学历 / 行业 / 规模 / 融资阶段 / 职位类型、`--with-score`、`--sort score`、`--no-cache`，只把 `--page` 换成 N+1；`--preset` 展开成等价的显式筛选。所有值按 POSIX shell 规则转义，可直接复制执行。带 `--welfare` / `--active` 的搜索需要逐个查详情，分页语义不同，不提供下一页提示。
+`search` 的下一页命令（信封 `hints.next_actions` 与终端 `more:` 提示是同一条）保留本次调用生效的全部条件：位置参数关键词、`--url`、城市 / 薪资 / 经验 / 学历 / 行业 / 规模 / 融资阶段 / 职位类型、`--with-score`、`--sort score`、`--no-cache`，只把 `--page` 换成 N+1（N 是上面的有效页码，而不是本次请求页）；`--preset` 展开成等价的显式筛选。所有值按 POSIX shell 规则转义，可直接复制执行。带 `--welfare` / `--active` 的搜索需要逐个查详情，分页语义不同，不提供下一页提示。
 
 `search` 与 `preset` 的全部后继命令（`detail` / `apply` / `greet`、翻页、`preset list` / `preset add` / `preset remove`）都保留本次调用的 `--data-dir` 与平台，并按 shell 参数转义，照抄即可在同一数据目录里执行。搜索缓存只保存结果与分页证据，不保存 `hints`：命中时按本次调用参数重建提示，缓存键不含 `--sort`，未排序的调用也不会拿到上一次 `--sort score` 的翻页命令。
 
@@ -193,7 +193,7 @@ MCP 的 `boss_crawl_shortlist.selectors` 与 `boss_wizard.requested_steps` 若�
 | `boss interviews` | 面试邀请 |
 | `boss history` | 浏览历史 |
 
-`boss chat --page N` 返回 `pagination`：`page` 是本次请求页；`has_more` 只在平台返回布尔 `hasMore` 时取 `true` 或 `false`，缺失或类型不明确时为 `null`，`has_more_source` 相应为 `platform_hasMore` 或 `unknown`；`total` 是本页经 `--from` / `--days` 筛选后的条数，`total_kind=returned_page_count`，不代表平台上的会话总数。只有 `has_more=true` 时 `hints.next_actions` 才附加下一页命令并保留筛选参数；`has_more=null` 时 `hints.operator_actions` 说明不能仅凭本页条数判断是否还有记录。
+`boss chat --page N` 返回 `pagination`：`page` 优先使用平台返回的有效页码，否则回显请求页；`has_more` 只在平台返回布尔 `hasMore` 时取 `true` 或 `false`，缺失或类型不明确时为 `null`，`has_more_source` 相应为 `platform_hasMore` 或 `unknown`；`total` 是本页经 `--from` / `--days` 筛选后的条数，`total_kind=returned_page_count`，不代表平台上的会话总数。只有 `has_more=true` 时 `hints.next_actions` 才附加下一页命令并保留筛选参数；`has_more=null` 时 `hints.operator_actions` 说明不能仅凭本页条数判断是否还有记录。
 
 `boss chat --export <格式>` 同时保存当日 `chat-history/YYYY-MM-DD.json` 快照并与上次快照对比。快照记录本次平台页面返回的全部联系人，`--from` / `--days` 只筛选导出正文与变化摘要；`data.diff.removed` 仅在本次覆盖完整列表（第 1 页且平台明确 `hasMore=false`）时才可能非空，否则为空且 `complete=false`，Markdown / HTML 摘要注明“本次采集不完整，未判断消失”。同日多次导出按稳定 `uid`（旧数据回退 `security_id`）合并为并集。采集完整性写在快照旁的 `YYYY-MM-DD.meta`（快照本身仍是 JSON 数组，旧快照无标记时按完整处理）；上一份快照不完整时 `data.diff.added` 为空且 `baseline_complete=false`，摘要注明“上次采集不完整，未判断新增”，不把当时没翻到的联系人误报为新增。
 
@@ -350,13 +350,17 @@ AI 命令同样读取 `--data-dir` 中的 AI 配置、`resumes/`、候选池与�
 | 命令 | 说明 |
 |------|------|
 | `boss config list/set/reset` | 配置管理 |
-| `boss clean` | 清理缓存；`--all` 清理全部缓存（含搜索缓存、打招呼/投递记录、招聘者打招呼记录、职位描述缓存和工作地点发送记录）；`--risk-lock` 在用户确认官方目标业务页恢复后显式清除本地风险锁，`--dry-run` 不解除锁，不宣称平台解封；`--pending-claims <reference>` 按释放失败信封中的标识清除本次 greet/apply 预约 |
+| `boss clean` | 清理缓存；`--all` 清理全部缓存（含搜索缓存、打招呼/投递记录、招聘者打招呼记录、职位描述缓存和工作地点发送记录）；`--risk-lock` 在用户确认官方目标业务页恢复后显式清除本地风险锁，`--dry-run` 不解除锁，不宣称平台解封；`--pending-claims <reference>` 按释放失败信封中的标识清除本次 greet/apply 预约；`--pending-recruiter-greet <geek_id> <job_id>` 按招聘者招呼信封中的标识清除该候选人的 pending 预约；`--pending-recruiter-location <friend_id>` 按招聘者工作地点信封中的会话标识清除 pending 预约 |
 | `boss stats` | 投递转化漏斗统计（greeted/applied/shortlist） |
 | `boss export <query>` | 导出结果（CSV/JSON/HTML，支持 `--url` 网页筛选；`--welfare` / `--active` 与 `search` 同口径，逐个查详情后过滤） |
 
-`clean --dry-run` 返回的执行提示会去掉 `--dry-run`，保留本次 `--data-dir`、`--all` / `--privacy` 与 `--days`；路径会正确转义，照提示执行时仍操作预演的数据目录与清理范围。清理后的登录、自检提示也沿用该目录。带 `--risk-lock` 的预演只在 `hints.operator_actions` 提供保留范围的人工执行命令。
+`clean --dry-run` 返回的执行提示会去掉 `--dry-run`，保留本次 `--data-dir`、`--all` / `--privacy`、`--days` 与三种定向清理标识；路径会正确转义，照提示执行时仍操作预演的数据目录与清理范围。清理后的登录、自检提示也沿用该目录。带 `--risk-lock` 的预演只在 `hints.operator_actions` 提供保留范围的人工执行命令。
 
 `clean --pending-claims <reference>` 只清除释放失败信封中 `error.details.claim_reference` 指定的本次 greet/apply 预约；该标识仅在请求可证明未发出或平台明确拒绝、但本地预约释放失败时返回。其他账号、其他动作、在途或结果未知的预约以及成功记录均保留。每次新建预约使用不同标识，因此旧指引无法删除后续新预约；该选项不并入 `--all`。`--dry-run` 只预览指定预约，执行指引保留标识与数据目录。若本地状态无法读取而拿不到标识，信封会要求备份缓存并联系维护者，不提供批量清理或直接重发指引。
+
+`clean --pending-recruiter-greet <geek_id> <job_id>` 同样来自 `hr greet` 的 `LOCAL_STATE_WRITE_FAILED` 信封：只删除该候选人与职位组合的 pending 预约，已发送或权益受限的去重记录不动，也不影响其他候选人与求职者侧预约。招聘者表没有随机 claim_reference，所以恢复指引携带这两个信封字段；先备份数据目录，用 `--dry-run` 预览后再执行。该选项不进 MCP 工具参数面，须由真人判断。
+
+`clean --pending-recruiter-location <friend_id>` 来自 `hr location` 的同类信封：只删除该会话的 pending 工作地点预约，已发出的卡片记录与其他会话不变。同样先备份、预览再执行，也不进 MCP 参数面。
 
 `config list` / `get` / `set` / `reset` 的后继命令与 `INVALID_PARAM` 恢复提示保留本次 `--data-dir` 与平台：未知配置项、非法取值与写入成功后的 `config get` / `config list` / `config set` 示例都携带经过 shell 参数转义的绝对目录，照抄即读写同一份 `config.json`，不会在默认目录另建配置。TTY 的「下一步」列表按字面渲染命令文本，目录含 `[bold]` 等 Rich 标签时不会被改写或中断输出。
 
@@ -428,7 +432,7 @@ boss search --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280
 boss export --url 'https://www.zhipin.com/web/geek/jobs?query=Golang&city=101280100' --count 50 -o jobs.csv
 ```
 
-`boss export` 的 JSON 信封带 `truncated` 与 `stop_reason`，用于区分「取满请求量」与「本地扫描到上限」：`count_reached`、`platform_has_more_false`、`empty_page` 都表示结果完整；`page_budget_exhausted`（内部页数预算耗尽）与 `active_target_reached`（活跃度筛选在可判定范围内提前停止、未取满 `--count`）时 `truncated=true`，结果可能不完整，并附带对应的 `operator_actions`，同时 `hints.operator_actions` 给出缩小筛选条件的指引。`--format html` 直出没有信封，截断提示写到 stderr。
+`boss export` 的 JSON 信封带 `truncated` 与 `stop_reason`，用于区分「取满请求量」与「本地扫描到上限」：`count_reached`、`platform_has_more_false`、`empty_page` 都表示结果完整；`page_budget_exhausted`（内部页数预算耗尽）与 `active_target_reached`（活跃度筛选在可判定范围内提前停止、未取满 `--count`）时 `truncated=true`，结果可能不完整，并附带对应的 `operator_actions`，同时 `hints.operator_actions` 给出缩小筛选条件的指引。`--format html` 直出没有信封，截断提示写到 stderr。向导 `candidate_export` 步骤的 `stop_reason` 使用同一组词汇，取满 `count` 时统一为 `count_reached`（Issue #3119）。
 
 `export` 的成功后继与参数错误恢复提示保留本次 `--data-dir` 与平台：写完文件后的 `search` / `recommend`、`--format html --json` 与 CSV/stdout 的重导出示例，以及空 query / 空 `--url` / URL 解析失败的恢复命令都携带按 shell 参数转义的绝对目录，照抄提示仍使用同一登录态与缓存。
 

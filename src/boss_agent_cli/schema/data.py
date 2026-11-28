@@ -967,7 +967,7 @@ SCHEMA_DATA = {
 			"options": {
 				"list": {
 				"description": "预览职位收藏单页（不落库）。",
-					"--page": {"type": "int", "default": 1, "minimum": 1, "description": "页码"},
+					"--page": {"type": "int", "default": 1, "minimum": 1, "maximum": 1000000, "description": "页码"},
 				},
 				"sync": {},
 			},
@@ -1047,6 +1047,20 @@ SCHEMA_DATA = {
 					"type": "string",
 					"default": None,
 					"description": "释放失败信封中的 claim_reference；仅清除对应的本次 greet/apply 预约，其他预约保持不变",
+				},
+				"--pending-recruiter-greet": {
+					"type": "array",
+					"items": {"type": "string", "minLength": 1},
+					"minItems": 2,
+					"maxItems": 2,
+					"default": None,
+					"description": "招聘者招呼释放失败信封中的 geek_id 与 job_id；仅清除该候选人的本次 pending 预约，已发送记录不变",
+				},
+				"--pending-recruiter-location": {
+					"type": "integer",
+					"minimum": 1,
+					"default": None,
+					"description": "招聘者工作地点释放失败信封中的 friend_id；仅清除该会话的 pending 预约，已发送记录不变",
 				},
 			},
 		},

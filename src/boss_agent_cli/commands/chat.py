@@ -4,6 +4,7 @@ from typing import Any
 
 import click
 
+from boss_agent_cli.api.models import safe_text
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.compliance import require_compliance_allowed
 from boss_agent_cli.commands._platform import get_platform_instance
@@ -11,13 +12,17 @@ from boss_agent_cli.commands._output_path import validate_output_path_or_emit
 from boss_agent_cli.services.chat_export import render_export
 from boss_agent_cli.services.friend_list_pages import friend_list_page_observation
 from boss_agent_cli.services.output_path import prepare_output_path
-from boss_agent_cli.services.pagination import MAX_TRUSTED_PAGE, page_can_advance
+from boss_agent_cli.services.pagination import MAX_TRUSTED_PAGE, list_pagination, page_can_advance
 from boss_agent_cli.services.text_files import write_text_atomic
 from boss_agent_cli.services.chat_snapshot import save_snapshot_and_diff, load_snapshot
 from boss_agent_cli.services.chat_utils import (
 	RELATION_LABELS, FROM_FILTER, MSG_STATUS_LABELS,
 	chat_cutoff_ts, contact_identity, int_code, matches_chat_filters, relation_text,
 	safe_local_time, sanitize_csv_cell, escape_md_cell,
+)
+from boss_agent_cli.services.contact_lookup import (
+	friend_display_name,
+	friend_security_id,
 )
 from boss_agent_cli.display import boss_command_for_ctx, handle_auth_errors, handle_error_output, handle_not_supported, handle_output, handle_platform_error_output, render_simple_list
 
@@ -28,6 +33,34 @@ _MSG_STATUS_LABELS = MSG_STATUS_LABELS
 _GROUP_ORDER = ["对方主动", "我主动", "投递"]
 _sanitize_csv_cell = sanitize_csv_cell
 _escape_md_cell = escape_md_cell
+
+
+def _friend_uid_value(item: dict[str, Any]) -> str | int:
+	"""联系人 uid：非空字符串或可安全字符串化的整数（Issue #3075）。
+
+	既有信封对整数 uid 原样输出（平台与历史快照都有整数形态），这里保留原
+	类型；bool / 容器 / 浮点 / 超长整数按缺失（``""``），与 ``stable_uid``
+	同口径，避免不同联系人共用 ``"True"`` / ``"{}"`` 这类身份。
+	"""
+	value = item.get("uid")
+	if isinstance(value, str):
+		return value if value.strip() else ""
+	if isinstance(value, int) and not isinstance(value, bool):
+		return value if value and safe_text(value) else ""
+	return ""
+
+
+def _friend_text(item: dict[str, Any], key: str, default: str = "-") -> str:
+	"""联系人展示字段只认非空字符串（Issue #3075）。
+
+	``item.get(key) or default`` 会把容器 / 布尔 / ``null`` 原样写进成功信封，
+	``.get(key, default)`` 只在键缺失时生效。漂移值按缺失处理，与
+	``friend_display_name`` / ``friend_security_id`` 同口径。
+	"""
+	value = item.get(key)
+	if isinstance(value, str) and value.strip():
+		return value
+	return default
 
 
 @click.command("chat")
@@ -133,7 +166,7 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 			if last_ts:
 				last_time_str = _format_ts(last_ts)
 			else:
-				last_time_str = item.get("lastTime", "-")
+				last_time_str = _friend_text(item, "lastTime")
 			# lastMessageInfo 是对象；平台字段漂移成非空字符串 / 数组 / 数字时
 			# `.get` 会抛 AttributeError，状态的缺失语义本就是「未知」，按缺失处理
 			# （Issue #1317）。
@@ -143,19 +176,21 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 			message_status = last_message_info.get("status")
 			msg_status_label = _MSG_STATUS_LABELS.get(int_code(message_status), "未知")
 			return {
-				"name": item.get("name") or "-",
-				"title": item.get("title") or "-",
-				"brand_name": item.get("brandName") or "-",
+				"name": friend_display_name(item),
+				"title": _friend_text(item, "title"),
+				"brand_name": _friend_text(item, "brandName"),
 				"initiated_by": relation_text(item.get("relationType")),
-				"last_msg": item.get("lastMsg") or "-",
+				"last_msg": _friend_text(item, "lastMsg"),
 				"last_time": last_time_str,
 				"last_ts": last_ts,
 				"msg_status": msg_status_label,
 				# uid 是跨请求稳定的联系人标识，chatmsg/chat-summary/mark/exchange
 				# 都应优先使用它；security_id 是每请求轮换的令牌，仅作参考。
-				"uid": item.get("uid") or "",
-				"security_id": item.get("securityId") or "",
-				"encrypt_job_id": item.get("encryptJobId") or "",
+				# 两者都只接受可用字符串：容器 / 布尔漂移会让信封给出不可读标识，
+				# 还会让快照身份为空（Issue #3075，与 services.contact_lookup 同口径）。
+				"uid": _friend_uid_value(item),
+				"security_id": friend_security_id(item),
+				"encrypt_job_id": _friend_text(item, "encryptJobId", ""),
 				"unread": int_code(item.get("unreadMsgCount")) or 0,
 			}
 
@@ -183,8 +218,8 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 			output_friends = [{**all_friends[index], "raw": items[index]} for index in selected_indexes]
 
 
-		raw_has_more = platform_data.get("hasMore")
-		has_more = raw_has_more if isinstance(raw_has_more, bool) else None
+		pagination = list_pagination(platform_data, page=page, rows=friends)
+		has_more = pagination["has_more"]
 		# 首页明确没有下一页，且未在解析时丢失条目，才能证明列表完整（#1914、#2179）。
 		collection_complete = page == 1 and has_more is False and page_items_complete
 
@@ -263,20 +298,9 @@ def chat_cmd(ctx: click.Context, page: int, from_who: str | None, days: int | No
 				],
 			)
 
-		# --page 一直存在，但此前不从平台响应推导分页事实：Agent 翻页时既不知道
-		# 当前是哪一页，也没有「是否还有下一页」的证据。与 recommend 保持同一套
-		# 保守语义：只有平台返回布尔 hasMore 才据此给出下一页命令。
-		# 请求页钳制到可信上限：MCP / 直接调用可以绕过 Click 的 IntRange，
-		# 而 ``page + 1`` 在 4300 位整数上字符串化会抛 ValueError，被兜成
-		# 可重试的 NETWORK_ERROR（Issue #2542，与 #1824 / #1880 同口径）。
-		current_page = min(max(page, 1), MAX_TRUSTED_PAGE)
-		pagination: dict[str, Any] = {
-			"page": current_page,
-			"has_more": has_more,
-			"has_more_source": "platform_hasMore" if has_more is not None else "unknown",
-			"total": len(friends),
-			"total_kind": "returned_page_count",
-		}
+		# 与 recommend / history / chatmsg 共用分页证据：平台纠正页码时信封、
+		# 下一页命令与 TTY 页码都采用有效页码；无效值回显钳制后的请求页。
+		# ``pagination["page"] + 1`` 必须来自已钳制值，避免超长整数字符串化。
 		next_actions = [
 			boss_command_for_ctx(ctx, "detail <security_id>", include_data_dir=True),
 			boss_command_for_ctx(ctx, "chatmsg <uid>", include_data_dir=True),

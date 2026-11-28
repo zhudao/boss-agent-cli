@@ -10,13 +10,13 @@ import math
 from typing import Any
 
 from boss_agent_cli.services.chat_utils import MSG_STATUS_LABELS, message_text_value, safe_local_time
+from boss_agent_cli.services.pagination import dict_rows_from
 from boss_agent_cli.services.recruiter_last_messages import (
 	DEFAULT_SUMMARY_LIMIT,
 	MAX_SUMMARY_LIMIT,
 	fetch_last_messages,
 	friend_id_for,
 	friend_sources,
-	list_dict_items,
 )
 
 RECRUITER_MSG_STATUS_LABELS = {0: "发送中", **MSG_STATUS_LABELS}
@@ -51,15 +51,24 @@ def format_chat_time(value: Any) -> str | None:
 
 
 def friend_items(data: Any) -> list[dict[str, Any]]:
-	if isinstance(data, list):
-		return list_dict_items(data)
-	if not isinstance(data, dict):
-		return []
-	for key in ("friendList", "result", "list"):
-		value = data.get(key)
-		if isinstance(value, list):
-			return list_dict_items(value)
-	return []
+	"""沟通列表的实际渲染行：与 ``pagination.total`` 共用同一份提取口径。"""
+	return dict_rows_from(data, "friendList", "result", "list") or []
+
+
+#: 招聘者聊天记录的列表容器：终端渲染与 ``pagination.total`` 共用（Issue #3038）。
+#: 顺序取渲染层原有优先级；``historyMsgList`` 是 ``chat_utils.message_list``
+#: 早已识别的候选，此前只有 total 认它、屏幕不显示。
+MESSAGE_CONTAINER_KEYS = ("messageList", "msgList", "messages", "historyMsgList", "list", "result")
+
+
+def message_items(data: Any) -> list[dict[str, Any]]:
+	"""招聘者聊天记录的实际渲染行：与 ``pagination.total`` 共用同一份提取。
+
+	``hr chatmsg`` 的 total 与终端渲染必须来自同一次提取：只让 total 认
+	``historyMsgList`` 或只让渲染认 ``msgList``，同一份响应就会在屏幕上和分页
+	证据里给出不同的消息数（Issue #3038）。
+	"""
+	return dict_rows_from(data, *MESSAGE_CONTAINER_KEYS) or []
 
 
 def friend_ids_from_items(items: list[dict[str, Any]]) -> list[int]:

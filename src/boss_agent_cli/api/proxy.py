@@ -12,6 +12,7 @@ Chromium also leaks the real address over WebRTC UDP unless told otherwise;
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from typing import Mapping, TypedDict
 from urllib.parse import unquote, urlsplit
@@ -44,9 +45,8 @@ class PlaywrightProxy(TypedDict, total=False):
 	password: str | None
 
 
-#: Chromium 只按 https 出口选代理：平台 API 全是 https，httpx 在 trust_env 下
-#: 也不会把 HTTP_PROXY 用于 https 请求，Chromium 若继续用它就会与 API 通道
-#: 分叉出第二个出口（Issue #1869）。
+#: 本模块关注的代理变量（仅作取值域说明；实际选择复刻 urllib 的两遍算法：
+#: 小写拼写覆盖大写、小写空值清除，见 ``_proxy_environment``，Issue #3084）。
 PROXY_ENV_KEYS: tuple[str, ...] = (
 	"HTTPS_PROXY",
 	"https_proxy",
@@ -54,6 +54,7 @@ PROXY_ENV_KEYS: tuple[str, ...] = (
 	"all_proxy",
 )
 
+#: 绕过列表同样走 urllib 两遍算法（Issue #3084）。
 _NO_PROXY_ENV_KEYS: tuple[str, ...] = ("NO_PROXY", "no_proxy")
 
 # Chromium keeps non-proxied UDP (STUN) out of the proxy by default, which
@@ -79,31 +80,103 @@ def resolve_proxy(environ: Mapping[str, str] | None = None) -> PlaywrightProxy |
 	``trust_env=True`` does for https requests (Issue #1869).
 	"""
 	source = os.environ if environ is None else environ
-	raw = ""
-	key = ""
-	for key in PROXY_ENV_KEYS:
-		value = source.get(key, "").strip()
-		if value:
-			raw = value
-			break
-	if not raw:
+	proxies, keys = _proxy_environment(source)
+	# httpx 按 ("http", "https", "all") 顺序挂载；平台请求是 https，只有
+	# https / all 会命中，且 https 优先（Issue #3084）。
+	scheme = "https" if proxies.get("https") else "all"
+	raw = proxies.get(scheme, "")
+	if not raw.strip():
 		return None
-	proxy = parse_proxy_url(raw, env_key=key)
+	proxy = parse_proxy_url(raw, env_key=keys.get(scheme))
 	if proxy is not None:
-		bypass = _no_proxy_value(source)
+		bypass = proxies.get("no", "").strip()
 		if bypass:
-			# Chromium 的 ``bypass`` 与 httpx 的 NO_PROXY 一样按目标主机生效：
-			# 原样传下去，两个通道对同一域名同时直连（Issue #1869）。
-			proxy["bypass"] = bypass
+			# httpx 把普通域名转成 ``all://*<host>``（根域 + 子域都直连），
+			# Chromium 的 bypass 只按字面主机名匹配，必须显式补子域条目
+			# 才不会让 sub.api.test 仍走代理（Issue #3091）。
+			proxy["bypass"] = _chromium_bypass(bypass)
 	return proxy
 
 
-def _no_proxy_value(source: Mapping[str, str]) -> str:
-	for key in _NO_PROXY_ENV_KEYS:
-		value = source.get(key, "").strip()
+def _chromium_bypass(no_proxy: str) -> str:
+	"""把 NO_PROXY 条目映射成 Chromium 可识别的 bypass 列表（Issue #3091）。
+
+	httpx 0.28 的 ``all://*api.test`` 让 ``api.test`` 与 ``sub.api.test`` 同时
+	直连；Chromium 的 ``api.test`` 只精确匹配根域。普通域名因此同时输出根域与
+	``*.`` 前缀，IP / localhost / CIDR / ``*`` 保持精确语义（不扩大绕过范围）。
+	"""
+	entries: list[str] = []
+	for raw in no_proxy.split(","):
+		host = raw.strip()
+		if not host:
+			continue
+		if host == "*":
+			return "*"
+		if host.startswith("."):
+			# 前导点本身就表示「子域」，补前缀会生成 `*..host`。
+			entries.append(f"*{host}")
+			continue
+		if "://" in host or _is_exact_bypass(host):
+			# 带 scheme 的条目由 httpx 当 URLPattern 挂载，Chromium 只认主机名，
+			# 保守保留原值；IP / localhost / CIDR 不做子域扩展。
+			entries.append(host)
+		else:
+			entries.extend((host, f"*.{host}"))
+	seen: set[str] = set()
+	unique: list[str] = []
+	for entry in entries:
+		if entry not in seen:
+			seen.add(entry)
+			unique.append(entry)
+	return ",".join(unique)
+
+
+def _is_exact_bypass(host: str) -> bool:
+	"""该条目在 httpx 侧已经按精确主机 / 网段匹配，不需要子域通配。"""
+	if host.lower() == "localhost":
+		return True
+	for parser in (ipaddress.ip_address, ipaddress.ip_network):
+		try:
+			parser(host[1:-1] if host.startswith("[") and host.endswith("]") else host)
+		except ValueError:
+			continue
+		return True
+	return False
+
+
+def _proxy_environment(source: Mapping[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+	"""复刻 ``urllib.request.getproxies_environment`` 的两遍算法（Issue #3084）。
+
+	httpx 的 ``trust_env=True`` 经 ``getproxies()`` 使用同一算法：第一遍收集
+	所有非空 ``*_proxy`` 值（键名归一化成小写 scheme），第二遍只处理**全小写
+	拼写**的变量——非空则覆盖，空值则清除该 scheme。旧实现按固定顺序取第一个
+	非空值，``HTTPS_PROXY`` 与 ``https_proxy`` 同时存在或小写空值显式关闭代理
+	时，API 通道与浏览器通道会得到不同出口 / 不同绕过边界。
+
+	返回 ``(scheme -> value, scheme -> 命中的变量名)``；变量名只用于错误信息，
+	绝不回显值（其中可能含凭据）。
+	"""
+	proxies: dict[str, str] = {}
+	keys: dict[str, str] = {}
+	entries: list[tuple[str, str, str]] = []
+	for name, value in source.items():
+		if len(name) > 5 and name[-6] == "_" and name[-5:].lower() == "proxy":
+			scheme = name[:-6].lower()
+			entries.append((name, value, scheme))
+			if value:
+				proxies[scheme] = value
+				keys[scheme] = name
+	for name, value, scheme in entries:
+		if name[-6:] != "_proxy":
+			# 大写 / 混合拼写在第二遍不参与，与 urllib 的逐字符判定一致。
+			continue
 		if value:
-			return value
-	return ""
+			proxies[scheme] = value
+			keys[scheme] = name
+		else:
+			proxies.pop(scheme, None)
+			keys.pop(scheme, None)
+	return proxies, keys
 
 
 #: Chromium / Playwright 能使用的代理 scheme（Issue #1920）。

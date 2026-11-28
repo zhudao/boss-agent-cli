@@ -301,6 +301,19 @@ def boss_command_for_ctx(
 	return boss_command(command, platform_name=platform_name, data_dir=data_dir, role=role)
 
 
+def recovery_command_for_ctx(ctx: Any, command: str) -> str:
+	"""恢复指引里的命令：agent 组不在 hr 下，招聘者必须显式带角色（Issue #3063）。
+
+	角色来自本次运行的 ctx；没有招聘者上下文时不注入，避免候选人照抄后
+	被切到招聘者那套本地状态。
+	"""
+	role = None
+	if command.startswith("agent ") and ctx and getattr(ctx, "obj", None):
+		if ctx.obj.get("role") == "recruiter":
+			role = "recruiter"
+	return boss_command_for_ctx(ctx, command, include_data_dir=True, role=role)
+
+
 def show_command_for_ctx(ctx: Any, *, index_saved: bool) -> str | None:
 	"""编号查看命令：只有本次列表写入了编号索引时才可用。
 
@@ -317,22 +330,38 @@ def login_action_for_ctx(ctx: Any) -> str:
 	return boss_command_for_ctx(ctx, "login", include_data_dir=True)
 
 
-def contact_refresh_command_for_ctx(ctx: Any) -> str:
-	"""CONTACT_NOT_FOUND 的后继命令：招聘者刷新 hr chat，求职者刷新 chat。"""
-	command = "hr chat" if ctx and getattr(ctx, "obj", None) and ctx.obj.get("role") == "recruiter" else "chat"
-	return boss_command_for_ctx(ctx, command, include_data_dir=True)
+def _recruiter_side_command(ctx: Any, command: str | None) -> bool:
+	"""后继命令跟随命令族；共用工作流入口与缺少标识时按运行角色（Issue #3065）。"""
+	if command is not None:
+		group = command.split(".", 1)[0]
+		if group not in {"wizard", "agent"}:
+			return command.startswith("recruiter-")
+	return bool(ctx and getattr(ctx, "obj", None) and ctx.obj.get("role") == "recruiter")
 
 
-def unconfirmed_write_contract_for_ctx(ctx: Any) -> tuple[str, dict[str, list[str]]]:
-	"""ACTION_UNCONFIRMED 的恢复指引：按角色给出可执行的核对命令。
+def contact_refresh_command_for_ctx(ctx: Any, *, command: str | None = None) -> str:
+	"""CONTACT_NOT_FOUND 的后继命令：招聘者刷新 hr chat，求职者刷新 chat。
+
+	``command`` 是本次执行的内部命令标识（``exchange`` / ``recruiter-chat``）；
+	显式给出时按命令族选择，避免求职者命令在 ``--role recruiter`` 下被引向
+	招聘者专属命令（Issue #3065）。
+	"""
+	refresh = "hr chat" if _recruiter_side_command(ctx, command) else "chat"
+	return boss_command_for_ctx(ctx, refresh, include_data_dir=True)
+
+
+def unconfirmed_write_contract_for_ctx(
+	ctx: Any, *, command: str | None = None
+) -> tuple[str, dict[str, list[str]]]:
+	"""ACTION_UNCONFIRMED 的恢复指引：按命令族给出可执行的核对命令。
 
 	登记表只保留角色中立文案；求职者只能核对自己的会话 / 投递，招聘者才用
 	``hr chatmsg <friend_id>``。共享错误出口在回填或改写登记表文案时都走这里，
-	避免未来新增的写命令漏掉角色覆盖（Issue #2921）。
+	避免未来新增的写命令漏掉角色覆盖（Issue #2921）。``command`` 存在时按命令族
+	判断，避免求职者命令在 ``--role recruiter`` 下被引向招聘者核对入口。
 	"""
-	role = ctx.obj.get("role") if ctx and getattr(ctx, "obj", None) else None
-	command = "hr chatmsg <friend_id>" if role == "recruiter" else "chat"
-	check_command = boss_command_for_ctx(ctx, command, include_data_dir=True)
+	command_name = "hr chatmsg <friend_id>" if _recruiter_side_command(ctx, command) else "chat"
+	check_command = boss_command_for_ctx(ctx, command_name, include_data_dir=True)
 	return (
 		f"动作可能已生效：先用 {check_command} 核对平台记录，不要自动重试",
 		{"next_actions": [check_command]},
@@ -428,13 +457,7 @@ def registry_recovery_for_ctx(ctx: Any, text: str) -> str:
 	if ctx is None:
 		return text
 
-	def command_for(command: str) -> str:
-		# agent 命令不在 hr 组下：恢复命令必须显式带角色，否则会读另一套本地
-		# 状态，与同信封的 next_actions 也不一致（Issue #1524）。
-		role = "recruiter" if command.startswith("agent ") else None
-		return boss_command_for_ctx(ctx, command, include_data_dir=True, role=role)
-
-	return rewrite_command_examples(text, _REGISTRY_COMMANDS, command_for)
+	return rewrite_command_examples(text, _REGISTRY_COMMANDS, lambda command: recovery_command_for_ctx(ctx, command))
 
 
 def error_contract_for_code(
@@ -458,6 +481,7 @@ def platform_error_contract(
 	clean_command: str | None = None,
 	doctor_command: str | None = None,
 	read_only: bool = False,
+	command: str | None = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
 	"""Return ``(recoverable, recovery_action, hints)`` for a platform error code.
 
@@ -472,6 +496,8 @@ def platform_error_contract(
 
 	CONTACT_NOT_FOUND 是确定性结果：``next_actions`` 指向同一数据目录刷新沟通
 	列表（招聘者 ``hr chat`` / 求职者 ``chat``），不重放原命令（Issue #1485）。
+	``command`` 是本次执行的内部命令标识，用于让后继命令跟随命令族，而不是
+	只看 ``--role``（Issue #3065）。
 	"""
 	if code == "UNKNOWN" and read_only:
 		code = "NETWORK_ERROR"
@@ -484,11 +510,11 @@ def platform_error_contract(
 	if code == "CONTACT_NOT_FOUND":
 		# friend_id 写错或联系人已变化是确定性结果：给出去同一数据目录刷新沟通
 		# 列表的下一步，而不是让 Agent 重放同一条命令或让用户提 issue（#1485）。
-		chat_command = contact_refresh_command_for_ctx(ctx)
+		chat_command = contact_refresh_command_for_ctx(ctx, command=command)
 		return recoverable, f"用 {chat_command} 核对联系人标识后重试", {"next_actions": [chat_command]}
 	if code == "ACTION_UNCONFIRMED":
-		# 写请求结果未知：登记表文案不区分角色，出口必须按当前角色注入核对命令。
-		recovery_action, hints = unconfirmed_write_contract_for_ctx(ctx)
+		# 写请求结果未知：登记表文案不区分角色，出口必须按命令族注入核对命令。
+		recovery_action, hints = unconfirmed_write_contract_for_ctx(ctx, command=command)
 		return recoverable, recovery_action, hints
 	if recovery_action:
 		# 登记表是通用示例；诊断类命令（doctor / crawl status / resume list）读的
@@ -639,9 +665,9 @@ def handle_error_output(
 		recoverable = registered_recoverable
 	if recovery_action is None:
 		if code == "ACTION_UNCONFIRMED":
-			# 持久化失败记录的错误码回填也要按当前角色生成核对命令，不能把
-			# 招聘者专属命令交给求职者（Issue #2921）。
-			recovery_action, role_hints = unconfirmed_write_contract_for_ctx(ctx)
+			# 持久化失败记录的错误码回填也要按命令族生成核对命令，不能把
+			# 招聘者专属命令交给求职者命令（Issue #2921 #3065）。
+			recovery_action, role_hints = unconfirmed_write_contract_for_ctx(ctx, command=command)
 			hints = {**role_hints, **(hints or {})}
 		else:
 			recovery_action = registered_recovery_action
@@ -659,7 +685,7 @@ def handle_error_output(
 		recovery_action = login_action_for_ctx(ctx)
 		hints = {**auth_required_hints(ctx), **(hints or {})}
 	elif code == "ACTION_UNCONFIRMED" and recovery_action in registered_variants:
-		recovery_action, role_hints = unconfirmed_write_contract_for_ctx(ctx)
+		recovery_action, role_hints = unconfirmed_write_contract_for_ctx(ctx, command=command)
 		hints = {**role_hints, **(hints or {})}
 	elif recovery_action and recovery_action == registered_recovery_action:
 		# 仍是登记表原文：doctor / resume list / crawl status 读的是本次运行的数据
@@ -789,7 +815,9 @@ def handle_platform_error_output(
 	# 自相矛盾信封（Issue #1900）。
 	if read_only and code == "UNKNOWN":
 		code = "NETWORK_ERROR"
-	recoverable, recovery_action, risk_hints = platform_error_contract(code, ctx=ctx, read_only=read_only)
+	recoverable, recovery_action, risk_hints = platform_error_contract(
+		code, ctx=ctx, read_only=read_only, command=command
+	)
 	hints = {**(extra_hints or {}), **(risk_hints or {})} or None
 	details = None
 	if isinstance(response, dict):
@@ -1074,6 +1102,42 @@ def render_status(
 		)
 
 
+def _simple_list_min_width(columns: list[tuple[str, str, str]]) -> int:
+	"""表格可读所需的最小终端宽度（Issue #3046）。
+
+	Rich 在宽度不足时会把每列压到 1 格；CJK 字符宽度为 2，放不进 1 格就
+	整列消失，屏幕上只剩行号和纯数字列。按「每个数据列至少 4 格（两个
+	汉字）+ 两侧 padding + 一条边线」估算，低于它时改用纵向逐字段布局。
+	"""
+	width = 3  # ``#`` 列
+	width += 3 * (len(columns) + 1)  # 每列两侧 padding 与一条边线
+	for header, _, _ in columns:
+		width += max(cell_len(header), 4)
+	return width
+
+
+def _render_simple_list_vertical(
+	items: list[dict[str, Any]],
+	title: str,
+	columns: list[tuple[str, str, str]],
+) -> None:
+	"""窄终端降级：逐条纵向渲染字段，业务字段不会被压成空格（Issue #3046）。
+
+	值按字面写入 ``Text``（不经 markup 解析），与表格单元格同样只做
+	``cell_text`` 归一；超宽值交给终端折行，不做截断。
+	"""
+	console.print(Text(f"{title} ({len(items)})", style="bold"), soft_wrap=True)
+	for index, item in enumerate(items, 1):
+		block = Text()
+		for position, (header, key, style) in enumerate(columns):
+			if position:
+				block.append("\n")
+			block.append(f"{index}. " if position == 0 else "   ", style="dim")
+			block.append(f"{header}: ", style="bold")
+			block.append(cell_text(item.get(key)), style=style or None)
+		console.print(block, soft_wrap=True)
+
+
 def render_simple_list(
 	items: list[dict[str, Any]],
 	title: str,
@@ -1088,10 +1152,15 @@ def render_simple_list(
 	if not items:
 		console.print(f"[yellow]no {escape_markup(title)}[/yellow]")
 		return
+	if console.width < _simple_list_min_width(columns):
+		_render_simple_list_vertical(items, title, columns)
+		return
 
 	# title 可能含外部输入（联系人名、配置路径等）：整个标题按字面渲染。
 	table = Table(title=f"{escape_markup(title)} ({len(items)})", show_lines=True)
-	table.add_column("#", style="dim", width=3)
+	# 行号列按实际条数自适应：固定 3 格时第 1000 行起被 Rich 截成 ``10…``，
+	# 1000 / 1001 显示成同一个编号（Issue #3049）。
+	table.add_column("#", style="dim", width=max(3, len(str(len(items)))))
 	for header, _, style in columns:
 		# 不设列宽上限：Rich 按终端宽度分配，超宽内容按字符折行（Issue #2761）。
 		table.add_column(escape_markup(header), style=style, overflow="fold")
@@ -1345,7 +1414,8 @@ def render_saved_search_list(
 			"name": item["name"],
 			"params": "\n".join(
 				f"{key}: {cell_text(value)}" for key, value in configured_search_params(item["params"]).items()
-			) or "-",
+			)
+			or "-",
 			"created_at": unix_time_label(item.get("created_at")),
 		}
 		for item in items
@@ -2033,8 +2103,7 @@ def handle_auth_errors(command_name: str) -> Callable[[Callable[..., Any]], Call
 						message=str(e),
 						recoverable=busy_recoverable,
 						recovery_action=(
-							"稍后重试本命令；并发导出同一数据目录时会短暂争用当天快照锁，"
-							"快照文件本身完好，不需要删除"
+							"稍后重试本命令；并发导出同一数据目录时会短暂争用当天快照锁，快照文件本身完好，不需要删除"
 						),
 					)
 				elif is_browser_kernel_missing(str(e)):

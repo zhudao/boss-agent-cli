@@ -15,9 +15,11 @@ from boss_agent_cli.display import (
 	render_next_steps,
 	render_sectioned_record,
 )
+from boss_agent_cli.services.pagination import dict_rows_from
 from boss_agent_cli.services.recruiter_chat_summary import (
 	friend_items,
 	format_chat_time,
+	message_items,
 	message_text,
 	message_time,
 	unread_count,
@@ -34,19 +36,12 @@ def _first_value(item: dict[str, Any], *keys: str) -> Any:
 
 
 def _dict_rows(data: Any, *keys: str) -> list[dict[str, Any]]:
-	"""从平台响应里取对象列表；字段缺失或类型漂移时返回空列表。"""
-	value: Any = None
-	if isinstance(data, list):
-		value = data
-	elif isinstance(data, dict):
-		for key in keys:
-			candidate = data.get(key)
-			if isinstance(candidate, list):
-				value = candidate
-				break
-	if not isinstance(value, list):
-		return []
-	return [item for item in value if isinstance(item, dict)]
+	"""从平台响应里取对象列表；字段缺失或类型漂移时返回空列表。
+
+	与命令层的 ``pagination.total`` 共用 ``dict_rows_from``：非对象元素不渲染、
+	顶层列表照常渲染，总数才是本次实际渲染的行数（Issue #3034、#3037）。
+	"""
+	return dict_rows_from(data, *keys) or []
 
 
 # ── 列表行映射 ────────────────────────────────────────────────────────
@@ -69,6 +64,19 @@ def friend_list_rows(data: Any) -> list[dict[str, Any]]:
 	return rows
 
 
+def _active_text(item: dict[str, Any]) -> Any:
+	"""活跃列：优先平台文案；缺失时把数字时间戳格式化成可读时间。
+
+	``activeTime`` 是毫秒时间戳，直接交给单元格会把 13 位毫秒数打给真人
+	（Issue #3045）。与聊天时间列共用 ``format_chat_time``：``activeTimeDesc``
+	存在时原样显示，缺失时按 ``MM-DD HH:MM`` 展示，坏值由渲染层显示 ``-``。
+	"""
+	desc = _first_value(item, "activeTimeDesc")
+	if desc is not None:
+		return desc
+	return format_chat_time(item.get("activeTime"))
+
+
 def candidate_list_rows(data: Any) -> list[dict[str, Any]]:
 	"""候选人 / 推荐牛人列表：姓名、意向职位、城市、经验、学历、活跃度。"""
 	rows: list[dict[str, Any]] = []
@@ -80,7 +88,7 @@ def candidate_list_rows(data: Any) -> list[dict[str, Any]]:
 				"city": _first_value(item, "city", "cityName"),
 				"experience": _first_value(item, "workYearDesc", "experience"),
 				"education": _first_value(item, "degreeCategory", "degreeName", "education"),
-				"active": _first_value(item, "activeTimeDesc", "activeTime"),
+				"active": _active_text(item),
 			}
 		)
 	return rows
@@ -103,10 +111,18 @@ def job_list_rows(data: Any) -> list[dict[str, Any]]:
 
 
 def _direction(item: dict[str, Any]) -> str:
-	"""消息方向：平台给 from / role / side，缺失时按 isSelf 判定。"""
+	"""消息方向：优先发送人姓名，其次平台类型码的「我 / 对方」归一。"""
 	value = _first_value(item, "from", "role", "side")
 	if isinstance(value, dict):
-		value = _first_value(value, "type", "name")
+		# name 是平台给真人的展示文本；type 是内部机器码（boss / geek），
+		# 直接打印会让终端只剩 boss / geek（Issue #3057）。
+		name = _first_value(value, "name")
+		if isinstance(name, str) and name.strip():
+			return name.strip()
+		kind = _first_value(value, "type")
+		if isinstance(kind, str) and kind.strip():
+			return {"boss": "我", "geek": "对方"}.get(kind.strip().lower(), kind.strip())
+		value = None
 	if isinstance(value, str) and value.strip():
 		return value.strip()
 	if item.get("isSelf") is True or item.get("self") is True:
@@ -115,9 +131,12 @@ def _direction(item: dict[str, Any]) -> str:
 
 
 def message_rows(data: Any) -> list[dict[str, Any]]:
-	"""聊天记录：方向、内容与时间。"""
+	"""聊天记录：方向、内容与时间。
+
+	与 ``hr chatmsg`` 的 ``pagination.total`` 共用 ``message_items``（Issue #3038）。
+	"""
 	rows: list[dict[str, Any]] = []
-	for item in _dict_rows(data, "messageList", "msgList", "messages", "list", "result"):
+	for item in message_items(data):
 		rows.append(
 			{
 				"direction": _direction(item),

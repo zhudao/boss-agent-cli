@@ -90,3 +90,34 @@ def rows_from(platform_data: Any, key: str) -> list[Any] | None:
 	"""取平台响应里的列表字段；缺失或类型不符时返回 ``None``。"""
 	value = platform_data.get(key) if isinstance(platform_data, dict) else None
 	return value if isinstance(value, list) else None
+
+
+def rows_from_first(platform_data: Any, *keys: str) -> list[Any] | None:
+	"""按优先级取第一个可识别的列表容器；都不是列表时返回 ``None``。
+
+	终端渲染与 ``pagination.total`` 必须共用同一组候选键：只数固定键时，平台把
+	列表换到 ``result`` / ``items`` / ``jobList`` 等替代容器，信封里明明有记录
+	却报 ``total=None`` / ``0``（Issue #3034）。空列表也是可识别容器，命中即返回，
+	不能继续找兄弟键。
+	"""
+	if not isinstance(platform_data, dict):
+		return None
+	for key in keys:
+		value = platform_data.get(key)
+		if isinstance(value, list):
+			return value
+	return None
+
+
+def dict_rows_from(platform_data: Any, *keys: str) -> list[dict[str, Any]] | None:
+	"""按渲染口径取对象行：接受顶层列表，过滤非对象元素。
+
+	``pagination.total`` 声明为 ``returned_page_count``，必须等于终端实际渲染的
+	行数：``null`` 等非对象元素不渲染，平台把载荷换成顶层列表时却照常渲染。
+	命令层与渲染层共用本函数；只统计原始列表长度或只接受对象容器，都会让
+	``total`` 与屏幕上的行数不一致（Issue #3037）。
+	"""
+	value = platform_data if isinstance(platform_data, list) else rows_from_first(platform_data, *keys)
+	if value is None:
+		return None
+	return [item for item in value if isinstance(item, dict)]
